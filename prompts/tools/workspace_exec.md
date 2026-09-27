@@ -1,0 +1,1 @@
+Run a shell command in this thread's sandbox (cwd {{workdir}} unless given). Use it to clone, inspect (git, rg, ls), build and run tests. Returns exitCode, stdout and stderr; long output keeps its tail.

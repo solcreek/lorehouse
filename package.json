@@ -1,0 +1,22 @@
+{
+  "name": "lorehouse",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/server.ts",
+    "build": "bun build --compile --minify ./src/server.ts --outfile dist/lorehouse",
+    "test": "bun test test/",
+    "typecheck": "tsc --noEmit",
+    "conformance": "bun conformance/run.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
+    "@junejs/core": "0.2.0-dev.44",
+    "@junejs/server": "1.0.0-dev.24"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  }
+}

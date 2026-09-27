@@ -1,0 +1,1 @@
+Push the sandbox's committed HEAD to a new branch and open a GitHub pull request. Commit your work first (workspace_exec: git add/commit). The branch must start with "{{branch_prefix}}". A human in the thread must approve before anything is pushed; if they deny it, stop and ask what to change.
