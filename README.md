@@ -7,3 +7,40 @@ sandbox of its own.
 The agent's name is set per install. It defaults to `scout`.
 
 > Status: pre-alpha, not yet usable.
+
+## Run it
+
+```bash
+bun install
+SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=xoxb-… ANTHROPIC_API_KEY=… \
+AGENT_CHANNELS=C0123456 KNOWLEDGE_SEED=./my-docs.jsonl \
+bun start                       # POST /slack/events, GET /healthz
+```
+
+| env | default | |
+|---|---|---|
+| `AGENT_NAME` | `scout` | the agent's handle; must match the Slack app's display name |
+| `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never answers DMs or private channels |
+| `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
+| `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
+| `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |
+| `SANDBOX_URL` `SANDBOX_TOKEN` `GITHUB_TOKEN` | (off) | set all three to enable the code tools and pull requests |
+
+## Layout
+
+| path | what |
+|---|---|
+| `src/` | the TypeScript implementation (on [June](https://june.build)) |
+| `prompts/` | the system prompt and tool descriptions, as Markdown |
+| `migrations/` | Lorehouse's own data, as plain SQL |
+| `conformance/` | the behavioral contract: a mocked Slack + Anthropic, and black-box scenarios |
+| `sandbox/` | the Firecracker sandbox's in-VM agent (Go) and a feasibility spike |
+| `docs/adr/` | decisions, starting with [why TypeScript first](docs/adr/0001-typescript-first-conformance-as-contract.md) |
+
+## Check it
+
+```bash
+bun run typecheck && bun run test
+bun run conformance                          # against the source
+bun run build && bun run conformance --app ./dist/lorehouse
+```
