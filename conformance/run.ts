@@ -7,7 +7,9 @@
 //
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
-// LOREHOUSE_DB. It must answer GET /healthz once ready.
+// LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_DEBOUNCE_MS. It must answer GET /healthz
+// once listening, and GET /status with { knowledge: { state: "ready", … } } once its
+// Slack backfill is done.
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
@@ -60,8 +62,32 @@ const mention = (channel: string, extra: Record<string, unknown> = {}) => {
   return { type: "app_mention", user: "U1", team: "T1", text: "<@UBOT> [q1] how does soft navigation work", ts, event_ts: ts, channel, ...extra };
 };
 
-const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number> };
+const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[] };
 const reset = () => fetch(`${MOCK}/reset`, { method: "POST" });
+
+// Ask the agent something in the allowed channel and read back what it cited.
+async function ask(question: string): Promise<{ cite?: string; src?: string; text: string }> {
+  const n = ++seq;
+  const ts = `${1970000000 + n}.000100`;
+  await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${n}] ${question}`, ts, event_ts: ts, channel: ALLOWED });
+  const r = await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`);
+  const { text = "" } = (await r.json()) as { text?: string };
+  return { cite: text.match(/\[cite:([^\]\s]+)\]/)?.[1], src: text.match(/\[src:([^\]\s]+)\]/)?.[1], text };
+}
+
+type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }> } };
+const status = async () => (await (await fetch(`http://localhost:${APP_PORT}/status`)).json()) as Status;
+
+// Post a message into Slack's history, then deliver the Events API event for it.
+async function liveMessage(channel: string, channelType: string, text: string): Promise<string> {
+  const ts = `${1980000000 + ++seq}.000100`;
+  await fetch(`${MOCK}/fixtures/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel, message: { ts, user: "U6", text } }) });
+  await sendEvent({ type: "message", channel, channel_type: channelType, user: "U6", text, ts, event_ts: ts });
+  return ts;
+}
+
+const SEED_DOCS = (await Bun.file(join(HERE, "fixtures/corpus.jsonl")).text()).split("\n").filter((l) => l.trim()).length;
+const WOMBAT_THREAD = "slack:C1:1790000001.000100";
 
 // ── scenarios ───────────────────────────────────────────────────────────────
 
@@ -78,6 +104,60 @@ const scenarios: Scenario[] = [
       const expected = (await Bun.file(join(HERE, "fixtures/expected-cites.json")).json()) as Record<string, string>;
       const wrong = Object.entries(expected).filter(([q, id]) => r.cites[q] !== id);
       return wrong.length ? `top hit differs for ${wrong.length} question(s), e.g. "${wrong[0]![0]}": got ${r.cites[wrong[0]![0]]}, want ${wrong[0]![1]}` : null;
+    },
+  },
+  {
+    name: "reports ingest state and document count at GET /status",
+    run: async () => {
+      const s = await status();
+      // seeds + the wombat thread + the password message; the bot post and the join are not documents
+      const want = SEED_DOCS + 2;
+      if (s.knowledge.state !== "ready") return `state ${s.knowledge.state}, want ready`;
+      return s.knowledge.documents === want ? null : `documents ${s.knowledge.documents}, want ${want}`;
+    },
+  },
+  {
+    name: "answers from backfilled Slack history, citing the thread's permalink",
+    run: async () => {
+      const a = await ask("when is the quarterly wombat review");
+      if (a.cite !== WOMBAT_THREAD) return `cited ${a.cite}, want ${WOMBAT_THREAD}`;
+      const want = "https://acme.slack.com/archives/C1/p1790000001000100";
+      return a.src === want ? null : `source ${a.src}, want ${want}`;
+    },
+  },
+  {
+    name: "indexes whole threads: an answer only a reply holds is found",
+    run: async () => {
+      const a = await ask("which floor is the ops room on");
+      return a.cite === WOMBAT_THREAD ? null : `cited ${a.cite}, want ${WOMBAT_THREAD}`;
+    },
+  },
+  {
+    name: "leaves bot and system messages out of knowledge",
+    run: async () => {
+      const a = await ask("platypus build succeeded");
+      return a.cite === "slack:C1:1790000020.000100" ? "cited the deploy bot's message" : null;
+    },
+  },
+  {
+    name: "indexes a live message in a public channel",
+    run: async () => {
+      const ts = await liveMessage(ALLOWED, "channel", "Reminder: the kangaroo deploy freeze starts Friday at noon");
+      await Bun.sleep(1000); // > INGEST_DEBOUNCE_MS
+      const a = await ask("when does the kangaroo deploy freeze start");
+      return a.cite === `slack:${ALLOWED}:${ts}` ? null : `cited ${a.cite}, want slack:${ALLOWED}:${ts}`;
+    },
+  },
+  {
+    name: "never reads or indexes a private channel",
+    run: async () => {
+      await reset();
+      await liveMessage("G1", "group", "Confidential: echidna merger talks resume next week");
+      await Bun.sleep(1000);
+      const s = await stats();
+      if (s.readChannels.includes("G1")) return "read the private channel's history";
+      const a = await ask("echidna merger talks");
+      return a.cite?.startsWith("slack:G1") ? `cited ${a.cite}` : null;
     },
   },
   {
@@ -146,7 +226,11 @@ const scenarios: Scenario[] = [
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
-const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], { env: { ...process.env, PORT: String(MOCK_PORT), TTFT_MS: "50", TOKEN_DELAY_MS: "2" }, stdout: "ignore", stderr: "inherit" });
+const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], {
+  env: { ...process.env, PORT: String(MOCK_PORT), TTFT_MS: "50", TOKEN_DELAY_MS: "2", SLACK_FIXTURES: join(HERE, "fixtures/slack-history.json") },
+  stdout: "ignore",
+  stderr: "inherit",
+});
 const app = Bun.spawn(APP_CMD, {
   // An external app runs from its own directory, so a binary that quietly reads files
   // from this repo (prompts, migrations) fails here instead of passing by accident.
@@ -162,6 +246,9 @@ const app = Bun.spawn(APP_CMD, {
     AGENT_CHANNELS: ALLOWED,
     KNOWLEDGE_SEED: join(HERE, "fixtures/corpus.jsonl"),
     LOREHOUSE_DB: ":memory:",
+    // Fixture timestamps are fixed, so backfill far enough back that they never age out.
+    INGEST_BACKFILL_DAYS: "36500",
+    INGEST_DEBOUNCE_MS: "200",
   },
   stdout: "ignore",
   stderr: "pipe",
@@ -174,6 +261,12 @@ try {
   if (!(await waitHttp(`http://localhost:${APP_PORT}/healthz`, 15000))) throw new Error(`app never answered /healthz\n${await new Response(app.stderr).text()}`);
   const owners = await listenerPids(APP_PORT);
   if (!owners.includes(String(app.pid))) throw new Error(`:${APP_PORT} is held by ${owners.join(",")}, not the app under test (${app.pid})`);
+  // Scenarios assume the Slack backfill has finished; the app reports it at /status.
+  const t0 = Date.now();
+  while ((await status().catch(() => undefined))?.knowledge.state !== "ready") {
+    if (Date.now() - t0 > 15000) throw new Error(`ingest never became ready: ${JSON.stringify(await status().catch((e) => String(e)))}`);
+    await Bun.sleep(50);
+  }
 
   for (const s of scenarios) {
     const t0 = Date.now();
