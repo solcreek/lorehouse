@@ -9,3 +9,4 @@ console.log(
     (app.seeded ? ` (seeded ${app.seeded} knowledge chunks)` : "") +
     (config.sandbox ? " — code tools on" : " — code tools off"),
 );
+void app.startIngest();

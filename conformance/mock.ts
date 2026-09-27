@@ -1,19 +1,25 @@
 // mock.ts — one process standing in for BOTH external APIs, so the TS and Go
 // implementations are measured against identical, deterministic upstreams.
 //
-//   /slack/api/<method>        Slack Web API (JSON or form bodies). Records every call.
+//   /slack/api/<method>        Slack Web API (JSON, form or query params). Records every call.
+//                              Serves conversations.history/replies from its fixtures.
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
-//   GET  /stats                all recorded Slack calls + model call count
-//   POST /reset
+//   GET  /stats                recorded Slack calls, model call count, channels read
+//   POST /fixtures/messages    {channel, message} — add a message to Slack's history
+//   POST /reset                clear recorded calls (fixtures stay)
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
 // question; turn 2 (tool_result present) → a streamed answer that echoes the question's
-// nonce and cites the first chunk id it finds in the tool_result, so the harness can
-// check the retrieval actually reached the model.
+// nonce and cites the first hit's id and source from the tool_result
+// ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), so the harness can check what the
+// retrieval actually handed the model.
 //
 // Env: PORT (8900), TTFT_MS (300) delay before the first event, TOKENS (80),
-//      TOKEN_DELAY_MS (15) between text deltas.
+//      TOKEN_DELAY_MS (15) between text deltas, SLACK_FIXTURES (JSON file:
+//      { "<channel>": [message, …] }, roots and replies together).
+
+import { readFileSync } from "node:fs";
 
 const PORT = Number(process.env.PORT ?? 8900);
 const TTFT_MS = Number(process.env.TTFT_MS ?? 300);
@@ -25,6 +31,31 @@ let calls: SlackCall[] = [];
 let modelCalls = 0;
 const waiters = new Map<string, ((c: SlackCall[]) => void)[]>();
 let nextTs = 1_700_000_000;
+
+// Slack's message history, per channel: roots and replies together.
+type FixtureMessage = { ts: string; thread_ts?: string; user?: string; bot_id?: string; subtype?: string; text?: string };
+const history = new Map<string, FixtureMessage[]>();
+if (process.env.SLACK_FIXTURES) {
+  const seed = JSON.parse(readFileSync(process.env.SLACK_FIXTURES, "utf8")) as Record<string, FixtureMessage[]>;
+  for (const [channel, messages] of Object.entries(seed)) history.set(channel, [...messages]);
+}
+
+function conversations(method: string, body: Record<string, unknown>): Response {
+  const all = history.get(String(body.channel)) ?? [];
+  if (method === "conversations.history") {
+    // top-level messages newer than `oldest`, newest first, each with its reply count
+    const oldest = Number(body.oldest ?? 0);
+    const roots = all.filter((m) => (!m.thread_ts || m.thread_ts === m.ts) && Number(m.ts) > oldest);
+    const messages = roots
+      .map((m) => ({ ...m, reply_count: all.filter((r) => r.thread_ts === m.ts && r.ts !== m.ts).length || undefined }))
+      .sort((a, b) => Number(b.ts) - Number(a.ts));
+    return Response.json({ ok: true, messages, has_more: false });
+  }
+  // conversations.replies: the root, then its replies, oldest first
+  const root = String(body.ts);
+  const messages = all.filter((m) => m.ts === root || m.thread_ts === root).sort((a, b) => Number(a.ts) - Number(b.ts));
+  return messages.length ? Response.json({ ok: true, messages, has_more: false }) : Response.json({ ok: false, error: "thread_not_found" });
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -72,7 +103,8 @@ function slack(method: string, body: Record<string, unknown>): Response {
     for (const w of waiters.get(thread) ?? []) w(threadCalls(thread));
     waiters.delete(thread);
   }
-  if (method === "auth.test") return Response.json({ ok: true, user_id: "UBOT", team_id: "T1", bot_id: "B1" });
+  if (method === "auth.test") return Response.json({ ok: true, url: "https://acme.slack.com/", user_id: "UBOT", team_id: "T1", bot_id: "B1" });
+  if (method === "conversations.history" || method === "conversations.replies") return conversations(method, body);
   return Response.json({ ok: true });
 }
 
@@ -94,12 +126,22 @@ function firstUserText(messages: Msg[]): string {
   return m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
 }
 
+// The first search hit in a tool_result, whether its content arrived as the JSON
+// string, as text blocks, or as structured data.
+function firstHit(content: unknown): { id?: string; source?: string } {
+  let v: unknown = content;
+  if (Array.isArray(v) && v.every((b) => b && typeof b === "object" && "type" in b)) v = (v as Block[]).map((b) => b.text ?? "").join("");
+  if (typeof v === "string") { try { v = JSON.parse(v); } catch { /* not JSON */ } }
+  if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
+  return {};
+}
+
 function answerFor(messages: Msg[], result: Block): string {
   const question = firstUserText(messages);
   const nonce = question.match(/\[q\d+\]/)?.[0] ?? "[q?]";
-  const cite = JSON.stringify(result.content ?? "").match(/\bc\d+\b/)?.[0] ?? "none";
+  const hit = firstHit(result.content);
   const words = Array.from({ length: TOKENS }, (_, i) => `w${i}`);
-  return `${nonce} [cite:${cite}] ${words.join(" ")}`;
+  return `${nonce} [cite:${hit.id ?? "none"}] [src:${hit.source ?? "none"}] ${words.join(" ")}`;
 }
 
 function sse(events: [string, unknown][], firstDelay: number, gap: (i: number) => number): Response {
@@ -173,7 +215,16 @@ Bun.serve({
   idleTimeout: 120,
   async fetch(req) {
     const url = new URL(req.url);
-    if (url.pathname.startsWith("/slack/api/")) return slack(url.pathname.slice("/slack/api/".length), await parseBody(req));
+    if (url.pathname.startsWith("/slack/api/")) {
+      // reads come as GET query params, writes as JSON/form bodies; accept both
+      const params = { ...Object.fromEntries(url.searchParams), ...(await parseBody(req)) };
+      return slack(url.pathname.slice("/slack/api/".length), params);
+    }
+    if (url.pathname === "/fixtures/messages" && req.method === "POST") {
+      const { channel, message } = (await req.json()) as { channel: string; message: FixtureMessage };
+      history.set(channel, [...(history.get(channel) ?? []), message]);
+      return Response.json({ ok: true });
+    }
     if (url.pathname === "/anthropic/v1/messages" && req.method === "POST") return anthropic(req);
     if (url.pathname === "/wait") {
       const thread = url.searchParams.get("thread_ts") ?? "";
@@ -186,7 +237,10 @@ Bun.serve({
       ]);
       return got ? Response.json(summarize(got)) : Response.json({ timeout: true, calls: threadCalls(thread).map((c) => c.method) }, { status: 504 });
     }
-    if (url.pathname === "/stats") return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)) });
+    if (url.pathname === "/stats") {
+      const readChannels = [...new Set(calls.filter((c) => c.method.startsWith("conversations.")).map((c) => String(c.body.channel)))];
+      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels });
+    }
     if (url.pathname === "/reset") { calls = []; modelCalls = 0; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });
   },

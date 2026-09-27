@@ -9,6 +9,8 @@ export type Config = {
   // Lorehouse's own database (knowledge, migrations) — separate from the framework's
   // session store on purpose.
   db: { lorehouse: string; sessions: string; knowledgeSeed?: string };
+  // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
+  ingest: { backfillDays: number; debounceMs: number };
   // Code tools are on only when all three are set.
   sandbox?: { url: string; token: string; githubToken: string };
 };
@@ -19,6 +21,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     const v = env[key];
     if (!v) missing.push(key);
     return v ?? "";
+  };
+  const nonNegative = (key: string, fallback: number) => {
+    const raw = env[key];
+    if (raw === undefined || raw === "") return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) missing.push(`${key} (must be a number ≥ 0, got "${raw}")`);
+    return n;
   };
   const config: Config = {
     port: Number(env.PORT ?? 3000),
@@ -43,6 +52,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       sessions: env.SESSIONS_DB || ":memory:",
       knowledgeSeed: env.KNOWLEDGE_SEED || undefined,
     },
+    ingest: {
+      backfillDays: nonNegative("INGEST_BACKFILL_DAYS", 90),
+      debounceMs: nonNegative("INGEST_DEBOUNCE_MS", 5000),
+    },
   };
   const sandboxKeys = ["SANDBOX_URL", "SANDBOX_TOKEN", "GITHUB_TOKEN"] as const;
   const set = sandboxKeys.filter((k) => env[k]);
@@ -51,6 +64,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   } else if (set.length > 0) {
     missing.push(...sandboxKeys.filter((k) => !env[k]).map((k) => `${k} (code tools need all of ${sandboxKeys.join(", ")})`));
   }
-  if (missing.length) throw new Error(`lorehouse: missing configuration: ${missing.join(", ")}`);
+  if (missing.length) throw new Error(`lorehouse: missing or invalid configuration: ${missing.join(", ")}`);
   return config;
 }

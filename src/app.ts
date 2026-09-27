@@ -9,7 +9,9 @@ import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import type { Config } from "./config";
 import { agentIdentity } from "./identity";
-import { openKnowledge, searcher, seedFromJsonl } from "./knowledge";
+import { countDocuments, openKnowledge, searcher, seedFromJsonl } from "./knowledge";
+import { SlackIngester } from "./ingest/slack";
+import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
 import { systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
@@ -26,6 +28,16 @@ export async function createApp(config: Config) {
 
   const knowledge = openKnowledge(config.db.lorehouse);
   const seeded = config.db.knowledgeSeed ? seedFromJsonl(knowledge, config.db.knowledgeSeed) : 0;
+
+  // Slack history becomes knowledge — only for channels the agent is allowed in.
+  const ingester = config.agent.channels.size
+    ? new SlackIngester(slackApi({ token: config.slack.botToken, apiUrl: config.slack.apiUrl }), knowledge, {
+        channels: config.agent.channels,
+        backfillDays: config.ingest.backfillDays,
+        debounceMs: config.ingest.debounceMs,
+        log: (m) => console.log(m),
+      })
+    : undefined;
 
   const tools: Tool[] = [searchKnowledgeTool(searcher(knowledge))];
   if (config.sandbox) {
@@ -47,6 +59,9 @@ export async function createApp(config: Config) {
         botUserId: config.slack.botUserId,
         path: "/slack/events",
         respondTo: ["app_mention"],
+        // Every public message the policy lets through feeds the knowledge index; only
+        // mentions start a turn.
+        on: ingester ? { message: (e) => ingester.onMessage(e) } : undefined,
         accept: publicChannelsOnly(config.agent.channels),
         stream: true,
         onError: (err) => console.error("slack:", err),
@@ -70,8 +85,18 @@ export async function createApp(config: Config) {
   return {
     identity,
     seeded,
+    // Kick off the Slack backfill; call after the server is listening (it runs in the
+    // background and never blocks /healthz).
+    startIngest: () => ingester?.start(),
     async fetch(req: Request): Promise<Response> {
-      if (new URL(req.url).pathname === "/healthz") return new Response("ok");
+      const path = new URL(req.url).pathname;
+      if (path === "/healthz") return new Response("ok");
+      if (path === "/status" && req.method === "GET") {
+        return Response.json({
+          agent: identity.name,
+          knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
+        });
+      }
       return (await mounted.fetch(req)) ?? new Response("not found", { status: 404 });
     },
     close() {

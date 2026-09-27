@@ -96,7 +96,7 @@ async function one(i: number): Promise<Result> {
     if (s.appends < 1 && !s.text) problems.push("no text");
     if (s.recipients.team !== "T1" || s.recipients.user !== "U1") problems.push(`recipients=${JSON.stringify(s.recipients)}`);
     const text = s.text.trim();
-    const cite = text.match(/\[cite:(c\d+|none)\]/)?.[1];
+    const cite = text.match(/\[cite:([^\]\s]+)\]/)?.[1];
     if (!text.startsWith(`[q${n}]`)) problems.push(`nonce missing: ${JSON.stringify(text.slice(0, 40))}`);
     if (!cite || cite === "none") problems.push("no chunk cited (retrieval didn't reach the model)");
     if (!text.endsWith(`w${TOKENS - 1}`)) problems.push(`text truncated: …${JSON.stringify(text.slice(-20))}`);

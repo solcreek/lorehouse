@@ -1,0 +1,13 @@
+{
+  "C1": [
+    { "ts": "1790000001.000100", "user": "U2", "text": "Heads up: the quarterly wombat review moves to Thursdays starting next month" },
+    { "ts": "1790000002.000100", "thread_ts": "1790000001.000100", "user": "U3", "text": "Thanks! Same room as before?" },
+    { "ts": "1790000003.000100", "thread_ts": "1790000001.000100", "user": "U2", "text": "Yes, the <#C77|ops> room on the third floor" },
+    { "ts": "1790000010.000100", "user": "U4", "text": "The staging database password rotates every 30 days, ask <@U2> for access" },
+    { "ts": "1790000020.000100", "bot_id": "B1", "text": "Deploy bot: platypus build 42 succeeded" },
+    { "ts": "1790000030.000100", "subtype": "channel_join", "user": "U9", "text": "<@U9> has joined the channel" }
+  ],
+  "G1": [
+    { "ts": "1790000040.000100", "user": "U5", "text": "Confidential: echidna merger talks resume next week" }
+  ]
+}
