@@ -60,8 +60,8 @@ export async function createApp(config: Config) {
     // Injected: bundlers can't see June's lazy SDK import, so a compiled binary needs it.
     // The cast works around a June typing gap: its AnthropicStreamEvent.delta is an
     // all-optional ("weak") type, and @anthropic-ai/sdk 0.128's message_delta shares none
-    // of its keys, so tsc rejects the real SDK. Runtime behavior is fine; see
-    // docs/experiments/slack-rag/JUNE-ISSUES.md #9.
+    // of its keys, so tsc rejects the real SDK. Runtime behavior is fine. Drop the cast
+    // when junebuild/june#195 ships.
     client: new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl }) as unknown as AnthropicClient,
   });
   const runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions);

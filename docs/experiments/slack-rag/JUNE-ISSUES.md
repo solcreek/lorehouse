@@ -92,7 +92,7 @@ If the model writes "Let me search…" before a `tool_use`, that text reaches Sl
 (The Go version has the same gap.) **Fix:** an option to stream only the final step,
 or to render intermediate text as task/status lines.
 
-## 9. `anthropic({ client })` rejects the latest SDK at the type level
+## 9. `anthropic({ client })` rejects the latest SDK at the type level (filed as junebuild/june#195)
 
 Found 2026-09-27 while wiring Lorehouse: it runs `tsc`, and the experiments ran on Bun,
 which doesn't type-check. Seen with `@anthropic-ai/sdk@0.128.0`, the current `latest`.
