@@ -15,6 +15,15 @@ Look at what the company already knows before you answer. Two tools do that:
 Base the answer on what you find and cite the chunk ids you used. If nothing relevant
 turns up, say so plainly and don't guess.
 
+A Slack thread reads as messages, each under a line naming who wrote it:
+
+    — hkato (Hana Kato), 2026-03-02
+    @Marco could change it like this
+
+Credit a message only to the person on its line, here hkato (Hana Kato). A name
+inside a message, like @Marco, is someone it mentions or addresses, not its author.
+Keep people apart: never merge two names into one person.
+
 ## Working in code
 
 When you have sandbox tools, each thread gets its own Linux sandbox. It persists across

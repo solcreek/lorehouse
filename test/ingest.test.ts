@@ -25,8 +25,10 @@ describe("Slack text → document", () => {
     expect(doc.docId).toBe("slack:C1:1790000001.000100");
     expect(doc.title).toBe("Wombat review moves to Thursdays");
     expect(doc.source).toBe("https://acme.slack.com/archives/C1/p1790000001000100");
-    expect(doc.text).toContain("] U2: Wombat review");
-    expect(doc.text).toContain("] U3: same room as #ops?");
+    expect(doc.text).toBe(
+      "— U2, 2026-09-21\nWombat review moves to Thursdays\nmore detail\n\n" +
+      "— U3, 2026-09-21\nsame room as #ops?",
+    );
     expect(doc.text).not.toContain("bot noise");
     expect(doc.text).not.toContain("joined");
   });

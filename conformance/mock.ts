@@ -13,10 +13,11 @@
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
 // question (or, when the question contains "[recent]", a recent_knowledge tool_use with
-// no input); turn 2 (tool_result present) → a streamed answer that echoes the question's
-// nonce and cites the first hit's id and source from the tool_result
-// ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), so the harness can check what the
-// retrieval actually handed the model.
+// no input; "[thread]", a slack_read_thread tool_use with no input); turn 2 (tool_result
+// present) → a streamed answer that echoes the question's nonce and cites the first hit's
+// id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), or for
+// a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
+// so the harness can check what the tool actually handed the model.
 //
 // Env: PORT (8900), TTFT_MS (300) delay before the first event, TOKENS (80),
 //      TOKEN_DELAY_MS (15) between text deltas, SLACK_FIXTURES (JSON file:
@@ -139,21 +140,32 @@ function firstUserText(messages: Msg[]): string {
   return m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
 }
 
-// The first search hit in a tool_result, whether its content arrived as the JSON
-// string, as text blocks, or as structured data.
+// The first search hit in a tool_result.
 function firstHit(content: unknown): { id?: string; source?: string } {
+  const v = resultValue(content);
+  if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
+  return {};
+}
+
+// A tool_result's content as a value, whether it arrived as a JSON string, as text
+// blocks, or as structured data.
+function resultValue(content: unknown): unknown {
   let v: unknown = content;
   if (Array.isArray(v) && v.every((b) => b && typeof b === "object" && "type" in b)) v = (v as Block[]).map((b) => b.text ?? "").join("");
   if (typeof v === "string") { try { v = JSON.parse(v); } catch { /* not JSON */ } }
-  if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
-  return {};
+  return v;
 }
 
 function answerFor(messages: Msg[], result: Block): string {
   const question = firstUserText(messages);
   const nonce = question.match(/\[q\d+\]/)?.[0] ?? "[q?]";
-  const hit = firstHit(result.content);
   const words = Array.from({ length: TOKENS }, (_, i) => `w${i}`);
+  const thread = (resultValue(result.content) as { messages?: { author?: string; user?: string; text?: string }[] } | undefined)?.messages;
+  if (thread) {
+    const first = thread[0] ?? {};
+    return `${nonce} [author:${first.author ?? `none (user ${first.user})`}] [text:${(first.text ?? "").replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
+  }
+  const hit = firstHit(result.content);
   return `${nonce} [cite:${hit.id ?? "none"}] [src:${hit.source ?? "none"}] ${words.join(" ")}`;
 }
 
@@ -187,10 +199,12 @@ async function anthropic(req: Request): Promise<Response> {
   if (!result) {
     const question = firstUserText(body.messages);
     // "[recent]" in the question → an overview question: list recent threads instead of searching
+    // "[thread]" → read the thread the question was asked in
     const recent = question.includes("[recent]");
-    const toolName = recent ? "recent_knowledge" : "search_knowledge";
+    const thread = question.includes("[thread]");
+    const toolName = thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = recent ? {} : { query };
+    const input = recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));

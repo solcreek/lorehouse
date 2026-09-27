@@ -17,6 +17,7 @@ import { publicChannelsOnly } from "./policy";
 import { systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
 import { searchKnowledgeTool } from "./tools/search-knowledge";
+import { withNamedThreads } from "./tools/slack-names";
 import { pullRequestTool } from "./tools/pull-request";
 import { workspaceTools } from "./tools/workspace";
 
@@ -68,7 +69,7 @@ export async function createApp(config: Config) {
     instructions: systemPrompt(identity),
     tools,
     channels: [
-      slackChannel({
+      withNamedThreads(slackChannel({
         signingSecret: config.slack.signingSecret,
         botToken: config.slack.botToken,
         apiUrl: config.slack.apiUrl,
@@ -92,7 +93,7 @@ export async function createApp(config: Config) {
         intermediateText: "status",
         tasks: (call) => TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`,
         onError: (err) => console.error("slack:", err),
-      }),
+      }), async (ids) => (await ingester?.names(ids)) ?? new Map()),
     ],
   });
 

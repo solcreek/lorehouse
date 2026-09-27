@@ -25,7 +25,7 @@
 import type { Database } from "bun:sqlite";
 import { countDocuments, deleteDocument, docIdsWithPrefix, documentVersion, getCursor, setCursor, upsertDocument, type Document } from "../knowledge";
 import { SlackApiError, type SlackApi } from "../slack-api";
-import { SlackUsers } from "./slack-users";
+import { SlackUsers, type PersonName } from "./slack-users";
 
 export type SlackMessage = {
   ts: string;
@@ -47,11 +47,11 @@ export function isHumanMessage(m: SlackMessage, botUserId?: string): boolean {
   return !(botUserId && m.text.includes(`<@${botUserId}>`));
 }
 
-// Slack's markup → readable text: <@U1> → @Wendy (or @U1 when the name is unknown),
+// Slack's markup → readable text: <@U1> → @Wendy (the short name; @U1 when unknown),
 // <#C1|ops> → #ops, <url|label> → label (url).
-export function cleanSlackText(text: string, names: Map<string, string> = new Map()): string {
+export function cleanSlackText(text: string, names: Map<string, PersonName> = new Map()): string {
   return text
-    .replace(/<@([A-Z0-9]+)(?:\|([^>]*))?>/g, (_, id: string, label?: string) => `@${names.get(id) ?? label ?? id}`)
+    .replace(/<@([A-Z0-9]+)(?:\|([^>]*))?>/g, (_, id: string, label?: string) => `@${names.get(id)?.short ?? label ?? id}`)
     .replace(/<#[A-Z0-9]+\|([^>]+)>/g, "#$1")
     .replace(/<#([A-Z0-9]+)>/g, "#$1")
     .replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, "@$1")
@@ -76,7 +76,6 @@ function rootVersion(root: SlackMessage): string {
   return maxTs(root.latest_reply ?? root.ts, root.edited?.ts ?? "0");
 }
 
-// A thread (root first) → a document, or null when nothing in it is human-written.
 // Every user id a thread refers to — its authors and the people mentioned in it.
 export function userIdsIn(messages: SlackMessage[]): string[] {
   const ids = new Set<string>();
@@ -87,14 +86,25 @@ export function userIdsIn(messages: SlackMessage[]): string[] {
   return [...ids];
 }
 
-export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string, botUserId?: string, names: Map<string, string> = new Map()): Document | null {
+// A thread (root first) → a document, or null when nothing in it is human-written.
+//
+// The rendering contract. Each message is a speaker line, then its text, then a blank
+// line:
+//
+//   — hkato (Hana Kato), 2026-03-02
+//   @Marco 這版可以再簡化
+//
+// The speaker line uses the full name and stands alone. The older "hkato: @Marco …"
+// put the speaker right against a mention, and a model read the pair as one person
+// ("Marco (hkato)"). Mentions in the text use the short name.
+export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string, botUserId?: string, names: Map<string, PersonName> = new Map()): Document | null {
   const human = messages.filter((m) => isHumanMessage(m, botUserId));
   const root = messages[0];
   if (!root || human.length === 0) return null;
-  const lines = human.map((m) => {
+  const blocks = human.map((m) => {
     const day = new Date(Number(m.ts) * 1000).toISOString().slice(0, 10);
-    const who = m.user ? (names.get(m.user) ?? m.user) : "unknown";
-    return `[${day}] ${who}: ${cleanSlackText(m.text!, names)}`;
+    const who = m.user ? (names.get(m.user)?.full ?? m.user) : "unknown";
+    return `— ${who}, ${day}\n${cleanSlackText(m.text!, names)}`;
   });
   const firstLine = cleanSlackText(human[0]!.text!, names).split("\n")[0]!.trim();
   return {
@@ -102,7 +112,7 @@ export function threadDocument(channel: string, messages: SlackMessage[], worksp
     kind: "slack_thread",
     source: permalink(workspaceUrl, channel, root.ts),
     title: firstLine.length > 80 ? `${firstLine.slice(0, 77)}…` : firstLine,
-    text: lines.join("\n"),
+    text: blocks.join("\n\n"),
     sourceVersion: threadVersion(messages),
   };
 }
@@ -145,7 +155,7 @@ export type IngestOptions = {
 // Bump whenever threadDocument renders differently (what it leaves out, how it names
 // people, …). On the next start every stored thread is re-read and re-rendered in
 // place, so old documents never keep an outdated shape.
-export const SLACK_DOC_VERSION = "names-1";
+export const SLACK_DOC_VERSION = "names-2"; // names-2: speaker lines with "display (real)" names
 
 export class SlackIngester {
   private workspaceUrl = "";
@@ -163,6 +173,11 @@ export class SlackIngester {
     private readonly opts: IngestOptions,
   ) {
     this.users = new SlackUsers(api, db, { log: opts.log, now: opts.now });
+  }
+
+  // People's names, as knowledge names them (and from the same cache).
+  names(ids: string[]): Promise<Map<string, PersonName>> {
+    return this.users.names(ids);
   }
 
   // Resolve the workspace URL (for permalinks) and the bot's own user id, re-render

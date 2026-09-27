@@ -168,6 +168,16 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "knows people by their real name too, when it differs from their display name",
+    run: async () => {
+      // U2 displays as "Wendy"; only her real name, "Wendy Wu", has "Wu". A speaker is
+      // labeled "Wendy (Wendy Wu)", so her own thread is found by "Wu"; a thread that only
+      // mentions her is not (mentions use the display name).
+      const a = await ask("Wu");
+      return a.cite === WOMBAT_THREAD ? null : `cited ${a.cite}, want ${WOMBAT_THREAD}`;
+    },
+  },
+  {
     name: "answers an overview question from the most recently active thread",
     run: async () => {
       // "what's been discussed lately?" has no keywords to search for; the answer is the
@@ -326,6 +336,24 @@ const scenarios: Scenario[] = [
       const r = await fetch(TARGET, { method: "POST", headers: { "content-type": "application/json", "x-slack-request-timestamp": now, "x-slack-signature": sig }, body });
       const text = await r.text();
       return r.status === 200 && text.includes("conformance-challenge") ? null : `got ${r.status} ${text.slice(0, 80)}`;
+    },
+  },
+  {
+    // Last: it adds the newest thread to Slack's history, which earlier scenarios would see.
+    name: "reading the thread it was asked in, it sees who wrote each message by name",
+    run: async () => {
+      // A thread's raw replies carry only user ids. Given an id it can't name while
+      // search results name people, a model guesses who wrote what; the author must
+      // arrive named, and mentions must read as names.
+      const root = `${1985000000 + ++seq}.000100`;
+      await post("/fixtures/messages", { channel: ALLOWED, message: { ts: root, user: "U2", text: "<@U3> can you check the heron budget" } });
+      const ts = `${1985000000 + ++seq}.000100`;
+      await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${seq}] [thread] who asked about the heron budget`, ts, event_ts: ts, thread_ts: root, channel: ALLOWED });
+      const { text = "" } = (await (await fetch(`${MOCK}/wait?thread_ts=${root}&timeout_ms=15000`)).json()) as { text?: string };
+      const author = text.match(/\[author:([^\]]*)\]/)?.[1];
+      const said = text.match(/\[text:([^\]]*)\]/)?.[1];
+      if (author !== "Wendy (Wendy Wu)") return `author ${JSON.stringify(author)}, want "Wendy (Wendy Wu)"`;
+      return said === "@Omar Ortiz can you check the heron budget" ? null : `text ${JSON.stringify(said)}, want mentions as names`;
     },
   },
 ];
