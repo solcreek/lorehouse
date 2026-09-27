@@ -4,6 +4,9 @@
 -- Lorehouse's database. It is never inside the agent framework's session tables: those
 -- are an implementation detail of whatever runtime drives the agent.
 --
+-- (Superseded by 0002_documents.sql, which moves these rows into knowledge_documents.
+-- Applied migrations are never edited beyond comments.)
+--
 -- Search contract (every implementation must match it; conformance checks the top hit):
 -- lowercase the query, take the [a-z0-9]+ tokens of 2+ characters, join them with
 -- " OR ", then
