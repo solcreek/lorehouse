@@ -13,6 +13,8 @@
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
@@ -75,7 +77,7 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
   return { cite: text.match(/\[cite:([^\]\s]+)\]/)?.[1], src: text.match(/\[src:([^\]\s]+)\]/)?.[1], text };
 }
 
-type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }> } };
+type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
 const status = async () => (await (await fetch(`http://localhost:${APP_PORT}/status`)).json()) as Status;
 
 // Post a message into Slack's history, then deliver the Events API event for it.
@@ -84,6 +86,21 @@ async function liveMessage(channel: string, channelType: string, text: string): 
   await fetch(`${MOCK}/fixtures/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel, message: { ts, user: "U6", text } }) });
   await sendEvent({ type: "message", channel, channel_type: channelType, user: "U6", text, ts, event_ts: ts });
   return ts;
+}
+
+const post = (path: string, body: unknown) => fetch(`${MOCK}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+// Edit / delete a message in Slack's history; `announce` also delivers the event, as
+// Slack would to a running app (off = the change happened while the app was down).
+async function editMessage(channel: string, ts: string, text: string, announce = true): Promise<void> {
+  const editedTs = `${1990000000 + ++seq}.000100`;
+  await post("/fixtures/edit", { channel, ts, text, editedTs });
+  if (announce) await sendEvent({ type: "message", subtype: "message_changed", hidden: true, channel, channel_type: "channel", ts: editedTs, event_ts: editedTs, message: { ts, user: "U7", text, edited: { user: "U7", ts: editedTs } }, previous_message: { ts } });
+}
+async function deleteMessage(channel: string, ts: string, announce = true): Promise<void> {
+  await post("/fixtures/delete", { channel, ts });
+  const now = `${1990000000 + ++seq}.000100`;
+  if (announce) await sendEvent({ type: "message", subtype: "message_deleted", hidden: true, channel, channel_type: "channel", ts: now, event_ts: now, deleted_ts: ts, previous_message: { ts } });
 }
 
 const SEED_DOCS = (await Bun.file(join(HERE, "fixtures/corpus.jsonl")).text()).split("\n").filter((l) => l.trim()).length;
@@ -110,8 +127,8 @@ const scenarios: Scenario[] = [
     name: "reports ingest state and document count at GET /status",
     run: async () => {
       const s = await status();
-      // seeds + the wombat thread + the password message; the bot post and the join are not documents
-      const want = SEED_DOCS + 2;
+      // seeds + wombat thread, password, ibex and emu messages; the bot post and the join are not documents
+      const want = SEED_DOCS + 4;
       if (s.knowledge.state !== "ready") return `state ${s.knowledge.state}, want ready`;
       return s.knowledge.documents === want ? null : `documents ${s.knowledge.documents}, want ${want}`;
     },
@@ -158,6 +175,50 @@ const scenarios: Scenario[] = [
       if (s.readChannels.includes("G1")) return "read the private channel's history";
       const a = await ask("echidna merger talks");
       return a.cite?.startsWith("slack:G1") ? `cited ${a.cite}` : null;
+    },
+  },
+  {
+    name: "reflects an edit: the new text is cited, the old text no longer is",
+    run: async () => {
+      const doc = "slack:C1:1790000050.000100";
+      await editMessage("C1", "1790000050.000100", "The ibex standup moved to the falcon room");
+      await Bun.sleep(1000);
+      const now = await ask("which room is the ibex standup in falcon");
+      if (now.cite !== doc) return `after the edit, cited ${now.cite}, want ${doc}`;
+      // only the old text had "bluebird" (the new one still says "room", so don't ask that)
+      const old = await ask("bluebird");
+      return old.cite === doc ? "the edited-away text (bluebird) still cites the message" : null;
+    },
+  },
+  {
+    name: "forgets a deleted message: it is no longer cited or counted",
+    run: async () => {
+      const doc = "slack:C1:1790000055.000100";
+      const before = await ask("temporary emu vault code");
+      if (before.cite !== doc) return `before deleting, cited ${before.cite}, want ${doc}`;
+      const docs = (await status()).knowledge.documents;
+      await deleteMessage("C1", "1790000055.000100");
+      await Bun.sleep(1000);
+      const after = await ask("temporary emu vault code");
+      if (after.cite === doc) return "the deleted message is still cited";
+      const now = (await status()).knowledge.documents;
+      return now === docs - 1 ? null : `documents ${docs} → ${now}, want ${docs - 1}`;
+    },
+  },
+  {
+    name: "catches up after a restart on changes made while it was down",
+    run: async () => {
+      await stopApp();
+      // While down: a new reply to an old thread, and a message deleted outright.
+      await post("/fixtures/messages", { channel: "C1", message: { ts: "1790000090.000100", thread_ts: "1790000001.000100", user: "U5", text: "The wombat review now covers the koala budget too" } });
+      await deleteMessage("C1", "1790000010.000100", false);
+      await startApp();
+      const s = await status();
+      if (s.knowledge.reconciled.refreshed < 1 || s.knowledge.reconciled.removed < 1) return `reconciled ${JSON.stringify(s.knowledge.reconciled)}, want ≥1 refreshed and ≥1 removed`;
+      const reply = await ask("koala budget");
+      if (reply.cite !== WOMBAT_THREAD) return `the reply added while down: cited ${reply.cite}, want ${WOMBAT_THREAD}`;
+      const gone = await ask("staging database password rotates");
+      return gone.cite === "slack:C1:1790000010.000100" ? "the message deleted while down is still cited" : null;
     },
   },
   {
@@ -231,42 +292,64 @@ const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], {
   stdout: "ignore",
   stderr: "inherit",
 });
-const app = Bun.spawn(APP_CMD, {
-  // An external app runs from its own directory, so a binary that quietly reads files
-  // from this repo (prompts, migrations) fails here instead of passing by accident.
-  cwd: appIdx >= 0 ? dirname(APP_CMD[0]!) : ROOT,
-  env: {
-    ...process.env,
-    PORT: String(APP_PORT),
-    SLACK_SIGNING_SECRET: SECRET,
-    SLACK_BOT_TOKEN: "xoxb-conformance",
-    SLACK_API_URL: `${MOCK}/slack/api`,
-    ANTHROPIC_API_KEY: "conformance",
-    ANTHROPIC_BASE_URL: `${MOCK}/anthropic`,
-    AGENT_CHANNELS: ALLOWED,
-    KNOWLEDGE_SEED: join(HERE, "fixtures/corpus.jsonl"),
-    LOREHOUSE_DB: ":memory:",
-    // Fixture timestamps are fixed, so backfill far enough back that they never age out.
-    INGEST_BACKFILL_DAYS: "36500",
-    INGEST_DEBOUNCE_MS: "200",
-  },
-  stdout: "ignore",
-  stderr: "pipe",
-});
-const stop = () => { app.kill(); mock.kill(); };
+// A file, not :memory:, so the restart scenario comes back to the same knowledge.
+const DB = join(tmpdir(), `lorehouse-conformance-${process.pid}.db`);
+const removeDb = () => { for (const s of ["", "-wal", "-shm"]) rmSync(DB + s, { force: true }); };
+removeDb();
 
-let failed = 0;
-try {
-  if (!(await waitHttp(`${MOCK}/stats`, 5000))) throw new Error("mock never came up");
-  if (!(await waitHttp(`http://localhost:${APP_PORT}/healthz`, 15000))) throw new Error(`app never answered /healthz\n${await new Response(app.stderr).text()}`);
+let app: ReturnType<typeof Bun.spawn> | undefined;
+
+// Start the app and wait until it listens, owns its port, and has finished its Slack
+// backfill/reconcile (GET /status → ready).
+async function startApp(): Promise<void> {
+  const proc = Bun.spawn(APP_CMD, {
+    // An external app runs from its own directory, so a binary that quietly reads files
+    // from this repo (prompts, migrations) fails here instead of passing by accident.
+    cwd: appIdx >= 0 ? dirname(APP_CMD[0]!) : ROOT,
+    env: {
+      ...process.env,
+      PORT: String(APP_PORT),
+      SLACK_SIGNING_SECRET: SECRET,
+      SLACK_BOT_TOKEN: "xoxb-conformance",
+      SLACK_API_URL: `${MOCK}/slack/api`,
+      ANTHROPIC_API_KEY: "conformance",
+      ANTHROPIC_BASE_URL: `${MOCK}/anthropic`,
+      AGENT_CHANNELS: ALLOWED,
+      KNOWLEDGE_SEED: join(HERE, "fixtures/corpus.jsonl"),
+      LOREHOUSE_DB: DB,
+      // Fixture timestamps are fixed, so look back far enough that they never age out.
+      INGEST_BACKFILL_DAYS: "36500",
+      INGEST_REFRESH_DAYS: "36500",
+      INGEST_DEBOUNCE_MS: "200",
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  app = proc;
+  if (!(await waitHttp(`http://localhost:${APP_PORT}/healthz`, 15000))) throw new Error(`app never answered /healthz\n${await new Response(proc.stderr as ReadableStream).text()}`);
   const owners = await listenerPids(APP_PORT);
-  if (!owners.includes(String(app.pid))) throw new Error(`:${APP_PORT} is held by ${owners.join(",")}, not the app under test (${app.pid})`);
-  // Scenarios assume the Slack backfill has finished; the app reports it at /status.
+  if (!owners.includes(String(proc.pid))) throw new Error(`:${APP_PORT} is held by ${owners.join(",")}, not the app under test (${proc.pid})`);
   const t0 = Date.now();
   while ((await status().catch(() => undefined))?.knowledge.state !== "ready") {
     if (Date.now() - t0 > 15000) throw new Error(`ingest never became ready: ${JSON.stringify(await status().catch((e) => String(e)))}`);
     await Bun.sleep(50);
   }
+}
+
+async function stopApp(): Promise<void> {
+  if (!app) return;
+  app.kill();
+  await app.exited;
+  app = undefined;
+  // wait until the port is free, so the next start can't be answered by a dying process
+  const t0 = Date.now();
+  while ((await listenerPids(APP_PORT)).length && Date.now() - t0 < 5000) await Bun.sleep(20);
+}
+
+let failed = 0;
+try {
+  if (!(await waitHttp(`${MOCK}/stats`, 5000))) throw new Error("mock never came up");
+  await startApp();
 
   for (const s of scenarios) {
     const t0 = Date.now();
@@ -278,7 +361,9 @@ try {
   failed++;
   console.log(`✗ setup: ${e instanceof Error ? e.message : e}`);
 } finally {
-  stop();
+  await stopApp();
+  mock.kill();
+  removeDb();
 }
 console.log(failed ? `\n${failed} failed` : `\nall ${scenarios.length} scenarios passed`);
 process.exit(failed ? 1 : 0);

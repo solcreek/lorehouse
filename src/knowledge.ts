@@ -15,6 +15,7 @@ export type Document = {
   source: string; // where a human opens it
   title: string;
   text: string;
+  sourceVersion?: string; // freshness in the source's terms (Slack: newest message/edit ts)
 };
 
 export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
@@ -35,10 +36,24 @@ export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
 // Insert, or replace in place (a Slack thread grows; its id doesn't change).
 export function upsertDocument(db: Database, doc: Document): void {
   db.query(
-    `INSERT INTO knowledge_documents (doc_id, kind, source, title, text, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO knowledge_documents (doc_id, kind, source, title, text, updated_at, source_version) VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(doc_id) DO UPDATE SET kind = excluded.kind, source = excluded.source, title = excluded.title,
-       text = excluded.text, updated_at = excluded.updated_at`,
-  ).run(doc.docId, doc.kind, doc.source, doc.title, doc.text, new Date().toISOString());
+       text = excluded.text, updated_at = excluded.updated_at, source_version = excluded.source_version`,
+  ).run(doc.docId, doc.kind, doc.source, doc.title, doc.text, new Date().toISOString(), doc.sourceVersion ?? null);
+}
+
+// Remove a document (and, through the trigger, its index entry). True if it existed.
+export function deleteDocument(db: Database, docId: string): boolean {
+  return db.query("DELETE FROM knowledge_documents WHERE doc_id = ?").run(docId).changes > 0;
+}
+
+export function documentVersion(db: Database, docId: string): string | null | undefined {
+  const row = db.query("SELECT source_version FROM knowledge_documents WHERE doc_id = ?").get(docId) as { source_version: string | null } | null;
+  return row ? row.source_version : undefined; // undefined = no such document; null = version unknown
+}
+
+export function docIdsWithPrefix(db: Database, prefix: string): string[] {
+  return (db.query("SELECT doc_id FROM knowledge_documents WHERE doc_id >= ? AND doc_id < ?").all(prefix, `${prefix}￿`) as { doc_id: string }[]).map((r) => r.doc_id);
 }
 
 export function countDocuments(db: Database): number {

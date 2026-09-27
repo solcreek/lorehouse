@@ -10,7 +10,7 @@ export type Config = {
   // session store on purpose.
   db: { lorehouse: string; sessions: string; knowledgeSeed?: string };
   // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
-  ingest: { backfillDays: number; debounceMs: number };
+  ingest: { backfillDays: number; refreshDays: number; debounceMs: number };
   // Code tools are on only when all three are set.
   sandbox?: { url: string; token: string; githubToken: string };
 };
@@ -54,6 +54,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     },
     ingest: {
       backfillDays: nonNegative("INGEST_BACKFILL_DAYS", 90),
+      refreshDays: nonNegative("INGEST_REFRESH_DAYS", 14),
       debounceMs: nonNegative("INGEST_DEBOUNCE_MS", 5000),
     },
   };
