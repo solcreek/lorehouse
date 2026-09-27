@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+      # The behavioral contract — against the source, then against the compiled binary
+      # (which proves prompts/ and migrations/ are embedded, not read from the checkout).
+      - run: bun run conformance
+      - run: bun run build
+      - run: bun run conformance --app ./dist/lorehouse
+
+  sandbox-guest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sandbox/guest/go.mod
+      - run: go vet ./...
+        working-directory: sandbox/guest
+      - run: CGO_ENABLED=0 go build ./...
+        working-directory: sandbox/guest
