@@ -34,6 +34,7 @@ export async function createApp(config: Config) {
     ? new SlackIngester(slackApi({ token: config.slack.botToken, apiUrl: config.slack.apiUrl }), knowledge, {
         channels: config.agent.channels,
         backfillDays: config.ingest.backfillDays,
+        refreshDays: config.ingest.refreshDays,
         debounceMs: config.ingest.debounceMs,
         log: (m) => console.log(m),
       })
@@ -59,9 +60,10 @@ export async function createApp(config: Config) {
         botUserId: config.slack.botUserId,
         path: "/slack/events",
         respondTo: ["app_mention"],
-        // Every public message the policy lets through feeds the knowledge index; only
-        // mentions start a turn.
-        on: ingester ? { message: (e) => ingester.onMessage(e) } : undefined,
+        // Every public message event the policy lets through (new, edited, deleted) keeps
+        // the knowledge index in step; only mentions start a turn. onEvent, not
+        // on.message: the framework normalizes away edits and deletions.
+        onEvent: ingester ? ({ raw }) => ingester.onRawEvent((raw as { event?: Record<string, unknown> }).event) : undefined,
         accept: publicChannelsOnly(config.agent.channels),
         stream: true,
         onError: (err) => console.error("slack:", err),

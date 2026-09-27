@@ -75,7 +75,7 @@ describe("SlackIngester", () => {
       },
       { "C1:1790000001.000100": [{ ts: "1790000001.000100", user: "U2", text: "wombat review moves to thursdays" }, { ts: "1790000002.000100", thread_ts: "1790000001.000100", user: "U3", text: "which room?" }] },
     );
-    const ing = new SlackIngester(api, db, { channels: new Set(["C1"]), backfillDays: 30, debounceMs: 0, now });
+    const ing = new SlackIngester(api, db, { channels: new Set(["C1"]), refreshDays: 0, backfillDays: 30, debounceMs: 0, now });
     await ing.start();
     expect(ing.status()).toMatchObject({ state: "ready", documents: 2, channels: { C1: { cursor: "1790000020.000100", threads: 2 } } });
     expect(searcher(db)("which room for the wombat review")[0]?.id).toBe("slack:C1:1790000001.000100");
@@ -85,9 +85,9 @@ describe("SlackIngester", () => {
   test("a restart resumes from the cursor instead of re-reading history", async () => {
     const db = openKnowledge(":memory:");
     const history = { C1: [[{ ts: "1790000001.000100", user: "U2", text: "first" }]] };
-    await new SlackIngester(fakeApi(history).api, db, { channels: new Set(["C1"]), backfillDays: 30, debounceMs: 0, now }).start();
+    await new SlackIngester(fakeApi(history).api, db, { channels: new Set(["C1"]), refreshDays: 0, backfillDays: 30, debounceMs: 0, now }).start();
     const second = fakeApi(history);
-    await new SlackIngester(second.api, db, { channels: new Set(["C1"]), backfillDays: 30, debounceMs: 0, now }).start();
+    await new SlackIngester(second.api, db, { channels: new Set(["C1"]), refreshDays: 0, backfillDays: 30, debounceMs: 0, now }).start();
     const historyCall = second.calls.find((c) => c.method === "conversations.history")!;
     expect(historyCall.params.oldest).toBe("1790000001.000100");
     expect(getCursor(db, "slack:C1")).toBe("1790000001.000100");
@@ -95,18 +95,18 @@ describe("SlackIngester", () => {
 
   test("backfill starts backfillDays ago on first run", async () => {
     const { api, calls } = fakeApi({ C1: [[]] });
-    await new SlackIngester(api, openKnowledge(":memory:"), { channels: new Set(["C1"]), backfillDays: 10, debounceMs: 0, now }).start();
+    await new SlackIngester(api, openKnowledge(":memory:"), { channels: new Set(["C1"]), refreshDays: 0, backfillDays: 10, debounceMs: 0, now }).start();
     expect(calls.find((c) => c.method === "conversations.history")!.params.oldest).toBe(String(1790100000 - 10 * 86400));
   });
 
   test("live messages re-read their thread once per burst, and only for allowed channels", async () => {
     const db = openKnowledge(":memory:");
     const { api, calls } = fakeApi({}, { "C1:1790000050.000100": [{ ts: "1790000050.000100", user: "U6", text: "kangaroo deploy freeze starts friday" }] });
-    const ing = new SlackIngester(api, db, { channels: new Set(["C1"]), backfillDays: 0, debounceMs: 20, now });
+    const ing = new SlackIngester(api, db, { channels: new Set(["C1"]), refreshDays: 0, backfillDays: 0, debounceMs: 20, now });
     await ing.start();
-    ing.onMessage({ channelId: "C1", threadId: "1790000050.000100" });
-    ing.onMessage({ channelId: "C1", threadId: "1790000050.000100" });
-    ing.onMessage({ channelId: "C9", threadId: "1790000099.000100" }); // not allowed
+    ing.onRawEvent({ type: "message", channel: "C1", ts: "1790000050.000100", text: "x" });
+    ing.onRawEvent({ type: "message", channel: "C1", ts: "1790000050.000100", text: "x" });
+    ing.onRawEvent({ type: "message", channel: "C9", ts: "1790000099.000100", text: "x" }); // not allowed
     await Bun.sleep(60);
     expect(calls.filter((c) => c.method === "conversations.replies").map((c) => c.params.channel)).toEqual(["C1"]);
     expect(searcher(db)("kangaroo freeze")[0]?.id).toBe("slack:C1:1790000050.000100");
@@ -114,7 +114,7 @@ describe("SlackIngester", () => {
 
   test("a failed backfill reports error in status, without throwing", async () => {
     const api: SlackApi = { call: async () => { throw new SlackApiError("auth.test", "invalid_auth"); }, paginate: async function* () {} };
-    const ing = new SlackIngester(api, openKnowledge(":memory:"), { channels: new Set(["C1"]), backfillDays: 1, debounceMs: 0 });
+    const ing = new SlackIngester(api, openKnowledge(":memory:"), { channels: new Set(["C1"]), refreshDays: 0, backfillDays: 1, debounceMs: 0 });
     await ing.start();
     expect(ing.status()).toMatchObject({ state: "error", error: expect.stringContaining("invalid_auth") });
   });

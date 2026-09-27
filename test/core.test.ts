@@ -17,10 +17,8 @@ describe("knowledge store", () => {
       a.close();
       const b = openKnowledge(path);
       const rows = b.query("SELECT version, name FROM lorehouse_migrations ORDER BY version").all();
-      expect(rows).toEqual([
-        { version: 1, name: "0001_knowledge.sql" },
-        { version: 2, name: "0002_documents.sql" },
-      ]);
+      expect(rows).toEqual(MIGRATIONS.map((m) => ({ version: m.version, name: m.name })));
+      expect(rows.length).toBeGreaterThanOrEqual(3);
       b.close();
     } finally {
       for (const suffix of ["", "-wal", "-shm"]) rmSync(path + suffix, { force: true });
