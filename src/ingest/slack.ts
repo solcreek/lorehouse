@@ -4,7 +4,8 @@
 // Only channels on the agent's allowlist are read, and the channel policy has already
 // dropped DMs and private channels before a live event gets here. Bot and system
 // messages (joins, topic changes, deletion tombstones) are left out: the agent's own
-// answers must not become its sources.
+// answers must not become its sources. So are messages that mention the agent: they
+// are questions put to it, not knowledge.
 //
 // Every change funnels into one operation, refreshThread: re-read the thread, then
 // upsert it — or DELETE it when Slack no longer has it or nothing human is left. What
@@ -37,8 +38,12 @@ export type SlackMessage = {
   edited?: { ts: string };
 };
 
-export function isHumanMessage(m: SlackMessage): boolean {
-  return !m.bot_id && !m.subtype && !!m.text?.trim();
+// A message that is knowledge: written by a person, not a system notice, and not a
+// question put to the agent (a message mentioning the bot is asking, not telling —
+// indexing it would let the agent cite the question back as an answer).
+export function isHumanMessage(m: SlackMessage, botUserId?: string): boolean {
+  if (m.bot_id || m.subtype || !m.text?.trim()) return false;
+  return !(botUserId && m.text.includes(`<@${botUserId}>`));
 }
 
 // Slack's markup → readable text: <@U1> → @U1, <#C1|ops> → #ops, <url|label> → label (url).
@@ -70,8 +75,8 @@ function rootVersion(root: SlackMessage): string {
 }
 
 // A thread (root first) → a document, or null when nothing in it is human-written.
-export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string): Document | null {
-  const human = messages.filter(isHumanMessage);
+export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string, botUserId?: string): Document | null {
+  const human = messages.filter((m) => isHumanMessage(m, botUserId));
   const root = messages[0];
   if (!root || human.length === 0) return null;
   const lines = human.map((m) => {
@@ -97,6 +102,9 @@ export function threadOfEvent(ev: Record<string, unknown> | undefined): { channe
   if (!ev || ev.type !== "message" || typeof ev.channel !== "string") return undefined;
   const msg = (ev.message ?? {}) as SlackMessage;
   const prev = (ev.previous_message ?? {}) as SlackMessage;
+  // A bot's own posts and edits never change knowledge (bots are left out), and the
+  // agent's streamed replies arrive as a burst of edits: skip them without a re-read.
+  if (ev.bot_id || (ev.subtype === "message_changed" && msg.bot_id)) return undefined;
   let threadTs: string | undefined;
   if (ev.subtype === "message_changed") threadTs = msg.thread_ts ?? msg.ts;
   else if (ev.subtype === "message_deleted") threadTs = prev.thread_ts ?? (ev.deleted_ts as string | undefined);
@@ -123,6 +131,7 @@ export type IngestOptions = {
 
 export class SlackIngester {
   private workspaceUrl = "";
+  private botUserId?: string;
   private state: IngestStatus["state"] = "idle";
   private error?: string;
   private threadsByChannel = new Map<string, number>();
@@ -140,8 +149,9 @@ export class SlackIngester {
   async start(): Promise<void> {
     this.state = "backfilling";
     try {
-      const auth = await this.api.call<{ url: string }>("auth.test");
+      const auth = await this.api.call<{ url: string; user_id?: string }>("auth.test");
       this.workspaceUrl = auth.url;
+      this.botUserId = auth.user_id;
       for (const channel of this.opts.channels) {
         if (this.opts.backfillDays > 0 || getCursor(this.db, `slack:${channel}`)) await this.backfill(channel);
         if (this.opts.refreshDays > 0) await this.reconcile(channel);
@@ -185,7 +195,7 @@ export class SlackIngester {
         root.subtype === "tombstone" // the root was deleted; its replies live on
           ? stored !== undefined
           : stored === undefined
-            ? isHumanMessage(root) || !!root.reply_count // new to us (the cursor can lag an edit's window)
+            ? isHumanMessage(root, this.botUserId) || !!root.reply_count // new to us (the cursor can lag an edit's window)
             : stored === null || Number(rootVersion(root)) > Number(stored);
       if (stale) await this.refreshThread(channel, root.ts, "reconcile");
     }
@@ -203,7 +213,7 @@ export class SlackIngester {
   }
 
   private store(channel: string, thread: SlackMessage[]): boolean {
-    const doc = threadDocument(channel, thread, this.workspaceUrl);
+    const doc = threadDocument(channel, thread, this.workspaceUrl, this.botUserId);
     if (!doc) return false;
     upsertDocument(this.db, doc);
     return true;

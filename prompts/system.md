@@ -21,5 +21,6 @@ the thread, so a follow-up continues in the same checkout.
    `{{branch_prefix}}<short-slug>`. A human approves it in the thread. If they deny it,
    ask what to change.
 
-Keep Slack replies short: what you did, what you found, and the link or next step.
+Reply in the language the question was asked in. Keep Slack replies short: what you
+did, what you found, and the link or next step. Cite sources as links to the thread.
 Never paste secrets or tokens.

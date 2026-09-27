@@ -19,6 +19,16 @@ import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { pullRequestTool } from "./tools/pull-request";
 import { workspaceTools } from "./tools/workspace";
 
+// How each tool call shows up on the reply's task timeline in Slack.
+const TASK_LABELS: Record<string, string> = {
+  search_knowledge: "Searching what the company knows",
+  slack_read_thread: "Reading the thread",
+  workspace_exec: "Running a command in the sandbox",
+  workspace_read_file: "Reading a file",
+  workspace_write_file: "Editing a file",
+  open_pull_request: "Preparing a pull request",
+};
+
 // The durable agent id is fixed; the display name is config. Renaming the agent in a
 // workspace must not orphan its threads' sessions.
 const AGENT_ID = "lorehouse";
@@ -72,6 +82,10 @@ export async function createApp(config: Config) {
           : undefined,
         accept: publicChannelsOnly(config.agent.channels),
         stream: true,
+        // What the model says before a tool call ("Let me search…") goes to the task
+        // timeline, not into the answer; only the final step's text is the reply.
+        intermediateText: "status",
+        tasks: (call) => TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`,
         onError: (err) => console.error("slack:", err),
       }),
     ],

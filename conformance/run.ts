@@ -181,6 +181,16 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "does not learn from questions put to the agent",
+    run: async () => {
+      // Slack delivers a mention as a `message` event too; it is a question, not knowledge.
+      const ts = await liveMessage(ALLOWED, "channel", "<@UBOT> what is the pelican budget for next quarter?");
+      await Bun.sleep(1000);
+      const a = await ask("pelican budget next quarter");
+      return a.cite === `slack:${ALLOWED}:${ts}` ? "cited the question itself as knowledge" : null;
+    },
+  },
+  {
     name: "never reads or indexes a private channel",
     run: async () => {
       await reset();

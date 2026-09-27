@@ -31,6 +31,18 @@ describe("Slack text → document", () => {
     expect(doc.text).not.toContain("joined");
   });
 
+  test("a question put to the agent is not knowledge; the rest of its thread is", () => {
+    const doc = threadDocument("C1", [
+      { ts: "1.1", user: "U2", text: "<@UBOT> what's the pelican budget?" },
+      { ts: "1.2", thread_ts: "1.1", user: "U3", text: "it's 40k, per the finance sync" },
+    ], WS, "UBOT")!;
+    expect(doc.text).not.toContain("pelican budget?");
+    expect(doc.text).toContain("40k");
+    expect(threadDocument("C1", [{ ts: "2.1", user: "U2", text: "<@UBOT> hello" }], WS, "UBOT")).toBeNull();
+    // without a known bot id nothing is dropped (e.g. before auth.test answered)
+    expect(threadDocument("C1", [{ ts: "2.1", user: "U2", text: "<@UBOT> hello" }], WS)).not.toBeNull();
+  });
+
   test("a thread with nothing human-written is not a document", () => {
     expect(threadDocument("C1", [{ ts: "1.1", bot_id: "B1", text: "deploy ok" }], WS)).toBeNull();
     expect(threadDocument("C1", [], WS)).toBeNull();
