@@ -1,4 +1,9 @@
 {
+  "_users": {
+    "U2": { "name": "wendy.w", "profile": { "display_name": "Wendy", "real_name": "Wendy Wu" } },
+    "U3": { "name": "omar", "profile": { "display_name": "", "real_name": "Omar Ortiz" } },
+    "U4": { "name": "kai", "profile": { "display_name": "Kai" } }
+  },
   "C1": [
     { "ts": "1790000001.000100", "user": "U2", "text": "Heads up: the quarterly wombat review moves to Thursdays starting next month" },
     { "ts": "1790000002.000100", "thread_ts": "1790000001.000100", "user": "U3", "text": "Thanks! Same room as before?" },

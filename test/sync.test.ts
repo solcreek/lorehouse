@@ -18,6 +18,7 @@ function fakeSlack(initial: Record<string, SlackMessage[]>) {
     async call<T>(method: string) {
       calls.push({ method, params: {} });
       if (method === "auth.test") return { url: WS } as T;
+      if (method === "users.info") throw new SlackApiError("users.info", "missing_scope"); // names fall back to ids
       throw new Error(`unexpected ${method}`);
     },
     async *paginate<T>(method: string, params: Record<string, unknown>) {

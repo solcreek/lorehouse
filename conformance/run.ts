@@ -158,6 +158,16 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "knows people by name: asking by name alone finds what they wrote or were named in",
+    run: async () => {
+      // "Wendy" appears in no message text; only users.info knows U2 is Wendy. Asked by
+      // the name alone (no other word to match), so this fails when names aren't resolved.
+      const wendys = [WOMBAT_THREAD, "slack:C1:1790000010.000100"]; // she wrote the first, is mentioned in the second
+      const a = await ask("Wendy");
+      return a.cite && wendys.includes(a.cite) ? null : `cited ${a.cite}, want one of ${wendys.join(", ")}`;
+    },
+  },
+  {
     name: "answers an overview question from the most recently active thread",
     run: async () => {
       // "what's been discussed lately?" has no keywords to search for; the answer is the

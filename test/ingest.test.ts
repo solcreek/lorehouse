@@ -25,8 +25,8 @@ describe("Slack text → document", () => {
     expect(doc.docId).toBe("slack:C1:1790000001.000100");
     expect(doc.title).toBe("Wombat review moves to Thursdays");
     expect(doc.source).toBe("https://acme.slack.com/archives/C1/p1790000001000100");
-    expect(doc.text).toContain("@U2: Wombat review");
-    expect(doc.text).toContain("@U3: same room as #ops?");
+    expect(doc.text).toContain("] U2: Wombat review");
+    expect(doc.text).toContain("] U3: same room as #ops?");
     expect(doc.text).not.toContain("bot noise");
     expect(doc.text).not.toContain("joined");
   });
@@ -56,6 +56,7 @@ function fakeApi(history: Record<string, SlackMessage[][]>, threads: Record<stri
     async call<T>(method: string, params: Record<string, unknown> = {}) {
       calls.push({ method, params });
       if (method === "auth.test") return { url: WS } as T;
+      if (method === "users.info") throw new SlackApiError("users.info", "missing_scope"); // names fall back to ids
       throw new Error(`unexpected ${method}`);
     },
     async *paginate<T>(method: string, params: Record<string, unknown>) {

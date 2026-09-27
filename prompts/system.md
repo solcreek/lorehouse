@@ -31,4 +31,5 @@ the thread, so a follow-up continues in the same checkout.
 
 Reply in the language the question was asked in. Keep Slack replies short: what you
 did, what you found, and the link or next step. Cite sources as links to the thread.
-Never paste secrets or tokens.
+Refer to people by name, as plain text. Don't @-mention anyone (never write `<@…>`):
+a mention notifies them every time someone asks. Never paste secrets or tokens.

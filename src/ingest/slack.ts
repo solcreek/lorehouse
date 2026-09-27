@@ -25,6 +25,7 @@
 import type { Database } from "bun:sqlite";
 import { countDocuments, deleteDocument, docIdsWithPrefix, documentVersion, getCursor, setCursor, upsertDocument, type Document } from "../knowledge";
 import { SlackApiError, type SlackApi } from "../slack-api";
+import { SlackUsers } from "./slack-users";
 
 export type SlackMessage = {
   ts: string;
@@ -46,10 +47,11 @@ export function isHumanMessage(m: SlackMessage, botUserId?: string): boolean {
   return !(botUserId && m.text.includes(`<@${botUserId}>`));
 }
 
-// Slack's markup → readable text: <@U1> → @U1, <#C1|ops> → #ops, <url|label> → label (url).
-export function cleanSlackText(text: string): string {
+// Slack's markup → readable text: <@U1> → @Wendy (or @U1 when the name is unknown),
+// <#C1|ops> → #ops, <url|label> → label (url).
+export function cleanSlackText(text: string, names: Map<string, string> = new Map()): string {
   return text
-    .replace(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g, "@$1")
+    .replace(/<@([A-Z0-9]+)(?:\|([^>]*))?>/g, (_, id: string, label?: string) => `@${names.get(id) ?? label ?? id}`)
     .replace(/<#[A-Z0-9]+\|([^>]+)>/g, "#$1")
     .replace(/<#([A-Z0-9]+)>/g, "#$1")
     .replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, "@$1")
@@ -75,15 +77,26 @@ function rootVersion(root: SlackMessage): string {
 }
 
 // A thread (root first) → a document, or null when nothing in it is human-written.
-export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string, botUserId?: string): Document | null {
+// Every user id a thread refers to — its authors and the people mentioned in it.
+export function userIdsIn(messages: SlackMessage[]): string[] {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (m.user) ids.add(m.user);
+    for (const [, id] of m.text?.matchAll(/<@([A-Z0-9]+)/g) ?? []) ids.add(id!);
+  }
+  return [...ids];
+}
+
+export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string, botUserId?: string, names: Map<string, string> = new Map()): Document | null {
   const human = messages.filter((m) => isHumanMessage(m, botUserId));
   const root = messages[0];
   if (!root || human.length === 0) return null;
   const lines = human.map((m) => {
     const day = new Date(Number(m.ts) * 1000).toISOString().slice(0, 10);
-    return `[${day}] @${m.user ?? "unknown"}: ${cleanSlackText(m.text!)}`;
+    const who = m.user ? (names.get(m.user) ?? m.user) : "unknown";
+    return `[${day}] ${who}: ${cleanSlackText(m.text!, names)}`;
   });
-  const firstLine = cleanSlackText(human[0]!.text!).split("\n")[0]!.trim();
+  const firstLine = cleanSlackText(human[0]!.text!, names).split("\n")[0]!.trim();
   return {
     docId: threadDocId(channel, root.ts),
     kind: "slack_thread",
@@ -129,9 +142,15 @@ export type IngestOptions = {
   log?: (msg: string) => void;
 };
 
+// Bump whenever threadDocument renders differently (what it leaves out, how it names
+// people, …). On the next start every stored thread is re-read and re-rendered in
+// place, so old documents never keep an outdated shape.
+export const SLACK_DOC_VERSION = "names-1";
+
 export class SlackIngester {
   private workspaceUrl = "";
   private botUserId?: string;
+  private readonly users: SlackUsers;
   private state: IngestStatus["state"] = "idle";
   private error?: string;
   private threadsByChannel = new Map<string, number>();
@@ -142,16 +161,20 @@ export class SlackIngester {
     private readonly api: SlackApi,
     private readonly db: Database,
     private readonly opts: IngestOptions,
-  ) {}
+  ) {
+    this.users = new SlackUsers(api, db, { log: opts.log, now: opts.now });
+  }
 
-  // Resolve the workspace URL (for permalinks), then for each allowed channel: read new
-  // history since the cursor, and reconcile what changed while the app was down.
+  // Resolve the workspace URL (for permalinks) and the bot's own user id, re-render
+  // stored threads if the document shape changed, then for each allowed channel: read
+  // new history since the cursor, and reconcile what changed while the app was down.
   async start(): Promise<void> {
     this.state = "backfilling";
     try {
       const auth = await this.api.call<{ url: string; user_id?: string }>("auth.test");
       this.workspaceUrl = auth.url;
       this.botUserId = auth.user_id;
+      await this.rerenderIfStale();
       for (const channel of this.opts.channels) {
         if (this.opts.backfillDays > 0 || getCursor(this.db, `slack:${channel}`)) await this.backfill(channel);
         if (this.opts.refreshDays > 0) await this.reconcile(channel);
@@ -168,6 +191,26 @@ export class SlackIngester {
     return (this.opts.now?.() ?? Date.now()) / 1000;
   }
 
+  private async rerenderIfStale(): Promise<void> {
+    const row = this.db.query("SELECT value FROM knowledge_index_meta WHERE key = 'slack_doc_version'").get() as { value: string } | null;
+    if (row?.value === SLACK_DOC_VERSION) return;
+    let n = 0;
+    for (const channel of this.opts.channels) {
+      for (const docId of docIdsWithPrefix(this.db, `slack:${channel}:`)) {
+        await this.refreshThread(channel, docId.slice(`slack:${channel}:`.length));
+        n++;
+      }
+    }
+    // Without users:read the re-render fell back to ids: leave the version unset so the
+    // next start (after the scope is added and the app reinstalled) tries again.
+    if (!this.users.available) {
+      this.opts.log?.(`ingest: re-rendered ${n} threads without names; will retry once users:read is granted`);
+      return;
+    }
+    this.db.query("INSERT INTO knowledge_index_meta (key, value) VALUES ('slack_doc_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(SLACK_DOC_VERSION);
+    if (n) this.opts.log?.(`ingest: re-rendered ${n} threads for document version ${SLACK_DOC_VERSION}`);
+  }
+
   private async backfill(channel: string): Promise<void> {
     const source = `slack:${channel}`;
     const oldest = getCursor(this.db, source) ?? String(Math.floor(this.nowSec() - this.opts.backfillDays * 86400));
@@ -176,7 +219,7 @@ export class SlackIngester {
       if (Number(m.ts) > Number(newest)) newest = m.ts;
       if (m.thread_ts && m.thread_ts !== m.ts) continue; // a broadcast reply; its thread is indexed from the root
       const thread = m.reply_count ? await this.readThread(channel, m.ts) : [m];
-      if (this.store(channel, thread)) this.threadsByChannel.set(channel, (this.threadsByChannel.get(channel) ?? 0) + 1);
+      if (await this.store(channel, thread)) this.threadsByChannel.set(channel, (this.threadsByChannel.get(channel) ?? 0) + 1);
     }
     setCursor(this.db, source, newest);
     this.opts.log?.(`ingest: ${channel} backfilled up to ${newest}`);
@@ -212,8 +255,9 @@ export class SlackIngester {
     return out;
   }
 
-  private store(channel: string, thread: SlackMessage[]): boolean {
-    const doc = threadDocument(channel, thread, this.workspaceUrl, this.botUserId);
+  private async store(channel: string, thread: SlackMessage[]): Promise<boolean> {
+    const names = await this.users.names(userIdsIn(thread));
+    const doc = threadDocument(channel, thread, this.workspaceUrl, this.botUserId, names);
     if (!doc) return false;
     upsertDocument(this.db, doc);
     return true;
@@ -230,7 +274,7 @@ export class SlackIngester {
       thread = [];
     }
     const docId = threadDocId(channel, threadTs);
-    if (this.store(channel, thread)) {
+    if (await this.store(channel, thread)) {
       if (why === "reconcile") this.reconciled.refreshed++;
       return "updated";
     }

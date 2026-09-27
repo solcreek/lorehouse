@@ -20,6 +20,7 @@ oauth_config:
       - app_mentions:read  # being @-mentioned
       - channels:history   # reading public channel history (backfill, threads) and message.channels events
       - chat:write         # replying in the thread (streamed)
+      - users:read         # naming people in knowledge ("Wendy: …" instead of a user id)
 settings:
   org_deploy_enabled: false
   socket_mode_enabled: false

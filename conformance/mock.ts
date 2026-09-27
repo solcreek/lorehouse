@@ -38,9 +38,12 @@ let nextTs = 1_700_000_000;
 // Slack's message history, per channel: roots and replies together.
 type FixtureMessage = { ts: string; thread_ts?: string; user?: string; bot_id?: string; subtype?: string; text?: string; edited?: { ts: string } };
 const history = new Map<string, FixtureMessage[]>();
+// users.info answers, from the fixture's "_users" key: { "U2": { profile: {…} }, … }
+let users: Record<string, unknown> = {};
 if (process.env.SLACK_FIXTURES) {
-  const seed = JSON.parse(readFileSync(process.env.SLACK_FIXTURES, "utf8")) as Record<string, FixtureMessage[]>;
-  for (const [channel, messages] of Object.entries(seed)) history.set(channel, [...messages]);
+  const seed = JSON.parse(readFileSync(process.env.SLACK_FIXTURES, "utf8")) as Record<string, unknown>;
+  users = (seed._users ?? {}) as Record<string, unknown>;
+  for (const [channel, messages] of Object.entries(seed)) if (channel !== "_users") history.set(channel, [...(messages as FixtureMessage[])]);
 }
 
 function conversations(method: string, body: Record<string, unknown>): Response {
@@ -111,6 +114,10 @@ function slack(method: string, body: Record<string, unknown>): Response {
   }
   if (method === "auth.test") return Response.json({ ok: true, url: "https://acme.slack.com/", user_id: "UBOT", team_id: "T1", bot_id: "B1" });
   if (method === "conversations.history" || method === "conversations.replies") return conversations(method, body);
+  if (method === "users.info") {
+    const user = users[String(body.user)];
+    return user ? Response.json({ ok: true, user: { id: body.user, ...(user as object) } }) : Response.json({ ok: false, error: "user_not_found" });
+  }
   return Response.json({ ok: true });
 }
 
