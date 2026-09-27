@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+*.log
+.env
+.dev.vars
+
+# Research scratch space (benchmark builds, node_modules, raw result JSON).
+# Its conclusions live in docs/experiments/.
+experiments/
