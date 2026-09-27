@@ -163,7 +163,6 @@ export class SlackIngester {
   private readonly users: SlackUsers;
   private state: IngestStatus["state"] = "idle";
   private error?: string;
-  private threadsByChannel = new Map<string, number>();
   private reconciled = { refreshed: 0, removed: 0 };
   private pending = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -234,7 +233,7 @@ export class SlackIngester {
       if (Number(m.ts) > Number(newest)) newest = m.ts;
       if (m.thread_ts && m.thread_ts !== m.ts) continue; // a broadcast reply; its thread is indexed from the root
       const thread = m.reply_count ? await this.readThread(channel, m.ts) : [m];
-      if (await this.store(channel, thread)) this.threadsByChannel.set(channel, (this.threadsByChannel.get(channel) ?? 0) + 1);
+      await this.store(channel, thread);
     }
     setCursor(this.db, source, newest);
     this.opts.log?.(`ingest: ${channel} backfilled up to ${newest}`);
@@ -313,7 +312,8 @@ export class SlackIngester {
 
   status(): IngestStatus {
     const channels: IngestStatus["channels"] = {};
-    for (const c of this.opts.channels) channels[c] = { cursor: getCursor(this.db, `slack:${c}`), threads: this.threadsByChannel.get(c) ?? 0 };
+    // threads: what the index holds for the channel now, not what this run happened to read
+    for (const c of this.opts.channels) channels[c] = { cursor: getCursor(this.db, `slack:${c}`), threads: countDocuments(this.db, `slack:${c}:`) };
     return { state: this.state, documents: countDocuments(this.db), channels, reconciled: { ...this.reconciled }, ...(this.error ? { error: this.error } : {}) };
   }
 }

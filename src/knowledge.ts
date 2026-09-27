@@ -101,8 +101,10 @@ export function docIdsWithPrefix(db: Database, prefix: string): string[] {
   return (db.query("SELECT doc_id FROM knowledge_documents WHERE doc_id >= ? AND doc_id < ?").all(prefix, `${prefix}￿`) as { doc_id: string }[]).map((r) => r.doc_id);
 }
 
-export function countDocuments(db: Database): number {
-  return (db.query("SELECT count(*) AS n FROM knowledge_documents").get() as { n: number }).n;
+// All documents, or only those whose id starts with `prefix`.
+export function countDocuments(db: Database, prefix?: string): number {
+  if (prefix === undefined) return (db.query("SELECT count(*) AS n FROM knowledge_documents").get() as { n: number }).n;
+  return (db.query("SELECT count(*) AS n FROM knowledge_documents WHERE doc_id >= ? AND doc_id < ?").get(prefix, `${prefix}￿`) as { n: number }).n;
 }
 
 export function getCursor(db: Database, source: string): string | undefined {

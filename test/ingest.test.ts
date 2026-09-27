@@ -108,6 +108,18 @@ describe("SlackIngester", () => {
     expect(getCursor(db, "slack:C1")).toBe("1790000001.000100");
   });
 
+  test("status counts the threads the index holds per channel, also after a restart that read nothing new", async () => {
+    const db = openKnowledge(":memory:");
+    const history = { C1: [[{ ts: "1790000001.000100", user: "U2", text: "first" }, { ts: "1790000002.000100", user: "U2", text: "second" }]], C10: [[{ ts: "1790000003.000100", user: "U2", text: "elsewhere" }]] };
+    const opts = { channels: new Set(["C1", "C10"]), refreshDays: 0, backfillDays: 30, debounceMs: 0, now };
+    await new SlackIngester(fakeApi(history).api, db, opts).start();
+    const restarted = new SlackIngester(fakeApi(history).api, db, opts);
+    await restarted.start();
+    // C1 is a prefix of C10: each channel counts only its own threads
+    expect(restarted.status().channels).toMatchObject({ C1: { threads: 2 }, C10: { threads: 1 } });
+    expect(restarted.status().documents).toBe(3);
+  });
+
   test("backfill starts backfillDays ago on first run", async () => {
     const { api, calls } = fakeApi({ C1: [[]] });
     await new SlackIngester(api, openKnowledge(":memory:"), { channels: new Set(["C1"]), refreshDays: 0, backfillDays: 10, debounceMs: 0, now }).start();
