@@ -1,0 +1,22 @@
+{
+  "how does soft navigation work": "c252",
+  "what is juno and when should I use it": "c29",
+  "how are static files served": "c11",
+  "how do I integrate authentication": "c241",
+  "how does the google drive integration authenticate": "c93",
+  "how does styling with tailwind work": "c69",
+  "what are the navigation tiers": "c22",
+  "how does the data layer boundary work": "c59",
+  "how is juno sqlite performance": "c81",
+  "what does the june cli do": "c180",
+  "how do islands hydrate on the client": "c70",
+  "how is markdown served without drift": "c227",
+  "how does the built in mcp server work": "c16",
+  "how do I deploy to cloudflare workers": "c163",
+  "what is the runtime convergence plan": "c14",
+  "how does the turn as a live process rfc work": "c43",
+  "how do og images render": "c281",
+  "how does i18n routing work": "c214",
+  "how does caching invalidate after a write": "c270",
+  "what is the client router persist option": "c265"
+}
