@@ -71,3 +71,34 @@ Record what you see next to each item. Each one maps to an assumption in
 With `LOG_SLACK_EVENTS=1`, every event the policy lets through is printed raw
 (`slack event: {…}`). Compare those shapes with what `conformance/run.ts` sends. Any
 field the mock gets wrong is a conformance fix.
+
+## 5. Results
+
+Run 2026-09-27 on a real workspace (one public test channel, about 20 threads of
+Chinese and English history), native Bun host behind a quick tunnel.
+
+| # | Result | Seen |
+|---|---|---|
+| 1 | pass | `ready`, one document per thread |
+| 2 | pass | streamed reply in the thread, cited permalink opens it |
+| 3 | pass | a fact only a reply held was found by search from a top-level question |
+| 4 | pass | the `message` event carried `channel_type: "channel"`; cited 14 s after posting |
+| 5 | pass | `message_changed` carried `message.ts` and `edited.ts`; only the new wording cited |
+| 6 | pass | `message_deleted` carried `deleted_ts` and `previous_message`; `documents` −1 |
+| 7 | pass | root deletion arrived as `message_changed` with `message.subtype: "tombstone"`; the reply stayed findable, the root's text did not |
+| 8 | pass | no reply in a DM or a private channel; neither event reached `onEvent` |
+| 9 | pass | after a restart, `reconciled: { refreshed: 1, removed: 1 }`; the reply made while down was indexed, the deleted one was gone |
+
+Every event shape matched `conformance/mock.ts`. What the run found instead was in
+how the model uses what it's given; each is fixed with a test:
+
+- Chinese questions found nothing (CJK tokenization) → bigram index.
+- "What has been discussed lately?" has no keywords → `recent_knowledge`.
+- Answers named people by user id → names from `users.info`.
+- A message was credited to the wrong colleague, the two names merged into one →
+  speaker lines with both names, and a named `slack_read_thread`.
+- `/status` showed `threads: 0` for a full channel after a restart (it counted what
+  that run had read) → it now counts what the index holds.
+
+A message that says it is a test ("test: the budget is 42k") is cited but not trusted
+as an answer: word live test facts as plain statements.
