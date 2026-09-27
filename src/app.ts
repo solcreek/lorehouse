@@ -63,7 +63,13 @@ export async function createApp(config: Config) {
         // Every public message event the policy lets through (new, edited, deleted) keeps
         // the knowledge index in step; only mentions start a turn. onEvent, not
         // on.message: the framework normalizes away edits and deletions.
-        onEvent: ingester ? ({ raw }) => ingester.onRawEvent((raw as { event?: Record<string, unknown> }).event) : undefined,
+        onEvent: ingester || config.logSlackEvents
+          ? ({ raw }) => {
+              const event = (raw as { event?: Record<string, unknown> }).event;
+              if (config.logSlackEvents) console.log(`slack event: ${JSON.stringify(event)}`);
+              ingester?.onRawEvent(event);
+            }
+          : undefined,
         accept: publicChannelsOnly(config.agent.channels),
         stream: true,
         onError: (err) => console.error("slack:", err),

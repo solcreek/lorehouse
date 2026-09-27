@@ -1,0 +1,26 @@
+# Slack app manifest for Lorehouse. Create the app from this file (api.slack.com/apps →
+# Create New App → From an app manifest), install it, then follow docs/live-slack.md.
+#
+# Event Subscriptions and Interactivity are left out on purpose: Slack verifies their
+# Request URL with a signed challenge the moment you save, and the app can only answer
+# once it has this app's signing secret. You add them after the app is running.
+#
+# Rename `scout` to the name you set in AGENT_NAME; the two must match.
+display_information:
+  name: scout
+  description: The company brain. Answers from what's in your public channels, and cites where.
+  background_color: "#2c2d30"
+features:
+  bot_user:
+    display_name: scout
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read  # being @-mentioned
+      - channels:history   # reading public channel history (backfill, threads) and message.channels events
+      - chat:write         # replying in the thread (streamed)
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

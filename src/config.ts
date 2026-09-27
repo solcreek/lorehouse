@@ -11,6 +11,9 @@ export type Config = {
   db: { lorehouse: string; sessions: string; knowledgeSeed?: string };
   // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
   ingest: { backfillDays: number; refreshDays: number; debounceMs: number };
+  // Print every Slack event the policy lets through, raw, to stdout. For checking what
+  // real Slack sends against what the conformance mock assumes. Off by default.
+  logSlackEvents: boolean;
   // Code tools are on only when all three are set.
   sandbox?: { url: string; token: string; githubToken: string };
 };
@@ -57,6 +60,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       refreshDays: nonNegative("INGEST_REFRESH_DAYS", 14),
       debounceMs: nonNegative("INGEST_DEBOUNCE_MS", 5000),
     },
+    logSlackEvents: env.LOG_SLACK_EVENTS === "1",
   };
   const sandboxKeys = ["SANDBOX_URL", "SANDBOX_TOKEN", "GITHUB_TOKEN"] as const;
   const set = sandboxKeys.filter((k) => env[k]);
