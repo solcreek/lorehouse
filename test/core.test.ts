@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
-import { countDocuments, getCursor, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
+import { countDocuments, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 import { render, systemPrompt, toolDescription } from "../src/prompts";
 import { agentIdentity } from "../src/identity";
@@ -33,14 +33,20 @@ describe("knowledge store", () => {
     expect(countDocuments(db)).toBe(first);
   });
 
-  test("0002 carries 0001's chunks over as seed documents, ids intact, still searchable", () => {
-    const db = openKnowledge(":memory:", MIGRATIONS.filter((m) => m.version === 1));
-    db.query("INSERT INTO knowledge_chunks (id, source, title, text) VALUES ('c7', 'docs/x.md', 'Wombats', 'wombats dig burrows')").run();
-    // An in-memory db can't be reopened, so apply the later migrations to this handle directly.
-    for (const m of MIGRATIONS.filter((m) => m.version > 1)) db.exec(m.sql);
-    expect(db.query("SELECT doc_id, kind, source FROM knowledge_documents").all()).toEqual([{ doc_id: "c7", kind: "seed", source: "docs/x.md" }]);
-    expect(searcher(db)("where do wombats dig")[0]?.id).toBe("c7");
-    expect(db.query("SELECT name FROM sqlite_master WHERE name = 'knowledge_chunks'").get()).toBeNull();
+  test("upgrading a 0001 database carries its chunks over as seeds, ids intact, still searchable", () => {
+    const path = join(import.meta.dir, `.tmp-upgrade-${process.pid}.db`);
+    try {
+      const old = openKnowledge(path, MIGRATIONS.filter((m) => m.version === 1));
+      old.query("INSERT INTO knowledge_chunks (id, source, title, text) VALUES ('c7', 'docs/x.md', 'Wombats', 'wombats dig burrows')").run();
+      old.close();
+      const db = openKnowledge(path); // the real upgrade path: remaining migrations + index rebuild
+      expect(db.query("SELECT doc_id, kind, source FROM knowledge_documents").all()).toEqual([{ doc_id: "c7", kind: "seed", source: "docs/x.md" }]);
+      expect(searcher(db)("where do wombats dig")[0]?.id).toBe("c7");
+      expect(db.query("SELECT name FROM sqlite_master WHERE name = 'knowledge_chunks'").get()).toBeNull();
+      db.close();
+    } finally {
+      for (const suffix of ["", "-wal", "-shm"]) rmSync(path + suffix, { force: true });
+    }
   });
 
   test("upsert replaces a document in place and the index follows", () => {
@@ -61,9 +67,44 @@ describe("knowledge store", () => {
   });
 
   test("the match expression follows the documented contract", () => {
-    expect(matchExpression("How does SOFT navigation work?")).toBe("how OR does OR soft OR navigation OR work");
-    expect(matchExpression("a b c")).toBeNull(); // every token is shorter than 2 chars
+    expect(matchExpression("How does SOFT navigation work?")).toBe('"how" OR "does" OR "soft" OR "navigation" OR "work"');
+    expect(matchExpression("a b c")).toBeNull(); // every Latin token is shorter than 2 chars
     expect(matchExpression("")).toBeNull();
+    expect(matchExpression("NOT this")).toBe('"not" OR "this"'); // quoted: never an operator
+  });
+
+  test("CJK runs become overlapping bigrams, in the index and in queries", () => {
+    expect(indexText("看到廣告公司推")).toBe(" 看到 到廣 廣告 告公 公司 司推 ");
+    expect(indexText("用 AI 做企劃")).toBe(" 用  AI  做企 企劃 "); // a one-char run stays single
+    expect(indexText("plain english")).toBe("plain english"); // untouched
+    expect(matchExpression("廣告 agent")).toBe('"agent" OR "廣告"');
+    expect(matchExpression("最近的主題")).toBe('"最近" OR "近的" OR "的主" OR "主題"');
+  });
+
+  test("Chinese content is found by a Chinese question, and by a single word inside it", () => {
+    const db = openKnowledge(":memory:");
+    upsertDocument(db, { docId: "slack:C1:1.1", kind: "slack_thread", source: "x", title: "企劃 AI Agent", text: "分享之前看到廣告公司推企劃 AI Agent" });
+    upsertDocument(db, { docId: "slack:C1:2.2", kind: "slack_thread", source: "y", title: "週會", text: "週會改到星期四下午" });
+    expect(searcher(db)("廣告公司的 agent 是什麼")[0]?.id).toBe("slack:C1:1.1");
+    expect(searcher(db)("廣告")[0]?.id).toBe("slack:C1:1.1");
+    expect(searcher(db)("週會什麼時候")[0]?.id).toBe("slack:C1:2.2");
+  });
+
+  test("an index built by an older contract is rebuilt on open", () => {
+    const path = join(import.meta.dir, `.tmp-reindex-${process.pid}.db`);
+    try {
+      const a = openKnowledge(path);
+      upsertDocument(a, { docId: "d1", kind: "seed", source: "s", title: "t", text: "廣告公司" });
+      a.exec("DELETE FROM knowledge_fts"); // simulate an index from an older contract…
+      a.query("UPDATE knowledge_index_meta SET value = 'old' WHERE key = 'version'").run(); // …and its version
+      a.close();
+      const b = openKnowledge(path);
+      expect(searcher(b)("廣告")[0]?.id).toBe("d1");
+      expect(b.query("SELECT value FROM knowledge_index_meta WHERE key = 'version'").get()).toEqual({ value: INDEX_VERSION });
+      b.close();
+    } finally {
+      for (const suffix of ["", "-wal", "-shm"]) rmSync(path + suffix, { force: true });
+    }
   });
 
   test("search returns at most 5 ranked chunks", () => {

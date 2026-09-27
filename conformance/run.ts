@@ -117,7 +117,11 @@ const scenarios: Scenario[] = [
       const out = await $`bun ${join(HERE, "drive.ts")} --target ${TARGET} --mock ${MOCK} --secret ${SECRET} --n 40 --c 4`.quiet().nothrow();
       const r = JSON.parse(out.stdout.toString()) as { ok: number; failed: number; sampleErrors: string[]; cites: Record<string, string> };
       if (r.ok !== 40) return `${r.ok}/40 ok — ${r.sampleErrors.join(" | ")}`;
-      // The search contract: the same question must surface the same top chunk.
+      // The search contract: the same question must surface the same top chunk. Only
+      // questions with a clear winner are pinned. "how does the built in mcp server work"
+      // is asked but not pinned: its top two (c16, c174) are within 0.0002 bm25, so any
+      // legitimate change to corpus statistics (a new fixture document, CJK bigrams)
+      // flips them. The closest pinned question has a margin above 0.1.
       const expected = (await Bun.file(join(HERE, "fixtures/expected-cites.json")).json()) as Record<string, string>;
       const wrong = Object.entries(expected).filter(([q, id]) => r.cites[q] !== id);
       return wrong.length ? `top hit differs for ${wrong.length} question(s), e.g. "${wrong[0]![0]}": got ${r.cites[wrong[0]![0]]}, want ${wrong[0]![1]}` : null;
@@ -127,8 +131,8 @@ const scenarios: Scenario[] = [
     name: "reports ingest state and document count at GET /status",
     run: async () => {
       const s = await status();
-      // seeds + wombat thread, password, ibex and emu messages; the bot post and the join are not documents
-      const want = SEED_DOCS + 4;
+      // seeds + wombat thread, password, ibex, emu and the Chinese message; the bot post and the join are not documents
+      const want = SEED_DOCS + 5;
       if (s.knowledge.state !== "ready") return `state ${s.knowledge.state}, want ready`;
       return s.knowledge.documents === want ? null : `documents ${s.knowledge.documents}, want ${want}`;
     },
@@ -140,6 +144,17 @@ const scenarios: Scenario[] = [
       if (a.cite !== WOMBAT_THREAD) return `cited ${a.cite}, want ${WOMBAT_THREAD}`;
       const want = "https://acme.slack.com/archives/C1/p1790000001000100";
       return a.src === want ? null : `source ${a.src}, want ${want}`;
+    },
+  },
+  {
+    name: "answers a question asked in Chinese from Chinese history",
+    run: async () => {
+      // CJK has no spaces between words: a whole sentence must not become one token
+      const doc = "slack:C1:1790000065.000100";
+      const a = await ask("週會什麼時候開");
+      if (a.cite !== doc) return `cited ${a.cite}, want ${doc}`;
+      const b = await ask("會議室在幾樓");
+      return b.cite === doc ? null : `a word from the middle of the sentence: cited ${b.cite}, want ${doc}`;
     },
   },
   {

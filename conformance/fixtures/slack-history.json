@@ -7,7 +7,8 @@
     { "ts": "1790000020.000100", "bot_id": "B1", "text": "Deploy bot: platypus build 42 succeeded" },
     { "ts": "1790000030.000100", "subtype": "channel_join", "user": "U9", "text": "<@U9> has joined the channel" },
     { "ts": "1790000050.000100", "user": "U7", "text": "The ibex standup meets in the bluebird room" },
-    { "ts": "1790000055.000100", "user": "U8", "text": "Temporary emu vault code is 4242, rotate after use" }
+    { "ts": "1790000055.000100", "user": "U8", "text": "Temporary emu vault code is 4242, rotate after use" },
+    { "ts": "1790000065.000100", "user": "U3", "text": "週會改到星期四下午三點，地點在十樓的大會議室" }
   ],
   "G1": [
     { "ts": "1790000040.000100", "user": "U5", "text": "Confidential: echidna merger talks resume next week" }
