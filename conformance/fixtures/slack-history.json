@@ -5,7 +5,9 @@
     { "ts": "1790000003.000100", "thread_ts": "1790000001.000100", "user": "U2", "text": "Yes, the <#C77|ops> room on the third floor" },
     { "ts": "1790000010.000100", "user": "U4", "text": "The staging database password rotates every 30 days, ask <@U2> for access" },
     { "ts": "1790000020.000100", "bot_id": "B1", "text": "Deploy bot: platypus build 42 succeeded" },
-    { "ts": "1790000030.000100", "subtype": "channel_join", "user": "U9", "text": "<@U9> has joined the channel" }
+    { "ts": "1790000030.000100", "subtype": "channel_join", "user": "U9", "text": "<@U9> has joined the channel" },
+    { "ts": "1790000050.000100", "user": "U7", "text": "The ibex standup meets in the bluebird room" },
+    { "ts": "1790000055.000100", "user": "U8", "text": "Temporary emu vault code is 4242, rotate after use" }
   ],
   "G1": [
     { "ts": "1790000040.000100", "user": "U5", "text": "Confidential: echidna merger talks resume next week" }

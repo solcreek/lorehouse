@@ -7,6 +7,8 @@
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
 //   GET  /stats                recorded Slack calls, model call count, channels read
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
+//   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
+//   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
 //   POST /reset                clear recorded calls (fixtures stay)
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
@@ -33,7 +35,7 @@ const waiters = new Map<string, ((c: SlackCall[]) => void)[]>();
 let nextTs = 1_700_000_000;
 
 // Slack's message history, per channel: roots and replies together.
-type FixtureMessage = { ts: string; thread_ts?: string; user?: string; bot_id?: string; subtype?: string; text?: string };
+type FixtureMessage = { ts: string; thread_ts?: string; user?: string; bot_id?: string; subtype?: string; text?: string; edited?: { ts: string } };
 const history = new Map<string, FixtureMessage[]>();
 if (process.env.SLACK_FIXTURES) {
   const seed = JSON.parse(readFileSync(process.env.SLACK_FIXTURES, "utf8")) as Record<string, FixtureMessage[]>;
@@ -47,7 +49,10 @@ function conversations(method: string, body: Record<string, unknown>): Response 
     const oldest = Number(body.oldest ?? 0);
     const roots = all.filter((m) => (!m.thread_ts || m.thread_ts === m.ts) && Number(m.ts) > oldest);
     const messages = roots
-      .map((m) => ({ ...m, reply_count: all.filter((r) => r.thread_ts === m.ts && r.ts !== m.ts).length || undefined }))
+      .map((m) => {
+        const replies = all.filter((r) => r.thread_ts === m.ts && r.ts !== m.ts).sort((a, b) => Number(a.ts) - Number(b.ts));
+        return { ...m, reply_count: replies.length || undefined, latest_reply: replies.at(-1)?.ts };
+      })
       .sort((a, b) => Number(b.ts) - Number(a.ts));
     return Response.json({ ok: true, messages, has_more: false });
   }
@@ -223,6 +228,24 @@ Bun.serve({
     if (url.pathname === "/fixtures/messages" && req.method === "POST") {
       const { channel, message } = (await req.json()) as { channel: string; message: FixtureMessage };
       history.set(channel, [...(history.get(channel) ?? []), message]);
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/fixtures/edit" && req.method === "POST") {
+      const { channel, ts, text, editedTs } = (await req.json()) as { channel: string; ts: string; text: string; editedTs: string };
+      const m = (history.get(channel) ?? []).find((x) => x.ts === ts);
+      if (!m) return Response.json({ ok: false }, { status: 404 });
+      m.text = text;
+      m.edited = { ts: editedTs };
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/fixtures/delete" && req.method === "POST") {
+      // Like Slack: a root with replies becomes a tombstone; anything else disappears.
+      const { channel, ts } = (await req.json()) as { channel: string; ts: string };
+      const all = history.get(channel) ?? [];
+      const hasReplies = all.some((m) => m.thread_ts === ts && m.ts !== ts);
+      history.set(channel, hasReplies
+        ? all.map((m) => (m.ts === ts ? { ts, thread_ts: ts, subtype: "tombstone", text: "This message was deleted." } : m))
+        : all.filter((m) => m.ts !== ts));
       return Response.json({ ok: true });
     }
     if (url.pathname === "/anthropic/v1/messages" && req.method === "POST") return anthropic(req);

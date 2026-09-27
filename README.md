@@ -18,8 +18,10 @@ bun start                       # POST /slack/events, GET /healthz, GET /status
 ```
 
 What it knows: every thread in the allowed channels (the root and its replies), read
-back `INGEST_BACKFILL_DAYS` on first start and kept current from live messages. Bot and
-system messages are left out. Answers cite the thread's permalink. The Slack app needs
+back `INGEST_BACKFILL_DAYS` on first start and kept current from live messages, edits
+and deletions. A deleted message stops being quotable. Changes made while the app was
+down are reconciled on the next start. Bot and system messages are left out. Answers
+cite the thread's permalink. The Slack app needs
 the bot scopes `channels:history`, `app_mentions:read` and `chat:write`, and must be
 subscribed to `message.channels` and `app_mention`. Invite the bot to each allowed
 channel first. Slack won't serve history to a non-member, so the backfill fails with
@@ -33,7 +35,8 @@ channel first. Slack won't serve history to a non-member, so the backfill fails 
 | `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |
 | `INGEST_BACKFILL_DAYS` | `90` | how far back to read each allowed channel's history on first start (`0` = live only) |
-| `INGEST_DEBOUNCE_MS` | `5000` | how long a thread must go quiet before a live message re-indexes it |
+| `INGEST_REFRESH_DAYS` | `14` | on each start, re-check threads this recent for replies, edits and deletions made while the app was down |
+| `INGEST_DEBOUNCE_MS` | `5000` | how long a thread must go quiet before a live change re-indexes it |
 | `SANDBOX_URL` `SANDBOX_TOKEN` `GITHUB_TOKEN` | (off) | set all three to enable the code tools and pull requests |
 
 ## Layout
