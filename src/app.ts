@@ -9,7 +9,8 @@ import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import type { Config } from "./config";
 import { agentIdentity } from "./identity";
-import { countDocuments, openKnowledge, searcher, seedFromJsonl } from "./knowledge";
+import { countDocuments, openKnowledge, recentDocuments, searcher, seedFromJsonl } from "./knowledge";
+import { recentKnowledgeTool } from "./tools/recent-knowledge";
 import { SlackIngester } from "./ingest/slack";
 import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
@@ -22,6 +23,7 @@ import { workspaceTools } from "./tools/workspace";
 // How each tool call shows up on the reply's task timeline in Slack.
 const TASK_LABELS: Record<string, string> = {
   search_knowledge: "Searching what the company knows",
+  recent_knowledge: "Looking at recent discussions",
   slack_read_thread: "Reading the thread",
   workspace_exec: "Running a command in the sandbox",
   workspace_read_file: "Reading a file",
@@ -50,7 +52,10 @@ export async function createApp(config: Config) {
       })
     : undefined;
 
-  const tools: Tool[] = [searchKnowledgeTool(searcher(knowledge))];
+  const tools: Tool[] = [
+    searchKnowledgeTool(searcher(knowledge)),
+    recentKnowledgeTool((o) => recentDocuments(knowledge, o)),
+  ];
   if (config.sandbox) {
     const { url, token, githubToken } = config.sandbox;
     // One sandbox per thread, keyed off the session (never model input).

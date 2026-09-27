@@ -130,6 +130,19 @@ export function seedFromJsonl(db: Database, path: string): number {
   return count;
 }
 
+// The most recently active documents, newest first — for "what's been discussed
+// lately?", which no keyword search can answer. Recency is the source's own
+// (source_version: for Slack, the thread's newest message or edit); documents without
+// one (seeds) never count as recent. `sinceSec` is a Unix timestamp lower bound.
+export function recentDocuments(db: Database, opts: { limit: number; sinceSec?: number; sourcePrefix?: string }): (Chunk & { activeAt: string })[] {
+  const rows = db.query(
+    `SELECT doc_id AS id, title, source, text, source_version AS v FROM knowledge_documents
+     WHERE source_version IS NOT NULL AND CAST(source_version AS REAL) >= ? AND doc_id >= ? AND doc_id < ?
+     ORDER BY CAST(source_version AS REAL) DESC LIMIT ?`,
+  ).all(opts.sinceSec ?? 0, opts.sourcePrefix ?? "", `${opts.sourcePrefix ?? ""}￿`, opts.limit) as (Chunk & { v: string })[];
+  return rows.map(({ v, ...c }) => ({ ...c, activeAt: new Date(Number(v) * 1000).toISOString() }));
+}
+
 // See the query contract in migrations/0004_cjk_index.sql. Each token is quoted so a
 // word like NOT can never be read as an operator.
 export function matchExpression(query: string): string | null {

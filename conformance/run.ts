@@ -158,6 +158,16 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "answers an overview question from the most recently active thread",
+    run: async () => {
+      // "what's been discussed lately?" has no keywords to search for; the answer is the
+      // newest threads. The newest fixture thread at this point is the Chinese message.
+      const want = "slack:C1:1790000065.000100";
+      const a = await ask("[recent] what has the team been discussing lately");
+      return a.cite === want ? null : `cited ${a.cite}, want the newest thread ${want}`;
+    },
+  },
+  {
     name: "indexes whole threads: an answer only a reply holds is found",
     run: async () => {
       const a = await ask("which floor is the ops room on");

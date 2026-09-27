@@ -12,7 +12,8 @@
 //   POST /reset                clear recorded calls (fixtures stay)
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
-// question; turn 2 (tool_result present) → a streamed answer that echoes the question's
+// question (or, when the question contains "[recent]", a recent_knowledge tool_use with
+// no input); turn 2 (tool_result present) → a streamed answer that echoes the question's
 // nonce and cites the first hit's id and source from the tool_result
 // ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), so the harness can check what the
 // retrieval actually handed the model.
@@ -177,16 +178,20 @@ async function anthropic(req: Request): Promise<Response> {
   const result = lastUserHasToolResult(body.messages);
 
   if (!result) {
-    const query = firstUserText(body.messages).replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = { query };
+    const question = firstUserText(body.messages);
+    // "[recent]" in the question → an overview question: list recent threads instead of searching
+    const recent = question.includes("[recent]");
+    const toolName = recent ? "recent_knowledge" : "search_knowledge";
+    const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
+    const input = recent ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
-      return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: "search_knowledge", input }], "tool_use"));
+      return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));
     }
     const json = JSON.stringify(input);
     return sse([
       ["message_start", { type: "message_start", message: { ...message(id, [], null as unknown as string), stop_reason: null } }],
-      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_${modelCalls}`, name: "search_knowledge", input: {} } }],
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input: {} } }],
       ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(0, Math.ceil(json.length / 2)) } }],
       ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(Math.ceil(json.length / 2)) } }],
       ["content_block_stop", { type: "content_block_stop", index: 0 }],

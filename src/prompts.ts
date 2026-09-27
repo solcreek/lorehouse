@@ -5,6 +5,7 @@
 
 import system from "../prompts/system.md" with { type: "text" };
 import searchKnowledge from "../prompts/tools/search_knowledge.md" with { type: "text" };
+import recentKnowledge from "../prompts/tools/recent_knowledge.md" with { type: "text" };
 import workspaceExec from "../prompts/tools/workspace_exec.md" with { type: "text" };
 import workspaceReadFile from "../prompts/tools/workspace_read_file.md" with { type: "text" };
 import workspaceWriteFile from "../prompts/tools/workspace_write_file.md" with { type: "text" };
@@ -13,6 +14,7 @@ import { branchPrefix, displayName, type AgentIdentity } from "./identity";
 
 const TOOLS: Record<string, string> = {
   search_knowledge: searchKnowledge,
+  recent_knowledge: recentKnowledge,
   workspace_exec: workspaceExec,
   workspace_read_file: workspaceReadFile,
   workspace_write_file: workspaceWriteFile,
