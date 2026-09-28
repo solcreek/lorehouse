@@ -13,13 +13,20 @@ function decodePart(part: string) {
   return JSON.parse(Buffer.from(part, "base64url").toString());
 }
 
-// A fake GitHub API: the installation lookup and the token exchange, with every request kept.
+// A plain token whose identity lookup never leaves the process (a clone asks for it).
+const offline = (token: string) => staticToken(token, { fetch: (async () => new Response("offline", { status: 503 })) as unknown as typeof fetch });
+
+// A fake GitHub API: the installation lookup and the token exchange, the App and its bot
+// user, with every request kept.
 function fakeApi(o: { installed?: boolean; expiresIn?: number } = {}) {
   const reqs: { method: string; path: string; auth: string; body?: unknown }[] = [];
   let n = 0;
   const f = (async (url: string, init: RequestInit = {}) => {
     const path = new URL(url).pathname;
     reqs.push({ method: init.method ?? "GET", path, auth: new Headers(init.headers).get("authorization") ?? "", body: init.body ? JSON.parse(String(init.body)) : undefined });
+    if (path === "/app") return Response.json({ slug: "acme-agent" });
+    if (path === "/users/acme-agent%5Bbot%5D") return Response.json({ id: 900, login: "acme-agent[bot]" });
+    if (path === "/user") return Response.json({ id: 7, login: "octo" });
     if (path.endsWith("/installation")) return o.installed === false ? new Response("not found", { status: 404 }) : Response.json({ id: 42 });
     if (path === "/app/installations/42/access_tokens") return Response.json({ token: `ghs_${++n}`, expires_at: new Date(NOW + (o.expiresIn ?? 3600_000)).toISOString() }, { status: 201 });
     return new Response("unexpected", { status: 500 });
@@ -70,6 +77,31 @@ describe("githubApp", () => {
     await expect(access({ owner: "acme", name: "secret" }, "read")).rejects.toThrow("the GitHub App isn't installed on acme/secret");
   });
 
+  test("commits are by the App's bot user, at its noreply address, so GitHub links them to it", async () => {
+    const api = fakeApi();
+    const access = githubApp({ appId: "123", privateKey, fetch: api.f, now: () => NOW });
+    expect(await access.identity!()).toEqual({ name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" });
+    expect(api.reqs.map((r) => `${r.path} ${r.auth ? "jwt" : "anonymous"}`)).toEqual(["/app jwt", "/users/acme-agent%5Bbot%5D anonymous"]);
+    await access.identity!();
+    expect(api.reqs).toHaveLength(2); // looked up once
+  });
+
+  test("a failed identity lookup isn't remembered: the next one tries again", async () => {
+    let down = true;
+    const api = fakeApi();
+    const f = (async (url: string, init?: RequestInit) => (down && new URL(url).pathname === "/app" ? new Response("down", { status: 502 }) : api.f(url, init))) as typeof fetch;
+    const access = githubApp({ appId: "123", privateKey, fetch: f, now: () => NOW });
+    await expect(access.identity!()).rejects.toThrow("502");
+    down = false;
+    expect((await access.identity!()).name).toBe("acme-agent[bot]");
+  });
+
+  test("with a plain token, commits are by the token's user", async () => {
+    const api = fakeApi();
+    expect(await staticToken("ghp_x", { fetch: api.f }).identity!()).toEqual({ name: "octo", email: "7+octo@users.noreply.github.com" });
+    expect(api.reqs[0]!.auth).toBe("Bearer ghp_x");
+  });
+
   test("a PEM stored with literal \\n escapes is restored", () => {
     expect(normalizePem("-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----")).toBe("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----");
     expect(normalizePem(privateKey)).toBe(privateKey);
@@ -107,17 +139,36 @@ describe("workspace_clone", () => {
     expect(clone.command).toContain("-c core.hooksPath=/dev/null");
   });
 
+  test("the checkout commits as the credential's account, so the model doesn't make one up", async () => {
+    const { sb, calls } = fakeSandbox();
+    const github = Object.assign(async () => "ghs_read", { identity: async () => ({ name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" }) });
+    expect(await run(cloneTool(() => sb, github), "acme/secret")).toMatchObject({ status: "cloned", commitsAs: "acme-agent[bot] <900+acme-agent[bot]@users.noreply.github.com>" });
+    const config = calls.find((c) => c.command.includes("git config user.name"))!;
+    expect(config.command).toBe("git config user.name 'acme-agent[bot]' && git config user.email '900+acme-agent[bot]@users.noreply.github.com'");
+    expect(config.opts?.cwd).toBe("/workspace/repo");
+  });
+
+  test("no identity (lookup failed, or not plain enough for a shell command): the clone still stands, nothing is set", async () => {
+    for (const identity of [async () => { throw new Error("502"); }, async () => ({ name: "x'; rm -rf / #", email: "a@b.c" })]) {
+      const { sb, calls } = fakeSandbox();
+      const r = await run(cloneTool(() => sb, Object.assign(async () => "t", { identity })), "acme/secret");
+      expect(r).toMatchObject({ status: "cloned" });
+      expect(r).not.toHaveProperty("commitsAs");
+      expect(calls.some((c) => c.command.includes("git config"))).toBe(false);
+    }
+  });
+
   test("already cloned: it fetches the same repo, and refuses to clone a different one over it", async () => {
     const same = fakeSandbox("https://github.com/acme/secret.git");
-    expect(await run(cloneTool(() => same.sb, staticToken("t")), "acme/secret")).toMatchObject({ status: "fetched" });
+    expect(await run(cloneTool(() => same.sb, offline("t")), "acme/secret")).toMatchObject({ status: "fetched" });
     expect(same.calls.some((c) => c.command.includes("fetch --prune origin"))).toBe(true);
     const other = fakeSandbox("https://github.com/acme/other.git");
-    expect(await run(cloneTool(() => other.sb, staticToken("t")), "acme/secret")).toMatchObject({ error: expect.stringContaining("already holds acme/other") });
+    expect(await run(cloneTool(() => other.sb, offline("t")), "acme/secret")).toMatchObject({ error: expect.stringContaining("already holds acme/other") });
   });
 
   test("a different checkout is never described by its remote URL, which may hold a credential", async () => {
     const leaky = fakeSandbox("https://x-access-token:ghs_leak@example.com/acme/other.git");
-    const r = (await run(cloneTool(() => leaky.sb, staticToken("t")), "acme/secret")) as { error: string };
+    const r = (await run(cloneTool(() => leaky.sb, offline("t")), "acme/secret")) as { error: string };
     expect(r.error).toContain("already holds a different repository");
     expect(r.error).not.toContain("ghs_leak");
   });
