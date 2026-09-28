@@ -44,8 +44,9 @@ In the app's settings, using the tunnel URL:
 - **Event Subscriptions** → on → Request URL `https://<tunnel>/slack/events`.
   It should turn **Verified**. That proves the signature check and the
   `url_verification` echo work.
-  - **Subscribe to bot events:** `app_mention`, `message.channels`, and `message.im`
-    unless `DM_MODE=ignore` → Save → reinstall if Slack asks.
+  - **Subscribe to bot events:** `app_mention`, `message.channels`, `reaction_added`,
+    `reaction_removed` (👍/👎 feedback), and `message.im` unless `DM_MODE=ignore` → Save
+    → reinstall if Slack asks.
 - **App Home** → Messages Tab on, **and** tick "Allow users to send Slash commands and
   messages from the messages tab" (unless `DM_MODE=ignore`). Without the tick, a DM
   reads "Sending messages to this app has been turned off". Reload Slack (⌘R) after.
