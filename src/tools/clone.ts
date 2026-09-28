@@ -19,7 +19,20 @@ export function parseRepo(input: string): RepoRef | undefined {
   return m && !m[1]!.startsWith(".") && !m[2]!.startsWith(".") ? { owner: m[1]!, name: m[2]! } : undefined;
 }
 
+// Only characters a GitHub login and a noreply address use: it goes into a shell command.
+const PLAIN = /^[A-Za-z0-9._+@[\] -]{1,100}$/;
+
 export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
+  // Commits in the checkout are by the account the credential acts as (the App's bot), at
+  // its noreply address, so GitHub links them to it. Left unset, the model would make one
+  // up. Best effort: without it the clone still stands.
+  async function commitAs(sb: ReturnType<SandboxFor>): Promise<{ commitsAs?: string }> {
+    const who = await github.identity?.().catch(() => undefined);
+    if (!who || !PLAIN.test(who.name) || !PLAIN.test(who.email)) return {};
+    const r = await sb.exec(`git config user.name '${who.name}' && git config user.email '${who.email}'`, { cwd: WORKDIR, timeoutMs: 30_000 }).catch(() => undefined);
+    return r?.exitCode === 0 ? { commitsAs: `${who.name} <${who.email}>` } : {};
+  }
+
   return {
     spec: {
       name: "workspace_clone",
@@ -61,11 +74,11 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
           }
           const r = await sb.exec(git("fetch --prune origin"), { cwd: WORKDIR, env, timeoutMs: 5 * 60_000 });
           if (r.exitCode !== 0) return { error: `fetch failed: ${r.stderr.slice(-500)}` };
-          return { status: "fetched", repo: `${repo.owner}/${repo.name}`, path: WORKDIR };
+          return { status: "fetched", repo: `${repo.owner}/${repo.name}`, path: WORKDIR, ...(await commitAs(sb)) };
         }
         const r = await sb.exec(git(`clone ${url} ${WORKDIR}`), { cwd: "/", env, timeoutMs: 10 * 60_000 });
         if (r.exitCode !== 0) return { error: `clone failed: ${r.stderr.slice(-500)}` };
-        return { status: "cloned", repo: `${repo.owner}/${repo.name}`, path: WORKDIR };
+        return { status: "cloned", repo: `${repo.owner}/${repo.name}`, path: WORKDIR, ...(await commitAs(sb)) };
       } catch (e) {
         return { error: (e as Error).message };
       }

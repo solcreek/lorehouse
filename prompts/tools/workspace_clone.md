@@ -1,1 +1,1 @@
-Clone a GitHub repo into this thread's sandbox at {{workdir}}, private repos included; if it is already there, fetch it instead. Give owner/name. Use this rather than git clone in workspace_exec, which has no access to private repos.
+Clone a GitHub repo into this thread's sandbox at {{workdir}}, private repos included; if it is already there, fetch it instead. Give owner/name. Use this rather than git clone in workspace_exec, which has no access to private repos. It also sets who commits in the checkout (`commitsAs` in the result): keep it.
