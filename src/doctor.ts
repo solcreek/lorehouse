@@ -203,7 +203,10 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     }
 
     // ── sandbox ──
-    if (sandbox.mode === "direct") {
+    // loadConfig checks only that SANDBOX_URL is set.
+    if (sandbox.mode === "direct" && !URL.canParse(sandbox.url)) {
+      add("sandbox", "host", "fail", `SANDBOX_URL "${sandbox.url}" isn't a URL`);
+    } else if (sandbox.mode === "direct") {
       const url = sandbox.url.replace(/\/$/, "");
       const { res, error } = await get(`${url}/v1/sandboxes`, { headers: { authorization: `Bearer ${sandbox.token}` } });
       if (!res) add("sandbox", "host", "fail", `${url}: ${error}`);
@@ -222,14 +225,14 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       add("storage", key, "warn", key === "SESSIONS_DB" ? "in memory: conversation state is lost on every restart; set a file path" : "in memory: the index is rebuilt from Slack on every start; set a file path");
       continue;
     }
-    // SQLite in WAL mode (knowledge.ts) writes -wal and -shm files beside the database,
-    // so its directory must be writable too, not only the file.
+    // SQLite reads and writes the database, and in WAL mode (knowledge.ts) creates -wal
+    // and -shm files beside it: the directory must be enterable and writable too.
     const full = resolve(path);
     const dir = dirname(full);
-    const writable = (p: string) => { try { accessSync(p, constants.W_OK); return true; } catch { return false; } };
+    const may = (p: string, mode: number) => { try { accessSync(p, mode); return true; } catch { return false; } };
     if (!existsSync(dir)) add("storage", key, "fail", `${dir} doesn't exist`);
-    else if (existsSync(full) && !writable(full)) add("storage", key, "fail", `${full} isn't writable`);
-    else if (!writable(dir)) add("storage", key, "fail", `${dir} isn't writable: SQLite keeps its -wal and -shm files there`);
+    else if (!may(dir, constants.W_OK | constants.X_OK)) add("storage", key, "fail", `${dir} must be writable and enterable: SQLite keeps its -wal and -shm files there`);
+    else if (existsSync(full) && !may(full, constants.R_OK | constants.W_OK)) add("storage", key, "fail", `${full} must be readable and writable`);
     else add("storage", key, "ok", existsSync(full) ? full : `${full} (created on first start)`);
   }
 
@@ -239,7 +242,12 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     add("deployment", "running app", "info", "pass --url https://<your app> to check the deployment Slack talks to");
     return checks;
   }
+  // doctor() can be called without doctorMain's check.
   const url = opts.url.replace(/\/$/, "");
+  if (!URL.canParse(url)) {
+    add("deployment", "URL", "fail", `"${opts.url}" isn't a URL`);
+    return checks;
+  }
   if (!/^https:/.test(url) && !isLoopback(url)) add("deployment", "URL", "warn", "Slack delivers events only to HTTPS URLs");
 
   const health = await get(`${url}/healthz`);
@@ -294,8 +302,10 @@ type RunningStatus = {
   runners?: { runner: string; transport: string; online: boolean; capacity: number; running: number }[];
 };
 
-// Only a literal loopback address: a name like 127.0.0.1.example.com is not one.
+// Only a literal loopback address: a name like 127.0.0.1.example.com is not one, and
+// neither is something that isn't a URL.
 function isLoopback(url: string): boolean {
+  if (!URL.canParse(url)) return false;
   const host = new URL(url).hostname;
   return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }

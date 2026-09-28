@@ -216,6 +216,11 @@ describe("code tools", () => {
     expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
   });
 
+  test("a SANDBOX_URL that isn't a URL fails the sandbox check instead of crashing", async () => {
+    const checks = await run({ SANDBOX_URL: "http://[bad", SANDBOX_TOKEN: "t".repeat(32), GITHUB_TOKEN: "ghp_1" });
+    expect(find(checks, "host").map((c) => c.level)).toEqual(["fail"]);
+  });
+
   test("a plain GitHub token works, with a warning that it's for development", async () => {
     const checks = await run({ SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" });
     expect(find(checks, "token")[0]).toMatchObject({ level: "warn" });
@@ -242,6 +247,29 @@ describe("storage", () => {
       chmodSync(dir, 0o755);
       rmSync(dir, { recursive: true });
     }
+  });
+
+  // A directory with one mode, holding a database file with another.
+  async function storageWith(dirMode: number, fileMode: number) {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-mode-`);
+    writeFileSync(`${dir}/lorehouse.db`, "");
+    chmodSync(`${dir}/lorehouse.db`, fileMode);
+    chmodSync(dir, dirMode);
+    try {
+      return find(await run({ LOREHOUSE_DB: `${dir}/lorehouse.db` }), "LOREHOUSE_DB")[0];
+    } finally {
+      chmodSync(dir, 0o755);
+      rmSync(dir, { recursive: true });
+    }
+  }
+
+  test("a directory that can be written but not entered fails", async () => {
+    expect(await storageWith(0o300, 0o600)).toMatchObject({ level: "ok" });
+    expect((await storageWith(0o600, 0o600))?.level).toBe("fail");
+  });
+
+  test("a database that can be written but not read fails", async () => {
+    expect(await storageWith(0o755, 0o200)).toMatchObject({ level: "fail", detail: expect.stringContaining("readable and writable") });
   });
 
   test("a directory that doesn't exist fails; sessions in memory warn", async () => {
@@ -288,6 +316,12 @@ describe("the running deployment (--url)", () => {
     expect(await warned("http://app.test")).toBe(true);
     expect(await warned("http://127.0.0.1:3000")).toBe(false);
     expect(await warned("http://localhost:3000")).toBe(false);
+  });
+
+  test("a --url that isn't a URL fails, even called without the command line's check", async () => {
+    const checks = await run({}, {}, "http://[bad");
+    expect(find(checks, "URL")).toMatchObject([{ level: "fail" }]);
+    expect(find(checks, "/healthz")).toEqual([]);
   });
 
   test("a URL nothing answers at fails without asking further", async () => {
