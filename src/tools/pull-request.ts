@@ -83,6 +83,12 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         // them carrying the token: only a plain ref name and a full commit id get that far.
         if (!isPlainRef(base)) return { error: "the repo's default branch isn't a plain branch name; give base explicitly" };
         if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) return { error: "HEAD isn't a commit id" };
+        // A base this checkout hasn't fetched: say how to get it, rather than git's failure.
+        // git fetch in workspace_exec has no access to a private repo; workspace_clone does.
+        const known = await sb.exec(`git rev-parse --verify --quiet origin/${base}`, { cwd: WORKDIR, timeoutMs: 30_000 });
+        if (known.exitCode !== 0) {
+          return { error: `origin/${base} isn't in this checkout yet. Fetch with workspace_clone (${repo.owner}/${repo.name}); git fetch in workspace_exec has no access. Then call open_pull_request again.` };
+        }
         stat = await sh(`git diff --stat origin/${base}...HEAD`);
       } catch (e) {
         return { error: (e as Error).message };

