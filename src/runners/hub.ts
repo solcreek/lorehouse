@@ -19,7 +19,8 @@ import { EXEC_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox } from
 // answer never arrived are handed out again.
 // `session` and `started` (unix ms) identify the runner process: of two with one name, the
 // later-started one is the runner, and the other's polls are ignored.
-export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number };
+// `sandboxes`: those whose VM is up (and counted in `running`).
+export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number; sandboxes?: string[] };
 
 type JobBody =
   | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string }
@@ -40,15 +41,19 @@ type Pending = { runner: string; gen: number; session?: string; deadline: number
 
 // A boot can precede the work: a job's deadline is its own timeout plus this.
 const BOOT_SLACK_MS = 60_000;
+// How long a new sandbox's room stays reserved if no status lists it: a boot, plus a
+// WebSocket runner's 20 s status interval, plus margin.
+const RESERVE_MS = BOOT_SLACK_MS + 30_000;
 
 export class RunnerHub {
   private runners = new Map<string, Runner>();
   private pending = new Map<string, Pending>();
   private gens = 0;
-  // Sandboxes just placed whose VM a runner's status may not count yet: sandbox → runner.
-  // Each holds a slot of room until the sandbox's first job settles (by then the VM is
-  // running, or failed to start).
-  private reserved = new Map<string, string>();
+  // Sandboxes just placed whose VM a runner's status doesn't count yet, and when: each holds
+  // a slot of room until a status from its runner lists it among `sandboxes` (from then on
+  // `running` counts it), or RESERVE_MS passes without that (it never started, or already
+  // stopped).
+  private reserved = new Map<string, { runner: string; at: number }>();
 
   constructor(
     private readonly db: Database,
@@ -193,6 +198,11 @@ export class RunnerHub {
       r.session = status.session;
       r.started = status.started;
     }
+    // Reservations this status settles: listed (now in `running`), or too old to wait for.
+    const up = new Set(status.sandboxes ?? []);
+    for (const [sandbox, v] of this.reserved) {
+      if (v.runner === name && (up.has(sandbox) || this.now() - v.at >= RESERVE_MS)) this.reserved.delete(sandbox);
+    }
   }
 
   // A result counts from the runner the job was sent to, arriving on that connection or a
@@ -245,24 +255,19 @@ export class RunnerHub {
     // capacity, so it isn't chosen until it does. When every runner is full, nothing is
     // recorded and the caller can try again. Room counts sandboxes placed since the status
     // was sent, so several new sandboxes at once don't all land on one runner.
-    const taken = (r: Runner) => [...this.reserved.values()].filter((n) => n === r.name).length;
+    const taken = (r: Runner) => [...this.reserved.values()].filter((v) => v.runner === r.name).length;
     const free = (r: Runner) => r.status.capacity - r.status.running - taken(r);
     const online = [...this.runners.values()].filter((r) => this.online(r));
     if (!online.length) throw new Error("no sandbox runner is connected");
     const best = online.filter((r) => free(r) > 0).sort((a, b) => free(b) - free(a) || a.name.localeCompare(b.name))[0];
     if (!best) throw new Error("every sandbox runner is full; try again in a few minutes");
     this.db.query("INSERT INTO sandbox_placements (sandbox, runner, placed_at) VALUES (?, ?, ?)").run(sandbox, best.name, new Date(this.now()).toISOString());
-    this.reserved.set(sandbox, best.name);
+    this.reserved.set(sandbox, { runner: best.name, at: this.now() });
     return best;
   }
 
   submit(sandbox: string, body: JobBody, timeoutMs: number): Promise<JobResult> {
     const runner = this.place(sandbox);
-    const settled = () => this.reserved.delete(sandbox);
-    return this.dispatch(runner, sandbox, body, timeoutMs).finally(settled);
-  }
-
-  private dispatch(runner: Runner, sandbox: string, body: JobBody, timeoutMs: number): Promise<JobResult> {
     // Random, not a counter: the runner remembers ids across Lorehouse restarts, and skips
     // one it has seen as a redelivery.
     const job = { ...body, id: `j_${crypto.randomUUID()}`, sandbox, timeoutMs } as Job;

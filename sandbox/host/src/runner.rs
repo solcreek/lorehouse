@@ -289,7 +289,7 @@ impl Runner {
 
     async fn status_json(&self) -> serde_json::Value {
         let jobs = self.ledger().ids(Instant::now());
-        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "version": VERSION, "jobs": jobs, "session": self.process, "started": self.started })
+        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "sandboxes": self.vms.running_ids().await, "version": VERSION, "jobs": jobs, "session": self.process, "started": self.started })
     }
 
     pub async fn run(self: Arc<Self>) {

@@ -281,18 +281,37 @@ describe("placement", () => {
     const a = wsRunner(hub, "a", 2, 0);
     const b = wsRunner(hub, "b", 1, 0);
     const first = hub.sandbox("s1").exec("a"); // a: 2 free, b: 1
-    const second = hub.sandbox("s2").exec("b"); // a: 1 free (s1 counts), b: 1; a by name
+    void hub.sandbox("s2").exec("b"); // a: 1 free (s1 counts), b: 1; a by name
     void hub.sandbox("s3").exec("c"); // a is taken: b
     expect(a.sent.map((j) => j.sandbox)).toEqual(["s1", "s2"]);
     expect(b.sent.map((j) => j.sandbox)).toEqual(["s3"]);
     expect(() => hub.submit("s4", { op: "destroy" }, 1000)).toThrow(/every sandbox runner is full/);
-    // A settled sandbox is in the runner's status from then on, and stops counting as reserved.
+    // A job settling doesn't free the room: the runner may not count the VM yet (a fast
+    // command, a status up to 20 s old). Nor does a later job for the same sandbox.
+    void hub.sandbox("s1").exec("again");
+    a.link.result(ok(a.sent[2]!, { exitCode: 0, stdout: "", stderr: "" }));
     a.link.result(ok(a.sent[0]!, { exitCode: 0, stdout: "", stderr: "" }));
-    a.link.result(ok(a.sent[1]!, { exitCode: 0, stdout: "", stderr: "" }));
-    await Promise.all([first, second]);
-    a.link.status(status("a", 2, 1)); // one of the two has since been destroyed
+    await first;
+    a.link.status(status("a", 2, 0)); // an old count: neither VM listed yet
+    expect(() => hub.submit("s4", { op: "destroy" }, 1000)).toThrow(/every sandbox runner is full/);
+    // Listed, a sandbox is in `running` and stops counting as reserved: counted once.
+    a.link.status({ ...status("a", 2, 1), sandboxes: ["s1"] });
+    expect(() => hub.submit("s4", { op: "destroy" }, 1000)).toThrow(/every sandbox runner is full/); // s1 running + s2 reserved
+    a.link.status({ ...status("a", 3, 1), sandboxes: ["s1"] }); // room for one more
     void hub.submit("s4", { op: "destroy" }, 1000);
-    expect(a.sent.map((j) => j.sandbox)).toEqual(["s1", "s2", "s4"]);
+    expect(a.sent.map((j) => j.sandbox)).toEqual(["s1", "s2", "s1", "s4"]);
+  });
+
+  test("a reservation no status ever lists (the VM never started, or already stopped) lapses", () => {
+    let now = 1_000_000;
+    const hub = hubWith({ now: () => now });
+    const a = wsRunner(hub, "a", 1, 0);
+    void hub.submit("s1", { op: "destroy" }, 1000).catch(() => {});
+    expect(() => hub.submit("s2", { op: "destroy" }, 1000)).toThrow(/every sandbox runner is full/);
+    now += 90_000;
+    a.link.status({ ...status("a", 1, 0), sandboxes: [] });
+    void hub.submit("s2", { op: "destroy" }, 1000).catch(() => {});
+    expect(a.sent.map((j) => j.sandbox)).toEqual(["s1", "s2"]);
   });
 
   test("placements survive a restart of Lorehouse (they are in the database)", () => {

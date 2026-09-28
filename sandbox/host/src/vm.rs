@@ -312,6 +312,15 @@ impl Manager {
         self.slots.lock().await.iter().filter(|taken| **taken).count()
     }
 
+    /// Sandboxes whose VM is up now, each already counted in running_count (for a runner's
+    /// status: Lorehouse holds a new sandbox's room until it is listed). One whose VM is
+    /// booting, or being checked by a request right now, is left out: holding its room a
+    /// little longer is the safe side.
+    pub async fn running_ids(&self) -> Vec<String> {
+        let list: Vec<Arc<Sandbox>> = self.sandboxes.lock().await.values().cloned().collect();
+        list.iter().filter(|sb| sb.running.try_lock().is_ok_and(|r| r.is_some())).map(|sb| sb.id.clone()).collect()
+    }
+
     pub fn capacity(&self) -> usize {
         self.cfg.max_vms
     }

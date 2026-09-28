@@ -25,15 +25,16 @@ function parseStatus(runner: string, v: unknown): RunnerStatus | undefined {
   const o = v as Partial<RunnerStatus> | undefined;
   const whole = (n: unknown) => typeof n === "number" && Number.isInteger(n) && n >= 0 && n <= 10_000;
   if (!o || !whole(o.capacity) || !whole(o.running)) return undefined;
-  // Job id lists: absent means "not reported"; present, an array of at most 10 000 short
-  // strings, or the whole status is refused. Never filtered: a malformed list read as empty
-  // would make reconcile fail jobs the runner still holds (and retries run them twice).
+  // Id lists (jobs, received, sandboxes): absent means "not reported"; present, an array of
+  // at most 10 000 short strings, or the whole status is refused. Never filtered: a
+  // malformed list read as empty would make reconcile fail jobs the runner still holds (and
+  // retries run them twice).
   const idList = (v: unknown) => Array.isArray(v) && v.length <= 10_000 && v.every((x) => typeof x === "string" && x.length <= 128);
-  if ((o.jobs !== undefined && !idList(o.jobs)) || (o.received !== undefined && !idList(o.received))) return undefined;
+  if ([o.jobs, o.received, o.sandboxes].some((v) => v !== undefined && !idList(v))) return undefined;
   const ids = (v: unknown) => v as string[] | undefined;
   // The runner process: an id, and when it started (unix ms). Both, or neither.
   const session = typeof o.session === "string" && /^[\w.-]{1,64}$/.test(o.session) && Number.isSafeInteger(o.started) && o.started! >= 0 ? { session: o.session, started: o.started } : {};
-  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received), ...session };
+  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received), sandboxes: ids(o.sandboxes), ...session };
 }
 
 function parseResult(v: unknown): JobResult | undefined {

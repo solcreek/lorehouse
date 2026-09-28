@@ -47,7 +47,8 @@ sandboxes on the runner with the most free room.
 
 ```json
 { "type": "status", "runner": "starship", "capacity": 4, "running": 1, "version": "0.1.0",
-  "jobs": ["j_…"], "received": ["j_…"], "session": "18f3a…-2c41", "started": 1790000000000 }
+  "sandboxes": ["slack_C1_1790000001.000100"], "jobs": ["j_…"], "received": ["j_…"],
+  "session": "18f3a…-2c41", "started": 1790000000000 }
 ```
 
 - `jobs` lists the ids the runner holds: running, or finished with a result not yet
@@ -58,8 +59,11 @@ sandboxes on the runner with the most free room.
 - `session` and `started` identify the runner process: an id, and when it started (unix
   ms). While an old process is being replaced by a new one with the same name, the old
   one's polls are ignored, so it can't take the new one's jobs.
-- All four are optional. A runner that omits them loses the guarantees in Delivery but
-  still works.
+- `sandboxes` lists the sandboxes whose VM is up, each counted in `running` (see
+  [Placement](#placement-and-failure)).
+- All of these are optional. A runner that omits them loses the guarantees they give but
+  still works. A list that is present must be an array of strings, or the whole status
+  is refused.
 
 A **job** is one request to the sandbox's guest agent, or the removal of a sandbox:
 
@@ -107,8 +111,10 @@ A **result** answers one job with an HTTP-like status:
   silently moved, because moving it would lose the checkout.
 - **New sandbox.** It goes to the online runner with free capacity, the most first. A
   runner that hasn't sent a status yet has none. A sandbox just placed takes a slot of its
-  runner's room until its first job settles, so several new sandboxes at once spread out
-  rather than all landing on one runner between two statuses.
+  runner's room until a status lists it in `sandboxes` (from then on `running` counts it),
+  or 90 s pass without that (its VM never started, or already stopped). Several new
+  sandboxes at once then spread out rather than all landing on one runner between two
+  statuses.
   - With none online, the job fails with "no sandbox runner is connected".
   - With all full, it fails with "every sandbox runner is full". Nothing is recorded, so a
     retry can land wherever room appears.
