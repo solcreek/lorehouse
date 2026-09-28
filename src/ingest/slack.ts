@@ -4,7 +4,8 @@
 // Only channels on the agent's allowlist are read, and the channel policy has already
 // dropped DMs and private channels before a live event gets here. Bot and system
 // messages (joins, topic changes, deletion tombstones) are left out: the agent's own
-// answers must not become its sources.
+// answers must not become its sources. So are messages that mention the agent: they
+// are questions put to it, not knowledge.
 //
 // Every change funnels into one operation, refreshThread: re-read the thread, then
 // upsert it — or DELETE it when Slack no longer has it or nothing human is left. What
@@ -24,6 +25,7 @@
 import type { Database } from "bun:sqlite";
 import { countDocuments, deleteDocument, docIdsWithPrefix, documentVersion, getCursor, setCursor, upsertDocument, type Document } from "../knowledge";
 import { SlackApiError, type SlackApi } from "../slack-api";
+import { SlackUsers, type PersonName } from "./slack-users";
 
 export type SlackMessage = {
   ts: string;
@@ -37,14 +39,19 @@ export type SlackMessage = {
   edited?: { ts: string };
 };
 
-export function isHumanMessage(m: SlackMessage): boolean {
-  return !m.bot_id && !m.subtype && !!m.text?.trim();
+// A message that is knowledge: written by a person, not a system notice, and not a
+// question put to the agent (a message mentioning the bot is asking, not telling —
+// indexing it would let the agent cite the question back as an answer).
+export function isHumanMessage(m: SlackMessage, botUserId?: string): boolean {
+  if (m.bot_id || m.subtype || !m.text?.trim()) return false;
+  return !(botUserId && m.text.includes(`<@${botUserId}>`));
 }
 
-// Slack's markup → readable text: <@U1> → @U1, <#C1|ops> → #ops, <url|label> → label (url).
-export function cleanSlackText(text: string): string {
+// Slack's markup → readable text: <@U1> → @Wendy (the short name; @U1 when unknown),
+// <#C1|ops> → #ops, <url|label> → label (url).
+export function cleanSlackText(text: string, names: Map<string, PersonName> = new Map()): string {
   return text
-    .replace(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g, "@$1")
+    .replace(/<@([A-Z0-9]+)(?:\|([^>]*))?>/g, (_, id: string, label?: string) => `@${names.get(id)?.short ?? label ?? id}`)
     .replace(/<#[A-Z0-9]+\|([^>]+)>/g, "#$1")
     .replace(/<#([A-Z0-9]+)>/g, "#$1")
     .replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, "@$1")
@@ -69,22 +76,43 @@ function rootVersion(root: SlackMessage): string {
   return maxTs(root.latest_reply ?? root.ts, root.edited?.ts ?? "0");
 }
 
+// Every user id a thread refers to — its authors and the people mentioned in it.
+export function userIdsIn(messages: SlackMessage[]): string[] {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (m.user) ids.add(m.user);
+    for (const [, id] of m.text?.matchAll(/<@([A-Z0-9]+)/g) ?? []) ids.add(id!);
+  }
+  return [...ids];
+}
+
 // A thread (root first) → a document, or null when nothing in it is human-written.
-export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string): Document | null {
-  const human = messages.filter(isHumanMessage);
+//
+// The rendering contract. Each message is a speaker line, then its text, then a blank
+// line:
+//
+//   — hkato (Hana Kato), 2026-03-02
+//   @Marco 這版可以再簡化
+//
+// The speaker line uses the full name and stands alone. The older "hkato: @Marco …"
+// put the speaker right against a mention, and a model read the pair as one person
+// ("Marco (hkato)"). Mentions in the text use the short name.
+export function threadDocument(channel: string, messages: SlackMessage[], workspaceUrl: string, botUserId?: string, names: Map<string, PersonName> = new Map()): Document | null {
+  const human = messages.filter((m) => isHumanMessage(m, botUserId));
   const root = messages[0];
   if (!root || human.length === 0) return null;
-  const lines = human.map((m) => {
+  const blocks = human.map((m) => {
     const day = new Date(Number(m.ts) * 1000).toISOString().slice(0, 10);
-    return `[${day}] @${m.user ?? "unknown"}: ${cleanSlackText(m.text!)}`;
+    const who = m.user ? (names.get(m.user)?.full ?? m.user) : "unknown";
+    return `— ${who}, ${day}\n${cleanSlackText(m.text!, names)}`;
   });
-  const firstLine = cleanSlackText(human[0]!.text!).split("\n")[0]!.trim();
+  const firstLine = cleanSlackText(human[0]!.text!, names).split("\n")[0]!.trim();
   return {
     docId: threadDocId(channel, root.ts),
     kind: "slack_thread",
     source: permalink(workspaceUrl, channel, root.ts),
     title: firstLine.length > 80 ? `${firstLine.slice(0, 77)}…` : firstLine,
-    text: lines.join("\n"),
+    text: blocks.join("\n\n"),
     sourceVersion: threadVersion(messages),
   };
 }
@@ -97,6 +125,9 @@ export function threadOfEvent(ev: Record<string, unknown> | undefined): { channe
   if (!ev || ev.type !== "message" || typeof ev.channel !== "string") return undefined;
   const msg = (ev.message ?? {}) as SlackMessage;
   const prev = (ev.previous_message ?? {}) as SlackMessage;
+  // A bot's own posts and edits never change knowledge (bots are left out), and the
+  // agent's streamed replies arrive as a burst of edits: skip them without a re-read.
+  if (ev.bot_id || (ev.subtype === "message_changed" && msg.bot_id)) return undefined;
   let threadTs: string | undefined;
   if (ev.subtype === "message_changed") threadTs = msg.thread_ts ?? msg.ts;
   else if (ev.subtype === "message_deleted") threadTs = prev.thread_ts ?? (ev.deleted_ts as string | undefined);
@@ -121,11 +152,17 @@ export type IngestOptions = {
   log?: (msg: string) => void;
 };
 
+// Bump whenever threadDocument renders differently (what it leaves out, how it names
+// people, …). On the next start every stored thread is re-read and re-rendered in
+// place, so old documents never keep an outdated shape.
+export const SLACK_DOC_VERSION = "names-2"; // names-2: speaker lines with "display (real)" names
+
 export class SlackIngester {
   private workspaceUrl = "";
+  private botUserId?: string;
+  private readonly users: SlackUsers;
   private state: IngestStatus["state"] = "idle";
   private error?: string;
-  private threadsByChannel = new Map<string, number>();
   private reconciled = { refreshed: 0, removed: 0 };
   private pending = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -133,15 +170,25 @@ export class SlackIngester {
     private readonly api: SlackApi,
     private readonly db: Database,
     private readonly opts: IngestOptions,
-  ) {}
+  ) {
+    this.users = new SlackUsers(api, db, { log: opts.log, now: opts.now });
+  }
 
-  // Resolve the workspace URL (for permalinks), then for each allowed channel: read new
-  // history since the cursor, and reconcile what changed while the app was down.
+  // People's names, as knowledge names them (and from the same cache).
+  names(ids: string[]): Promise<Map<string, PersonName>> {
+    return this.users.names(ids);
+  }
+
+  // Resolve the workspace URL (for permalinks) and the bot's own user id, re-render
+  // stored threads if the document shape changed, then for each allowed channel: read
+  // new history since the cursor, and reconcile what changed while the app was down.
   async start(): Promise<void> {
     this.state = "backfilling";
     try {
-      const auth = await this.api.call<{ url: string }>("auth.test");
+      const auth = await this.api.call<{ url: string; user_id?: string }>("auth.test");
       this.workspaceUrl = auth.url;
+      this.botUserId = auth.user_id;
+      await this.rerenderIfStale();
       for (const channel of this.opts.channels) {
         if (this.opts.backfillDays > 0 || getCursor(this.db, `slack:${channel}`)) await this.backfill(channel);
         if (this.opts.refreshDays > 0) await this.reconcile(channel);
@@ -158,6 +205,26 @@ export class SlackIngester {
     return (this.opts.now?.() ?? Date.now()) / 1000;
   }
 
+  private async rerenderIfStale(): Promise<void> {
+    const row = this.db.query("SELECT value FROM knowledge_index_meta WHERE key = 'slack_doc_version'").get() as { value: string } | null;
+    if (row?.value === SLACK_DOC_VERSION) return;
+    let n = 0;
+    for (const channel of this.opts.channels) {
+      for (const docId of docIdsWithPrefix(this.db, `slack:${channel}:`)) {
+        await this.refreshThread(channel, docId.slice(`slack:${channel}:`.length));
+        n++;
+      }
+    }
+    // Without users:read the re-render fell back to ids: leave the version unset so the
+    // next start (after the scope is added and the app reinstalled) tries again.
+    if (!this.users.available) {
+      this.opts.log?.(`ingest: re-rendered ${n} threads without names; will retry once users:read is granted`);
+      return;
+    }
+    this.db.query("INSERT INTO knowledge_index_meta (key, value) VALUES ('slack_doc_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(SLACK_DOC_VERSION);
+    if (n) this.opts.log?.(`ingest: re-rendered ${n} threads for document version ${SLACK_DOC_VERSION}`);
+  }
+
   private async backfill(channel: string): Promise<void> {
     const source = `slack:${channel}`;
     const oldest = getCursor(this.db, source) ?? String(Math.floor(this.nowSec() - this.opts.backfillDays * 86400));
@@ -166,7 +233,7 @@ export class SlackIngester {
       if (Number(m.ts) > Number(newest)) newest = m.ts;
       if (m.thread_ts && m.thread_ts !== m.ts) continue; // a broadcast reply; its thread is indexed from the root
       const thread = m.reply_count ? await this.readThread(channel, m.ts) : [m];
-      if (this.store(channel, thread)) this.threadsByChannel.set(channel, (this.threadsByChannel.get(channel) ?? 0) + 1);
+      await this.store(channel, thread);
     }
     setCursor(this.db, source, newest);
     this.opts.log?.(`ingest: ${channel} backfilled up to ${newest}`);
@@ -185,7 +252,7 @@ export class SlackIngester {
         root.subtype === "tombstone" // the root was deleted; its replies live on
           ? stored !== undefined
           : stored === undefined
-            ? isHumanMessage(root) || !!root.reply_count // new to us (the cursor can lag an edit's window)
+            ? isHumanMessage(root, this.botUserId) || !!root.reply_count // new to us (the cursor can lag an edit's window)
             : stored === null || Number(rootVersion(root)) > Number(stored);
       if (stale) await this.refreshThread(channel, root.ts, "reconcile");
     }
@@ -202,8 +269,9 @@ export class SlackIngester {
     return out;
   }
 
-  private store(channel: string, thread: SlackMessage[]): boolean {
-    const doc = threadDocument(channel, thread, this.workspaceUrl);
+  private async store(channel: string, thread: SlackMessage[]): Promise<boolean> {
+    const names = await this.users.names(userIdsIn(thread));
+    const doc = threadDocument(channel, thread, this.workspaceUrl, this.botUserId, names);
     if (!doc) return false;
     upsertDocument(this.db, doc);
     return true;
@@ -220,7 +288,7 @@ export class SlackIngester {
       thread = [];
     }
     const docId = threadDocId(channel, threadTs);
-    if (this.store(channel, thread)) {
+    if (await this.store(channel, thread)) {
       if (why === "reconcile") this.reconciled.refreshed++;
       return "updated";
     }
@@ -244,7 +312,8 @@ export class SlackIngester {
 
   status(): IngestStatus {
     const channels: IngestStatus["channels"] = {};
-    for (const c of this.opts.channels) channels[c] = { cursor: getCursor(this.db, `slack:${c}`), threads: this.threadsByChannel.get(c) ?? 0 };
+    // threads: what the index holds for the channel now, not what this run happened to read
+    for (const c of this.opts.channels) channels[c] = { cursor: getCursor(this.db, `slack:${c}`), threads: countDocuments(this.db, `slack:${c}:`) };
     return { state: this.state, documents: countDocuments(this.db), channels, reconciled: { ...this.reconciled }, ...(this.error ? { error: this.error } : {}) };
   }
 }

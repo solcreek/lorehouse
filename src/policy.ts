@@ -4,6 +4,11 @@
 // runs a code-writing agent in a DM. Enforced at the channel's `accept` gate, which sees
 // the signature-verified raw payload before any turn or model call.
 //
+// The one exception is a direct message, admitted only when `dms` is on (DM_MODE is not
+// "ignore") so it can be pointed to a public channel or answered from public knowledge.
+// A DM is never knowledge: ingest only reads the allowlisted channels. Private channels
+// and group DMs stay shut.
+//
 // `accept` is synchronous, so it can't ask Slack (conversations.info) whether a channel
 // is private. What the payload itself says:
 //   • message events carry channel_type: "channel" (public) | "group" | "im" | "mpim"
@@ -17,7 +22,7 @@ type SlackEnvelope = {
   event?: { type?: string; channel?: string; channel_type?: string };
 };
 
-export function publicChannelsOnly(allowlist: ReadonlySet<string>) {
+export function publicChannelsOnly(allowlist: ReadonlySet<string>, opts: { dms?: boolean } = {}) {
   return (raw: unknown): boolean => {
     const env = raw as SlackEnvelope | undefined;
     // slackChannel only consults accept for event_callback deliveries (Approve/Deny clicks
@@ -25,6 +30,7 @@ export function publicChannelsOnly(allowlist: ReadonlySet<string>) {
     if (env?.type !== "event_callback" || !env.event) return true;
     const { channel, channel_type } = env.event;
     if (!channel) return false;
+    if (channel_type === "im") return opts.dms === true;
     if (channel_type) return channel_type === "channel" && (allowlist.size === 0 || allowlist.has(channel));
     return allowlist.has(channel);
   };

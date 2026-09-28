@@ -25,10 +25,24 @@ describe("Slack text → document", () => {
     expect(doc.docId).toBe("slack:C1:1790000001.000100");
     expect(doc.title).toBe("Wombat review moves to Thursdays");
     expect(doc.source).toBe("https://acme.slack.com/archives/C1/p1790000001000100");
-    expect(doc.text).toContain("@U2: Wombat review");
-    expect(doc.text).toContain("@U3: same room as #ops?");
+    expect(doc.text).toBe(
+      "— U2, 2026-09-21\nWombat review moves to Thursdays\nmore detail\n\n" +
+      "— U3, 2026-09-21\nsame room as #ops?",
+    );
     expect(doc.text).not.toContain("bot noise");
     expect(doc.text).not.toContain("joined");
+  });
+
+  test("a question put to the agent is not knowledge; the rest of its thread is", () => {
+    const doc = threadDocument("C1", [
+      { ts: "1.1", user: "U2", text: "<@UBOT> what's the pelican budget?" },
+      { ts: "1.2", thread_ts: "1.1", user: "U3", text: "it's 40k, per the finance sync" },
+    ], WS, "UBOT")!;
+    expect(doc.text).not.toContain("pelican budget?");
+    expect(doc.text).toContain("40k");
+    expect(threadDocument("C1", [{ ts: "2.1", user: "U2", text: "<@UBOT> hello" }], WS, "UBOT")).toBeNull();
+    // without a known bot id nothing is dropped (e.g. before auth.test answered)
+    expect(threadDocument("C1", [{ ts: "2.1", user: "U2", text: "<@UBOT> hello" }], WS)).not.toBeNull();
   });
 
   test("a thread with nothing human-written is not a document", () => {
@@ -44,6 +58,7 @@ function fakeApi(history: Record<string, SlackMessage[][]>, threads: Record<stri
     async call<T>(method: string, params: Record<string, unknown> = {}) {
       calls.push({ method, params });
       if (method === "auth.test") return { url: WS } as T;
+      if (method === "users.info") throw new SlackApiError("users.info", "missing_scope"); // names fall back to ids
       throw new Error(`unexpected ${method}`);
     },
     async *paginate<T>(method: string, params: Record<string, unknown>) {
@@ -91,6 +106,18 @@ describe("SlackIngester", () => {
     const historyCall = second.calls.find((c) => c.method === "conversations.history")!;
     expect(historyCall.params.oldest).toBe("1790000001.000100");
     expect(getCursor(db, "slack:C1")).toBe("1790000001.000100");
+  });
+
+  test("status counts the threads the index holds per channel, also after a restart that read nothing new", async () => {
+    const db = openKnowledge(":memory:");
+    const history = { C1: [[{ ts: "1790000001.000100", user: "U2", text: "first" }, { ts: "1790000002.000100", user: "U2", text: "second" }]], C10: [[{ ts: "1790000003.000100", user: "U2", text: "elsewhere" }]] };
+    const opts = { channels: new Set(["C1", "C10"]), refreshDays: 0, backfillDays: 30, debounceMs: 0, now };
+    await new SlackIngester(fakeApi(history).api, db, opts).start();
+    const restarted = new SlackIngester(fakeApi(history).api, db, opts);
+    await restarted.start();
+    // C1 is a prefix of C10: each channel counts only its own threads
+    expect(restarted.status().channels).toMatchObject({ C1: { threads: 2 }, C10: { threads: 1 } });
+    expect(restarted.status().documents).toBe(3);
   });
 
   test("backfill starts backfillDays ago on first run", async () => {

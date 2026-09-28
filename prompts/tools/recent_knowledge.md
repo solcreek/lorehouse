@@ -1,0 +1,1 @@
+List the most recently active threads, newest first: id, title, source link, when it was last active, and the first 500 characters. Use it for overview questions keyword search can't answer: "what's been discussed lately", "summarize this week", "what topics came up". Use search_knowledge for questions about a specific fact.

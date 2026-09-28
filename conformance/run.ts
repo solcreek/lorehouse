@@ -64,7 +64,7 @@ const mention = (channel: string, extra: Record<string, unknown> = {}) => {
   return { type: "app_mention", user: "U1", team: "T1", text: "<@UBOT> [q1] how does soft navigation work", ts, event_ts: ts, channel, ...extra };
 };
 
-const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[] };
+const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[]; posts: { channel: string; thread_ts?: string; text: string }[] };
 const reset = () => fetch(`${MOCK}/reset`, { method: "POST" });
 
 // Ask the agent something in the allowed channel and read back what it cited.
@@ -79,6 +79,27 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
 
 type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
 const status = async () => (await (await fetch(`http://localhost:${APP_PORT}/status`)).json()) as Status;
+
+// A person's DM to the bot, as Slack delivers it: a `message` event with channel_type
+// "im" (a DM never produces an app_mention). Returns its ts.
+async function directMessage(text: string, extra: Record<string, unknown> = {}): Promise<string> {
+  const ts = `${1990000000 + ++seq}.000100`;
+  await sendEvent({ type: "message", channel: "D1", channel_type: "im", user: "U1", text, ts, event_ts: ts, ...extra });
+  return ts;
+}
+
+// Run a scenario with the app restarted under other settings, then restart it on the
+// defaults, pass or fail, so later scenarios see the usual app.
+async function inMode(env: Record<string, string>, run: () => Promise<string | null>): Promise<string | null> {
+  await stopApp();
+  await startApp(env);
+  try {
+    return await run();
+  } finally {
+    await stopApp();
+    await startApp();
+  }
+}
 
 // Post a message into Slack's history, then deliver the Events API event for it.
 async function liveMessage(channel: string, channelType: string, text: string): Promise<string> {
@@ -117,7 +138,11 @@ const scenarios: Scenario[] = [
       const out = await $`bun ${join(HERE, "drive.ts")} --target ${TARGET} --mock ${MOCK} --secret ${SECRET} --n 40 --c 4`.quiet().nothrow();
       const r = JSON.parse(out.stdout.toString()) as { ok: number; failed: number; sampleErrors: string[]; cites: Record<string, string> };
       if (r.ok !== 40) return `${r.ok}/40 ok — ${r.sampleErrors.join(" | ")}`;
-      // The search contract: the same question must surface the same top chunk.
+      // The search contract: the same question must surface the same top chunk. Only
+      // questions with a clear winner are pinned. "how does the built in mcp server work"
+      // is asked but not pinned: its top two (c16, c174) are within 0.0002 bm25, so any
+      // legitimate change to corpus statistics (a new fixture document, CJK bigrams)
+      // flips them. The closest pinned question has a margin above 0.1.
       const expected = (await Bun.file(join(HERE, "fixtures/expected-cites.json")).json()) as Record<string, string>;
       const wrong = Object.entries(expected).filter(([q, id]) => r.cites[q] !== id);
       return wrong.length ? `top hit differs for ${wrong.length} question(s), e.g. "${wrong[0]![0]}": got ${r.cites[wrong[0]![0]]}, want ${wrong[0]![1]}` : null;
@@ -127,8 +152,8 @@ const scenarios: Scenario[] = [
     name: "reports ingest state and document count at GET /status",
     run: async () => {
       const s = await status();
-      // seeds + wombat thread, password, ibex and emu messages; the bot post and the join are not documents
-      const want = SEED_DOCS + 4;
+      // seeds + wombat thread, password, ibex, emu and the Chinese message; the bot post and the join are not documents
+      const want = SEED_DOCS + 5;
       if (s.knowledge.state !== "ready") return `state ${s.knowledge.state}, want ready`;
       return s.knowledge.documents === want ? null : `documents ${s.knowledge.documents}, want ${want}`;
     },
@@ -140,6 +165,47 @@ const scenarios: Scenario[] = [
       if (a.cite !== WOMBAT_THREAD) return `cited ${a.cite}, want ${WOMBAT_THREAD}`;
       const want = "https://acme.slack.com/archives/C1/p1790000001000100";
       return a.src === want ? null : `source ${a.src}, want ${want}`;
+    },
+  },
+  {
+    name: "answers a question asked in Chinese from Chinese history",
+    run: async () => {
+      // CJK has no spaces between words: a whole sentence must not become one token
+      const doc = "slack:C1:1790000065.000100";
+      const a = await ask("週會什麼時候開");
+      if (a.cite !== doc) return `cited ${a.cite}, want ${doc}`;
+      const b = await ask("會議室在幾樓");
+      return b.cite === doc ? null : `a word from the middle of the sentence: cited ${b.cite}, want ${doc}`;
+    },
+  },
+  {
+    name: "knows people by name: asking by name alone finds what they wrote or were named in",
+    run: async () => {
+      // "Wendy" appears in no message text; only users.info knows U2 is Wendy. Asked by
+      // the name alone (no other word to match), so this fails when names aren't resolved.
+      const wendys = [WOMBAT_THREAD, "slack:C1:1790000010.000100"]; // she wrote the first, is mentioned in the second
+      const a = await ask("Wendy");
+      return a.cite && wendys.includes(a.cite) ? null : `cited ${a.cite}, want one of ${wendys.join(", ")}`;
+    },
+  },
+  {
+    name: "knows people by their real name too, when it differs from their display name",
+    run: async () => {
+      // U2 displays as "Wendy"; only her real name, "Wendy Wu", has "Wu". A speaker is
+      // labeled "Wendy (Wendy Wu)", so her own thread is found by "Wu"; a thread that only
+      // mentions her is not (mentions use the display name).
+      const a = await ask("Wu");
+      return a.cite === WOMBAT_THREAD ? null : `cited ${a.cite}, want ${WOMBAT_THREAD}`;
+    },
+  },
+  {
+    name: "answers an overview question from the most recently active thread",
+    run: async () => {
+      // "what's been discussed lately?" has no keywords to search for; the answer is the
+      // newest threads. The newest fixture thread at this point is the Chinese message.
+      const want = "slack:C1:1790000065.000100";
+      const a = await ask("[recent] what has the team been discussing lately");
+      return a.cite === want ? null : `cited ${a.cite}, want the newest thread ${want}`;
     },
   },
   {
@@ -163,6 +229,16 @@ const scenarios: Scenario[] = [
       await Bun.sleep(1000); // > INGEST_DEBOUNCE_MS
       const a = await ask("when does the kangaroo deploy freeze start");
       return a.cite === `slack:${ALLOWED}:${ts}` ? null : `cited ${a.cite}, want slack:${ALLOWED}:${ts}`;
+    },
+  },
+  {
+    name: "does not learn from questions put to the agent",
+    run: async () => {
+      // Slack delivers a mention as a `message` event too; it is a question, not knowledge.
+      const ts = await liveMessage(ALLOWED, "channel", "<@UBOT> what is the pelican budget for next quarter?");
+      await Bun.sleep(1000);
+      const a = await ask("pelican budget next quarter");
+      return a.cite === `slack:${ALLOWED}:${ts}` ? "cited the question itself as knowledge" : null;
     },
   },
   {
@@ -222,14 +298,57 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "stays silent in a DM",
+    name: "points a DM to the public channel: one reply, no model call, nothing read or indexed (DM_MODE=redirect, the default)",
     run: async () => {
       await reset();
-      await sendEvent(mention("D1", { channel_type: "im" }));
+      const docs = (await status()).knowledge.documents;
+      await directMessage("where is the wombat review?");
+      await Bun.sleep(1500);
+      const s = await stats();
+      if (s.modelCalls) return `called the model ${s.modelCalls}×`;
+      if (s.posts.length !== 1 || s.posts[0]!.channel !== "D1" || !s.posts[0]!.text.includes(`<#${ALLOWED}>`)) return `posts ${JSON.stringify(s.posts)}, want one in D1 linking <#${ALLOWED}>`;
+      if (s.readChannels.includes("D1")) return "read the DM's history";
+      return (await status()).knowledge.documents === docs ? null : "indexed the DM";
+    },
+  },
+  {
+    name: "does not answer its own reply in a DM, or an edit there",
+    run: async () => {
+      await reset();
+      await directMessage("I only answer in public…", { bot_id: "BBOT", user: "UBOT" });
+      await directMessage("", { subtype: "message_changed" });
       await Bun.sleep(1500);
       const s = await stats();
       return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
     },
+  },
+  {
+    name: "DM_MODE=ignore: a DM gets nothing at all",
+    run: () => inMode({ DM_MODE: "ignore" }, async () => {
+      await reset();
+      await directMessage("where is the wombat review?");
+      await Bun.sleep(1500);
+      const s = await stats();
+      return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
+    }),
+  },
+  {
+    name: "DM_MODE=answer: a DM is answered from public knowledge, a channel message still starts no turn",
+    run: () => inMode({ DM_MODE: "answer" }, async () => {
+      const docs = (await status()).knowledge.documents;
+      await reset();
+      // a public-channel message without a mention: knowledge only, never a turn
+      await liveMessage(ALLOWED, "channel", "the platypus offsite is in march");
+      await Bun.sleep(1500);
+      if ((await stats()).modelCalls) return "a channel message started a turn";
+      const ts = await directMessage(`[q${++seq}] when does the quarterly wombat review happen`);
+      const { text = "" } = (await (await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`)).json()) as { text?: string };
+      const cite = text.match(/\[cite:([^\]\s]+)\]/)?.[1];
+      if (cite !== WOMBAT_THREAD) return `the DM's answer cited ${cite}, want ${WOMBAT_THREAD}`;
+      if ((await stats()).readChannels.includes("D1")) return "read the DM's history";
+      // the channel message above is new knowledge (+1); the DM is not
+      return (await status()).knowledge.documents === docs + 1 ? null : `documents ${docs} → ${(await status()).knowledge.documents}, want ${docs + 1}`;
+    }),
   },
   {
     name: "stays silent in a private channel",
@@ -283,6 +402,24 @@ const scenarios: Scenario[] = [
       return r.status === 200 && text.includes("conformance-challenge") ? null : `got ${r.status} ${text.slice(0, 80)}`;
     },
   },
+  {
+    // Last: it adds the newest thread to Slack's history, which earlier scenarios would see.
+    name: "reading the thread it was asked in, it sees who wrote each message by name",
+    run: async () => {
+      // A thread's raw replies carry only user ids. Given an id it can't name while
+      // search results name people, a model guesses who wrote what; the author must
+      // arrive named, and mentions must read as names.
+      const root = `${1985000000 + ++seq}.000100`;
+      await post("/fixtures/messages", { channel: ALLOWED, message: { ts: root, user: "U2", text: "<@U3> can you check the heron budget" } });
+      const ts = `${1985000000 + ++seq}.000100`;
+      await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${seq}] [thread] who asked about the heron budget`, ts, event_ts: ts, thread_ts: root, channel: ALLOWED });
+      const { text = "" } = (await (await fetch(`${MOCK}/wait?thread_ts=${root}&timeout_ms=15000`)).json()) as { text?: string };
+      const author = text.match(/\[author:([^\]]*)\]/)?.[1];
+      const said = text.match(/\[text:([^\]]*)\]/)?.[1];
+      if (author !== "Wendy (Wendy Wu)") return `author ${JSON.stringify(author)}, want "Wendy (Wendy Wu)"`;
+      return said === "@Omar Ortiz can you check the heron budget" ? null : `text ${JSON.stringify(said)}, want mentions as names`;
+    },
+  },
 ];
 
 // ── run ─────────────────────────────────────────────────────────────────────
@@ -301,7 +438,7 @@ let app: ReturnType<typeof Bun.spawn> | undefined;
 
 // Start the app and wait until it listens, owns its port, and has finished its Slack
 // backfill/reconcile (GET /status → ready).
-async function startApp(): Promise<void> {
+async function startApp(extraEnv: Record<string, string> = {}): Promise<void> {
   const proc = Bun.spawn(APP_CMD, {
     // An external app runs from its own directory, so a binary that quietly reads files
     // from this repo (prompts, migrations) fails here instead of passing by accident.
@@ -321,6 +458,7 @@ async function startApp(): Promise<void> {
       INGEST_BACKFILL_DAYS: "36500",
       INGEST_REFRESH_DAYS: "36500",
       INGEST_DEBOUNCE_MS: "200",
+      ...extraEnv,
     },
     stdout: "ignore",
     stderr: "pipe",

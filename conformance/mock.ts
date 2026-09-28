@@ -5,17 +5,19 @@
 //                              Serves conversations.history/replies from its fixtures.
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
-//   GET  /stats                recorded Slack calls, model call count, channels read
+//   GET  /stats                recorded Slack calls, model call count, channels read, posts
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
 //   POST /reset                clear recorded calls (fixtures stay)
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
-// question; turn 2 (tool_result present) → a streamed answer that echoes the question's
-// nonce and cites the first hit's id and source from the tool_result
-// ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), so the harness can check what the
-// retrieval actually handed the model.
+// question (or, when the question contains "[recent]", a recent_knowledge tool_use with
+// no input; "[thread]", a slack_read_thread tool_use with no input); turn 2 (tool_result
+// present) → a streamed answer that echoes the question's nonce and cites the first hit's
+// id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), or for
+// a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
+// so the harness can check what the tool actually handed the model.
 //
 // Env: PORT (8900), TTFT_MS (300) delay before the first event, TOKENS (80),
 //      TOKEN_DELAY_MS (15) between text deltas, SLACK_FIXTURES (JSON file:
@@ -37,9 +39,12 @@ let nextTs = 1_700_000_000;
 // Slack's message history, per channel: roots and replies together.
 type FixtureMessage = { ts: string; thread_ts?: string; user?: string; bot_id?: string; subtype?: string; text?: string; edited?: { ts: string } };
 const history = new Map<string, FixtureMessage[]>();
+// users.info answers, from the fixture's "_users" key: { "U2": { profile: {…} }, … }
+let users: Record<string, unknown> = {};
 if (process.env.SLACK_FIXTURES) {
-  const seed = JSON.parse(readFileSync(process.env.SLACK_FIXTURES, "utf8")) as Record<string, FixtureMessage[]>;
-  for (const [channel, messages] of Object.entries(seed)) history.set(channel, [...messages]);
+  const seed = JSON.parse(readFileSync(process.env.SLACK_FIXTURES, "utf8")) as Record<string, unknown>;
+  users = (seed._users ?? {}) as Record<string, unknown>;
+  for (const [channel, messages] of Object.entries(seed)) if (channel !== "_users") history.set(channel, [...(messages as FixtureMessage[])]);
 }
 
 function conversations(method: string, body: Record<string, unknown>): Response {
@@ -110,6 +115,10 @@ function slack(method: string, body: Record<string, unknown>): Response {
   }
   if (method === "auth.test") return Response.json({ ok: true, url: "https://acme.slack.com/", user_id: "UBOT", team_id: "T1", bot_id: "B1" });
   if (method === "conversations.history" || method === "conversations.replies") return conversations(method, body);
+  if (method === "users.info") {
+    const user = users[String(body.user)];
+    return user ? Response.json({ ok: true, user: { id: body.user, ...(user as object) } }) : Response.json({ ok: false, error: "user_not_found" });
+  }
   return Response.json({ ok: true });
 }
 
@@ -131,21 +140,32 @@ function firstUserText(messages: Msg[]): string {
   return m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
 }
 
-// The first search hit in a tool_result, whether its content arrived as the JSON
-// string, as text blocks, or as structured data.
+// The first search hit in a tool_result.
 function firstHit(content: unknown): { id?: string; source?: string } {
+  const v = resultValue(content);
+  if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
+  return {};
+}
+
+// A tool_result's content as a value, whether it arrived as a JSON string, as text
+// blocks, or as structured data.
+function resultValue(content: unknown): unknown {
   let v: unknown = content;
   if (Array.isArray(v) && v.every((b) => b && typeof b === "object" && "type" in b)) v = (v as Block[]).map((b) => b.text ?? "").join("");
   if (typeof v === "string") { try { v = JSON.parse(v); } catch { /* not JSON */ } }
-  if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
-  return {};
+  return v;
 }
 
 function answerFor(messages: Msg[], result: Block): string {
   const question = firstUserText(messages);
   const nonce = question.match(/\[q\d+\]/)?.[0] ?? "[q?]";
-  const hit = firstHit(result.content);
   const words = Array.from({ length: TOKENS }, (_, i) => `w${i}`);
+  const thread = (resultValue(result.content) as { messages?: { author?: string; user?: string; text?: string }[] } | undefined)?.messages;
+  if (thread) {
+    const first = thread[0] ?? {};
+    return `${nonce} [author:${first.author ?? `none (user ${first.user})`}] [text:${(first.text ?? "").replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
+  }
+  const hit = firstHit(result.content);
   return `${nonce} [cite:${hit.id ?? "none"}] [src:${hit.source ?? "none"}] ${words.join(" ")}`;
 }
 
@@ -177,16 +197,22 @@ async function anthropic(req: Request): Promise<Response> {
   const result = lastUserHasToolResult(body.messages);
 
   if (!result) {
-    const query = firstUserText(body.messages).replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = { query };
+    const question = firstUserText(body.messages);
+    // "[recent]" in the question → an overview question: list recent threads instead of searching
+    // "[thread]" → read the thread the question was asked in
+    const recent = question.includes("[recent]");
+    const thread = question.includes("[thread]");
+    const toolName = thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
+    const input = recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
-      return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: "search_knowledge", input }], "tool_use"));
+      return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));
     }
     const json = JSON.stringify(input);
     return sse([
       ["message_start", { type: "message_start", message: { ...message(id, [], null as unknown as string), stop_reason: null } }],
-      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_${modelCalls}`, name: "search_knowledge", input: {} } }],
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input: {} } }],
       ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(0, Math.ceil(json.length / 2)) } }],
       ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(Math.ceil(json.length / 2)) } }],
       ["content_block_stop", { type: "content_block_stop", index: 0 }],
@@ -262,7 +288,8 @@ Bun.serve({
     }
     if (url.pathname === "/stats") {
       const readChannels = [...new Set(calls.filter((c) => c.method.startsWith("conversations.")).map((c) => String(c.body.channel)))];
-      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels });
+      const posts = calls.filter((c) => c.method === "chat.postMessage").map((c) => ({ channel: c.body.channel, thread_ts: c.body.thread_ts, text: c.body.text }));
+      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, posts });
     }
     if (url.pathname === "/reset") { calls = []; modelCalls = 0; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });

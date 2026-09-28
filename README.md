@@ -30,7 +30,8 @@ channel first. Slack won't serve history to a non-member, so the backfill fails 
 | env | default | |
 |---|---|---|
 | `AGENT_NAME` | `scout` | the agent's handle; must match the Slack app's display name |
-| `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never answers DMs or private channels |
+| `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never works in private channels |
+| `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call), `ignore`, or `answer` (from public knowledge; not with the code tools). A DM is never indexed |
 | `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
 | `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |

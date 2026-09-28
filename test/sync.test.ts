@@ -18,6 +18,7 @@ function fakeSlack(initial: Record<string, SlackMessage[]>) {
     async call<T>(method: string) {
       calls.push({ method, params: {} });
       if (method === "auth.test") return { url: WS } as T;
+      if (method === "users.info") throw new SlackApiError("users.info", "missing_scope"); // names fall back to ids
       throw new Error(`unexpected ${method}`);
     },
     async *paginate<T>(method: string, params: Record<string, unknown>) {
@@ -65,6 +66,11 @@ describe("which thread an event touches", () => {
     expect(threadOfEvent({ type: "message", subtype: "message_changed", channel: "C1", message: { ts: "5.2", thread_ts: "5.1" } })).toEqual({ channel: "C1", threadTs: "5.1" });
     expect(threadOfEvent({ type: "message", subtype: "message_deleted", channel: "C1", deleted_ts: "5.1", previous_message: { ts: "5.1" } })).toEqual({ channel: "C1", threadTs: "5.1" });
     expect(threadOfEvent({ type: "message", subtype: "message_deleted", channel: "C1", deleted_ts: "5.2", previous_message: { ts: "5.2", thread_ts: "5.1" } })).toEqual({ channel: "C1", threadTs: "5.1" });
+  });
+
+  test("a bot's own posts and edits are skipped — the agent's streamed reply is a burst of edits", () => {
+    expect(threadOfEvent({ type: "message", channel: "C1", ts: "5.3", thread_ts: "5.1", bot_id: "B1" })).toBeUndefined();
+    expect(threadOfEvent({ type: "message", subtype: "message_changed", channel: "C1", message: { ts: "5.3", thread_ts: "5.1", bot_id: "B1" } })).toBeUndefined();
   });
 
   test("everything else is ignored", () => {
