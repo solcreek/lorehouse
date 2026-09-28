@@ -307,6 +307,20 @@ impl Manager {
         while stops.join_next().await.is_some() {}
     }
 
+    /// VMs running now (for a runner's status: Lorehouse places new sandboxes by free room).
+    pub async fn running_count(&self) -> usize {
+        self.slots.lock().await.iter().filter(|taken| **taken).count()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.cfg.max_vms
+    }
+
+    /// Requests being served right now, across all sandboxes (shutdown waits on these).
+    pub async fn in_flight(&self) -> usize {
+        self.sandboxes.lock().await.values().map(|sb| sb.in_flight.load(Ordering::SeqCst)).sum()
+    }
+
     /// Every sandbox that exists: those used since this process started, and the disks
     /// kept from earlier runs (not running; idle since their disk last changed).
     pub async fn list(&self) -> Vec<Listing> {

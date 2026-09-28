@@ -2,12 +2,26 @@
 
 use std::{env, path::PathBuf, time::Duration};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transport {
+    /// WebSocket first; long poll if the upgrade is refused.
+    Auto,
+    Ws,
+    Poll,
+}
+
+/// How work reaches this host.
+#[derive(Clone, Debug)]
+pub enum Mode {
+    /// Connect out to Lorehouse and ask for work (docs/sandbox-runners.md). No open port.
+    Runner { app_url: String, token: String, name: String, transport: Transport },
+    /// Serve the HTTP API for Lorehouse to call, e.g. on the same machine over loopback.
+    Serve { listen: String, token: String },
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Where the HTTP API listens. Keep it on loopback and publish it through a tunnel.
-    pub listen: String,
-    /// Bearer token every /v1 request must carry.
-    pub token: String,
+    pub mode: Mode,
     /// Per-sandbox directories: rootfs.ext4, vm.json, sockets, console.log.
     pub state_dir: PathBuf,
     /// Prepared rootfs (guestd baked in, see prepare-golden.sh); reflinked per sandbox.
@@ -21,52 +35,80 @@ pub struct Config {
     pub mem_mib: u32,
 }
 
+fn var(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|v| !v.is_empty())
+}
+
 impl Config {
     pub fn from_env() -> Result<Config, String> {
-        let mut missing = Vec::new();
+        let mut problems = Vec::new();
         let mut need = |key: &str| -> String {
-            env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| {
-                missing.push(key.to_string());
+            var(key).unwrap_or_else(|| {
+                problems.push(format!("{key} is required"));
                 String::new()
             })
         };
-        let token = need("SANDBOXD_TOKEN");
         let golden = need("SANDBOXD_GOLDEN");
         let kernel = need("SANDBOXD_KERNEL");
         let uplink = need("SANDBOXD_UPLINK");
-        let num = |key: &str, default: u64| -> Result<u64, String> {
-            match env::var(key) {
-                Ok(v) if !v.is_empty() => v.parse().map_err(|_| format!("{key} must be a number, got {v:?}")),
-                _ => Ok(default),
+
+        let mode = if let Some(app_url) = var("SANDBOXD_APP_URL") {
+            let token = var("SANDBOXD_RUNNER_TOKEN").unwrap_or_default();
+            if token.len() < 32 {
+                problems.push("SANDBOXD_RUNNER_TOKEN is required with SANDBOXD_APP_URL (32+ characters, the app's SANDBOX_RUNNER_TOKEN)".into());
+            }
+            if !(app_url.starts_with("https://") || app_url.starts_with("http://")) {
+                problems.push(format!("SANDBOXD_APP_URL must be http(s)://…, got {app_url:?}"));
+            }
+            let name = var("SANDBOXD_RUNNER_NAME").or_else(|| var("HOSTNAME")).unwrap_or_else(|| "sandboxd".into());
+            if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
+                problems.push(format!("SANDBOXD_RUNNER_NAME must be 1–64 of [A-Za-z0-9_.-], got {name:?}"));
+            }
+            let transport = match var("SANDBOXD_TRANSPORT").as_deref() {
+                None | Some("auto") => Transport::Auto,
+                Some("ws") => Transport::Ws,
+                Some("poll") => Transport::Poll,
+                Some(other) => {
+                    problems.push(format!("SANDBOXD_TRANSPORT must be auto, ws or poll, got {other:?}"));
+                    Transport::Auto
+                }
+            };
+            Mode::Runner { app_url: app_url.trim_end_matches('/').to_string(), token, name, transport }
+        } else {
+            let token = var("SANDBOXD_TOKEN").unwrap_or_default();
+            if token.len() < 32 {
+                problems.push("SANDBOXD_TOKEN is required to serve the API (32+ characters); or set SANDBOXD_APP_URL to connect out".into());
+            }
+            Mode::Serve { listen: var("SANDBOXD_LISTEN").unwrap_or_else(|| "127.0.0.1:8787".into()), token }
+        };
+
+        let mut num = |key: &str, default: u64| -> u64 {
+            match var(key) {
+                None => default,
+                Some(v) => v.parse().unwrap_or_else(|_| {
+                    problems.push(format!("{key} must be a number, got {v:?}"));
+                    default
+                }),
             }
         };
-        let (max_vms, idle, vcpus, mem) = (
-            num("SANDBOXD_MAX_VMS", 4)?,
-            num("SANDBOXD_IDLE_SECS", 900)?,
-            num("SANDBOXD_VCPUS", 2)?,
-            num("SANDBOXD_MEM_MIB", 2048)?,
-        );
-        if !missing.is_empty() {
-            return Err(format!("sandboxd: missing configuration: {}", missing.join(", ")));
-        }
+        let (max_vms, idle, vcpus, mem) = (num("SANDBOXD_MAX_VMS", 4), num("SANDBOXD_IDLE_SECS", 900), num("SANDBOXD_VCPUS", 2), num("SANDBOXD_MEM_MIB", 2048));
         // Checked before the casts below, so an out-of-range value fails here instead of
         // wrapping (4294967297 as u32 is 1).
         if !(1..=32).contains(&vcpus) {
-            return Err("SANDBOXD_VCPUS must be 1..=32 (Firecracker's limit)".into());
+            problems.push("SANDBOXD_VCPUS must be 1..=32 (Firecracker's limit)".into());
         }
         if !(128..=262_144).contains(&mem) {
-            return Err("SANDBOXD_MEM_MIB must be 128..=262144".into());
+            problems.push("SANDBOXD_MEM_MIB must be 128..=262144".into());
         }
         if !(1..=64).contains(&max_vms) {
-            return Err("SANDBOXD_MAX_VMS must be 1..=64 (one /30 per VM in 172.30.0.0/24)".into());
+            problems.push("SANDBOXD_MAX_VMS must be 1..=64 (one /30 per VM in 172.30.0.0/24)".into());
         }
-        if token.len() < 32 {
-            return Err("SANDBOXD_TOKEN must be at least 32 characters".into());
+        if !problems.is_empty() {
+            return Err(format!("sandboxd: invalid configuration:\n  {}", problems.join("\n  ")));
         }
         Ok(Config {
-            listen: env::var("SANDBOXD_LISTEN").unwrap_or_else(|_| "127.0.0.1:8787".into()),
-            token,
-            state_dir: env::var("SANDBOXD_STATE").map(PathBuf::from).unwrap_or_else(|_| "/var/lib/lorehouse-sandboxes".into()),
+            mode,
+            state_dir: var("SANDBOXD_STATE").map(PathBuf::from).unwrap_or_else(|| "/var/lib/lorehouse-sandboxes".into()),
             golden: golden.into(),
             kernel: kernel.into(),
             uplink,

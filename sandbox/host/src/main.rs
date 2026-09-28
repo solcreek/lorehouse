@@ -15,6 +15,7 @@
 
 mod config;
 mod net;
+mod runner;
 mod vm;
 mod vsock;
 
@@ -147,7 +148,6 @@ async fn main() {
     }
 
     let vms = Manager::new(cfg.clone());
-    let app = App { vms: vms.clone(), token_digest: digest(&cfg.token) };
 
     let reaper = vms.clone();
     tokio::spawn(async move {
@@ -158,31 +158,9 @@ async fn main() {
         }
     });
 
-    let v1 = Router::new()
-        .route("/v1/sandboxes", get(list))
-        .route("/v1/sandboxes/{id}", axum::routing::delete(destroy))
-        .route("/v1/sandboxes/{id}/exec", post(exec))
-        .route("/v1/sandboxes/{id}/file", get(read_file).put(write_file))
-        .layer(middleware::from_fn_with_state(app.clone(), auth));
-    let router = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .merge(v1)
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
-        .with_state(app);
-
-    let listener = match tokio::net::TcpListener::bind(&cfg.listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("sandboxd: listen {}: {e}", cfg.listen);
-            net::teardown_all().await;
-            std::process::exit(1);
-        }
-    };
-    eprintln!("sandboxd: listening on {} (up to {} VMs, idle stop after {} s)", cfg.listen, cfg.max_vms, cfg.idle.as_secs());
-
-    // On SIGTERM/SIGINT: stop taking requests, give the ones in flight SHUTDOWN_GRACE,
-    // then stop the VMs anyway. A 10-minute command must not hold the service past
-    // systemd's stop timeout.
+    // On SIGTERM/SIGINT: stop taking work, give what's in flight SHUTDOWN_GRACE, then
+    // stop the VMs anyway. A 10-minute command must not hold the service past systemd's
+    // stop timeout.
     let signalled = Arc::new(tokio::sync::Notify::new());
     let shutdown = {
         let signalled = signalled.clone();
@@ -195,15 +173,54 @@ async fn main() {
             signalled.notify_one();
         }
     };
-    let serve = axum::serve(listener, router).with_graceful_shutdown(shutdown);
-    let grace = async {
-        signalled.notified().await;
-        tokio::time::sleep(SHUTDOWN_GRACE).await;
-        eprintln!("sandboxd: requests still running after {} s; stopping anyway", SHUTDOWN_GRACE.as_secs());
-    };
-    tokio::select! {
-        _ = serve => {}
-        _ = grace => {}
+
+    match &cfg.mode {
+        config::Mode::Runner { app_url, token, name, transport } => {
+            eprintln!("sandboxd: runner {name} for {app_url} ({transport:?}; up to {} VMs, idle stop after {} s)", cfg.max_vms, cfg.idle.as_secs());
+            let runner = Arc::new(runner::Runner { vms: vms.clone(), app_url: app_url.clone(), token: token.clone(), name: name.clone(), transport: *transport });
+            tokio::select! {
+                _ = runner.run() => {}
+                _ = shutdown => {}
+            }
+            // No new jobs now; let the running ones finish, within the grace.
+            let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+            while vms.in_flight().await > 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        config::Mode::Serve { listen, token } => {
+            let app = App { vms: vms.clone(), token_digest: digest(token) };
+            let v1 = Router::new()
+                .route("/v1/sandboxes", get(list))
+                .route("/v1/sandboxes/{id}", axum::routing::delete(destroy))
+                .route("/v1/sandboxes/{id}/exec", post(exec))
+                .route("/v1/sandboxes/{id}/file", get(read_file).put(write_file))
+                .layer(middleware::from_fn_with_state(app.clone(), auth));
+            let router = Router::new()
+                .route("/healthz", get(|| async { "ok" }))
+                .merge(v1)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+                .with_state(app);
+            let listener = match tokio::net::TcpListener::bind(listen).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("sandboxd: listen {listen}: {e}");
+                    net::teardown_all().await;
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("sandboxd: listening on {listen} (up to {} VMs, idle stop after {} s)", cfg.max_vms, cfg.idle.as_secs());
+            let serve = axum::serve(listener, router).with_graceful_shutdown(shutdown);
+            let grace = async {
+                signalled.notified().await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+                eprintln!("sandboxd: requests still running after {} s; stopping anyway", SHUTDOWN_GRACE.as_secs());
+            };
+            tokio::select! {
+                _ = serve => {}
+                _ = grace => {}
+            }
+        }
     }
     eprintln!("sandboxd: stopping every VM (disks kept)");
     vms.stop_all().await;

@@ -62,9 +62,12 @@ Every host needs the same few things:
 - the Slack and Anthropic secrets as environment variables
 - outbound HTTPS to Slack and Anthropic
 
-The sandbox is separate. It needs a host with KVM, such as bare metal or a VM with nested
-virtualization, and Lorehouse reaches it over `SANDBOX_URL`. The host running Lorehouse
-itself needs no KVM.
+The sandbox is separate. It runs on hosts with KVM, such as bare metal or a VM with nested
+virtualization. Those hosts **connect out** to Lorehouse, the way CI runners do, over
+WebSocket or long poll, whichever your network allows. So they need no open port, and the
+sandbox API is never on the internet. They can sit in a data center, a company network or
+behind NAT. The host running Lorehouse itself needs no KVM. See
+[sandbox runners](docs/sandbox-runners.md) and [`sandboxd`](sandbox/host/README.md).
 
 ### On Fly.io
 
@@ -124,7 +127,8 @@ To set up Slack:
 | `INGEST_BACKFILL_DAYS` | `90` | how far back to read each allowed channel's history on first start (`0` = live only) |
 | `INGEST_REFRESH_DAYS` | `14` | on each start, re-check threads this recent for replies, edits and deletions made while the app was down |
 | `INGEST_DEBOUNCE_MS` | `5000` | how long a thread must go quiet before a live change re-indexes it |
-| `SANDBOX_URL` `SANDBOX_TOKEN` `GITHUB_TOKEN` | (off) | set all three to enable the code tools and pull requests |
+| `SANDBOX_RUNNER_TOKEN` `GITHUB_TOKEN` | (off) | code tools and pull requests, with sandbox hosts connecting in ([runners](docs/sandbox-runners.md)); the token is 32+ characters |
+| `SANDBOX_URL` `SANDBOX_TOKEN` `GITHUB_TOKEN` | (off) | code tools with one sandbox host Lorehouse calls, e.g. on the same machine; not together with `SANDBOX_RUNNER_TOKEN` |
 
 ## One contract, more than one implementation
 

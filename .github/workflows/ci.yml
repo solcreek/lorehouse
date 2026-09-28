@@ -42,6 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo clippy --locked -- -D warnings
+      - run: cargo test --locked
       - run: cargo build --locked --release
 
   # A merge to main that passes the contract goes live; pull requests never deploy.
