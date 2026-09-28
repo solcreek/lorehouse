@@ -1,0 +1,23 @@
+# systemd unit for sandboxd. Install:
+#   sudo install -m 0755 target/release/sandboxd /usr/local/bin/sandboxd
+#   sudo install -m 0600 sandboxd.env /etc/lorehouse/sandboxd.env   # see README.md
+#   sudo install -m 0644 sandboxd.service /etc/systemd/system/
+#   sudo systemctl enable --now sandboxd
+[Unit]
+Description=Lorehouse sandbox host (Firecracker microVMs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Root: it creates taps and nftables rules, and runs Firecracker with /dev/kvm.
+ExecStart=/usr/local/bin/sandboxd
+EnvironmentFile=/etc/lorehouse/sandboxd.env
+Restart=on-failure
+RestartSec=5
+# SIGTERM stops every VM cleanly (sync first, disks kept) and removes its network rules:
+# requests in flight get 30 s, then all VMs stop at once (≤ 15 s each), well under this.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

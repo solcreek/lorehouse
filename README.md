@@ -150,7 +150,7 @@ Go or Rust version would have to pass
 | `migrations/` | Lorehouse's own data, as plain SQL |
 | `conformance/` | the behavioral contract: a mocked Slack + Anthropic, and black-box scenarios |
 | `slack/` | the Slack app manifest |
-| `sandbox/` | the Firecracker sandbox's in-VM agent (Go) and a feasibility spike |
+| `sandbox/` | the sandbox: the host daemon ([`host/`](sandbox/host/README.md), Rust), the in-VM agent (`guest/`, Go) and the feasibility spike |
 | `docs/` | the live-Slack runbook and its results, decisions (`adr/`) and experiments |
 
 ## Check it
