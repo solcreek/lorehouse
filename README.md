@@ -25,7 +25,7 @@ You name it per install; it defaults to `scout`.
   - It names people as plain text. A summary never @-mentions everyone in it.
 - **Carries on the conversation.** Once it's mentioned in a thread, a plain reply there
   gets an answer, no new mention needed. It stays out of threads it wasn't asked into,
-  and out of replies where people mention each other.
+  and out of replies that mention someone else, a group, or @channel / @here.
 - **Public by default.** It works only in public channels, so everyone learns from
   everyone's questions. A DM gets a one-line pointer to the public channel. It can also be
   set to answer DMs, or to ignore them. Either way, a DM never becomes knowledge.

@@ -25,6 +25,17 @@ describe("isFollowUp", () => {
     expect(isFollowUp(reply({ text: "cc <@U2|wendy>" }), joined)).toBe(false);
   });
 
+  test("not a follow-up: a reply that mentions a user group or the whole channel", () => {
+    expect(isFollowUp(reply({ text: "<!channel> deploy is done" }), joined)).toBe(false);
+    expect(isFollowUp(reply({ text: "<!here|here> anyone around?" }), joined)).toBe(false);
+    expect(isFollowUp(reply({ text: "<!everyone> heads up" }), joined)).toBe(false);
+    expect(isFollowUp(reply({ text: "<!subteam^S123|@oncall> can you look?" }), joined)).toBe(false);
+  });
+
+  test("a follow-up: Slack formatting that isn't a mention", () => {
+    expect(isFollowUp(reply({ text: "and after <!date^1700000000^{date}|Nov 14>?" }), joined)).toBe(true);
+  });
+
   test("not a follow-up: anything but a public-channel message (DMs, private channels, mentions, reactions)", () => {
     expect(isFollowUp(reply({ channelType: "im" }), joined)).toBe(false);
     expect(isFollowUp(reply({ channelType: "group" }), joined)).toBe(false);

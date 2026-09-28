@@ -8,7 +8,8 @@
 //   • threads it was never asked into
 //   • a reply that @-mentions the agent: Slack also sends that as an app_mention, which is
 //     already answered, so answering the message too would reply twice
-//   • a reply that @-mentions someone else: people talking to each other
+//   • a reply that @-mentions someone else, a user group, or the whole channel
+//     (@channel, @here, @everyone): people talking to each other
 // Bots and edits never get here (June normalizes only people's new messages).
 
 import type { Database } from "bun:sqlite";
@@ -25,10 +26,14 @@ type FollowUpEvent = { kind: string; channelId: string; channelType: string; thr
 
 // Whether a `message` event is a follow-up the agent should answer. Any mention rules it
 // out, the agent's (answered as the app_mention) or anyone else's (a conversation between
-// people), so the agent's own id isn't needed.
+// people), so the agent's own id isn't needed. Slack encodes a user as `<@U…>` and a
+// broadcast or user group as `<!channel>`, `<!here>`, `<!everyone>`, `<!subteam^S…>`; other
+// `<!…>` forms such as `<!date^…>` are formatting, not mentions.
+const MENTION = /<@[A-Z0-9]+|<!(?:channel|here|everyone|subteam\^)/;
+
 export function isFollowUp(e: FollowUpEvent, joined: (channel: string, threadTs: string) => boolean): boolean {
   if (e.kind !== "message" || e.channelType !== "channel") return false;
   if (!e.threadId || e.threadId === e.ts) return false; // a top-level message
-  if (/<@[A-Z0-9]+/.test(e.text ?? "")) return false;
+  if (MENTION.test(e.text ?? "")) return false;
   return joined(e.channelId, e.threadId);
 }
