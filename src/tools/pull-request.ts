@@ -58,8 +58,11 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       },
     },
     run: async (input: Input, ctx: ToolContext) => {
-      if (!input.branch.startsWith(BRANCH_PREFIX) || !/^[\w./-]+$/.test(input.branch)) {
-        return { error: `branch must start with "${BRANCH_PREFIX}" and contain only [A-Za-z0-9_./-]` };
+      if (!input.branch.startsWith(BRANCH_PREFIX) || !isPlainRef(input.branch)) {
+        return { error: `branch must start with "${BRANCH_PREFIX}" and be a plain branch name ([A-Za-z0-9_./-], no "..")` };
+      }
+      if (input.base !== undefined && !isPlainRef(input.base)) {
+        return { error: `base must be a plain branch name ([A-Za-z0-9_./-], no "..")` };
       }
       const sb = opts.sandboxFor(ctx);
       const sh = async (command: string, env?: Record<string, string>) => {
@@ -76,6 +79,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         repo = parseGithubRemote(await sh("git remote get-url origin"));
         base = input.base ?? (await sh("git rev-parse --abbrev-ref origin/HEAD")).replace(/^origin\//, "");
         head = await sh("git rev-parse HEAD");
+        // Both come from the sandbox (the model's), and go into shell commands below, one of
+        // them carrying the token: only a plain ref name and a full commit id get that far.
+        if (!isPlainRef(base)) return { error: "the repo's default branch isn't a plain branch name; give base explicitly" };
+        if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) return { error: "HEAD isn't a commit id" };
         stat = await sh(`git diff --stat origin/${base}...HEAD`);
       } catch (e) {
         return { error: (e as Error).message };
@@ -161,6 +168,13 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       return { status: "opened", url: pr.html_url, number: pr.number };
     },
   };
+}
+
+// A branch name safe to put in a shell command and a git refspec: letters, digits and
+// _ . / - only (no shell metacharacters, no spaces), not starting with - or /, no "..",
+// "//" or trailing "/" or ".lock" (which git refuses anyway).
+export function isPlainRef(ref: string): boolean {
+  return /^[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}$/.test(ref) && !ref.includes("..") && !ref.includes("//") && !ref.endsWith("/") && !ref.endsWith(".lock");
 }
 
 // A remote on github.com itself: https://github.com/o/r, git@github.com:o/r or
