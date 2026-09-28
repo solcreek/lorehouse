@@ -17,7 +17,9 @@ import { EXEC_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox } from
 // `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
 // `received` (long poll only): ids from the last poll answer the runner got, so jobs whose
 // answer never arrived are handed out again.
-export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[] };
+// `session` and `started` (unix ms) identify the runner process: of two with one name, the
+// later-started one is the runner, and the other's polls are ignored.
+export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number };
 
 type JobBody =
   | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string }
@@ -31,9 +33,9 @@ type Link =
   | { gen: number; kind: "ws"; send: (job: Job) => void }
   | { gen: number; kind: "poll"; queue: Job[]; waiter?: (jobs: Job[]) => void; unacked: Map<string, Job> };
 
-type Runner = { name: string; status: RunnerStatus; link: Link; lastSeen: number };
-// `gen` is the connection the job went out on.
-type Pending = { runner: string; gen: number; resolve: (r: JobResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
+type Runner = { name: string; status: RunnerStatus; link: Link; lastSeen: number; session?: string; started?: number };
+// `gen` is the connection the job went out on; `session`, the runner process it went to.
+type Pending = { runner: string; gen: number; session?: string; resolve: (r: JobResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 // A boot can precede the work: a job's deadline is its own timeout plus this.
 const BOOT_SLACK_MS = 60_000;
@@ -73,7 +75,7 @@ export class RunnerHub {
       status: (s: RunnerStatus) => {
         if (!current()) return;
         this.touch(name, s);
-        this.reconcile(name, link, s.jobs);
+        this.reconcile(name, link, s.jobs, s.session);
       },
       result: (r: JobResult) => this.settle(name, link, r),
       closed: () => {
@@ -102,13 +104,19 @@ export class RunnerHub {
   // older process would otherwise kick the runner off): it idles for pollWaitMs and
   // returns nothing. If that socket is in fact dead, it closes on its idle timeout, and
   // the next poll takes over.
+  //
+  // Nor does a poll from an older runner process (by `started`) displace a newer one's: a
+  // process being replaced may keep polling for a while, and would otherwise take the
+  // newer one's jobs. A newer process's first poll takes over from an older one.
   poll(status: RunnerStatus, signal?: AbortSignal): Promise<Job[]> {
     let r = this.runners.get(status.runner);
     if (r?.link.kind === "ws") return idle(this.opts.pollWaitMs ?? 25_000, signal);
-    if (r?.link.kind !== "poll") r = this.replace(status.runner, { gen: ++this.gens, kind: "poll", queue: [], unacked: new Map() });
+    const otherProcess = !!(r?.session && status.session && r.session !== status.session);
+    if (otherProcess && (status.started ?? 0) < (r!.started ?? 0)) return idle(this.opts.pollWaitMs ?? 25_000, signal);
+    if (r?.link.kind !== "poll" || otherProcess) r = this.replace(status.runner, { gen: ++this.gens, kind: "poll", queue: [], unacked: new Map() });
     this.touch(status.runner, status);
     const link = r.link as Extract<Link, { kind: "poll" }>;
-    this.reconcile(status.runner, link, status.jobs);
+    this.reconcile(status.runner, link, status.jobs, status.session);
     if (status.received) {
       for (const id of status.received) link.unacked.delete(id);
       link.queue.unshift(...link.unacked.values());
@@ -173,6 +181,10 @@ export class RunnerHub {
     if (!r) return;
     r.status = { runner: name, capacity: status.capacity, running: status.running, version: status.version };
     r.lastSeen = this.now();
+    if (status.session) {
+      r.session = status.session;
+      r.started = status.started;
+    }
   }
 
   // A result counts from the runner the job was sent to, arriving on that connection or a
@@ -188,12 +200,15 @@ export class RunnerHub {
 
   // A runner's status on `link` lists the jobs it holds. A job sent to it on an older
   // connection that isn't listed never reached it (lost with that connection), so it never
-  // ran: fail it now, safe to retry, instead of at its deadline.
-  private reconcile(runner: string, link: Link, held?: string[]): void {
+  // ran: fail it now, safe to retry, instead of at its deadline. Only the process a job went
+  // to can say it never got it: jobs sent to another (replaced) process wait for a result
+  // or their deadline.
+  private reconcile(runner: string, link: Link, held?: string[], session?: string): void {
     if (!held) return;
     const holds = new Set(held);
     for (const [id, p] of this.pending) {
       if (p.runner !== runner || p.gen >= link.gen || holds.has(id)) continue;
+      if (p.session && session && p.session !== session) continue;
       clearTimeout(p.timer);
       this.pending.delete(id);
       p.reject(new Error(`the job was lost when the connection to ${runner} dropped; it never ran`));
@@ -255,7 +270,7 @@ export class RunnerHub {
         }
         reject(new Error(`sandbox job timed out on ${runner.name}`));
       }, timeoutMs + BOOT_SLACK_MS);
-      this.pending.set(job.id, { runner: runner.name, gen: runner.link.gen, resolve, reject, timer });
+      this.pending.set(job.id, { runner: runner.name, gen: runner.link.gen, session: runner.session, resolve, reject, timer });
       if (runner.link.kind === "ws") runner.link.send(job);
       else if (runner.link.waiter) runner.link.waiter([job]);
       else runner.link.queue.push(job);

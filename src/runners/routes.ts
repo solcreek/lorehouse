@@ -27,7 +27,9 @@ function parseStatus(runner: string, v: unknown): RunnerStatus | undefined {
   if (!o || !whole(o.capacity) || !whole(o.running)) return undefined;
   // Job id lists: absent means "not reported"; present, only strings, and bounded.
   const ids = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, 10_000) : undefined);
-  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received) };
+  // The runner process: an id, and when it started (unix ms). Both, or neither.
+  const session = typeof o.session === "string" && /^[\w.-]{1,64}$/.test(o.session) && Number.isSafeInteger(o.started) && o.started! >= 0 ? { session: o.session, started: o.started } : {};
+  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received), ...session };
 }
 
 function parseResult(v: unknown): JobResult | undefined {

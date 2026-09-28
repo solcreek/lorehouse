@@ -36,7 +36,9 @@ Every request carries:
 - `Authorization: Bearer <SANDBOX_RUNNER_TOKEN>`, compared in constant time;
 - `X-Lorehouse-Runner: <name>`, 1–64 characters of `[A-Za-z0-9_.-]`.
 
-A second connection with the same name replaces the first.
+A second connection with the same name replaces the first, with two exceptions: a poll
+never displaces a live WebSocket, and a poll from an older runner process (by the status's
+`started`) never displaces a newer one's.
 
 ## Messages
 
@@ -45,7 +47,7 @@ sandboxes on the runner with the most free room.
 
 ```json
 { "type": "status", "runner": "starship", "capacity": 4, "running": 1, "version": "0.1.0",
-  "jobs": ["j_…"], "received": ["j_…"] }
+  "jobs": ["j_…"], "received": ["j_…"], "session": "18f3a…-2c41", "started": 1790000000000 }
 ```
 
 - `jobs` lists the ids the runner holds: running, or finished with a result not yet
@@ -53,8 +55,11 @@ sandboxes on the runner with the most free room.
   [Delivery](#delivery)).
 - `received` is for long poll only. It lists the ids in the last poll answer the runner
   got.
-- Both are optional. A runner that omits them loses the guarantees in Delivery but still
-  works.
+- `session` and `started` identify the runner process: an id, and when it started (unix
+  ms). While an old process is being replaced by a new one with the same name, the old
+  one's polls are ignored, so it can't take the new one's jobs.
+- All four are optional. A runner that omits them loses the guarantees in Delivery but
+  still works.
 
 A **job** is one request to the sandbox's guest agent, or the removal of a sandbox:
 
@@ -118,5 +123,7 @@ lost because a connection dropped while the job ran.
   next `received`) is handed out again.
 - **After a reconnect, `jobs` settles the rest.** A job sent on an older connection that
   isn't listed never reached the runner and never ran, so it fails at once and is safe to
-  retry. A listed job stays pending until its result arrives.
+  retry. A listed job stays pending until its result arrives. Only the process a job went
+  to can say it never got it: a job sent to a replaced process waits for its result or its
+  deadline.
 - **A runner that disconnects** has 60 s to come back before its pending jobs fail.

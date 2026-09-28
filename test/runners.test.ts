@@ -187,6 +187,34 @@ describe("over long poll", () => {
     await done;
   });
 
+  test("an older runner process still polling can't take over from a newer one, nor take its jobs", async () => {
+    const hub = hubWith({ pollWaitMs: 5000 });
+    const oldProc = { ...status("r1"), session: "old", started: 1000 };
+    const newProc = { ...status("r1"), session: "new", started: 2000 };
+    const first = hub.poll(oldProc);
+    const newer = hub.poll(newProc); // the new process's first poll takes over
+    expect(await first).toEqual([]);
+    const stop = new AbortController();
+    const stale = hub.poll(oldProc, stop.signal); // the old one polls again: it idles…
+    const done = hub.sandbox("s1").exec("true");
+    const jobs = await newer; // …and the job goes to the new one
+    expect(jobs).toHaveLength(1);
+    stop.abort();
+    expect(await stale).toEqual([]);
+    hub.results("r1", [ok(jobs[0]!, { exitCode: 0, stdout: "", stderr: "" })]);
+    await done;
+  });
+
+  test("a job sent to a replaced process isn't declared lost by the new one, which never got it", async () => {
+    const hub = hubWith({ pollWaitMs: 20 });
+    await hub.poll({ ...status("r1"), session: "old", started: 1000 });
+    const done = hub.sandbox("s1").exec("make", { timeoutMs: 600_000 });
+    const [job] = await hub.poll({ ...status("r1"), session: "old", started: 1000 }); // the old process runs it
+    await hub.poll({ ...status("r1"), session: "new", started: 2000, jobs: [] });
+    hub.results("r1", [ok(job!, { exitCode: 0, stdout: "finished by the old process", stderr: "" })]); // posted as it shuts down
+    expect((await done).stdout).toBe("finished by the old process");
+  });
+
   test("a runner whose last poll is too old is offline", async () => {
     let now = 1_000_000;
     const hub = hubWith({ pollWaitMs: 1, onlineMs: 45_000, now: () => now });

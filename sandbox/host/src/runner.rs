@@ -200,6 +200,10 @@ pub struct Runner {
     /// Signalled when a job finishes, so its result goes out at once.
     finished: Notify,
     sessions: AtomicU64,
+    /// This process, for Lorehouse: an id and its start time (unix ms). Of two processes with
+    /// one name, the later-started one is the runner.
+    process: String,
+    started: u64,
 }
 
 enum WsEnd {
@@ -211,7 +215,9 @@ enum WsEnd {
 
 impl Runner {
     pub fn new(vms: Arc<Manager>, app_url: String, token: String, name: String, transport: Transport) -> Arc<Runner> {
-        Arc::new(Runner { vms, app_url, token, name, transport, ledger: Mutex::default(), finished: Notify::new(), sessions: AtomicU64::new(0) })
+        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let process = format!("{started:x}-{:x}", std::process::id());
+        Arc::new(Runner { vms, app_url, token, name, transport, ledger: Mutex::default(), finished: Notify::new(), sessions: AtomicU64::new(0), process, started })
     }
 
     fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
@@ -233,7 +239,7 @@ impl Runner {
 
     async fn status_json(&self) -> serde_json::Value {
         let jobs = self.ledger().ids(Instant::now());
-        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "version": VERSION, "jobs": jobs })
+        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "version": VERSION, "jobs": jobs, "session": self.process, "started": self.started })
     }
 
     pub async fn run(self: Arc<Self>) {
