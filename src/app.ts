@@ -25,7 +25,7 @@ import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { inThread, isFollowUp, joinThread } from "./threads";
-import { recordAsk, recordSearch } from "./usage";
+import { feedbackOf, recordAsk, recordFeedback, recordSearch } from "./usage";
 import { pullRequestTool } from "./tools/pull-request";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
@@ -102,6 +102,19 @@ export async function createApp(config: Config) {
     e.kind === "app_mention" ||
     (dm === "answer" && e.channelType === "im") ||
     isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread));
+  // A 👍/👎 on one of the agent's replies is feedback, recorded and never answered.
+  // Without the agent's own id no reaction can count, and /status would read as if nobody
+  // reacted: say so, once.
+  let warnedNoBotId = false;
+  const onReaction = (e: SlackNormalizedEvent) => {
+    const botUserId = ingester?.ownUserId ?? config.slack.botUserId;
+    if (!botUserId && !warnedNoBotId) {
+      warnedNoBotId = true;
+      console.error("usage: a reaction arrived before the agent's own user id is known (auth.test pending or failed, and no SLACK_BOT_USER_ID); feedback is not counted");
+    }
+    const f = feedbackOf(e, botUserId);
+    if (f) tally(() => recordFeedback(knowledge, f, e.kind === "reaction_added"));
+  };
   const slack: Channel = withNamedPeople(slackChannel({
     signingSecret: config.slack.signingSecret,
     botToken: config.slack.botToken,
@@ -119,8 +132,13 @@ export async function createApp(config: Config) {
       if (respond && e.channelType !== "im" && user) tally(() => recordAsk(knowledge, { channel: e.channelId, ts: e.ts, threadTs: e.threadId ?? e.ts, user }));
       return respond;
     },
-    // A mention asks the agent into its thread.
-    on: { app_mention: (e) => joinThread(knowledge, e.channelId, e.threadId ?? e.ts) },
+    // A mention asks the agent into its thread. Reactions are observed only: they are not
+    // in respondTo, so none starts a turn.
+    on: {
+      app_mention: (e) => joinThread(knowledge, e.channelId, e.threadId ?? e.ts),
+      reaction_added: onReaction,
+      reaction_removed: onReaction,
+    },
     // Every public message event the policy lets through (new, edited, deleted) keeps
     // the knowledge index in step (DMs aren't on the allowlist, so never indexed). onEvent,
     // not on.message: the framework normalizes away edits and deletions.

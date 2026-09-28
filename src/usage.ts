@@ -1,6 +1,6 @@
 // usage.ts — how the agent is used, as GET /status reports it: how many people ask it
-// things and where, and which questions knowledge had no answer for (what to write down
-// next).
+// things and where, which questions knowledge had no answer for (what to write down
+// next), and the 👍/👎 people leave on its replies.
 //
 // Only public collaboration is counted: app.ts records nothing from a DM.
 
@@ -17,6 +17,38 @@ export function recordSearch(db: Database, search: { channel: string; threadTs: 
   db.query("INSERT INTO agent_searches (channel, thread_ts, query, hits, at) VALUES (?, ?, ?, ?, ?)").run(search.channel, search.threadTs, search.query, search.hits, now.toISOString());
 }
 
+export type Rating = "up" | "down";
+
+// Slack names 👍 "+1" (alias "thumbsup") and 👎 "-1" ("thumbsdown"); a skin tone arrives
+// as a suffix: "+1::skin-tone-3".
+export function rating(reactionName: string): Rating | undefined {
+  const name = reactionName.replace(/::skin-tone-\d+$/, "");
+  if (name === "+1" || name === "thumbsup") return "up";
+  if (name === "-1" || name === "thumbsdown") return "down";
+  return undefined;
+}
+
+export type Feedback = { channel: string; messageTs: string; user: string; rating: Rating };
+
+type ReactionEvent = { channelId: string; user?: { id: string }; reaction?: { name: string; itemTs: string }; raw?: unknown };
+
+// A person's 👍/👎 on a message the agent wrote, or undefined for any other reaction. The
+// raw event's item_user is the reacted-to message's author. Without the agent's own id
+// there is no telling its replies apart, so nothing counts.
+export function feedbackOf(e: ReactionEvent, botUserId: string | undefined): Feedback | undefined {
+  const user = e.user?.id;
+  const r = e.reaction && rating(e.reaction.name);
+  if (!botUserId || !user || user === botUserId || !r) return undefined;
+  if ((e.raw as { item_user?: string } | undefined)?.item_user !== botUserId) return undefined;
+  return { channel: e.channelId, messageTs: e.reaction!.itemTs, user, rating: r };
+}
+
+// Added, or taken back (a removed reaction deletes it).
+export function recordFeedback(db: Database, f: Feedback, added: boolean, now = new Date()): void {
+  if (added) db.query("INSERT OR IGNORE INTO agent_feedback (channel, message_ts, user, rating, at) VALUES (?, ?, ?, ?, ?)").run(f.channel, f.messageTs, f.user, f.rating, now.toISOString());
+  else db.query("DELETE FROM agent_feedback WHERE channel = ? AND message_ts = ? AND user = ? AND rating = ?").run(f.channel, f.messageTs, f.user, f.rating);
+}
+
 export type UsageSummary = {
   since: string; // RFC 3339
   people: number; // distinct people who asked
@@ -25,6 +57,8 @@ export type UsageSummary = {
   // Threads where the agent searched and every search came back empty, out of the threads
   // where it searched at all; and the latest distinct queries that found nothing.
   notFound: { threads: number; of: number; queries: string[] };
+  // 👍/👎 on the agent's replies, by how many people, and the latest replies given a 👎.
+  feedback: { up: number; down: number; people: number; downMessages: { channel: string; ts: string }[] };
 };
 
 const LATEST = 10;
@@ -43,9 +77,18 @@ export function usageSummary(db: Database, { since }: { since: Date }): UsageSum
   const queries = db.query(
     "SELECT query FROM agent_searches WHERE at >= ? AND hits = 0 GROUP BY query ORDER BY MAX(id) DESC LIMIT ?",
   ).all(at, LATEST) as { query: string }[];
+  const feedback = db.query(
+    `SELECT COALESCE(SUM(rating = 'up'), 0) AS up, COALESCE(SUM(rating = 'down'), 0) AS down, COUNT(DISTINCT user) AS people
+     FROM agent_feedback WHERE at >= ?`,
+  ).get(at) as { up: number; down: number; people: number };
+  const downMessages = db.query(
+    `SELECT channel, message_ts AS ts FROM agent_feedback WHERE at >= ? AND rating = 'down'
+     GROUP BY channel, message_ts ORDER BY MAX(at) DESC LIMIT ?`,
+  ).all(at, LATEST) as { channel: string; ts: string }[];
   return {
     since: at,
     ...asks,
     notFound: { threads: searched.threads, of: searched.of, queries: queries.map((q) => q.query) },
+    feedback: { ...feedback, downMessages },
   };
 }

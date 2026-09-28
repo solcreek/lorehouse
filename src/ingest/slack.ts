@@ -174,6 +174,11 @@ export class SlackIngester {
     this.users = new SlackUsers(api, db, { log: opts.log, now: opts.now });
   }
 
+  // The bot's own user id, once start() has asked auth.test.
+  get ownUserId(): string | undefined {
+    return this.botUserId;
+  }
+
   // People's names, as knowledge names them (and from the same cache).
   names(ids: string[]): Promise<Map<string, PersonName>> {
     return this.users.names(ids);
