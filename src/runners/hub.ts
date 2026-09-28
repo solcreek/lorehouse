@@ -162,9 +162,15 @@ export class RunnerHub {
       if (r && this.online(r)) return r;
       throw new Error(`the sandbox's host (${placed}) is offline; its checkout lives there, so it can't move`);
     }
+    // Only a runner with room: a full one would answer 503, and the placement below would
+    // pin the sandbox to it for good. A socket that hasn't sent its status yet reports no
+    // capacity, so it isn't chosen until it does. When every runner is full, nothing is
+    // recorded and the caller can try again.
     const free = (r: Runner) => r.status.capacity - r.status.running;
-    const best = [...this.runners.values()].filter((r) => this.online(r)).sort((a, b) => free(b) - free(a) || a.name.localeCompare(b.name))[0];
-    if (!best) throw new Error("no sandbox runner is connected");
+    const online = [...this.runners.values()].filter((r) => this.online(r));
+    if (!online.length) throw new Error("no sandbox runner is connected");
+    const best = online.filter((r) => free(r) > 0).sort((a, b) => free(b) - free(a) || a.name.localeCompare(b.name))[0];
+    if (!best) throw new Error("every sandbox runner is full; try again in a few minutes");
     this.db.query("INSERT INTO sandbox_placements (sandbox, runner, placed_at) VALUES (?, ?, ?)").run(sandbox, best.name, new Date(this.now()).toISOString());
     return best;
   }

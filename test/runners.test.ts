@@ -161,6 +161,20 @@ describe("placement", () => {
     expect(() => hubWith().submit("s9", { op: "destroy" }, 1000)).toThrow(/no sandbox runner is connected/);
   });
 
+  test("only a runner with room is chosen: not a full one, nor a socket that hasn't reported yet", () => {
+    const hub = hubWith();
+    const quiet = { sent: [] as Job[] };
+    hub.attachWs("quiet", (j) => quiet.sent.push(j)); // connected, no status yet: capacity 0
+    const full = wsRunner(hub, "full", 2, 2);
+    expect(() => hub.submit("s1", { op: "destroy" }, 1000)).toThrow(/every sandbox runner is full/);
+    expect(quiet.sent).toHaveLength(0);
+    expect(full.sent).toHaveLength(0);
+    // Nothing was recorded, so once room appears the same sandbox lands where the room is.
+    full.link.status(status("full", 2, 1));
+    void hub.submit("s1", { op: "destroy" }, 1000);
+    expect(full.sent).toHaveLength(1);
+  });
+
   test("placements survive a restart of Lorehouse (they are in the database)", () => {
     const db = openKnowledge(":memory:");
     const a = new RunnerHub(db);
