@@ -4,6 +4,11 @@
 //! poll, each POST /runners/poll is held until there's work. `auto` tries WebSocket and
 //! falls back to long poll when the upgrade is refused (a 426, or a proxy that strips
 //! it). Either way a lost connection is retried with backoff, and jobs run concurrently.
+//!
+//! Delivery (the protocol's "Delivery" section): jobs write files and run commands, so a
+//! job id runs once, even if it's handed out again, and a result is kept until it has
+//! been delivered, so a connection that drops while a job runs doesn't lose it. The ledger
+//! below holds both, across connections.
 
 use crate::config::Transport;
 use crate::vm::{self, Manager};
@@ -13,12 +18,19 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use hyper::Method;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How many recent job ids are remembered, so a job handed out again doesn't run twice.
+const SEEN_IDS: usize = 2048;
+/// How long a finished result is kept for delivery on a later connection.
+const KEEP_RESULTS: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Deserialize, Debug)]
 struct Job {
@@ -31,7 +43,7 @@ struct Job {
     body_base64: Option<String>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 struct JobResult {
     id: String,
     status: u16,
@@ -98,16 +110,96 @@ async fn execute(vms: &Manager, job: Job) -> JobResult {
     }
 }
 
-async fn status_json(vms: &Manager, name: &str) -> serde_json::Value {
-    serde_json::json!({ "type": "status", "runner": name, "capacity": vms.capacity(), "running": vms.running_count().await, "version": VERSION })
+// ── the ledger: which jobs ran, and which results still need delivering ─────────────────
+
+struct Held {
+    /// None while the job runs.
+    result: Option<JobResult>,
+    done_at: Option<Instant>,
+    /// The connection (session) it was last sent on; 0 = not sent.
+    sent_in: u64,
 }
 
+#[derive(Default)]
+struct Ledger {
+    seen: VecDeque<String>,
+    seen_set: HashSet<String>,
+    held: HashMap<String, Held>,
+}
+
+impl Ledger {
+    /// Whether to run this job: false for an id already taken (a redelivery).
+    fn accept(&mut self, id: &str) -> bool {
+        if self.seen_set.contains(id) {
+            return false;
+        }
+        self.seen.push_back(id.to_string());
+        self.seen_set.insert(id.to_string());
+        while self.seen.len() > SEEN_IDS {
+            if let Some(old) = self.seen.pop_front() {
+                self.seen_set.remove(&old);
+            }
+        }
+        self.held.insert(id.to_string(), Held { result: None, done_at: None, sent_in: 0 });
+        true
+    }
+
+    fn finish(&mut self, result: JobResult, now: Instant) {
+        if let Some(h) = self.held.get_mut(&result.id) {
+            h.result = Some(result);
+            h.done_at = Some(now);
+        }
+    }
+
+    /// Finished results not yet sent on `session`, marked as sent on it.
+    fn take_unsent(&mut self, session: u64) -> Vec<JobResult> {
+        let mut out = Vec::new();
+        for h in self.held.values_mut() {
+            if let Some(r) = &h.result {
+                if h.sent_in != session {
+                    h.sent_in = session;
+                    out.push(r.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Lorehouse confirmed these (an HTTP 204): no need to keep them.
+    fn delivered(&mut self, ids: &[String]) {
+        for id in ids {
+            self.held.remove(id);
+        }
+    }
+
+    /// Sending these failed: try again.
+    fn unsend(&mut self, ids: &[String]) {
+        for id in ids {
+            if let Some(h) = self.held.get_mut(id) {
+                h.sent_in = 0;
+            }
+        }
+    }
+
+    /// Ids held (running, or a result kept for delivery), for the status's `jobs`.
+    fn ids(&mut self, now: Instant) -> Vec<String> {
+        self.held.retain(|_, h| h.done_at.is_none_or(|t| now.duration_since(t) < KEEP_RESULTS));
+        self.held.keys().cloned().collect()
+    }
+}
+
+// ── the runner ────────────────────────────────────────────────────────────────────────────
+
 pub struct Runner {
-    pub vms: Arc<Manager>,
-    pub app_url: String,
-    pub token: String,
-    pub name: String,
-    pub transport: Transport,
+    vms: Arc<Manager>,
+    app_url: String,
+    token: String,
+    name: String,
+    transport: Transport,
+    ledger: Mutex<Ledger>,
+    /// Signalled when a job finishes, so its result goes out at once.
+    finished: Notify,
+    sessions: AtomicU64,
 }
 
 enum WsEnd {
@@ -118,6 +210,32 @@ enum WsEnd {
 }
 
 impl Runner {
+    pub fn new(vms: Arc<Manager>, app_url: String, token: String, name: String, transport: Transport) -> Arc<Runner> {
+        Arc::new(Runner { vms, app_url, token, name, transport, ledger: Mutex::default(), finished: Notify::new(), sessions: AtomicU64::new(0) })
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
+        self.ledger.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run a job handed out by Lorehouse, unless this id already ran here.
+    fn take(self: &Arc<Self>, job: Job) {
+        if !self.ledger().accept(&job.id) {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let result = execute(&me.vms, job).await;
+            me.ledger().finish(result, Instant::now());
+            me.finished.notify_one();
+        });
+    }
+
+    async fn status_json(&self) -> serde_json::Value {
+        let jobs = self.ledger().ids(Instant::now());
+        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "version": VERSION, "jobs": jobs })
+    }
+
     pub async fn run(self: Arc<Self>) {
         let mut use_ws = self.transport != Transport::Poll;
         let mut backoff = Duration::from_secs(1);
@@ -169,12 +287,13 @@ impl Runner {
             }
             Err(e) => return WsEnd::Lost(e.to_string()),
         };
+        let session = self.sessions.fetch_add(1, Ordering::SeqCst) + 1;
         eprintln!("sandboxd: connected to {} over WebSocket as {}", self.app_url, self.name);
         let (mut sink, mut stream) = socket.split();
         let (out, mut out_rx) = mpsc::channel::<Message>(64);
-        // One writer: status every 20 s, and results as jobs finish. It ends when a send
-        // fails, and the read loop below watches for that: a connection that can no longer
-        // be written to must end the session (and reconnect) even if nothing more is read.
+        // One writer. It ends when a send fails, and the read loop below watches for that:
+        // a connection that can no longer be written to must end the session (and
+        // reconnect) even if nothing more is read.
         let mut writer = tokio::spawn(async move {
             while let Some(m) = out_rx.recv().await {
                 if sink.send(m).await.is_err() {
@@ -182,15 +301,35 @@ impl Runner {
                 }
             }
         });
+        // Status first (it lists the jobs held, which settles jobs from before a drop),
+        // then every 20 s.
         let ticker = {
             let (me, out) = (self.clone(), out.clone());
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(20));
                 loop {
                     tick.tick().await;
-                    let s = status_json(&me.vms, &me.name).await.to_string();
-                    if out.send(Message::text(s)).await.is_err() {
+                    if out.send(Message::text(me.status_json().await.to_string())).await.is_err() {
                         break;
+                    }
+                }
+            })
+        };
+        // Results, as jobs finish, including any a dropped connection didn't deliver.
+        let flusher = {
+            let (me, out) = (self.clone(), out.clone());
+            tokio::spawn(async move {
+                loop {
+                    let ready = me.ledger().take_unsent(session);
+                    for result in ready {
+                        let frame = serde_json::json!({ "type": "result", "result": result }).to_string();
+                        if out.send(Message::text(frame)).await.is_err() {
+                            return;
+                        }
+                    }
+                    tokio::select! {
+                        _ = me.finished.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                 }
             })
@@ -209,15 +348,9 @@ impl Runner {
                         job: Option<Job>,
                     }
                     let Ok(Frame { kind, job: Some(job) }) = serde_json::from_str::<Frame>(&t) else { continue };
-                    if kind != "job" {
-                        continue;
+                    if kind == "job" {
+                        self.take(job);
                     }
-                    let (vms, out) = (self.vms.clone(), out.clone());
-                    tokio::spawn(async move {
-                        let result = execute(&vms, job).await;
-                        let frame = serde_json::json!({ "type": "result", "result": result }).to_string();
-                        let _ = out.send(Message::text(frame)).await;
-                    });
                 }
                 Some(Ok(Message::Close(_))) | None => break "closed by the app".to_string(),
                 Some(Ok(_)) => {}
@@ -225,6 +358,7 @@ impl Runner {
             }
         };
         ticker.abort();
+        flusher.abort();
         drop(out);
         writer.abort();
         WsEnd::Lost(end)
@@ -232,61 +366,81 @@ impl Runner {
 
     /// Long poll until an error, which it returns. Each poll is held by the app up to ~25 s.
     async fn poll_session(self: Arc<Self>) -> String {
-        match self.poll_loop().await {
-            Ok(never) => match never {},
-            Err(e) => e,
-        }
+        let session = self.sessions.fetch_add(1, Ordering::SeqCst) + 1;
+        let http = match reqwest::Client::builder().timeout(Duration::from_secs(40)).build() {
+            Ok(c) => c,
+            Err(e) => return e.to_string(),
+        };
+        // Results go out as jobs finish; a 2xx confirms them, a failure sends them again.
+        let poster = {
+            let (me, http) = (self.clone(), http.clone());
+            tokio::spawn(async move {
+                loop {
+                    let ready = me.ledger().take_unsent(session);
+                    if !ready.is_empty() {
+                        let ids: Vec<String> = ready.iter().map(|r| r.id.clone()).collect();
+                        let sent = me.post(&http, "/runners/results", &serde_json::json!({ "results": ready })).await;
+                        match sent {
+                            Ok(res) if res.status().is_success() => me.ledger().delivered(&ids),
+                            _ => me.ledger().unsend(&ids),
+                        }
+                    }
+                    tokio::select! {
+                        _ = me.finished.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    }
+                }
+            })
+        };
+        let err = self.poll_loop(&http).await;
+        poster.abort();
+        err
     }
 
-    async fn poll_loop(self: Arc<Self>) -> Result<std::convert::Infallible, String> {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(40)).build().map_err(|e| e.to_string())?;
-        let auth = format!("Bearer {}", self.token);
+    async fn poll_loop(self: &Arc<Self>, http: &reqwest::Client) -> String {
         eprintln!("sandboxd: polling {} as {}", self.app_url, self.name);
+        // Ids from the last poll answer received: jobs Lorehouse handed out but that never
+        // arrived here are then handed out again.
+        let mut received: Vec<String> = Vec::new();
         loop {
-            let res = http
-                .post(format!("{}/runners/poll", self.app_url))
-                .header("authorization", &auth)
-                .header("x-lorehouse-runner", &self.name)
-                .json(&status_json(&self.vms, &self.name).await)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut body = self.status_json().await;
+            body["received"] = serde_json::json!(received);
+            let res = match self.post(http, "/runners/poll", &body).await {
+                Ok(r) => r,
+                Err(e) => return e.to_string(),
+            };
             if !res.status().is_success() {
-                return Err(format!("poll: HTTP {}", res.status().as_u16()));
+                return format!("poll: HTTP {}", res.status().as_u16());
             }
             #[derive(Deserialize)]
             struct Batch {
                 jobs: Vec<Job>,
             }
-            let batch: Batch = res.json().await.map_err(|e| format!("poll body: {e}"))?;
+            let batch: Batch = match res.json().await {
+                Ok(b) => b,
+                Err(e) => return format!("poll body: {e}"),
+            };
+            received = batch.jobs.iter().map(|j| j.id.clone()).collect();
             for job in batch.jobs {
-                let (me, http, auth) = (self.clone(), http.clone(), auth.clone());
-                tokio::spawn(async move {
-                    let result = execute(&me.vms, job).await;
-                    let body = serde_json::json!({ "results": [result] });
-                    for attempt in 0..3 {
-                        let sent = http
-                            .post(format!("{}/runners/results", me.app_url))
-                            .header("authorization", &auth)
-                            .header("x-lorehouse-runner", &me.name)
-                            .json(&body)
-                            .send()
-                            .await;
-                        if matches!(&sent, Ok(r) if r.status().is_success()) {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-                    }
-                    eprintln!("sandboxd: couldn't deliver a result to {}", me.app_url);
-                });
+                self.take(job);
             }
         }
+    }
+
+    async fn post(&self, http: &reqwest::Client, path: &str, body: &serde_json::Value) -> reqwest::Result<reqwest::Response> {
+        http.post(format!("{}{path}", self.app_url))
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("x-lorehouse-runner", &self.name)
+            .json(body)
+            .send()
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::allowed;
+    use super::{allowed, JobResult, Ledger, KEEP_RESULTS, SEEN_IDS};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn only_the_three_guest_calls_are_allowed() {
@@ -298,5 +452,50 @@ mod tests {
         assert!(allowed("GET", "/file").is_none()); // no path given
         assert!(allowed("GET", "/healthz").is_none());
         assert!(allowed("POST", "/exec/../admin").is_none());
+    }
+
+    fn done(id: &str) -> JobResult {
+        JobResult { id: id.into(), status: 200, content_type: None, body_base64: None, error: None }
+    }
+
+    #[test]
+    fn a_job_handed_out_again_runs_once() {
+        let mut l = Ledger::default();
+        assert!(l.accept("j1"));
+        assert!(!l.accept("j1"));
+        // the memory is bounded, oldest first
+        for i in 0..SEEN_IDS {
+            l.accept(&format!("x{i}"));
+        }
+        assert!(l.accept("j1"));
+    }
+
+    #[test]
+    fn a_result_goes_out_once_per_connection_and_again_on_the_next() {
+        let mut l = Ledger::default();
+        let now = Instant::now();
+        l.accept("j1");
+        assert!(l.take_unsent(1).is_empty()); // still running
+        l.finish(done("j1"), now);
+        assert_eq!(l.take_unsent(1), vec![done("j1")]);
+        assert!(l.take_unsent(1).is_empty()); // not twice on one connection
+        assert_eq!(l.take_unsent(2), vec![done("j1")]); // but again on a new one
+        l.unsend(&["j1".into()]);
+        assert_eq!(l.take_unsent(2), vec![done("j1")]); // a failed send retries
+        l.delivered(&["j1".into()]);
+        assert!(l.take_unsent(3).is_empty()); // confirmed: gone
+    }
+
+    #[test]
+    fn held_ids_list_running_jobs_and_kept_results_until_they_expire() {
+        let mut l = Ledger::default();
+        let now = Instant::now();
+        l.accept("running");
+        l.accept("finished");
+        l.finish(done("finished"), now);
+        let mut ids = l.ids(now);
+        ids.sort();
+        assert_eq!(ids, vec!["finished", "running"]);
+        assert_eq!(l.ids(now + KEEP_RESULTS + Duration::from_secs(1)), vec!["running"]);
     }
 }
