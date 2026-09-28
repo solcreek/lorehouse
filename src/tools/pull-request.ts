@@ -6,10 +6,11 @@
 // click resumes the turn with the clicker's verified id. Only then does anything leave
 // the sandbox.
 //
-// Credentials: the write token lives in the worker env. It enters the sandbox for the
-// single `git push` command only (per-command env, read by an inline credential helper —
-// never written to .git/config, never in argv), and the PR itself is opened from the
-// worker side over the REST API.
+// Credentials: a write token for this one repo is asked for only after the approval (from
+// a GitHub App, a short-lived installation token; see github-auth.ts). It enters the
+// sandbox for the single `git push` command only (per-command env, read by an inline
+// credential helper — never written to .git/config, never in argv), and the PR itself is
+// opened from the worker side over the REST API.
 //
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
 // is read-only (it recomputes the same summary), requestInput then returns the stored
@@ -20,10 +21,12 @@ import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { WORKDIR, type SandboxFor } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
+import type { GithubAccess } from "../github-auth";
 
 export type PullRequestOptions = {
   sandboxFor: SandboxFor;
-  githubToken: () => string;
+  // A write credential for the repo, asked for only after a human approved.
+  github: GithubAccess;
   identity?: AgentIdentity; // default: scout
   fetch?: typeof fetch; // injectable for tests
 };
@@ -83,12 +86,18 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
 
       // ── after approval: push, then open (or find) the PR ────────────────────
+      let token: string;
+      try {
+        token = await opts.github(repo, "write");
+      } catch (e) {
+        return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
+      }
       try {
         await sh(
           // The helper reads the token from THIS command's env — nothing persists in the repo.
           `git -c credential.helper='!f() { echo username=x-access-token; echo "password=$LOREHOUSE_GH_TOKEN"; }; f' ` +
             `push origin ${head}:refs/heads/${input.branch}`,
-          { LOREHOUSE_GH_TOKEN: opts.githubToken() },
+          { LOREHOUSE_GH_TOKEN: token },
         );
       } catch (e) {
         return { error: `push failed: ${(e as Error).message}` };
@@ -99,7 +108,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
           ...init,
           headers: {
             accept: "application/vnd.github+json",
-            authorization: `Bearer ${opts.githubToken()}`,
+            authorization: `Bearer ${token}`,
             "user-agent": `${id.name}-agent`,
             ...(init?.body ? { "content-type": "application/json" } : {}),
           },

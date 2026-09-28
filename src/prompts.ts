@@ -10,6 +10,7 @@ import workspaceExec from "../prompts/tools/workspace_exec.md" with { type: "tex
 import workspaceReadFile from "../prompts/tools/workspace_read_file.md" with { type: "text" };
 import workspaceWriteFile from "../prompts/tools/workspace_write_file.md" with { type: "text" };
 import openPullRequest from "../prompts/tools/open_pull_request.md" with { type: "text" };
+import workspaceClone from "../prompts/tools/workspace_clone.md" with { type: "text" };
 import { branchPrefix, displayName, type AgentIdentity } from "./identity";
 
 const TOOLS: Record<string, string> = {
@@ -19,6 +20,7 @@ const TOOLS: Record<string, string> = {
   workspace_read_file: workspaceReadFile,
   workspace_write_file: workspaceWriteFile,
   open_pull_request: openPullRequest,
+  workspace_clone: workspaceClone,
 };
 
 export function render(template: string, vars: Record<string, string>): string {

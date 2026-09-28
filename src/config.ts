@@ -25,12 +25,18 @@ export type Config = {
   logSlackEvents: boolean;
   // Bearer token for GET /status. Unset: /status is closed (404).
   statusToken?: string;
-  // Code tools, on when a sandbox is configured (plus GITHUB_TOKEN for pull requests):
+  // Code tools, on when a sandbox is configured, with GitHub credentials:
   //   runners  sandbox hosts connect in (SANDBOX_RUNNER_TOKEN); see docs/sandbox-runners.md
   //   direct   one sandbox host Lorehouse calls (SANDBOX_URL + SANDBOX_TOKEN), e.g. on the
   //            same machine over loopback
-  sandbox?: { mode: "runners"; runnerToken: string; githubToken: string } | { mode: "direct"; url: string; token: string; githubToken: string };
+  sandbox?: ({ mode: "runners"; runnerToken: string } | { mode: "direct"; url: string; token: string }) & { github: GithubCredentials };
 };
+
+// A GitHub App (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY): short-lived tokens per repo, a bot
+// identity, owned by the org. Or a plain token (GITHUB_TOKEN), for development.
+export type GithubCredentials = { kind: "app"; appId: string; privateKey: string } | { kind: "token"; token: string };
+
+import { normalizePem } from "./github-auth";
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const missing: string[] = [];
@@ -84,19 +90,33 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     logSlackEvents: env.LOG_SLACK_EVENTS === "1",
     statusToken: env.STATUS_TOKEN || undefined,
   };
+  // GitHub credentials: an App, or a plain token, never both.
+  const app = !!(env.GITHUB_APP_ID || env.GITHUB_APP_PRIVATE_KEY);
+  let github: GithubCredentials | undefined;
+  if (app && env.GITHUB_TOKEN) missing.push("GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY or GITHUB_TOKEN (one GitHub credential, not both)");
+  else if (app) {
+    if (!env.GITHUB_APP_ID || !/^\d+$/.test(env.GITHUB_APP_ID)) missing.push("GITHUB_APP_ID (the App's numeric id)");
+    const key = normalizePem(env.GITHUB_APP_PRIVATE_KEY ?? "");
+    if (!/-----BEGIN (RSA )?PRIVATE KEY-----/.test(key)) missing.push("GITHUB_APP_PRIVATE_KEY (the App's .pem private key)");
+    github = { kind: "app", appId: env.GITHUB_APP_ID ?? "", privateKey: key };
+  } else if (env.GITHUB_TOKEN) github = { kind: "token", token: env.GITHUB_TOKEN };
+
   const runners = !!env.SANDBOX_RUNNER_TOKEN;
   const direct = !!(env.SANDBOX_URL || env.SANDBOX_TOKEN);
+  const needGithub = "GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (a GitHub App), or GITHUB_TOKEN (code tools need GitHub credentials)";
   if (runners && direct) {
     missing.push("SANDBOX_RUNNER_TOKEN or SANDBOX_URL/SANDBOX_TOKEN (one sandbox mode, not both)");
   } else if (runners) {
     if (env.SANDBOX_RUNNER_TOKEN!.length < 32) missing.push("SANDBOX_RUNNER_TOKEN (at least 32 characters)");
-    if (!env.GITHUB_TOKEN) missing.push("GITHUB_TOKEN (code tools need it with SANDBOX_RUNNER_TOKEN)");
-    config.sandbox = { mode: "runners", runnerToken: env.SANDBOX_RUNNER_TOKEN!, githubToken: env.GITHUB_TOKEN ?? "" };
-  } else if (direct || env.GITHUB_TOKEN) {
-    const keys = ["SANDBOX_URL", "SANDBOX_TOKEN", "GITHUB_TOKEN"] as const;
-    const absent = keys.filter((k) => !env[k]);
-    if (absent.length === 0) config.sandbox = { mode: "direct", url: env.SANDBOX_URL!, token: env.SANDBOX_TOKEN!, githubToken: env.GITHUB_TOKEN! };
-    else missing.push(...absent.map((k) => `${k} (code tools need SANDBOX_RUNNER_TOKEN, or all of ${keys.join(", ")}, with GITHUB_TOKEN)`));
+    if (!github) missing.push(needGithub);
+    else config.sandbox = { mode: "runners", runnerToken: env.SANDBOX_RUNNER_TOKEN!, github };
+  } else if (direct) {
+    const absent = (["SANDBOX_URL", "SANDBOX_TOKEN"] as const).filter((k) => !env[k]);
+    if (absent.length) missing.push(...absent.map((k) => `${k} (the direct sandbox mode needs SANDBOX_URL and SANDBOX_TOKEN)`));
+    if (!github) missing.push(needGithub);
+    if (!absent.length && github) config.sandbox = { mode: "direct", url: env.SANDBOX_URL!, token: env.SANDBOX_TOKEN!, github };
+  } else if (github) {
+    missing.push("SANDBOX_RUNNER_TOKEN or SANDBOX_URL + SANDBOX_TOKEN (GitHub credentials are set, but no sandbox)");
   }
   if (config.agent.dm === "answer" && config.sandbox) missing.push("DM_MODE=answer (not with code tools: code work stays in public channels)");
   if (missing.length) throw new Error(`lorehouse: missing or invalid configuration: ${missing.join(", ")}`);

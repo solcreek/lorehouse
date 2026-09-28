@@ -7,6 +7,7 @@ import { AgentSession, replyStream, type EventSink, type ModelReply, type Model,
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
 import { pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
+import { staticToken } from "../src/github-auth";
 import { parseAllowlist, publicChannelsOnly } from "../src/policy";
 import { directMessage, redirectText } from "../src/dm";
 import { remoteSandbox } from "../src/sandbox-client";
@@ -70,7 +71,7 @@ describe("open_pull_request — the approval gate", () => {
   test("parks before touching anything, then Approve pushes and opens a draft PR", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "ghs_secret", fetch: gh.f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("ghs_secret"), fetch: gh.f }));
 
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     const parked = await s.result(t1);
@@ -95,10 +96,40 @@ describe("open_pull_request — the approval gate", () => {
     expect(toolResult()?.result).toMatchObject({ status: "opened", number: 7 });
   });
 
+  test("a credential is asked for only after Approve, for write access to that one repo", async () => {
+    const { sb } = fakeRepo();
+    const asked: string[] = [];
+    const github = async (repo: { owner: string; name: string }, access: "read" | "write") => {
+      asked.push(`${repo.owner}/${repo.name}:${access}`);
+      return "ghs_short_lived";
+    };
+    const { s } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    const parked = (await s.result(t1)) as { request: { id: string } };
+    expect(asked).toEqual([]); // nothing before a human says yes
+    s.resume(t1, parked.request.id, true);
+    await s.result(t1);
+    expect(asked).toEqual(["acme/widgets:write"]);
+  });
+
+  test("no credential (e.g. the App isn't installed there): the model is told, nothing is pushed", async () => {
+    const { sb, calls } = fakeRepo();
+    const gh = fakeGithub();
+    const github = async () => { throw new Error("the GitHub App isn't installed on acme/widgets"); };
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: gh.f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    const parked = (await s.result(t1)) as { request: { id: string } };
+    s.resume(t1, parked.request.id, true);
+    await s.result(t1);
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+    expect(gh.reqs).toHaveLength(0);
+    expect(String(toolResult()?.result.error)).toContain("isn't installed on acme/widgets");
+  });
+
   test("Deny pushes nothing", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: gh.f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     const parked = (await s.result(t1)) as { request: { id: string } };
     s.resume(t1, parked.request.id, false);
@@ -111,7 +142,7 @@ describe("open_pull_request — the approval gate", () => {
   test("an already-open PR for the branch is returned, not duplicated", async () => {
     const { sb } = fakeRepo();
     const gh = fakeGithub([{ html_url: "https://github.com/acme/widgets/pull/3", number: 3 }]);
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: gh.f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     s.resume(t1, ((await s.result(t1)) as { request: { id: string } }).request.id, true);
     await s.result(t1);
@@ -121,14 +152,14 @@ describe("open_pull_request — the approval gate", () => {
 
   test("uncommitted changes fail fast — no approval is asked for", async () => {
     const { sb } = fakeRepo({ dirty: true });
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: fakeGithub().f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f }));
     expect(await s.result(s.start({ turnId: "t1", userText: "open a PR" }).turnId)).toMatchObject({ status: "completed" });
     expect(toolResult()?.result).toMatchObject({ error: expect.stringContaining("uncommitted") });
   });
 
   test("branches outside the agent prefix (scout/) are refused", async () => {
     const { sb, calls } = fakeRepo();
-    const tool = pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: fakeGithub().f });
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
     const out = await tool.run({ branch: "main", title: "x" }, {} as never);
     expect(out).toMatchObject({ error: expect.stringContaining("scout/") });
     expect(calls).toHaveLength(0);
@@ -273,7 +304,7 @@ describe("agent identity — the name is per-install config", () => {
   test("a renamed agent uses its own branch prefix and PR attribution", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
-    const tool = pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: gh.f, identity: agentIdentity("atlas") });
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, identity: agentIdentity("atlas") });
     expect(await tool.run({ branch: "scout/x", title: "x" }, {} as never)).toMatchObject({ error: expect.stringContaining('"atlas/"') });
     expect(calls).toHaveLength(0);
 

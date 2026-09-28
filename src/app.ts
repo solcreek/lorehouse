@@ -26,6 +26,8 @@ import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { inThread, isFollowUp, joinThread } from "./threads";
 import { pullRequestTool } from "./tools/pull-request";
+import { cloneTool } from "./tools/clone";
+import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 
 // How each tool call shows up on the reply's task timeline in Slack.
@@ -33,6 +35,7 @@ const TASK_LABELS: Record<string, string> = {
   search_knowledge: "Searching what the company knows",
   recent_knowledge: "Looking at recent discussions",
   slack_read_thread: "Reading the thread",
+  workspace_clone: "Getting the repo",
   workspace_exec: "Running a command in the sandbox",
   workspace_read_file: "Reading a file",
   workspace_write_file: "Editing a file",
@@ -74,7 +77,9 @@ export async function createApp(config: Config) {
     const sandboxFor = sb.mode === "runners"
       ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx))
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
-    tools.push(...workspaceTools(sandboxFor), pullRequestTool({ sandboxFor, githubToken: () => sb.githubToken, identity }));
+    // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
+    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey }) : staticToken(sb.github.token);
+    tools.push(...workspaceTools(sandboxFor), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity }));
   }
 
   const dm = config.agent.dm;

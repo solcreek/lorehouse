@@ -145,15 +145,26 @@ describe("config", () => {
     expect(loadConfig(base).sandbox).toBeUndefined();
     expect(() => loadConfig({ ...base, SANDBOX_URL: "http://x" })).toThrow(/SANDBOX_TOKEN.*GITHUB_TOKEN/);
     expect(() => loadConfig({ ...base, GITHUB_TOKEN: "z" })).toThrow(/SANDBOX_URL/);
-    expect(loadConfig({ ...base, SANDBOX_URL: "http://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "direct", url: "http://x", token: "y", githubToken: "z" });
+    expect(loadConfig({ ...base, SANDBOX_URL: "http://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "direct", url: "http://x", token: "y", github: { kind: "token", token: "z" } });
   });
 
   test("runner mode: a long SANDBOX_RUNNER_TOKEN plus GITHUB_TOKEN; never together with direct mode", () => {
     const runner = "r".repeat(32);
-    expect(loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "runners", runnerToken: runner, githubToken: "z" });
+    expect(loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "runners", runnerToken: runner, github: { kind: "token", token: "z" } });
     expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner })).toThrow(/GITHUB_TOKEN/);
     expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: "short", GITHUB_TOKEN: "z" })).toThrow(/at least 32 characters/);
     expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, SANDBOX_URL: "http://x", GITHUB_TOKEN: "z" })).toThrow(/one sandbox mode, not both/);
+  });
+
+  test("GitHub App credentials: a numeric id and a PEM key (escaped newlines restored); never with GITHUB_TOKEN; never without a sandbox", () => {
+    const runner = { SANDBOX_RUNNER_TOKEN: "r".repeat(32) };
+    const pem = "-----BEGIN RSA PRIVATE KEY-----\\nabc\\n-----END RSA PRIVATE KEY-----";
+    expect(loadConfig({ ...base, ...runner, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: pem }).sandbox?.github).toEqual({ kind: "app", appId: "123", privateKey: "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----" });
+    expect(() => loadConfig({ ...base, ...runner, GITHUB_APP_ID: "my-app", GITHUB_APP_PRIVATE_KEY: pem })).toThrow(/GITHUB_APP_ID \(the App's numeric id\)/);
+    expect(() => loadConfig({ ...base, ...runner, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: "ssh-rsa AAAA" })).toThrow(/GITHUB_APP_PRIVATE_KEY/);
+    expect(() => loadConfig({ ...base, ...runner, GITHUB_APP_ID: "123" })).toThrow(/GITHUB_APP_PRIVATE_KEY/);
+    expect(() => loadConfig({ ...base, ...runner, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: pem, GITHUB_TOKEN: "z" })).toThrow(/one GitHub credential, not both/);
+    expect(() => loadConfig({ ...base, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: pem })).toThrow(/GitHub credentials are set, but no sandbox/);
   });
 
   test("defaults: port 3000, claude-opus-5, sessions in memory, empty channel allowlist", () => {
