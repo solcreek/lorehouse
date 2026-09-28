@@ -1,6 +1,6 @@
 // usage.ts — how the agent is used, as GET /status reports it: how many people ask it
-// things and where, which questions knowledge had no answer for (what to write down
-// next), and the 👍/👎 people leave on its replies.
+// things and where, which searches came back empty, and the 👍/👎 people leave on its
+// replies.
 //
 // Only public collaboration is counted: app.ts records nothing from a DM.
 
@@ -43,7 +43,6 @@ export function feedbackOf(e: ReactionEvent, botUserId: string | undefined): Fee
   return { channel: e.channelId, messageTs: e.reaction!.itemTs, user, rating: r };
 }
 
-// Added, or taken back (a removed reaction deletes it).
 export function recordFeedback(db: Database, f: Feedback, added: boolean, now = new Date()): void {
   if (added) db.query("INSERT OR IGNORE INTO agent_feedback (channel, message_ts, user_id, rating, reacted_at) VALUES (?, ?, ?, ?, ?)").run(f.channel, f.messageTs, f.user, f.rating, now.toISOString());
   else db.query("DELETE FROM agent_feedback WHERE channel = ? AND message_ts = ? AND user_id = ? AND rating = ?").run(f.channel, f.messageTs, f.user, f.rating);
@@ -51,7 +50,7 @@ export function recordFeedback(db: Database, f: Feedback, added: boolean, now = 
 
 export type UsageSummary = {
   since: string; // RFC 3339
-  people: number; // distinct people who asked
+  people: number;
   channels: number;
   threads: number;
   // Threads where the agent searched and every search came back empty, out of the threads

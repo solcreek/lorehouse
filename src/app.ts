@@ -135,7 +135,6 @@ export async function createApp(config: Config) {
     // (see threads.ts); with DM_MODE=answer, DMs too. Those arrive as `message` events
     // like every channel message: respondWhen keeps the rest to knowledge.
     respondTo: ["app_mention", "message"],
-    // Each message answered in public counts as an ask (usage.ts).
     respondWhen: (e) => {
       const respond = shouldRespond(e);
       const user = e.user?.id;
@@ -205,7 +204,6 @@ export async function createApp(config: Config) {
       if (path === "/status" && req.method === "GET") {
         const refusal = statusRefusal(req, config.statusToken);
         if (refusal) return refusal;
-        // Usage over the last ?days= (1–90, default 7).
         const days = Number.parseInt(url.searchParams.get("days") ?? "", 10);
         const since = new Date(Date.now() - (Number.isNaN(days) ? 7 : Math.min(90, Math.max(1, days))) * 86_400_000);
         return Response.json({
