@@ -46,6 +46,9 @@ In the app's settings, using the tunnel URL:
   `url_verification` echo work.
   - **Subscribe to bot events:** `app_mention`, `message.channels`, and `message.im`
     unless `DM_MODE=ignore` → Save → reinstall if Slack asks.
+- **App Home** → Messages Tab on, **and** tick "Allow users to send Slash commands and
+  messages from the messages tab" (unless `DM_MODE=ignore`). Without the tick, a DM
+  reads "Sending messages to this app has been turned off". Reload Slack (⌘R) after.
 - **Interactivity** → on → the same URL. Only needed for Approve/Deny on pull requests.
 
 The quick tunnel's URL changes every time `cloudflared` restarts. Update both URLs
@@ -86,7 +89,7 @@ Chinese and English history), native Bun host behind a quick tunnel.
 | 5 | pass | `message_changed` carried `message.ts` and `edited.ts`; only the new wording cited |
 | 6 | pass | `message_deleted` carried `deleted_ts` and `previous_message`; `documents` −1 |
 | 7 | pass | root deletion arrived as `message_changed` with `message.subtype: "tombstone"`; the reply stayed findable, the root's text did not |
-| 8 | pass | no reply in a DM or a private channel; neither event reached `onEvent` |
+| 8 | pass | before DM_MODE: no reply in a DM or a private channel. With `DM_MODE=redirect` (after enabling the App Home messages tab, `im:history`, `message.im`): the DM arrived as a `message` with `channel_type: "im"`, got one line linking the channel, the agent's own reply came back with `bot_id` and was skipped, and `documents` did not change |
 | 9 | pass | after a restart, `reconciled: { refreshed: 1, removed: 1 }`; the reply made while down was indexed, the deleted one was gone |
 
 Every event shape matched `conformance/mock.ts`. What the run found instead was in
