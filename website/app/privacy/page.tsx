@@ -1,5 +1,6 @@
-// What this site stores and why. Keep it in step with app/_actions.ts and
-// db/migrations/: every stored field is named here.
+// What this site stores and why. Keep it in step with app/_actions.ts,
+// db/migrations/ and creek-entry.js (counter retention): every stored field is
+// named here. Keep it true of what the browser loads too (fonts are self-hosted).
 export const prerender = true;
 
 // A page with no loader can't serve .json (junebuild/june#225); /privacy.md covers agents.
@@ -26,11 +27,13 @@ If you ask for early access, we store:
 - **Your email address**, lowercased, and **when you signed up**. We use it to send you
   one email when hosted Lorehouse opens. We don't share or sell it, and we don't add
   you to anything else.
-- **A counter of sign-up attempts per hour**, keyed by a one-way hash (SHA-256) of your
-  IP address, never the address itself. It stops one source from flooding the list.
-  Counters are deleted after a day.
+- **Two counters of sign-up attempts per hour**, which stop anyone flooding the list:
+  one keyed by a one-way hash (SHA-256) of your IP address, never the address itself,
+  and one site-wide total that says nothing about who made the attempts. Both are
+  deleted once they're a day old; a job checks every hour.
 
-That's all. The site sets no cookies and runs no analytics scripts.
+That's all. The site sets no cookies, runs no analytics scripts, and serves its own
+fonts, so your browser contacts no one else to show it.
 
 ## Who handles it
 
@@ -71,11 +74,15 @@ export default function Privacy() {
             hosted Lorehouse opens. We don't share or sell it, and we don't add you to anything else.
           </li>
           <li>
-            <b>A counter of sign-up attempts per hour</b>, keyed by a one-way hash (SHA-256) of your IP address, never
-            the address itself. It stops one source from flooding the list. Counters are deleted after a day.
+            <b>Two counters of sign-up attempts per hour</b>, which stop anyone flooding the list: one keyed by a
+            one-way hash (SHA-256) of your IP address, never the address itself, and one site-wide total that says
+            nothing about who made the attempts. Both are deleted once they're a day old; a job checks every hour.
           </li>
         </ul>
-        <p>That's all. The site sets no cookies and runs no analytics scripts.</p>
+        <p>
+          That's all. The site sets no cookies, runs no analytics scripts, and serves its own fonts, so your browser
+          contacts no one else to show it.
+        </p>
 
         <h2>Who handles it</h2>
         <p>
