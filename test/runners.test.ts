@@ -49,6 +49,40 @@ describe("over WebSocket", () => {
   });
 });
 
+describe("a replaced connection", () => {
+  test("its late frames are ignored: a status can't overwrite the new one's, a result can't settle the new one's job", async () => {
+    const hub = hubWith();
+    const old = wsRunner(hub, "r1", 4, 0);
+    const fresh = wsRunner(hub, "r1", 4, 1);
+    old.link.status(status("r1", 4, 4)); // stale: would claim the runner is full
+    expect(hub.status()[0]).toMatchObject({ capacity: 4, running: 1 });
+    const done = hub.sandbox("s1").exec("true");
+    old.link.result(ok(fresh.sent[0]!, { exitCode: 0, stdout: "stale", stderr: "" }));
+    fresh.link.result(ok(fresh.sent[0]!, { exitCode: 0, stdout: "fresh", stderr: "" }));
+    expect((await done).stdout).toBe("fresh");
+  });
+
+  test("jobs that went out on it fail at once when a new connection takes over, not at their deadline", async () => {
+    const hub = hubWith();
+    wsRunner(hub, "r1");
+    const inFlight = hub.sandbox("s1").exec("sleep 100", { timeoutMs: 600_000 });
+    wsRunner(hub, "r1");
+    await expect(inFlight).rejects.toThrow(/reconnected; the job's connection is gone/);
+  });
+
+  test("a poll can't displace a live WebSocket, and a poller's results can't settle the socket's jobs", async () => {
+    const hub = hubWith({ pollWaitMs: 20 });
+    const ws = wsRunner(hub, "r1");
+    expect(await hub.poll(status("r1"))).toEqual([]); // a stale poller with the same name
+    expect(hub.status()[0]).toMatchObject({ transport: "ws" });
+    const done = hub.sandbox("s1").exec("true");
+    expect(ws.sent).toHaveLength(1); // the socket still gets the work
+    hub.results("r1", [ok(ws.sent[0]!, { exitCode: 0, stdout: "via poll", stderr: "" })]);
+    ws.link.result(ok(ws.sent[0]!, { exitCode: 0, stdout: "via ws", stderr: "" }));
+    expect((await done).stdout).toBe("via ws");
+  });
+});
+
 describe("over long poll", () => {
   test("a held poll returns as soon as a job arrives, and posted results resolve the call", async () => {
     const hub = hubWith({ pollWaitMs: 5000 });
