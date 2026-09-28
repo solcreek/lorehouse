@@ -33,6 +33,7 @@ INGEST_DEBOUNCE_MS=2000
 ```
 
 ```bash
+bun run doctor                                      # every ✗ names its fix
 bun start                                           # :3000
 cloudflared tunnel --url http://localhost:3000     # prints https://<random>.trycloudflare.com
 ```
@@ -54,6 +55,9 @@ In the app's settings, using the tunnel URL:
 
 The quick tunnel's URL changes every time `cloudflared` restarts. Update both URLs
 when it does.
+
+`bun run doctor --url https://<tunnel>` then checks the path Slack takes: the tunnel
+reaches the app, and the app answers Slack's URL check with your signing secret.
 
 ## 4. Check, in order
 

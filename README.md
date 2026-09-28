@@ -89,6 +89,13 @@ configured to handle interactive responses"). A fresh
 volume backfills from Slack on first start, so nothing needs copying over. Keep the
 `STATUS_TOKEN` you set: without it `/status` is closed to you too.
 
+To check the deployment, run the doctor on the machine itself, where the secrets are
+already in its environment:
+
+```bash
+fly ssh console -a <app> -C "lorehouse doctor --url https://<app>.fly.dev"
+```
+
 CI deploys every merge to `main` that passes the conformance suite. To do the same:
 
 1. Create a token that can deploy only this app: `fly tokens create deploy -a <app>`.
@@ -103,10 +110,24 @@ The deploy job pins its actions to commit SHAs, because it holds that token.
 bun install
 SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=xoxb-… ANTHROPIC_API_KEY=… \
 AGENT_CHANNELS=C0123456 \
-bun start                       # POST /slack/events, GET /healthz, GET /status (with STATUS_TOKEN)
+bun start                       # POST /slack/events, GET /healthz, GET /status (with STATUS_TOKEN), /api/v1 (with ADMIN_TOKEN)
 
 bun run build                   # → dist/lorehouse, a single binary
 ```
+
+Before starting, and whenever something doesn't answer, run the doctor with the same
+environment. It asks Slack, Anthropic, GitHub and the sandbox host directly, and says what
+to fix: a bot not invited to a channel, a missing scope, a model that doesn't exist, a
+GitHub App that can't open pull requests. With `--url` it also checks the running
+deployment: that it answers Slack's URL check with the same signing secret, and what
+`/status` reports.
+
+```bash
+bun run doctor                          # or: lorehouse doctor
+lorehouse doctor --url https://<app>    # also the running deployment
+```
+
+It exits 1 if anything failed, so it can gate a deploy.
 
 To set up Slack:
 
@@ -115,6 +136,7 @@ To set up Slack:
 2. Subscribe to the events `app_mention`, `message.channels` and `message.im`.
 3. Invite the bot to each allowed channel. Slack won't serve history to a non-member, so
    the backfill fails with `not_in_channel`, and `GET /status` shows the error.
+   `lorehouse doctor` checks all three before you start.
 
 [`docs/live-slack.md`](docs/live-slack.md) walks through it end to end.
 
@@ -124,6 +146,7 @@ To set up Slack:
 | `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never works in private channels |
 | `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call), `ignore`, or `answer` (from public knowledge; not with the code tools). A DM is never indexed |
 | `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). `/healthz` is always open and says only `ok` |
+| `ADMIN_TOKEN` | (none) | bearer token for the read-only [admin API](docs/admin-api.md) under `/api/v1`: the indexed threads and their text, search, the agent's threads, the sandboxes. 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |
 | `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
 | `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |

@@ -22,7 +22,7 @@ import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { WORKDIR, type SandboxFor } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
-import type { GithubAccess } from "../github-auth";
+import type { GitIdentity, GithubAccess } from "../github-auth";
 import { gitWithToken, tokenEnv } from "./git-credential";
 
 export type PullRequestOptions = {
@@ -30,6 +30,9 @@ export type PullRequestOptions = {
   // A write credential for the repo, asked for only after a human approved.
   github: GithubAccess;
   identity?: AgentIdentity; // default: scout
+  // The approver's name for the PR body, from their Slack user id. The id itself never
+  // goes into the PR: it identifies the workspace, and a PR can be public.
+  approverName?: (slackUserId: string) => Promise<string | undefined>;
   fetch?: typeof fetch; // injectable for tests
 };
 
@@ -55,8 +58,11 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       },
     },
     run: async (input: Input, ctx: ToolContext) => {
-      if (!input.branch.startsWith(BRANCH_PREFIX) || !/^[\w./-]+$/.test(input.branch)) {
-        return { error: `branch must start with "${BRANCH_PREFIX}" and contain only [A-Za-z0-9_./-]` };
+      if (!input.branch.startsWith(BRANCH_PREFIX) || !isPlainRef(input.branch)) {
+        return { error: `branch must start with "${BRANCH_PREFIX}" and be a plain branch name ([A-Za-z0-9_./-], no "..")` };
+      }
+      if (input.base !== undefined && !isPlainRef(input.base)) {
+        return { error: `base must be a plain branch name ([A-Za-z0-9_./-], no "..")` };
       }
       const sb = opts.sandboxFor(ctx);
       const sh = async (command: string, env?: Record<string, string>) => {
@@ -73,11 +79,51 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         repo = parseGithubRemote(await sh("git remote get-url origin"));
         base = input.base ?? (await sh("git rev-parse --abbrev-ref origin/HEAD")).replace(/^origin\//, "");
         head = await sh("git rev-parse HEAD");
+        // Both come from the sandbox (the model's), and go into shell commands below, one of
+        // them carrying the token: only a plain ref name and a full commit id get that far.
+        if (!isPlainRef(base)) return { error: "the repo's default branch isn't a plain branch name; give base explicitly" };
+        if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) return { error: "HEAD isn't a commit id" };
+        // A base this checkout hasn't fetched: say how to get it, rather than git's failure.
+        // git fetch in workspace_exec has no access to a private repo; workspace_clone does.
+        const known = await sb.exec(`git rev-parse --verify --quiet origin/${base}`, { cwd: WORKDIR, timeoutMs: 30_000 });
+        if (known.exitCode !== 0) {
+          return { error: `origin/${base} isn't in this checkout yet. Fetch with workspace_clone (${repo.owner}/${repo.name}); git fetch in workspace_exec has no access. Then call open_pull_request again.` };
+        }
         stat = await sh(`git diff --stat origin/${base}...HEAD`);
       } catch (e) {
         return { error: (e as Error).message };
       }
       if (!stat) return { error: `HEAD has no changes against origin/${base}` };
+
+      // Every commit must be by the account the PR comes from (the App's bot), before anyone
+      // is asked to approve it: a commit made before that was enforced, or with an identity
+      // the model set, would otherwise go out under a made-up name. It fails closed: when
+      // the account can't be looked up (GitHub unreachable), nobody is asked to approve
+      // commits that can't be checked. Only a credential with no account to commit as
+      // (no identity provider) skips the check.
+      let who: GitIdentity | undefined;
+      try {
+        who = await opts.github.identity?.();
+      } catch (e) {
+        return { error: `can't check who the commits are by: looking up the GitHub account failed (${(e as Error).message}). Nothing was pushed; try again shortly.` };
+      }
+      if (who) {
+        const want = `${who.name} <${who.email}>`;
+        let lines: string[];
+        try {
+          lines = (await sh(`git log --format='%an <%ae>|%cn <%ce>' origin/${base}..HEAD`)).split("\n").filter(Boolean);
+        } catch (e) {
+          return { error: (e as Error).message };
+        }
+        const off = lines.filter((l) => l !== `${want}|${want}`).length;
+        if (off) {
+          return {
+            error:
+              `${off} of ${lines.length} commit(s) on HEAD aren't by ${want}. Re-author them, then call open_pull_request again: ` +
+              `workspace_exec \`git rebase --exec 'git commit --amend --no-edit --reset-author' origin/${base}\` (commands already run as ${who.name}).`,
+          };
+        }
+      }
 
       const approved = await ctx.requestInput({
         id: `pr:${input.branch}:${head.slice(0, 12)}`,
@@ -99,6 +145,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       } catch (e) {
         return { error: `push failed: ${(e as Error).message}` };
       }
+      // A push to the URL (not to `origin`) doesn't update origin/<branch>: record it, so the
+      // checkout knows what it pushed and a later PR can be based on this branch. Local only;
+      // if it fails, a fetch (workspace_clone) brings it in anyway.
+      await sb.exec(`git update-ref refs/remotes/origin/${input.branch} ${head}`, { cwd: WORKDIR, timeoutMs: 30_000 }).catch(() => undefined);
 
       const gh = (path: string, init?: RequestInit) =>
         f(`https://api.github.com/repos/${repo.owner}/${repo.name}${path}`, {
@@ -116,10 +166,9 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         const [pr] = (await existing.json()) as { html_url: string; number: number }[];
         if (pr) return { status: "exists", url: pr.html_url, number: pr.number };
       }
-      const approver = ctx.event?.user?.id;
-      const body =
-        `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack` +
-        (approver ? `, approved by Slack user ${approver}` : "") + ".";
+      const approverId = ctx.event?.user?.id;
+      const approver = approverId ? await opts.approverName?.(approverId).catch(() => undefined) : undefined;
+      const body = `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack, approved there${approver ? ` by ${approver}` : ""}.`;
       const res = await gh("/pulls", {
         method: "POST",
         body: JSON.stringify({ title: input.title, head: input.branch, base, body, draft: true }),
@@ -129,6 +178,13 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       return { status: "opened", url: pr.html_url, number: pr.number };
     },
   };
+}
+
+// A branch name safe to put in a shell command and a git refspec: letters, digits and
+// _ . / - only (no shell metacharacters, no spaces), not starting with - or /, no "..",
+// "//" or trailing "/" or ".lock" (which git refuses anyway).
+export function isPlainRef(ref: string): boolean {
+  return /^[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}$/.test(ref) && !ref.includes("..") && !ref.includes("//") && !ref.endsWith("/") && !ref.endsWith(".lock");
 }
 
 // A remote on github.com itself: https://github.com/o/r, git@github.com:o/r or

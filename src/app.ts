@@ -24,6 +24,7 @@ import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
+import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
 import { feedbackOf, recordAsk, recordFeedback, recordSearch, usageSummary } from "./usage";
 import { pullRequestTool } from "./tools/pull-request";
@@ -104,7 +105,8 @@ export async function createApp(config: Config) {
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
     const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey }) : staticToken(sb.github.token);
-    tools.push(...workspaceTools(sandboxFor), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity }));
+    const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
+    tools.push(...workspaceTools(sandboxFor, { commitAs: github.identity }), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName }));
   }
 
   const dm = config.agent.dm;
@@ -188,6 +190,14 @@ export async function createApp(config: Config) {
   });
   const runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions);
   const mounted = mountAgent(agent, runtime);
+  // The read-only admin API (/api/v1), behind ADMIN_TOKEN.
+  const admin = adminRoutes({
+    db: knowledge,
+    token: config.adminToken,
+    ingest: () => ingester?.status(),
+    sandbox: config.sandbox?.mode ?? "off",
+    runners: hub ? () => hub.status() : undefined,
+  });
 
   return {
     identity,
@@ -213,6 +223,8 @@ export async function createApp(config: Config) {
           ...(hub ? { runners: hub.status() } : {}),
         });
       }
+      const adminReply = await admin(req);
+      if (adminReply) return adminReply;
       const runnerReply = await runners?.handle(req, server);
       if (runnerReply) return runnerReply;
       return (await mounted.fetch(req)) ?? new Response("not found", { status: 404 });

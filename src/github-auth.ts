@@ -13,10 +13,31 @@
 import { createSign } from "node:crypto";
 
 export type RepoRef = { owner: string; name: string };
-export type GithubAccess = (repo: RepoRef, access: "read" | "write") => Promise<string>;
+// Who the agent's commits are by: the GitHub account the credential acts as, with its
+// noreply address, so GitHub links each commit to that account (the App's bot).
+export type GitIdentity = { name: string; email: string };
+export type GithubAccess = ((repo: RepoRef, access: "read" | "write") => Promise<string>) & { identity?: () => Promise<GitIdentity> };
 
-export function staticToken(token: string): GithubAccess {
-  return async () => token;
+const noreply = (id: number, login: string): GitIdentity => ({ name: login, email: `${id}+${login}@users.noreply.github.com` });
+const HEADERS = { accept: "application/vnd.github+json", "user-agent": "lorehouse" };
+
+// Look something up once; a failure isn't cached, so the next call tries again.
+function once<T>(load: () => Promise<T>): () => Promise<T> {
+  let p: Promise<T> | undefined;
+  return () => (p ??= load().catch((e) => { p = undefined; throw e; }));
+}
+
+export function staticToken(token: string, opts: { fetch?: typeof fetch; apiUrl?: string } = {}): GithubAccess {
+  const f = opts.fetch ?? fetch;
+  const api = (opts.apiUrl ?? "https://api.github.com").replace(/\/$/, "");
+  const access: GithubAccess = async () => token;
+  access.identity = once(async () => {
+    const res = await f(`${api}/user`, { headers: { ...HEADERS, authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`GitHub: who is this token? ${res.status}`);
+    const u = (await res.json()) as { id: number; login: string };
+    return noreply(u.id, u.login);
+  });
+  return access;
 }
 
 type AppOptions = { appId: string; privateKey: string; fetch?: typeof fetch; now?: () => number; apiUrl?: string };
@@ -43,7 +64,7 @@ export function githubApp(opts: AppOptions): GithubAccess {
     });
   }
 
-  return async (repo, access) => {
+  const tokenFor: GithubAccess = async (repo, access) => {
     const key = `${repo.owner}/${repo.name}:${access}`;
     const hit = cache.get(key);
     if (hit && hit.expiresAt - 5 * 60_000 > now()) return hit.token;
@@ -60,6 +81,17 @@ export function githubApp(opts: AppOptions): GithubAccess {
     cache.set(key, { token, expiresAt: Date.parse(expires_at) });
     return token;
   };
+  // The App's bot user, "<slug>[bot]": the App says its slug, the (public) user record its id.
+  tokenFor.identity = once(async () => {
+    const app = await call("/app");
+    if (!app.ok) throw new Error(`GitHub App: looking up the App: ${app.status}`);
+    const { slug } = (await app.json()) as { slug: string };
+    const login = `${slug}[bot]`;
+    const user = await f(`${api}/users/${encodeURIComponent(login)}`, { headers: HEADERS });
+    if (!user.ok) throw new Error(`GitHub: looking up ${login}: ${user.status}`);
+    return noreply(((await user.json()) as { id: number }).id, login);
+  });
+  return tokenFor;
 }
 
 // A PEM from the environment: platforms often store it with literal "\n" escapes.
