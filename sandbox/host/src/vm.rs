@@ -302,17 +302,30 @@ impl Manager {
         }
     }
 
+    /// Every sandbox that exists: those used since this process started, and the disks
+    /// kept from earlier runs (not running; idle since their disk last changed).
     pub async fn list(&self) -> Vec<Listing> {
         let list: Vec<Arc<Sandbox>> = self.sandboxes.lock().await.values().cloned().collect();
         let now = now_secs();
         let mut out = Vec::new();
-        for sb in list {
+        for sb in &list {
             out.push(Listing {
                 id: sb.id.clone(),
                 running: sb.running.lock().await.is_some(),
                 idle_secs: now.saturating_sub(sb.last_used.load(Ordering::SeqCst)),
                 in_flight: sb.in_flight.load(Ordering::SeqCst),
             });
+        }
+        if let Ok(mut dirs) = tokio::fs::read_dir(&self.cfg.state_dir).await {
+            while let Ok(Some(entry)) = dirs.next_entry().await {
+                let Some(id) = entry.file_name().to_str().map(String::from) else { continue };
+                if !valid_id(&id) || list.iter().any(|sb| sb.id == id) {
+                    continue;
+                }
+                let Ok(meta) = tokio::fs::metadata(entry.path().join("rootfs.ext4")).await else { continue };
+                let changed = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(now);
+                out.push(Listing { id, running: false, idle_secs: now.saturating_sub(changed), in_flight: 0 });
+            }
         }
         out
     }
