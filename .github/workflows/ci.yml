@@ -29,15 +29,27 @@ jobs:
           go-version-file: sandbox/guest/go.mod
       - run: go vet ./...
         working-directory: sandbox/guest
+      - run: go test ./...
+        working-directory: sandbox/guest
       - run: CGO_ENABLED=0 go build ./...
         working-directory: sandbox/guest
+
+  sandbox-host:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sandbox/host
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo build --locked --release
 
   # A merge to main that passes the contract goes live; pull requests never deploy.
   # Only this repository deploys (a fork has no FLY_API_TOKEN). flyctl waits for the
   # new machine's /healthz before it reports success.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
-    needs: [check, sandbox-guest]
+    needs: [check, sandbox-guest, sandbox-host]
     runs-on: ubuntu-latest
     concurrency:
       group: deploy

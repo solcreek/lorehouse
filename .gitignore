@@ -11,3 +11,6 @@ dist/
 # Its conclusions live in docs/experiments/. (Root-anchored: a bare `experiments/`
 # would also hide docs/experiments/.)
 /experiments/
+
+# Rust build output (sandbox/host)
+target/

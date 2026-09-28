@@ -13,10 +13,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -30,6 +30,35 @@ import (
 )
 
 const port = 1024
+
+// Output a command can return, per stream. A command like `yes` must not exhaust the
+// guest's memory or the host's: past the limit only the tail is kept (a failing test
+// run's summary is at the end), with a marker saying how much was dropped.
+const maxOutput = 4 << 20
+
+// Largest file GET /file returns.
+const maxFile = 16 << 20
+
+type tailBuffer struct {
+	buf     []byte
+	dropped int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if over := len(t.buf) - maxOutput; over > 0 {
+		t.dropped += over
+		t.buf = append(t.buf[:0:0], t.buf[over:]...)
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	if t.dropped == 0 {
+		return string(t.buf)
+	}
+	return fmt.Sprintf("[guestd: %d earlier bytes dropped]\n%s", t.dropped, t.buf)
+}
 
 type execReq struct {
 	Command   string            `json:"command"`
@@ -88,7 +117,7 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	cmd.Cancel = func() error { return unix.Kill(-cmd.Process.Pid, unix.SIGKILL) }
 	cmd.WaitDelay = 5 * time.Second
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr tailBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	res := execRes{}
 	if err := cmd.Run(); err != nil {
@@ -98,11 +127,11 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 			res.ExitCode = ee.ExitCode()
 		default:
 			res.ExitCode = 127
-			stderr.WriteString(err.Error())
+			stderr.Write([]byte(err.Error()))
 		}
 		if ctx.Err() == context.DeadlineExceeded {
 			res.ExitCode = 124
-			stderr.WriteString("\n[guestd] command timed out")
+			stderr.Write([]byte("\n[guestd] command timed out"))
 		}
 	}
 	res.Stdout, res.Stderr = stdout.String(), stderr.String()
@@ -111,7 +140,12 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleRead(w http.ResponseWriter, r *http.Request) {
-	b, err := os.ReadFile(r.URL.Query().Get("path"))
+	path := r.URL.Query().Get("path")
+	if info, err := os.Stat(path); err == nil && info.Size() > maxFile {
+		http.Error(w, fmt.Sprintf("file is %d bytes; the limit is %d", info.Size(), maxFile), http.StatusRequestEntityTooLarge)
+		return
+	}
+	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
