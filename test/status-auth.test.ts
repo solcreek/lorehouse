@@ -22,6 +22,12 @@ describe("statusRefusal", () => {
     expect(statusRefusal(req("Basic s3cret"), "s3cret")?.status).toBe(401);
   });
 
+  test("the scheme name is case-insensitive; the token is not", () => {
+    expect(statusRefusal(req("bearer s3cret"), "s3cret")).toBeUndefined();
+    expect(statusRefusal(req("BEARER s3cret"), "s3cret")).toBeUndefined();
+    expect(statusRefusal(req("Bearer S3CRET"), "s3cret")?.status).toBe(401);
+  });
+
   test("a refusal says it wants a bearer token", () => {
     expect(statusRefusal(req(), "s3cret")?.headers.get("www-authenticate")).toBe("Bearer");
   });
