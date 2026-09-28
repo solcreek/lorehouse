@@ -1,0 +1,9 @@
+# Only what the build stage copies. Never secrets or local data.
+.env*
+.dev.vars
+*.db
+*.db-*
+node_modules
+dist
+experiments
+.git
