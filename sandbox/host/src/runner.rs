@@ -172,8 +172,10 @@ impl Runner {
         eprintln!("sandboxd: connected to {} over WebSocket as {}", self.app_url, self.name);
         let (mut sink, mut stream) = socket.split();
         let (out, mut out_rx) = mpsc::channel::<Message>(64);
-        // One writer: status every 20 s, and results as jobs finish.
-        let writer = tokio::spawn(async move {
+        // One writer: status every 20 s, and results as jobs finish. It ends when a send
+        // fails, and the read loop below watches for that: a connection that can no longer
+        // be written to must end the session (and reconnect) even if nothing more is read.
+        let mut writer = tokio::spawn(async move {
             while let Some(m) = out_rx.recv().await {
                 if sink.send(m).await.is_err() {
                     break;
@@ -194,7 +196,11 @@ impl Runner {
             })
         };
         let end = loop {
-            match stream.next().await {
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = &mut writer => break "writing to the app failed".to_string(),
+            };
+            match next {
                 Some(Ok(Message::Text(t))) => {
                     #[derive(Deserialize)]
                     struct Frame {
