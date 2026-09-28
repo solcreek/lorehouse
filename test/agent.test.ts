@@ -342,6 +342,22 @@ describe("agent identity — the name is per-install config", () => {
     expect((post.body as { body: string }).body).toContain("Opened by Atlas from Slack");
   });
 
+  test("the PR names who approved it, never by Slack user id; unknown, it says only that it was approved", async () => {
+    const approvedBy = (userId: string) => ({ requestInput: async () => true, event: { user: { id: userId } } }) as never;
+    const bodyWith = async (approverName?: (id: string) => Promise<string | undefined>) => {
+      const gh = fakeGithub();
+      const tool = pullRequestTool({ sandboxFor: () => fakeRepo().sb, github: staticToken("t"), fetch: gh.f, approverName });
+      await tool.run({ branch: "scout/x", title: "x" }, approvedBy("U0SECRETID"));
+      return (gh.reqs.find((r) => r.method === "POST")!.body as { body: string }).body;
+    };
+    const named = await bodyWith(async (id) => (id === "U0SECRETID" ? "Ada Park" : undefined));
+    expect(named).toContain("Opened by Scout from Slack, approved there by Ada Park.");
+    for (const body of [named, await bodyWith(), await bodyWith(async () => undefined), await bodyWith(async () => { throw new Error("users.info down"); })]) {
+      expect(body).not.toContain("U0SECRETID");
+    }
+    expect(await bodyWith()).toContain("Opened by Scout from Slack, approved there.");
+  });
+
   test("instructions carry the name, the prefix, and the trailer only when configured", () => {
     const withTrailer = systemPrompt(agentIdentity("scout", "Scout <scout@example.com>"));
     expect(withTrailer).toContain("You are Scout");

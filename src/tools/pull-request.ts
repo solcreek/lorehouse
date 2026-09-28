@@ -30,6 +30,9 @@ export type PullRequestOptions = {
   // A write credential for the repo, asked for only after a human approved.
   github: GithubAccess;
   identity?: AgentIdentity; // default: scout
+  // The approver's name for the PR body, from their Slack user id. The id itself never
+  // goes into the PR: it identifies the workspace, and a PR can be public.
+  approverName?: (slackUserId: string) => Promise<string | undefined>;
   fetch?: typeof fetch; // injectable for tests
 };
 
@@ -116,10 +119,9 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         const [pr] = (await existing.json()) as { html_url: string; number: number }[];
         if (pr) return { status: "exists", url: pr.html_url, number: pr.number };
       }
-      const approver = ctx.event?.user?.id;
-      const body =
-        `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack` +
-        (approver ? `, approved by Slack user ${approver}` : "") + ".";
+      const approverId = ctx.event?.user?.id;
+      const approver = approverId ? await opts.approverName?.(approverId).catch(() => undefined) : undefined;
+      const body = `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack, approved there${approver ? ` by ${approver}` : ""}.`;
       const res = await gh("/pulls", {
         method: "POST",
         body: JSON.stringify({ title: input.title, head: input.branch, base, body, draft: true }),
