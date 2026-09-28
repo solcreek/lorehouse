@@ -3,7 +3,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { anthropic, type AnthropicClient } from "@junejs/core/agent-models";
-import { slackChannel } from "@junejs/core/channels";
+import { slackChannel, type SlackNormalizedEvent } from "@junejs/core/channels";
 import { defineAgent, type Channel } from "@junejs/core/agent-config";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
@@ -25,6 +25,7 @@ import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { inThread, isFollowUp, joinThread } from "./threads";
+import { recordAsk, recordSearch } from "./usage";
 import { pullRequestTool } from "./tools/pull-request";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
@@ -63,8 +64,22 @@ export async function createApp(config: Config) {
       })
     : undefined;
 
+  // Usage is bookkeeping: a failed write is logged, never allowed to cost an answer.
+  const tally = (write: () => void) => {
+    try {
+      write();
+    } catch (err) {
+      console.error("usage:", err);
+    }
+  };
+
   const tools: Tool[] = [
-    searchKnowledgeTool(searcher(knowledge)),
+    // A search is counted in the Slack thread it ran for; DMs aren't counted.
+    searchKnowledgeTool(searcher(knowledge), (query, hits, ctx) => {
+      const e = ctx.event as SlackNormalizedEvent | undefined;
+      if (e?.source !== "slack" || !e.channelId || !e.threadId || e.channelType === "im") return;
+      tally(() => recordSearch(knowledge, { channel: e.channelId, threadTs: e.threadId!, query, hits }));
+    }),
     recentKnowledgeTool((o) => recentDocuments(knowledge, o)),
   ];
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
@@ -83,6 +98,10 @@ export async function createApp(config: Config) {
   }
 
   const dm = config.agent.dm;
+  const shouldRespond = (e: SlackNormalizedEvent) =>
+    e.kind === "app_mention" ||
+    (dm === "answer" && e.channelType === "im") ||
+    isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread));
   const slack: Channel = withNamedPeople(slackChannel({
     signingSecret: config.slack.signingSecret,
     botToken: config.slack.botToken,
@@ -93,10 +112,13 @@ export async function createApp(config: Config) {
     // (see threads.ts); with DM_MODE=answer, DMs too. Those arrive as `message` events
     // like every channel message: respondWhen keeps the rest to knowledge.
     respondTo: ["app_mention", "message"],
-    respondWhen: (e) =>
-      e.kind === "app_mention" ||
-      (dm === "answer" && e.channelType === "im") ||
-      isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread)),
+    // Each message answered in public counts as an ask (usage.ts).
+    respondWhen: (e) => {
+      const respond = shouldRespond(e);
+      const user = e.user?.id;
+      if (respond && e.channelType !== "im" && user) tally(() => recordAsk(knowledge, { channel: e.channelId, ts: e.ts, threadTs: e.threadId ?? e.ts, user }));
+      return respond;
+    },
     // A mention asks the agent into its thread.
     on: { app_mention: (e) => joinThread(knowledge, e.channelId, e.threadId ?? e.ts) },
     // Every public message event the policy lets through (new, edited, deleted) keeps
