@@ -25,7 +25,7 @@ import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { inThread, isFollowUp, joinThread } from "./threads";
-import { feedbackOf, recordAsk, recordFeedback, recordSearch } from "./usage";
+import { feedbackOf, recordAsk, recordFeedback, recordSearch, usageSummary } from "./usage";
 import { pullRequestTool } from "./tools/pull-request";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
@@ -70,6 +70,16 @@ export async function createApp(config: Config) {
       write();
     } catch (err) {
       console.error("usage:", err);
+    }
+  };
+
+  // A broken usage read must not take the knowledge and runner status down with it.
+  const usageOrError = (since: Date) => {
+    try {
+      return usageSummary(knowledge, { since });
+    } catch (err) {
+      console.error("usage:", err);
+      return { error: String(err) };
     }
   };
 
@@ -189,14 +199,19 @@ export async function createApp(config: Config) {
     // Bun.serve's websocket handlers (sandbox runners), when runners are enabled.
     websocket: runners?.websocket,
     async fetch(req: Request, server?: Server<RunnerSocketData>): Promise<Response> {
-      const path = new URL(req.url).pathname;
+      const url = new URL(req.url);
+      const path = url.pathname;
       if (path === "/healthz") return new Response("ok");
       if (path === "/status" && req.method === "GET") {
         const refusal = statusRefusal(req, config.statusToken);
         if (refusal) return refusal;
+        // Usage over the last ?days= (1–90, default 7).
+        const days = Number.parseInt(url.searchParams.get("days") ?? "", 10);
+        const since = new Date(Date.now() - (Number.isNaN(days) ? 7 : Math.min(90, Math.max(1, days))) * 86_400_000);
         return Response.json({
           agent: identity.name,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
+          usage: usageOrError(since),
           ...(hub ? { runners: hub.status() } : {}),
         });
       }

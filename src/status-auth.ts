@@ -1,8 +1,9 @@
 // status-auth.ts — bearer tokens: who may read GET /status, and the check itself.
 //
 // /status tells whoever asks which channels the agent reads, how much it knows, when it
-// last saw a message and any ingest error, so it is closed unless STATUS_TOKEN is set,
-// and then needs `Authorization: Bearer <token>`. /healthz stays open (it says only
+// last saw a message and any ingest error, and how people use it, including the text of
+// searches that found nothing. So it is closed unless STATUS_TOKEN is set, and then
+// needs `Authorization: Bearer <token>`. /healthz stays open (it says only
 // "ok", and a platform's health check needs it).
 
 import { createHash, timingSafeEqual } from "node:crypto";

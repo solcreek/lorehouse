@@ -9,9 +9,9 @@
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
 // STATUS_TOKEN, and per scenario DM_MODE. It must answer GET /healthz (open) once
-// listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
-// backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
-// 404 when STATUS_TOKEN is unset).
+// listening, and GET /status with { knowledge: { state: "ready", … }, usage: { … } } once
+// its Slack backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401
+// otherwise; 404 when STATUS_TOKEN is unset).
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
@@ -80,7 +80,12 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
   return { cite: text.match(/\[cite:([^\]\s]+)\]/)?.[1], src: text.match(/\[src:([^\]\s]+)\]/)?.[1], text };
 }
 
-type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
+type Usage = {
+  since: string; people: number; channels: number; threads: number;
+  notFound: { threads: number; of: number; queries: string[] };
+  feedback: { up: number; down: number; people: number; downMessages: { channel: string; ts: string }[] };
+};
+type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } }; usage: Usage };
 const STATUS_TOKEN = "conformance-status";
 const APP = `http://localhost:${APP_PORT}`;
 // Runner mode: sandbox hosts connect in (docs/sandbox-runners.md).
@@ -127,6 +132,17 @@ async function inMode(env: Record<string, string>, run: () => Promise<string | n
   } finally {
     await stopApp();
     await startApp();
+  }
+}
+
+// Run a usage scenario from zero: the app restarted on a database of its own, deleted
+// after, and then restarted on the usual one.
+async function withFreshDb(run: () => Promise<string | null>, env: Record<string, string> = {}): Promise<string | null> {
+  const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+  try {
+    return await inMode({ ...env, LOREHOUSE_DB: db }, run);
+  } finally {
+    removeDb(db);
   }
 }
 
@@ -405,6 +421,50 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "reports usage at GET /status: two people in one thread are 2 people, 1 thread, 1 channel; an answered DM is not counted",
+    run: () => withFreshDb(async () => {
+      const thread = await mentionAndWait("where is the wombat review"); // U1
+      await threadReply(thread, "and which floor is that on?", { user: "U2" });
+      const dm = await directMessage(`[q${++seq}] where is the wombat review`, { user: "U3" });
+      await fetch(`${MOCK}/wait?thread_ts=${dm}&timeout_ms=15000`);
+      await Bun.sleep(1000);
+      const u = (await status()).usage;
+      return u.people === 2 && u.threads === 1 && u.channels === 1 ? null : `people ${u.people}, threads ${u.threads}, channels ${u.channels}; want 2, 1, 1`;
+    }, { DM_MODE: "answer" }),
+  },
+  {
+    name: "reports what knowledge had no answer for: the thread whose search found nothing, and its query",
+    run: () => withFreshDb(async () => {
+      await mentionAndWait("where is the wombat review");
+      await mentionAndWait("qxzv jjkw"); // no document has either word
+      const { notFound } = (await status()).usage;
+      return notFound.threads === 1 && notFound.of === 2 && JSON.stringify(notFound.queries) === JSON.stringify(["qxzv jjkw"])
+        ? null
+        : `notFound ${JSON.stringify(notFound)}, want 1 of 2 threads and the query "qxzv jjkw"`;
+    }),
+  },
+  {
+    name: "counts a 👎 on its own reply as feedback, not one on a person's message or outside the allowlist, and answers no reaction",
+    run: async () => {
+      await reset();
+      const reaction = (type: string, extra: Record<string, unknown> = {}) => {
+        const ts = `${1995000000 + ++seq}.000100`;
+        return { type, user: "U2", reaction: "-1", item_user: "UBOT", item: { type: "message", channel: ALLOWED, ts: "1995000001.000100" }, event_ts: ts, ...extra };
+      };
+      const down = async () => { await Bun.sleep(500); return (await status()).usage.feedback.down; };
+      const before = await down();
+      await sendEvent(reaction("reaction_added"));
+      if ((await down()) !== before + 1) return `a 👎 on its reply: down ${await down()}, want ${before + 1}`;
+      await sendEvent(reaction("reaction_removed"));
+      if ((await down()) !== before) return `the 👎 taken back: down ${await down()}, want ${before}`;
+      await sendEvent(reaction("reaction_added", { item_user: "U1" })); // a person's message
+      await sendEvent(reaction("reaction_added", { item: { type: "message", channel: "C9", ts: "1995000001.000100" } })); // not allowlisted
+      if ((await down()) !== before) return `down ${await down()}, want ${before}: counted a 👎 on a person's message or outside the allowlist`;
+      const s = await stats();
+      return s.modelCalls || s.slackCalls ? `a reaction got a response: ${JSON.stringify(s)}` : null;
+    },
+  },
+  {
     name: "points a DM to the public channel: one reply, no model call, nothing read or indexed (DM_MODE=redirect, the default)",
     run: async () => {
       await reset();
@@ -589,7 +649,7 @@ const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], {
 });
 // A file, not :memory:, so the restart scenario comes back to the same knowledge.
 const DB = join(tmpdir(), `lorehouse-conformance-${process.pid}.db`);
-const removeDb = () => { for (const s of ["", "-wal", "-shm"]) rmSync(DB + s, { force: true }); };
+const removeDb = (path = DB) => { for (const s of ["", "-wal", "-shm"]) rmSync(path + s, { force: true }); };
 removeDb();
 
 let app: ReturnType<typeof Bun.spawn> | undefined;
