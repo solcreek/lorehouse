@@ -302,3 +302,17 @@ pre .c{opacity:.55}
 }
 .cta .done{font:500 26px/1.25 var(--hand);color:var(--pencil)}
 .cta button:disabled{opacity:.6;cursor:progress}
+.cta .note a{color:inherit}
+.titleblock .tb-link{margin-top:6px;color:var(--muted)}
+.titleblock .tb-link:hover{color:var(--ink)}
+
+/* the privacy page: one readable column on the same sheet */
+.doc{max-width:68ch;margin-block:44px 80px;border:1.5px solid var(--ink);background:var(--sheet);padding:40px 44px}
+.doc h1{font-size:clamp(28px,4vw,42px);text-transform:uppercase;margin-top:12px}
+.doc h2{font-size:17px;text-transform:uppercase;letter-spacing:.06em;margin-top:34px;padding-top:14px;border-top:1px solid var(--faint)}
+.doc p,.doc li{font-size:16.5px;margin-top:12px}
+.doc ul{padding-left:20px;margin:0}
+.doc .lede{font-size:18px;color:var(--muted)}
+.doc .addr{font:400 14px var(--mono);border-bottom:1.5px solid var(--orange);user-select:all}
+.doc .updated{margin-top:34px;font:400 11px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+@media (max-width:640px){.doc{padding:28px 20px}}
