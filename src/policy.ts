@@ -15,7 +15,7 @@
 //   • app_mention events carry NO channel_type — so a mention is admitted only in a
 //     channel on the explicit allowlist.
 // An async accept (or a cached conversations.info lookup) in @junejs/core would let this
-// drop the allowlist; see README "Gaps in June".
+// drop the allowlist for mentions. June has neither yet.
 
 type SlackEnvelope = {
   type?: string;
