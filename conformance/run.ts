@@ -199,6 +199,17 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "looking up someone the question mentions, it gets the one name knowledge uses",
+    run: async () => {
+      // The question arrives as Slack's raw text, so a person it mentions is a <@U…> the
+      // model must look up. Slack's users.info gives a handle, a display and a real name;
+      // the model gets the single name the rest of knowledge uses for that person.
+      const { text } = await ask("[whois] what did <@U2> say about the review");
+      const got = text.match(/\[whois:(\{.*?\})\]/)?.[1];
+      return got === JSON.stringify({ name: "Wendy (Wendy Wu)" }) ? null : `looked up ${got}, want {"name":"Wendy (Wendy Wu)"}`;
+    },
+  },
+  {
     name: "answers an overview question from the most recently active thread",
     run: async () => {
       // "what's been discussed lately?" has no keywords to search for; the answer is the

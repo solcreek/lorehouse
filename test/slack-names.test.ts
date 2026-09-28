@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import type { PersonName } from "../src/ingest/slack-users";
-import { namedThreadTool, withNamedThreads } from "../src/tools/slack-names";
+import { namedThreadTool, namedUserTool, withNamedPeople } from "../src/tools/slack-names";
 
 const NAMES = new Map<string, PersonName>([
   ["U5", { short: "hkato", full: "hkato (Hana Kato)" }],
@@ -55,17 +55,46 @@ describe("namedThreadTool", () => {
   });
 });
 
-describe("withNamedThreads", () => {
-  test("swaps only slack_read_thread; the channel's other tools are unchanged", async () => {
-    const other: Tool = { spec: { name: "slack_resolve_user", description: "d", input: { type: "object", properties: {} } }, run: async () => "same" };
-    const channel = withNamedThreads({ name: "slack", tools: () => [rawThreadTool({ messages: [{ user: "U5", text: "x", ts: "1" }] }), other] }, names);
-    const [thread, resolve] = channel.tools!();
+// Stands in for June's slack_resolve_user: three names for one person.
+function rawUserTool(result: unknown): Tool {
+  return {
+    spec: { name: "slack_resolve_user", description: "raw", input: { type: "object", properties: { userId: { type: "string" } } } },
+    run: async () => result,
+  };
+}
+
+describe("namedUserTool", () => {
+  test("returns the person under the one name knowledge uses, not a handle, display and real name", async () => {
+    const tool = namedUserTool(rawUserTool({ id: "U5", name: "hana", realName: "Hana Kato", displayName: "hkato" }), names);
+    expect(await tool.run({ userId: "U5" }, ctx)).toEqual({ id: "U5", name: "hkato (Hana Kato)" });
+  });
+
+  test("someone it can't name here, and errors, pass through as June returned them", async () => {
+    const raw = { id: "U404", name: "ghost", realName: "G", displayName: "g" };
+    expect(await namedUserTool(rawUserTool(raw), names).run({ userId: "U404" }, ctx)).toEqual(raw);
+    expect(await namedUserTool(rawUserTool({ error: "user_not_found" }), names).run({ userId: "U9" }, ctx)).toEqual({ error: "user_not_found" });
+  });
+
+  test("keeps the tool's name and input; the description says to use it for mentions in the question", () => {
+    const tool = namedUserTool(rawUserTool({}), names);
+    expect(tool.spec.name).toBe("slack_resolve_user");
+    expect(tool.spec.input).toEqual({ type: "object", properties: { userId: { type: "string" } } });
+    expect(tool.spec.description).toContain("<@U…> mention in the question");
+  });
+});
+
+describe("withNamedPeople", () => {
+  test("swaps the thread and user tools for the named ones; the channel's other tools are unchanged", async () => {
+    const other: Tool = { spec: { name: "slack_list_reactions", description: "d", input: { type: "object", properties: {} } }, run: async () => "same" };
+    const channel = withNamedPeople({ name: "slack", tools: () => [rawThreadTool({ messages: [{ user: "U5", text: "x", ts: "1" }] }), rawUserTool({ id: "U5", name: "hana" }), other] }, names);
+    const [thread, user, reactions] = channel.tools!();
     expect(await thread!.run({}, ctx)).toEqual({ messages: [{ author: "hkato (Hana Kato)", user: "U5", text: "x", ts: "1" }] });
-    expect(resolve).toBe(other);
+    expect(await user!.run({ userId: "U5" }, ctx)).toEqual({ id: "U5", name: "hkato (Hana Kato)" });
+    expect(reactions).toBe(other);
   });
 
   test("a channel without tools is returned as is", () => {
     const channel: { name: string; tools?: () => Tool[] } = { name: "web" };
-    expect(withNamedThreads(channel, names)).toBe(channel);
+    expect(withNamedPeople(channel, names)).toBe(channel);
   });
 });
