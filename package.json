@@ -9,7 +9,8 @@
     "build": "bun build --compile --minify ./src/server.ts --outfile dist/lorehouse",
     "test": "bun test test/",
     "typecheck": "tsc --noEmit",
-    "conformance": "bun conformance/run.ts"
+    "conformance": "bun conformance/run.ts",
+    "doctor": "bun src/server.ts doctor"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",

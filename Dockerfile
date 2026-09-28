@@ -1,6 +1,7 @@
-# Lorehouse as a container: the single compiled binary (prompts and migrations are
-# built in) on a slim base. Everything it keeps goes under /data, so mount a volume
-# there. Configuration is all environment variables; see the README.
+# Lorehouse as a container: the single compiled binary (prompts, migrations and the
+# Slack manifest `lorehouse doctor` checks scopes against are built in) on a slim base.
+# Everything it keeps goes under /data, so mount a volume there. Configuration is all
+# environment variables; see the README.
 
 FROM oven/bun:1.3 AS build
 WORKDIR /src
@@ -10,6 +11,7 @@ COPY tsconfig.json ./
 COPY src ./src
 COPY prompts ./prompts
 COPY migrations ./migrations
+COPY slack ./slack
 RUN bun run build
 
 FROM debian:bookworm-slim
