@@ -1,7 +1,14 @@
 # sandboxd
 
 The sandbox host: one Firecracker microVM per sandbox id (Lorehouse uses one per Slack
-thread), behind the small HTTP API that `src/sandbox-client.ts` speaks. Rust.
+thread). Rust. Work reaches it one of two ways:
+
+- **Runner** (the usual one): it connects out to Lorehouse over WebSocket or long poll
+  and asks for work, like a CI runner, so it holds no open port and the sandbox API is
+  never on the internet. It works from a data center, a company network or behind NAT.
+  Protocol: [`docs/sandbox-runners.md`](../../docs/sandbox-runners.md).
+- **Serve**: it serves an HTTP API (`src/sandbox-client.ts`) on loopback, for Lorehouse
+  running on the same machine.
 
 - **First use** reflinks the golden rootfs (copy-on-write, milliseconds) and boots it.
 - **Idle** VMs are stopped after `SANDBOXD_IDLE_SECS`; the disk is kept, so a thread that
@@ -29,18 +36,34 @@ sudo SOURCE=<ubuntu-rootfs.ext4> GUESTD=../guest/guestd ./prepare-golden.sh /var
 
 | env | default | |
 |---|---|---|
-| `SANDBOXD_TOKEN` | (required) | bearer token for every `/v1` request, 32+ characters |
+| `SANDBOXD_APP_URL` | (none) | runner mode: Lorehouse's URL, e.g. `https://lorehouse.example.com`. Must be HTTPS: the runner token travels with every request |
+| `SANDBOXD_ALLOW_INSECURE_HTTP` | (off) | `1` allows an `http://` app URL, only for loopback or an already-encrypted private link (e.g. a WireGuard tailnet) in development |
+| `SANDBOXD_RUNNER_TOKEN` | (required with `SANDBOXD_APP_URL`) | Lorehouse's `SANDBOX_RUNNER_TOKEN` |
+| `SANDBOXD_RUNNER_NAME` | the hostname | how Lorehouse knows this host (sandboxes stick to it) |
+| `SANDBOXD_TRANSPORT` | `auto` | `ws`, `poll`, or `auto`: WebSocket, falling back to long poll when an upgrade is refused |
+| `SANDBOXD_TOKEN` | (required without `SANDBOXD_APP_URL`) | serve mode: bearer token for every `/v1` request, 32+ characters |
 | `SANDBOXD_GOLDEN` | (required) | the prepared rootfs |
 | `SANDBOXD_KERNEL` | (required) | guest kernel image |
 | `SANDBOXD_UPLINK` | (required) | the host's internet-facing interface |
-| `SANDBOXD_LISTEN` | `127.0.0.1:8787` | keep it on loopback and publish it through a tunnel |
+| `SANDBOXD_LISTEN` | `127.0.0.1:8787` | serve mode: where the API listens; keep it on loopback |
 | `SANDBOXD_STATE` | `/var/lib/lorehouse-sandboxes` | one directory per sandbox |
 | `SANDBOXD_MAX_VMS` | `4` | running at once (1–64); more gets a 503 |
 | `SANDBOXD_IDLE_SECS` | `900` | idle time before a VM is stopped |
 | `SANDBOXD_VCPUS` `SANDBOXD_MEM_MIB` | `2`, `2048` | per VM |
 
-Then install [`sandboxd.service`](sandboxd.service). Point Lorehouse at it with
-`SANDBOX_URL` and `SANDBOX_TOKEN` (plus `GITHUB_TOKEN` for pull requests).
+Then install [`sandboxd.service`](sandboxd.service). On Lorehouse's side, set
+`SANDBOX_RUNNER_TOKEN` for runners, or `SANDBOX_URL` and `SANDBOX_TOKEN` for a served
+host, plus `GITHUB_TOKEN` for pull requests either way.
+
+[`e2e.ts`](e2e.ts) checks the whole path. It runs Lorehouse in runner mode against the
+conformance mock of Slack and the model, waits for a real sandboxd to connect, and asks for
+a command only a microVM with internet can answer. Two options test the hard paths:
+
+- `E2E_NO_WS_PROXY=1` puts a proxy in front that strips WebSocket upgrades, so a runner on
+  `auto` has to fall back to long poll.
+- `E2E_DROP=1` routes the runner through a TCP relay that cuts every connection for 5 s
+  in the middle of a 12 s job. The runner must reconnect and deliver the result it
+  finished while cut off, and the job must run only once.
 
 ## Measured
 
@@ -53,6 +76,13 @@ On a Ryzen 7 8745HS with btrfs, using a 22 GB Ubuntu 24.04 CI image as the golde
 | boot again after an idle stop (disk kept, page cache warm) | 0.8 s |
 | command on a running VM | 22 ms |
 | golden prepared (reflink + guestd) | 0.13 s |
+| end to end, runner mode: "Slack" mention → command in a cold microVM → answer | 4.6 s over WebSocket, 4.7 s over long poll |
+| every connection cut for 5 s during a 12 s job | the result still arrived after the reconnect, the job ran once: 16.1 s over WebSocket and over long poll |
+
+The end-to-end run (2026-09-28) connected the runner over the tailnet to a Lorehouse on
+another machine. The command's output came from the microVM itself: 2 vCPUs, its own
+kernel, git, and GitHub reachable. Behind a proxy that strips WebSocket upgrades, `auto`
+got a 426 and fell back to long poll.
 
 The acceptance run also covered:
 

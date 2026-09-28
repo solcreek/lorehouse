@@ -25,8 +25,11 @@ export type Config = {
   logSlackEvents: boolean;
   // Bearer token for GET /status. Unset: /status is closed (404).
   statusToken?: string;
-  // Code tools are on only when all three are set.
-  sandbox?: { url: string; token: string; githubToken: string };
+  // Code tools, on when a sandbox is configured (plus GITHUB_TOKEN for pull requests):
+  //   runners  sandbox hosts connect in (SANDBOX_RUNNER_TOKEN); see docs/sandbox-runners.md
+  //   direct   one sandbox host Lorehouse calls (SANDBOX_URL + SANDBOX_TOKEN), e.g. on the
+  //            same machine over loopback
+  sandbox?: { mode: "runners"; runnerToken: string; githubToken: string } | { mode: "direct"; url: string; token: string; githubToken: string };
 };
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -81,12 +84,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     logSlackEvents: env.LOG_SLACK_EVENTS === "1",
     statusToken: env.STATUS_TOKEN || undefined,
   };
-  const sandboxKeys = ["SANDBOX_URL", "SANDBOX_TOKEN", "GITHUB_TOKEN"] as const;
-  const set = sandboxKeys.filter((k) => env[k]);
-  if (set.length === sandboxKeys.length) {
-    config.sandbox = { url: env.SANDBOX_URL!, token: env.SANDBOX_TOKEN!, githubToken: env.GITHUB_TOKEN! };
-  } else if (set.length > 0) {
-    missing.push(...sandboxKeys.filter((k) => !env[k]).map((k) => `${k} (code tools need all of ${sandboxKeys.join(", ")})`));
+  const runners = !!env.SANDBOX_RUNNER_TOKEN;
+  const direct = !!(env.SANDBOX_URL || env.SANDBOX_TOKEN);
+  if (runners && direct) {
+    missing.push("SANDBOX_RUNNER_TOKEN or SANDBOX_URL/SANDBOX_TOKEN (one sandbox mode, not both)");
+  } else if (runners) {
+    if (env.SANDBOX_RUNNER_TOKEN!.length < 32) missing.push("SANDBOX_RUNNER_TOKEN (at least 32 characters)");
+    if (!env.GITHUB_TOKEN) missing.push("GITHUB_TOKEN (code tools need it with SANDBOX_RUNNER_TOKEN)");
+    config.sandbox = { mode: "runners", runnerToken: env.SANDBOX_RUNNER_TOKEN!, githubToken: env.GITHUB_TOKEN ?? "" };
+  } else if (direct || env.GITHUB_TOKEN) {
+    const keys = ["SANDBOX_URL", "SANDBOX_TOKEN", "GITHUB_TOKEN"] as const;
+    const absent = keys.filter((k) => !env[k]);
+    if (absent.length === 0) config.sandbox = { mode: "direct", url: env.SANDBOX_URL!, token: env.SANDBOX_TOKEN!, githubToken: env.GITHUB_TOKEN! };
+    else missing.push(...absent.map((k) => `${k} (code tools need SANDBOX_RUNNER_TOKEN, or all of ${keys.join(", ")}, with GITHUB_TOKEN)`));
   }
   if (config.agent.dm === "answer" && config.sandbox) missing.push("DM_MODE=answer (not with code tools: code work stays in public channels)");
   if (missing.length) throw new Error(`lorehouse: missing or invalid configuration: ${missing.join(", ")}`);

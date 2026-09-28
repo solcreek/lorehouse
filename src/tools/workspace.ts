@@ -19,8 +19,13 @@ export type ExecOptions = {
   // Per-command env. Secrets go HERE, never into the sandbox's persistent env: a model-run
   // `env` or `cat ~/.config/...` in a later command must not be able to read them back.
   env?: Record<string, string>;
+  // Default: EXEC_TIMEOUT_MS.
   timeoutMs?: number;
 };
+
+// A command's timeout when none is given. Sandbox implementations resolve it themselves and
+// send it, so the guest's limit and the caller's deadline are the same number.
+export const EXEC_TIMEOUT_MS = 10 * 60_000;
 
 export interface Sandbox {
   exec(command: string, opts?: ExecOptions): Promise<ExecResult>;
@@ -47,6 +52,18 @@ export function clip(s: string, max = MAX_OUTPUT): string {
 // between the call and its checkpoint re-runs it on replay). Reads are naturally safe;
 // `workspace_exec` is only as idempotent as the command the model chose. Acceptable for a
 // throwaway checkout — the irreversible step (push + PR) lives in its own guarded tool.
+//
+// A failure (no sandbox host connected, the host offline or full, a timeout, a missing
+// file) is returned as { error } for the model to relay or work around. Thrown, June would
+// fail the whole turn and the thread would only see "the turn failed".
+async function orError<T>(work: () => Promise<T>): Promise<T | { error: string }> {
+  try {
+    return await work();
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export function workspaceTools(sandboxFor: SandboxFor): Tool[] {
   return [
     {
@@ -62,10 +79,11 @@ export function workspaceTools(sandboxFor: SandboxFor): Tool[] {
           required: ["command"],
         },
       },
-      run: async (input: { command: string; cwd?: string }, ctx: ToolContext) => {
-        const r = await sandboxFor(ctx).exec(input.command, { cwd: input.cwd ?? WORKDIR, timeoutMs: 10 * 60_000 });
-        return { exitCode: r.exitCode, stdout: clip(r.stdout), stderr: clip(r.stderr, 4_000) };
-      },
+      run: async (input: { command: string; cwd?: string }, ctx: ToolContext) =>
+        orError(async () => {
+          const r = await sandboxFor(ctx).exec(input.command, { cwd: input.cwd ?? WORKDIR, timeoutMs: EXEC_TIMEOUT_MS });
+          return { exitCode: r.exitCode, stdout: clip(r.stdout), stderr: clip(r.stderr, 4_000) };
+        }),
     },
     {
       spec: {
@@ -73,9 +91,8 @@ export function workspaceTools(sandboxFor: SandboxFor): Tool[] {
         description: toolDescription("workspace_read_file", { workdir: WORKDIR }),
         input: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
       },
-      run: async (input: { path: string }, ctx: ToolContext) => {
-        return { path: input.path, content: clip(await sandboxFor(ctx).readFile(resolve(input.path))) };
-      },
+      run: async (input: { path: string }, ctx: ToolContext) =>
+        orError(async () => ({ path: input.path, content: clip(await sandboxFor(ctx).readFile(resolve(input.path))) })),
     },
     {
       spec: {
@@ -87,10 +104,11 @@ export function workspaceTools(sandboxFor: SandboxFor): Tool[] {
           required: ["path", "content"],
         },
       },
-      run: async (input: { path: string; content: string }, ctx: ToolContext) => {
-        await sandboxFor(ctx).writeFile(resolve(input.path), input.content);
-        return { path: input.path, bytes: input.content.length };
-      },
+      run: async (input: { path: string; content: string }, ctx: ToolContext) =>
+        orError(async () => {
+          await sandboxFor(ctx).writeFile(resolve(input.path), input.content);
+          return { path: input.path, bytes: input.content.length };
+        }),
     },
   ];
 }

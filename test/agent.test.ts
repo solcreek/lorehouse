@@ -164,6 +164,22 @@ describe("workspace tools", () => {
     expect(ids).toEqual(["slack:C1:1.1"]);
   });
 
+  test("a sandbox failure comes back to the model as { error }, not a failed turn", async () => {
+    const down: Sandbox = {
+      async exec() { throw new Error("no sandbox runner is connected"); },
+      async readFile(path) { throw new Error(`no such file: ${path}`); },
+      async writeFile() { throw new Error("sandbox PUT /file: 503 busy"); },
+    };
+    const [exec, read, write] = workspaceTools(() => down);
+    expect(await exec!.run({ command: "ls" }, {} as never)).toEqual({ error: "no sandbox runner is connected" });
+    expect(await read!.run({ path: "README.md" }, {} as never)).toEqual({ error: "no such file: /workspace/repo/README.md" });
+    expect(await write!.run({ path: "a", content: "b" }, {} as never)).toEqual({ error: "sandbox PUT /file: 503 busy" });
+  });
+
+  test("every workspace tool's run is an async function, so June runs it as async (it checks constructor.name)", () => {
+    for (const t of workspaceTools(() => ({}) as Sandbox)) expect(t.run.constructor.name).toBe("AsyncFunction");
+  });
+
   test("clip is a no-op under the limit", () => {
     expect(clip("short")).toBe("short");
   });

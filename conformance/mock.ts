@@ -18,8 +18,11 @@
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), or for
 // a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
-// or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), so the
-// harness can check what the tool actually handed the model.
+// or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for
+// "[exec] <command>" (a workspace_exec tool_use), the exit code and output
+// ("[q7] [exec:0:<stdout>] …"), and for a tool that failed, its error text
+// ("[q7] [toolerror:<text>] …"), so the harness can check what the tool actually
+// handed the model.
 //
 // Env: PORT (8900), TTFT_MS (300) delay before the first event, TOKENS (80),
 //      TOKEN_DELAY_MS (15) between text deltas, SLACK_FIXTURES (JSON file:
@@ -164,6 +167,12 @@ function answerFor(messages: Msg[], result: Block): string {
   const words = Array.from({ length: TOKENS }, (_, i) => `w${i}`);
   const value = resultValue(result.content) as { messages?: { author?: string; user?: string; text?: string }[]; id?: string; name?: string; realName?: string } | undefined;
   if (value?.id) return `${nonce} [whois:${JSON.stringify({ name: value.name, realName: value.realName })}] ${words.join(" ")}`;
+  const exec = value as { exitCode?: number; stdout?: string } | undefined;
+  if (typeof exec?.exitCode === "number") return `${nonce} [exec:${exec.exitCode}:${(exec.stdout ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
+  // A tool that failed: its error text, so the harness can check what the model was told.
+  const raw: unknown = resultValue(result.content);
+  const failure = typeof raw === "string" && /error/i.test(raw) ? raw : (raw as { error?: unknown } | undefined)?.error;
+  if (typeof failure === "string") return `${nonce} [toolerror:${failure.replace(/[\[\]\n]/g, " ").slice(0, 200)}] ${words.join(" ")}`;
   const thread = value?.messages;
   if (thread) {
     const first = thread[0] ?? {};
@@ -205,12 +214,14 @@ async function anthropic(req: Request): Promise<Response> {
     // "[recent]" in the question → an overview question: list recent threads instead of searching
     // "[thread]" → read the thread the question was asked in
     // "[whois]" → look up the first person the question mentions (other than the bot)
+    // "[exec] <command>" → run the command in the thread's sandbox (workspace_exec)
+    const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
     const recent = question.includes("[recent]");
     const thread = question.includes("[thread]");
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = whois ? { userId: whois } : recent || thread ? {} : { query };
+    const input = execCommand ? { command: execCommand } : whois ? { userId: whois } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));

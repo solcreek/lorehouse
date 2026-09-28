@@ -18,6 +18,7 @@ import { createHmac } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { pollRunner, wsRunner } from "./fake-runner";
 
 const ROOT = join(import.meta.dir, "..");
 const HERE = import.meta.dir;
@@ -81,6 +82,10 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
 
 type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
 const STATUS_TOKEN = "conformance-status";
+const APP = `http://localhost:${APP_PORT}`;
+// Runner mode: sandbox hosts connect in (docs/sandbox-runners.md).
+const RUNNER_TOKEN = "conformance-runner-token-000000000000";
+const RUNNER_ENV = { SANDBOX_RUNNER_TOKEN: RUNNER_TOKEN, GITHUB_TOKEN: "conformance-github" };
 const statusAs = (auth?: string) => fetch(`http://localhost:${APP_PORT}/status`, { headers: auth ? { authorization: auth } : {} });
 const status = async () => (await (await statusAs(`Bearer ${STATUS_TOKEN}`)).json()) as Status;
 
@@ -485,6 +490,57 @@ const scenarios: Scenario[] = [
       if (a.status !== 200 || b.status !== 200) return `acks ${a.status}/${b.status}, want 200/200`;
       return s.byMethod["chat.startStream"] === 1 ? null : `startStream ×${s.byMethod["chat.startStream"] ?? 0}, want 1`;
     },
+  },
+  {
+    name: "sandbox runners: the endpoints refuse a missing token or runner name; a plain GET isn't an upgrade",
+    run: () => inMode(RUNNER_ENV, async () => {
+      const post = (headers: Record<string, string>) => fetch(`${APP}/runners/poll`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ capacity: 1, running: 0 }) });
+      const noToken = await post({ "x-lorehouse-runner": "r1" });
+      if (noToken.status !== 401) return `no token: got ${noToken.status}, want 401`;
+      const wrong = await post({ authorization: "Bearer wrong", "x-lorehouse-runner": "r1" });
+      if (wrong.status !== 401) return `a wrong token: got ${wrong.status}, want 401`;
+      const noName = await post({ authorization: `Bearer ${RUNNER_TOKEN}` });
+      if (noName.status !== 400) return `no runner name: got ${noName.status}, want 400`;
+      // A malformed job list is refused whole, never read as an empty (authoritative) one.
+      for (const bad of [{ jobs: [1, 2] }, { jobs: "j_1" }, { received: [null] }]) {
+        const r = await fetch(`${APP}/runners/poll`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${RUNNER_TOKEN}`, "x-lorehouse-runner": "r1" }, body: JSON.stringify({ capacity: 1, running: 0, ...bad }) });
+        if (r.status !== 400) return `a status with ${JSON.stringify(bad)}: got ${r.status}, want 400`;
+      }
+      const plain = await fetch(`${APP}/runners/connect`, { headers: { authorization: `Bearer ${RUNNER_TOKEN}`, "x-lorehouse-runner": "r1" } });
+      return plain.status === 426 ? null : `a GET without an upgrade: got ${plain.status}, want 426 (so a runner knows to fall back to long poll)`;
+    }),
+  },
+  {
+    name: "sandbox runners over WebSocket: a command reaches the runner and its output reaches the model; with no runner, the model is told",
+    run: () => inMode(RUNNER_ENV, async () => {
+      const none = await ask("[exec] echo hi");
+      if (!/\[toolerror:[^\]]*no sandbox runner is connected/.test(none.text)) return `with no runner: ${none.text.slice(0, 160)}`;
+      const runner = await wsRunner(APP, RUNNER_TOKEN, "r-ws");
+      try {
+        const a = await ask("[exec] echo hi");
+        if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
+        if (!/^slack_C1_\d+\.\d+$/.test(runner.jobs[0]?.sandbox ?? "")) return `the job's sandbox ${runner.jobs[0]?.sandbox}, want one per thread (slack_C1_<ts>)`;
+        const listed = (await status() as unknown as { runners?: { runner: string; transport: string; online: boolean }[] }).runners;
+        return listed?.some((r) => r.runner === "r-ws" && r.transport === "ws" && r.online) ? null : `/status runners ${JSON.stringify(listed)}`;
+      } finally {
+        await runner.stop();
+      }
+    }),
+  },
+  {
+    name: "sandbox runners over long poll: the same command, the same output",
+    run: () => inMode(RUNNER_ENV, async () => {
+      const runner = pollRunner(APP, RUNNER_TOKEN, "r-poll");
+      try {
+        await Bun.sleep(200); // the first poll registers the runner
+        const a = await ask("[exec] echo hi");
+        if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
+        const listed = (await status() as unknown as { runners?: { runner: string; transport: string }[] }).runners;
+        return listed?.some((r) => r.runner === "r-poll" && r.transport === "poll") ? null : `/status runners ${JSON.stringify(listed)}`;
+      } finally {
+        await runner.stop();
+      }
+    }),
   },
   {
     name: "rejects a bad signature with 401",
