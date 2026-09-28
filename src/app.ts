@@ -20,6 +20,7 @@ import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
+import { inThread, isFollowUp, joinThread } from "./threads";
 import { pullRequestTool } from "./tools/pull-request";
 import { workspaceTools } from "./tools/workspace";
 
@@ -73,10 +74,16 @@ export async function createApp(config: Config) {
     apiUrl: config.slack.apiUrl,
     botUserId: config.slack.botUserId,
     path: "/slack/events",
-    // Mentions start a turn. With DM_MODE=answer so do DMs, which arrive as `message`
-    // events like every channel message: respondWhen keeps channel messages to knowledge.
-    respondTo: dm === "answer" ? ["app_mention", "message"] : ["app_mention"],
-    respondWhen: dm === "answer" ? (e) => e.kind === "app_mention" || e.channelType === "im" : undefined,
+    // Mentions start a turn, and so do follow-ups in a thread the agent was mentioned in
+    // (see threads.ts); with DM_MODE=answer, DMs too. Those arrive as `message` events
+    // like every channel message: respondWhen keeps the rest to knowledge.
+    respondTo: ["app_mention", "message"],
+    respondWhen: (e) =>
+      e.kind === "app_mention" ||
+      (dm === "answer" && e.channelType === "im") ||
+      isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread)),
+    // A mention asks the agent into its thread.
+    on: { app_mention: (e) => joinThread(knowledge, e.channelId, e.threadId ?? e.ts) },
     // Every public message event the policy lets through (new, edited, deleted) keeps
     // the knowledge index in step (DMs aren't on the allowlist, so never indexed). onEvent,
     // not on.message: the framework normalizes away edits and deletions.
