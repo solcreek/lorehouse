@@ -44,8 +44,8 @@ In the app's settings, using the tunnel URL:
 - **Event Subscriptions** → on → Request URL `https://<tunnel>/slack/events`.
   It should turn **Verified**. That proves the signature check and the
   `url_verification` echo work.
-  - **Subscribe to bot events:** `app_mention`, `message.channels` → Save → reinstall
-    if Slack asks.
+  - **Subscribe to bot events:** `app_mention`, `message.channels`, and `message.im`
+    unless `DM_MODE=ignore` → Save → reinstall if Slack asks.
 - **Interactivity** → on → the same URL. Only needed for Approve/Deny on pull requests.
 
 The quick tunnel's URL changes every time `cloudflared` restarts. Update both URLs
@@ -65,7 +65,7 @@ Record what you see next to each item. Each one maps to an assumption in
 | 5 | Edit that message, then ask about the new wording | The new text is cited | `message_changed` carries `message.ts` (and `thread_ts` for replies) |
 | 6 | Delete a message, then ask about it; `curl …/status` | Not cited any more; `documents` drops by 1 | `message_deleted` carries `deleted_ts` and `previous_message` |
 | 7 | Delete a root that has replies | Replies still found; the root's text is gone | a root with replies becomes a `tombstone` |
-| 8 | DM the bot, or mention it in a private channel it's in | No reply | the policy on `channel_type: "im"`/`"group"`, and `app_mention` without `channel_type` |
+| 8 | DM the bot; mention it in a private channel it's in | The DM gets one line pointing to the public channel, and nothing else (`DM_MODE=redirect`); the private channel gets no reply | a DM is a `message` event with `channel_type: "im"` (never an `app_mention`); `app_mention` carries no `channel_type` |
 | 9 | Stop the app. Reply in an old thread, delete another message. Start again; `curl …/status` | `reconciled` shows ≥1 refreshed and ≥1 removed; the reply is found, the deleted one isn't | `latest_reply` on history roots; deleted messages vanish from history |
 
 With `LOG_SLACK_EVENTS=1`, every event the policy lets through is printed raw

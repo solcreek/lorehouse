@@ -153,5 +153,17 @@ describe("config", () => {
     expect(c.anthropic.model).toBe("claude-opus-5");
     expect(c.db.sessions).toBe(":memory:");
     expect(c.agent.channels.size).toBe(0);
+    expect(c.agent.dm).toBe("redirect");
+  });
+
+  test("DM_MODE is redirect, ignore or answer; anything else is reported", () => {
+    for (const mode of ["redirect", "ignore", "answer"] as const) expect(loadConfig({ ...base, DM_MODE: mode }).agent.dm).toBe(mode);
+    expect(() => loadConfig({ ...base, DM_MODE: "reply" })).toThrow(/DM_MODE \(one of redirect, ignore, answer, got "reply"\)/);
+  });
+
+  test("DM_MODE=answer can't be combined with code tools: code work stays public", () => {
+    const sandbox = { SANDBOX_URL: "http://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" };
+    expect(() => loadConfig({ ...base, ...sandbox, DM_MODE: "answer" })).toThrow(/DM_MODE=answer/);
+    expect(loadConfig({ ...base, ...sandbox, DM_MODE: "redirect" }).sandbox).toBeDefined();
   });
 });

@@ -64,7 +64,7 @@ const mention = (channel: string, extra: Record<string, unknown> = {}) => {
   return { type: "app_mention", user: "U1", team: "T1", text: "<@UBOT> [q1] how does soft navigation work", ts, event_ts: ts, channel, ...extra };
 };
 
-const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[] };
+const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[]; posts: { channel: string; thread_ts?: string; text: string }[] };
 const reset = () => fetch(`${MOCK}/reset`, { method: "POST" });
 
 // Ask the agent something in the allowed channel and read back what it cited.
@@ -79,6 +79,27 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
 
 type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
 const status = async () => (await (await fetch(`http://localhost:${APP_PORT}/status`)).json()) as Status;
+
+// A person's DM to the bot, as Slack delivers it: a `message` event with channel_type
+// "im" (a DM never produces an app_mention). Returns its ts.
+async function directMessage(text: string, extra: Record<string, unknown> = {}): Promise<string> {
+  const ts = `${1990000000 + ++seq}.000100`;
+  await sendEvent({ type: "message", channel: "D1", channel_type: "im", user: "U1", text, ts, event_ts: ts, ...extra });
+  return ts;
+}
+
+// Run a scenario with the app restarted under other settings, then restart it on the
+// defaults, pass or fail, so later scenarios see the usual app.
+async function inMode(env: Record<string, string>, run: () => Promise<string | null>): Promise<string | null> {
+  await stopApp();
+  await startApp(env);
+  try {
+    return await run();
+  } finally {
+    await stopApp();
+    await startApp();
+  }
+}
 
 // Post a message into Slack's history, then deliver the Events API event for it.
 async function liveMessage(channel: string, channelType: string, text: string): Promise<string> {
@@ -277,14 +298,57 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "stays silent in a DM",
+    name: "points a DM to the public channel: one reply, no model call, nothing read or indexed (DM_MODE=redirect, the default)",
     run: async () => {
       await reset();
-      await sendEvent(mention("D1", { channel_type: "im" }));
+      const docs = (await status()).knowledge.documents;
+      await directMessage("where is the wombat review?");
+      await Bun.sleep(1500);
+      const s = await stats();
+      if (s.modelCalls) return `called the model ${s.modelCalls}×`;
+      if (s.posts.length !== 1 || s.posts[0]!.channel !== "D1" || !s.posts[0]!.text.includes(`<#${ALLOWED}>`)) return `posts ${JSON.stringify(s.posts)}, want one in D1 linking <#${ALLOWED}>`;
+      if (s.readChannels.includes("D1")) return "read the DM's history";
+      return (await status()).knowledge.documents === docs ? null : "indexed the DM";
+    },
+  },
+  {
+    name: "does not answer its own reply in a DM, or an edit there",
+    run: async () => {
+      await reset();
+      await directMessage("I only answer in public…", { bot_id: "BBOT", user: "UBOT" });
+      await directMessage("", { subtype: "message_changed" });
       await Bun.sleep(1500);
       const s = await stats();
       return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
     },
+  },
+  {
+    name: "DM_MODE=ignore: a DM gets nothing at all",
+    run: () => inMode({ DM_MODE: "ignore" }, async () => {
+      await reset();
+      await directMessage("where is the wombat review?");
+      await Bun.sleep(1500);
+      const s = await stats();
+      return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
+    }),
+  },
+  {
+    name: "DM_MODE=answer: a DM is answered from public knowledge, a channel message still starts no turn",
+    run: () => inMode({ DM_MODE: "answer" }, async () => {
+      const docs = (await status()).knowledge.documents;
+      await reset();
+      // a public-channel message without a mention: knowledge only, never a turn
+      await liveMessage(ALLOWED, "channel", "the platypus offsite is in march");
+      await Bun.sleep(1500);
+      if ((await stats()).modelCalls) return "a channel message started a turn";
+      const ts = await directMessage(`[q${++seq}] when does the quarterly wombat review happen`);
+      const { text = "" } = (await (await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`)).json()) as { text?: string };
+      const cite = text.match(/\[cite:([^\]\s]+)\]/)?.[1];
+      if (cite !== WOMBAT_THREAD) return `the DM's answer cited ${cite}, want ${WOMBAT_THREAD}`;
+      if ((await stats()).readChannels.includes("D1")) return "read the DM's history";
+      // the channel message above is new knowledge (+1); the DM is not
+      return (await status()).knowledge.documents === docs + 1 ? null : `documents ${docs} → ${(await status()).knowledge.documents}, want ${docs + 1}`;
+    }),
   },
   {
     name: "stays silent in a private channel",
@@ -374,7 +438,7 @@ let app: ReturnType<typeof Bun.spawn> | undefined;
 
 // Start the app and wait until it listens, owns its port, and has finished its Slack
 // backfill/reconcile (GET /status → ready).
-async function startApp(): Promise<void> {
+async function startApp(extraEnv: Record<string, string> = {}): Promise<void> {
   const proc = Bun.spawn(APP_CMD, {
     // An external app runs from its own directory, so a binary that quietly reads files
     // from this repo (prompts, migrations) fails here instead of passing by accident.
@@ -394,6 +458,7 @@ async function startApp(): Promise<void> {
       INGEST_BACKFILL_DAYS: "36500",
       INGEST_REFRESH_DAYS: "36500",
       INGEST_DEBOUNCE_MS: "200",
+      ...extraEnv,
     },
     stdout: "ignore",
     stderr: "pipe",

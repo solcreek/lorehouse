@@ -4,7 +4,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { anthropic, type AnthropicClient } from "@junejs/core/agent-models";
 import { slackChannel } from "@junejs/core/channels";
-import { defineAgent } from "@junejs/core/agent-config";
+import { defineAgent, type Channel } from "@junejs/core/agent-config";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import type { Config } from "./config";
@@ -18,6 +18,7 @@ import { systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
 import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { withNamedThreads } from "./tools/slack-names";
+import { directMessage, redirectText } from "./dm";
 import { pullRequestTool } from "./tools/pull-request";
 import { workspaceTools } from "./tools/workspace";
 
@@ -64,37 +65,43 @@ export async function createApp(config: Config) {
     tools.push(...workspaceTools(sandboxFor), pullRequestTool({ sandboxFor, githubToken: () => githubToken, identity }));
   }
 
+  const dm = config.agent.dm;
+  const slack: Channel = withNamedThreads(slackChannel({
+    signingSecret: config.slack.signingSecret,
+    botToken: config.slack.botToken,
+    apiUrl: config.slack.apiUrl,
+    botUserId: config.slack.botUserId,
+    path: "/slack/events",
+    // Mentions start a turn. With DM_MODE=answer so do DMs, which arrive as `message`
+    // events like every channel message: respondWhen keeps channel messages to knowledge.
+    respondTo: dm === "answer" ? ["app_mention", "message"] : ["app_mention"],
+    respondWhen: dm === "answer" ? (e) => e.kind === "app_mention" || e.channelType === "im" : undefined,
+    // Every public message event the policy lets through (new, edited, deleted) keeps
+    // the knowledge index in step (DMs aren't on the allowlist, so never indexed). onEvent,
+    // not on.message: the framework normalizes away edits and deletions.
+    onEvent: ingester || config.logSlackEvents || dm === "redirect"
+      ? ({ raw }) => {
+          const event = (raw as { event?: Record<string, unknown> }).event;
+          if (config.logSlackEvents) console.log(`slack event: ${JSON.stringify(event)}`);
+          ingester?.onRawEvent(event);
+          const direct = dm === "redirect" ? directMessage(raw) : undefined;
+          if (direct) return slack.post!({ channelId: direct.channel }, redirectText(config.agent.channels)).then(() => undefined);
+        }
+      : undefined,
+    accept: publicChannelsOnly(config.agent.channels, { dms: dm !== "ignore" }),
+    stream: true,
+    // What the model says before a tool call ("Let me search…") goes to the task
+    // timeline, not into the answer; only the final step's text is the reply.
+    intermediateText: "status",
+    tasks: (call) => TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`,
+    onError: (err) => console.error("slack:", err),
+  }), async (ids) => (await ingester?.names(ids)) ?? new Map());
+
   const agent = defineAgent({
     name: AGENT_ID,
     instructions: systemPrompt(identity),
     tools,
-    channels: [
-      withNamedThreads(slackChannel({
-        signingSecret: config.slack.signingSecret,
-        botToken: config.slack.botToken,
-        apiUrl: config.slack.apiUrl,
-        botUserId: config.slack.botUserId,
-        path: "/slack/events",
-        respondTo: ["app_mention"],
-        // Every public message event the policy lets through (new, edited, deleted) keeps
-        // the knowledge index in step; only mentions start a turn. onEvent, not
-        // on.message: the framework normalizes away edits and deletions.
-        onEvent: ingester || config.logSlackEvents
-          ? ({ raw }) => {
-              const event = (raw as { event?: Record<string, unknown> }).event;
-              if (config.logSlackEvents) console.log(`slack event: ${JSON.stringify(event)}`);
-              ingester?.onRawEvent(event);
-            }
-          : undefined,
-        accept: publicChannelsOnly(config.agent.channels),
-        stream: true,
-        // What the model says before a tool call ("Let me search…") goes to the task
-        // timeline, not into the answer; only the final step's text is the reply.
-        intermediateText: "status",
-        tasks: (call) => TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`,
-        onError: (err) => console.error("slack:", err),
-      }), async (ids) => (await ingester?.names(ids)) ?? new Map()),
-    ],
+    channels: [slack],
   });
 
   const model = anthropic({

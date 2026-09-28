@@ -5,7 +5,7 @@
 //                              Serves conversations.history/replies from its fixtures.
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
-//   GET  /stats                recorded Slack calls, model call count, channels read
+//   GET  /stats                recorded Slack calls, model call count, channels read, posts
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
@@ -288,7 +288,8 @@ Bun.serve({
     }
     if (url.pathname === "/stats") {
       const readChannels = [...new Set(calls.filter((c) => c.method.startsWith("conversations.")).map((c) => String(c.body.channel)))];
-      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels });
+      const posts = calls.filter((c) => c.method === "chat.postMessage").map((c) => ({ channel: c.body.channel, thread_ts: c.body.thread_ts, text: c.body.text }));
+      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, posts });
     }
     if (url.pathname === "/reset") { calls = []; modelCalls = 0; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });

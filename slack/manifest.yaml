@@ -14,12 +14,18 @@ features:
   bot_user:
     display_name: scout
     always_online: true
+  # Lets people DM the agent (DM_MODE redirect or answer). With DM_MODE=ignore, set
+  # messages_tab_enabled to false and drop im:history.
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
 oauth_config:
   scopes:
     bot:
       - app_mentions:read  # being @-mentioned
       - channels:history   # reading public channel history (backfill, threads) and message.channels events
       - chat:write         # replying in the thread (streamed)
+      - im:history         # message.im events: DMs to the agent (never indexed)
       - users:read         # naming people in knowledge ("Wendy: …" instead of a user id)
 settings:
   org_deploy_enabled: false

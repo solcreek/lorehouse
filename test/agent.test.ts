@@ -8,6 +8,7 @@ import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
 import { pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
 import { parseAllowlist, publicChannelsOnly } from "../src/policy";
+import { directMessage, redirectText } from "../src/dm";
 import { remoteSandbox } from "../src/sandbox-client";
 import { agentIdentity, DEFAULT_AGENT_NAME } from "../src/identity";
 import { systemPrompt } from "../src/prompts";
@@ -188,6 +189,33 @@ describe("publicChannelsOnly", () => {
 
   test("with an allowlist, a public channel outside it is refused too", () => {
     expect(listed(ev({ type: "message", channel: "C3", channel_type: "channel" }))).toBe(false);
+  });
+
+  test("with dms on, a DM passes, whatever the allowlist; private channels and group DMs still don't", () => {
+    const withDms = publicChannelsOnly(parseAllowlist("C1"), { dms: true });
+    expect(withDms(ev({ type: "message", channel: "D1", channel_type: "im" }))).toBe(true);
+    expect(withDms(ev({ type: "message", channel: "G1", channel_type: "group" }))).toBe(false);
+    expect(withDms(ev({ type: "message", channel: "G2", channel_type: "mpim" }))).toBe(false);
+    expect(withDms(ev({ type: "message", channel: "C3", channel_type: "channel" }))).toBe(false);
+  });
+});
+
+describe("DM redirect", () => {
+  const dm = (event: Record<string, unknown>) => directMessage({ type: "event_callback", event: { type: "message", channel: "D1", channel_type: "im", user: "U1", text: "hi", ...event } });
+
+  test("a person's new DM gets one; an edit, a deletion, a bot's message (its own reply) and a channel message don't", () => {
+    expect(dm({})).toEqual({ channel: "D1", user: "U1" });
+    expect(dm({ subtype: "message_changed" })).toBeUndefined();
+    expect(dm({ subtype: "message_deleted" })).toBeUndefined();
+    expect(dm({ bot_id: "B1", user: "UBOT" })).toBeUndefined();
+    expect(dm({ channel: "C1", channel_type: "channel" })).toBeUndefined();
+    expect(dm({ type: "app_mention", channel_type: undefined })).toBeUndefined();
+  });
+
+  test("the reply links the allowlisted channels, or says any public channel", () => {
+    expect(redirectText(parseAllowlist("C1"))).toContain("Ask me in <#C1>.");
+    expect(redirectText(parseAllowlist("C1,C2"))).toContain("Ask me in <#C1> or <#C2>.");
+    expect(redirectText(new Set())).toContain("Ask me in any public channel I'm in.");
   });
 });
 
