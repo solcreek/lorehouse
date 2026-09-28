@@ -29,8 +29,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How many recent job ids are remembered, so a job handed out again doesn't run twice.
 const SEEN_IDS: usize = 2048;
-/// How long a finished result is kept for delivery on a later connection.
+/// How long a finished result is kept for delivery on a later connection, at least: longer
+/// for a job whose deadline at Lorehouse is later (see `keep_for`).
 const KEEP_RESULTS: Duration = Duration::from_secs(10 * 60);
+/// Lorehouse waits for a result until the job's `timeoutMs` plus this (boot time).
+const APP_BOOT_SLACK: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize, Debug)]
 struct Job {
@@ -41,6 +44,17 @@ struct Job {
     path: Option<String>,
     #[serde(rename = "bodyBase64")]
     body_base64: Option<String>,
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: Option<u64>,
+}
+
+/// How long to keep a job's result once it's done: past the job's deadline at Lorehouse
+/// (its timeout plus boot slack, counted from when it was sent, so from when it finished is
+/// more than enough), and never less than KEEP_RESULTS. Lorehouse still waits for it until
+/// then, and a reconnect's `jobs` must still list it. No timeout given: the host's backstop.
+fn keep_for(timeout_ms: Option<u64>) -> Duration {
+    let timeout = timeout_ms.map_or(crate::REQUEST_DEADLINE, Duration::from_millis).min(Duration::from_secs(24 * 3600));
+    (timeout + APP_BOOT_SLACK + Duration::from_secs(60)).max(KEEP_RESULTS)
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -116,6 +130,8 @@ struct Held {
     /// None while the job runs.
     result: Option<JobResult>,
     done_at: Option<Instant>,
+    /// How long the result is kept once done.
+    keep: Duration,
     /// The connection (session) it was last sent on; 0 = not sent.
     sent_in: u64,
 }
@@ -129,7 +145,7 @@ struct Ledger {
 
 impl Ledger {
     /// Whether to run this job: false for an id already taken (a redelivery).
-    fn accept(&mut self, id: &str) -> bool {
+    fn accept(&mut self, id: &str, keep: Duration) -> bool {
         if self.seen_set.contains(id) {
             return false;
         }
@@ -140,7 +156,7 @@ impl Ledger {
                 self.seen_set.remove(&old);
             }
         }
-        self.held.insert(id.to_string(), Held { result: None, done_at: None, sent_in: 0 });
+        self.held.insert(id.to_string(), Held { result: None, done_at: None, keep, sent_in: 0 });
         true
     }
 
@@ -183,7 +199,7 @@ impl Ledger {
 
     /// Ids held (running, or a result kept for delivery), for the status's `jobs`.
     fn ids(&mut self, now: Instant) -> Vec<String> {
-        self.held.retain(|_, h| h.done_at.is_none_or(|t| now.duration_since(t) < KEEP_RESULTS));
+        self.held.retain(|_, h| h.done_at.is_none_or(|t| now.duration_since(t) < h.keep));
         self.held.keys().cloned().collect()
     }
 }
@@ -226,7 +242,7 @@ impl Runner {
 
     /// Run a job handed out by Lorehouse, unless this id already ran here.
     fn take(self: &Arc<Self>, job: Job) {
-        if !self.ledger().accept(&job.id) {
+        if !self.ledger().accept(&job.id, keep_for(job.timeout_ms)) {
             return;
         }
         let me = self.clone();
@@ -445,7 +461,7 @@ impl Runner {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed, JobResult, Ledger, KEEP_RESULTS, SEEN_IDS};
+    use super::{allowed, keep_for, JobResult, Ledger, KEEP_RESULTS, SEEN_IDS};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -467,20 +483,20 @@ mod tests {
     #[test]
     fn a_job_handed_out_again_runs_once() {
         let mut l = Ledger::default();
-        assert!(l.accept("j1"));
-        assert!(!l.accept("j1"));
+        assert!(l.accept("j1", KEEP_RESULTS));
+        assert!(!l.accept("j1", KEEP_RESULTS));
         // the memory is bounded, oldest first
         for i in 0..SEEN_IDS {
-            l.accept(&format!("x{i}"));
+            l.accept(&format!("x{i}"), KEEP_RESULTS);
         }
-        assert!(l.accept("j1"));
+        assert!(l.accept("j1", KEEP_RESULTS));
     }
 
     #[test]
     fn a_result_goes_out_once_per_connection_and_again_on_the_next() {
         let mut l = Ledger::default();
         let now = Instant::now();
-        l.accept("j1");
+        l.accept("j1", KEEP_RESULTS);
         assert!(l.take_unsent(1).is_empty()); // still running
         l.finish(done("j1"), now);
         assert_eq!(l.take_unsent(1), vec![done("j1")]);
@@ -496,12 +512,29 @@ mod tests {
     fn held_ids_list_running_jobs_and_kept_results_until_they_expire() {
         let mut l = Ledger::default();
         let now = Instant::now();
-        l.accept("running");
-        l.accept("finished");
+        l.accept("running", KEEP_RESULTS);
+        l.accept("finished", KEEP_RESULTS);
         l.finish(done("finished"), now);
         let mut ids = l.ids(now);
         ids.sort();
         assert_eq!(ids, vec!["finished", "running"]);
         assert_eq!(l.ids(now + KEEP_RESULTS + Duration::from_secs(1)), vec!["running"]);
+    }
+
+    #[test]
+    fn a_result_is_kept_past_its_jobs_deadline_at_the_app() {
+        // A 10-minute job Lorehouse waits 11 minutes for: finished at once, its result must
+        // still be held (and listed) at 10.5 minutes.
+        let keep = keep_for(Some(10 * 60 * 1000));
+        assert!(keep > Duration::from_secs(11 * 60));
+        let mut l = Ledger::default();
+        let now = Instant::now();
+        l.accept("long", keep);
+        l.finish(done("long"), now);
+        assert_eq!(l.ids(now + Duration::from_secs(10 * 60 + 30)), vec!["long"]);
+        assert!(l.ids(now + keep + Duration::from_secs(1)).is_empty());
+        // short jobs keep the floor; no timeout means the host's backstop
+        assert_eq!(keep_for(Some(1000)), KEEP_RESULTS);
+        assert!(keep_for(None) > crate::REQUEST_DEADLINE);
     }
 }

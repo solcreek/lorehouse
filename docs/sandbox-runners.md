@@ -102,7 +102,9 @@ A **result** answers one job with an HTTP-like status:
 - **Placed runner offline.** The job fails with "the sandbox's host is offline". It is not
   silently moved, because moving it would lose the checkout.
 - **New sandbox.** It goes to the online runner with free capacity, the most first. A
-  runner that hasn't sent a status yet has none.
+  runner that hasn't sent a status yet has none. A sandbox just placed takes a slot of its
+  runner's room until its first job settles, so several new sandboxes at once spread out
+  rather than all landing on one runner between two statuses.
   - With none online, the job fails with "no sandbox runner is connected".
   - With all full, it fails with "every sandbox runner is full". Nothing is recorded, so a
     retry can land wherever room appears.
@@ -115,7 +117,9 @@ Jobs write files and run commands, so a job must not run twice, and a result mus
 lost because a connection dropped while the job ran.
 
 - **The runner keeps results until delivered.** A result finished on a connection that
-  dropped is sent on the next one. Lorehouse accepts a result from the runner on the job's
+  dropped is sent on the next one. An undelivered result is kept at least until the job's
+  deadline at Lorehouse has passed (its `timeoutMs` plus boot slack, and no less than 10
+  minutes), so a reconnect before then still lists it in `jobs`. Lorehouse accepts a result from the runner on the job's
   connection or any newer one, never an older one.
 - **The runner runs a job id once.** It remembers recent job ids and skips one it has
   already taken, so a job handed out again doesn't run twice.
