@@ -65,9 +65,8 @@ const LATEST = 10;
 export function usageSummary(db: Database, { since }: { since: Date }): UsageSummary {
   const at = since.toISOString();
   const asks = db.query(
-    `SELECT COUNT(DISTINCT user_id) AS people, COUNT(DISTINCT channel) AS channels,
-       (SELECT COUNT(*) FROM (SELECT DISTINCT channel, thread_ts FROM agent_asks WHERE asked_at >= ?1)) AS threads
-     FROM agent_asks WHERE asked_at >= ?1`,
+    `SELECT COUNT(DISTINCT user_id) AS people, COUNT(DISTINCT channel) AS channels, COUNT(DISTINCT channel || ' ' || thread_ts) AS threads
+     FROM agent_asks WHERE asked_at >= ?`,
   ).get(at) as { people: number; channels: number; threads: number };
   const searched = db.query(
     `SELECT COUNT(*) AS of, COALESCE(SUM(best = 0), 0) AS threads

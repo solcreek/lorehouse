@@ -433,7 +433,7 @@ const scenarios: Scenario[] = [
     }, { DM_MODE: "answer" }),
   },
   {
-    name: "reports what knowledge had no answer for: the thread whose search found nothing, and its query",
+    name: "reports empty searches: the thread whose every search found nothing, and its query",
     run: () => withFreshDb(async () => {
       await mentionAndWait("where is the wombat review");
       await mentionAndWait("qxzv jjkw"); // no document has either word
@@ -454,12 +454,15 @@ const scenarios: Scenario[] = [
       const down = async () => { await Bun.sleep(500); return (await status()).usage.feedback.down; };
       const before = await down();
       await sendEvent(reaction("reaction_added"));
-      if ((await down()) !== before + 1) return `a 👎 on its reply: down ${await down()}, want ${before + 1}`;
+      let now = await down();
+      if (now !== before + 1) return `a 👎 on its reply: down ${now}, want ${before + 1}`;
       await sendEvent(reaction("reaction_removed"));
-      if ((await down()) !== before) return `the 👎 taken back: down ${await down()}, want ${before}`;
+      now = await down();
+      if (now !== before) return `the 👎 taken back: down ${now}, want ${before}`;
       await sendEvent(reaction("reaction_added", { item_user: "U1" })); // a person's message
       await sendEvent(reaction("reaction_added", { item: { type: "message", channel: "C9", ts: "1995000001.000100" } })); // not allowlisted
-      if ((await down()) !== before) return `down ${await down()}, want ${before}: counted a 👎 on a person's message or outside the allowlist`;
+      now = await down();
+      if (now !== before) return `down ${now}, want ${before}: counted a 👎 on a person's message or outside the allowlist`;
       const s = await stats();
       return s.modelCalls || s.slackCalls ? `a reaction got a response: ${JSON.stringify(s)}` : null;
     },
