@@ -28,7 +28,7 @@ const scripted = (script: ModelReply[]): Model => (msgs) =>
   replyStream(script[Math.min(msgs.filter((m) => m.role === "assistant").length, script.length - 1)]!);
 
 // A sandbox that answers the git commands open_pull_request issues and records every exec.
-function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[] } = {}) {
+function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; knownBases?: string[] } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
   const sb: Sandbox = {
     async exec(command, opts) {
@@ -41,6 +41,8 @@ function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[] } = 
       if (command.startsWith("git diff --stat")) return ok(" src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
       if (command.startsWith("git log --format=")) return ok((o.authors ?? []).map((a) => `${a}\n`).join(""));
       if (command.includes(" push https://github.com/")) return ok("");
+      if (command.startsWith("git update-ref refs/remotes/origin/")) return ok("");
+      if (command.startsWith("git rev-parse --verify --quiet origin/")) return o.knownBases === undefined || o.knownBases.includes(command.split("origin/")[1]!.trim()) ? ok("x\n") : { exitCode: 1, stdout: "", stderr: "" };
       return { exitCode: 1, stdout: "", stderr: `unexpected: ${command}` };
     },
     async readFile() { return ""; },
@@ -96,6 +98,8 @@ describe("open_pull_request — the approval gate", () => {
     expect(push.command).not.toContain("ghs_secret"); // token never in argv…
     expect(push.opts?.env).toMatchObject({ LOREHOUSE_GH_TOKEN: "ghs_secret" }); // …only in this command's env
     expect(calls.filter((c) => c.opts?.env).length).toBe(1); // and in no other command
+    // the checkout records what it pushed (a push to the URL doesn't), for a PR based on it
+    expect(calls.some((c) => c.command === "git update-ref refs/remotes/origin/scout/fix-a 0123456789abcdef0123456789abcdef01234567")).toBe(true);
 
     const post = gh.reqs.find((r) => r.method === "POST")!;
     expect(post.url).toBe("https://api.github.com/repos/acme/widgets/pulls");
@@ -176,6 +180,14 @@ describe("open_pull_request — the approval gate", () => {
     expect(String(toolResult()?.result.error)).toContain("can't check who the commits are by");
     expect(asked).toEqual([]);
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+  });
+
+  test("a base the checkout hasn't fetched: the model is told to fetch with workspace_clone, nothing is asked", async () => {
+    const { sb, calls } = fakeRepo({ knownBases: ["main"] });
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+    const r = (await tool.run({ branch: "scout/x", title: "x", base: "scout/readme-license" }, { requestInput: async () => { throw new Error("asked"); } } as never)) as { error: string };
+    expect(r.error).toContain("origin/scout/readme-license isn't in this checkout yet. Fetch with workspace_clone (acme/widgets)");
+    expect(calls.some((c) => c.command.startsWith("git diff"))).toBe(false);
   });
 
   test("a base that isn't a plain branch name never reaches a shell command", async () => {
