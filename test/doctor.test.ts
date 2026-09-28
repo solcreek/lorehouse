@@ -129,7 +129,7 @@ describe("slack", () => {
   });
 
   test("a scope missing from the manifest's list fails and names it", async () => {
-    const checks = await run({}, { scopes: "app_mentions:read,channels:history,chat:write,im:history" });
+    const checks = await run({}, { scopes: MANIFEST_SCOPES.filter((s) => s !== "users:read").join(",") });
     expect(find(checks, "scopes")[0]).toMatchObject({ level: "fail" });
     expect(find(checks, "scopes")[0]!.detail).toStartWith("missing users:read");
   });
