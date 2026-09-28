@@ -43,11 +43,15 @@ to `latest`**, since that is what `npm create june` installs.
 
 ### 2. The `create-june` starter can't hydrate its own island (`create-june 0.0.28`)
 
+Checked on a fresh scaffold: its `Counter` is served as a plain `<button>`, with no
+`<june-island>` marker.
+- The template asks for `@junejs/*@^0.0.25`, which on `0.0.x` installs exactly 0.0.25.
+  That core has no JSX runtime, but the template's `client:load` islands need one.
 - Its `tsconfig.json` sets `jsxImportSource: "react"`. `client:*` islands only get their
-  `<june-island>` marker through June's JSX runtime (`"@junejs/core"`), so with the
-  starter's setting an island renders as plain HTML and never hydrates. We saw this on
-  our form; we infer the same for the starter's `Counter`.
-- It pins `@junejs/*@^0.0.25`, while `@junejs/cli@0.0.51` wants `core >=0.1.0`.
+  marker through June's runtime (`"@junejs/core"`). On 0.1.0 and later, changing this
+  one line is enough; on 0.0.25 it stops the dev server.
+- Its `global.css` imports Tailwind, but it doesn't install `@tailwindcss/postcss`, so
+  `june dev` serves the CSS raw.
 
 ### 3. The starter stylesheet leaks into apps that have their own (`core 0.2.0-dev.49`)
 
@@ -88,4 +92,11 @@ not rechecked on the dev line.
 2. Create the production D1 database, and decide who can read the early-access list.
 3. Whether the form island is worth ~96 KB, or the form becomes plain HTML posting to a
    route handler.
-4. Report findings 1–4 upstream to `junebuild/june`.
+## Reported upstream (2026-09-27)
+
+| finding | issue |
+|---|---|
+| 1. Workers POST body consumed; backport the fix to `latest` | [junebuild/june#222](https://github.com/junebuild/june/issues/222) |
+| 2. The starter's island never hydrates | [junebuild/june#223](https://github.com/junebuild/june/issues/223) |
+| 3. Starter look overrides an app's own CSS | [junebuild/june#224](https://github.com/junebuild/june/issues/224) |
+| 4. `.json` throws for a page with no loader | [junebuild/june#225](https://github.com/junebuild/june/issues/225) |
