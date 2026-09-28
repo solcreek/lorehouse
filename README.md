@@ -82,7 +82,10 @@ fly secrets set -a <app> --stage SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=… \
 fly deploy
 ```
 
-Then point the Slack app's Request URL at `https://<app>.fly.dev/slack/events`. A fresh
+Then point the Slack app at `https://<app>.fly.dev/slack/events`, in two places: **Event
+Subscriptions** (the Request URL) and, with the code tools on, **Interactivity** (the same
+URL; without it the Approve/Deny buttons on a pull request answer "This app is not
+configured to handle interactive responses"). A fresh
 volume backfills from Slack on first start, so nothing needs copying over. Keep the
 `STATUS_TOKEN` you set: without it `/status` is closed to you too.
 
