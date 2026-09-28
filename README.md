@@ -48,7 +48,7 @@ is enough; no zero-downtime setup is needed. A prototype of the same stack used 
 | where | status | how |
 |---|---|---|
 | **Linux you run**: a server at home, a Hetzner box, any VPS | works today | the compiled binary under systemd; HTTPS from Caddy or a Cloudflare Tunnel. CI builds the Linux binary and runs the full conformance suite against it on every change |
-| **Fly.io** | planned | one always-on machine with a volume for the SQLite file |
+| **Fly.io** | works today | one always-on machine with a volume for the SQLite files ([`fly.toml`](fly.toml), [below](#on-flyio)) |
 | **Render** | planned | a web service with a persistent disk |
 | **Cloudflare Workers** | exploring | needs June's edge host and Durable Object storage instead of a SQLite file |
 | **Your laptop** | works today | `bun start` behind a quick tunnel, for trying it out ([runbook](docs/live-slack.md)) |
@@ -63,13 +63,38 @@ The sandbox is separate. It needs a host with KVM, such as bare metal or a VM wi
 virtualization, and Lorehouse reaches it over `SANDBOX_URL`. The host running Lorehouse
 itself needs no KVM.
 
+### On Fly.io
+
+The [`Dockerfile`](Dockerfile) packs the binary into a 178 MB image. The SQLite files go
+under `/data`. Set `app` in `fly.toml` to your own name, then:
+
+```bash
+fly apps create <app>
+fly volumes create lorehouse_data --region <region> --size 1 -a <app>
+fly secrets set -a <app> --stage SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=… \
+  ANTHROPIC_API_KEY=… AGENT_CHANNELS=C0123456 STATUS_TOKEN="$(openssl rand -hex 32)"
+fly deploy
+```
+
+Then point the Slack app's Request URL at `https://<app>.fly.dev/slack/events`. A fresh
+volume backfills from Slack on first start, so nothing needs copying over. Keep the
+`STATUS_TOKEN` you set: without it `/status` is closed to you too.
+
+CI deploys every merge to `main` that passes the conformance suite. To do the same:
+
+1. Create a token that can deploy only this app: `fly tokens create deploy -a <app>`.
+2. Store it as the `FLY_API_TOKEN` repository secret.
+3. Change the repository check in [`ci.yml`](.github/workflows/ci.yml).
+
+The deploy job pins its actions to commit SHAs, because it holds that token.
+
 ## Run it
 
 ```bash
 bun install
 SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=xoxb-… ANTHROPIC_API_KEY=… \
 AGENT_CHANNELS=C0123456 \
-bun start                       # POST /slack/events, GET /healthz, GET /status
+bun start                       # POST /slack/events, GET /healthz, GET /status (with STATUS_TOKEN)
 
 bun run build                   # → dist/lorehouse, a single binary
 ```
@@ -89,6 +114,7 @@ To set up Slack:
 | `AGENT_NAME` | `scout` | the agent's handle; must match the Slack app's display name |
 | `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never works in private channels |
 | `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call), `ignore`, or `answer` (from public knowledge; not with the code tools). A DM is never indexed |
+| `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). `/healthz` is always open and says only `ok` |
 | `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
 | `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |

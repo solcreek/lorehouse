@@ -19,6 +19,7 @@ import { remoteSandbox } from "./sandbox-client";
 import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
+import { statusRefusal } from "./status-auth";
 import { pullRequestTool } from "./tools/pull-request";
 import { workspaceTools } from "./tools/workspace";
 
@@ -127,6 +128,8 @@ export async function createApp(config: Config) {
       const path = new URL(req.url).pathname;
       if (path === "/healthz") return new Response("ok");
       if (path === "/status" && req.method === "GET") {
+        const refusal = statusRefusal(req, config.statusToken);
+        if (refusal) return refusal;
         return Response.json({
           agent: identity.name,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
