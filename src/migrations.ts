@@ -6,6 +6,7 @@ import m0003 from "../migrations/0003_source_version.sql" with { type: "text" };
 import m0004 from "../migrations/0004_cjk_index.sql" with { type: "text" };
 import m0005 from "../migrations/0005_slack_users.sql" with { type: "text" };
 import m0006 from "../migrations/0006_slack_user_names.sql" with { type: "text" };
+import m0007 from "../migrations/0007_agent_threads.sql" with { type: "text" };
 
 export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   { version: 1, name: "0001_knowledge.sql", sql: m0001 },
@@ -14,4 +15,5 @@ export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   { version: 4, name: "0004_cjk_index.sql", sql: m0004 },
   { version: 5, name: "0005_slack_users.sql", sql: m0005 },
   { version: 6, name: "0006_slack_user_names.sql", sql: m0006 },
+  { version: 7, name: "0007_agent_threads.sql", sql: m0007 },
 ];

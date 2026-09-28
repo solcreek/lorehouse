@@ -84,6 +84,26 @@ const STATUS_TOKEN = "conformance-status";
 const statusAs = (auth?: string) => fetch(`http://localhost:${APP_PORT}/status`, { headers: auth ? { authorization: auth } : {} });
 const status = async () => (await (await statusAs(`Bearer ${STATUS_TOKEN}`)).json()) as Status;
 
+// A mention that starts a new thread in the allowed channel; resolves once it's answered.
+async function mentionAndWait(question: string): Promise<string> {
+  const ts = `${1995000000 + ++seq}.000100`;
+  await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${seq}] ${question}`, ts, event_ts: ts, channel: ALLOWED });
+  await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`);
+  return ts;
+}
+
+// A reply in a thread, as Slack delivers one: a `message` event with thread_ts.
+async function threadReply(threadTs: string, text: string, extra: Record<string, unknown> = {}): Promise<void> {
+  const ts = `${1995000000 + ++seq}.000100`;
+  await sendEvent({ type: "message", channel: ALLOWED, channel_type: "channel", user: "U1", text, ts, event_ts: ts, thread_ts: threadTs, ...extra });
+}
+
+// How many answers were streamed since the last reset(), once things settle.
+async function answersAfter(ms: number): Promise<number> {
+  await Bun.sleep(ms);
+  return (await stats()).byMethod["chat.stopStream"] ?? 0;
+}
+
 // A person's DM to the bot, as Slack delivers it: a `message` event with channel_type
 // "im" (a DM never produces an app_mention). Returns its ts.
 async function directMessage(text: string, extra: Record<string, unknown> = {}): Promise<string> {
@@ -341,6 +361,42 @@ const scenarios: Scenario[] = [
       if (reply.cite !== WOMBAT_THREAD) return `the reply added while down: cited ${reply.cite}, want ${WOMBAT_THREAD}`;
       const gone = await ask("staging database password rotates");
       return gone.cite === "slack:C1:1790000010.000100" ? "the message deleted while down is still cited" : null;
+    },
+  },
+  {
+    name: "carries on a thread it was asked into: a plain reply there is answered, without a new mention",
+    run: async () => {
+      const thread = await mentionAndWait("where is the wombat review");
+      await reset();
+      await threadReply(thread, "and which floor is that on?");
+      const n = await answersAfter(2500);
+      return n === 1 ? null : `answered the follow-up ${n}×, want once`;
+    },
+  },
+  {
+    name: "stays out of threads it wasn't asked into, and of people talking to each other",
+    run: async () => {
+      const thread = await mentionAndWait("where is the wombat review");
+      await reset();
+      await threadReply(`${1995000000 + ++seq}.000100`, "unrelated thread, no mention"); // never asked in
+      await threadReply(thread, "<@U2> what do you think?"); // someone else, in its own thread
+      await liveMessage(ALLOWED, "channel", "a top-level message, no mention");
+      const n = await answersAfter(2500);
+      return n === 0 ? null : `answered ${n}×, want none`;
+    },
+  },
+  {
+    name: "a reply that mentions it in its own thread is answered once, not twice",
+    run: async () => {
+      // Slack sends such a reply both as a message and as an app_mention.
+      const thread = await mentionAndWait("where is the wombat review");
+      await reset();
+      const ts = `${1995000000 + ++seq}.000100`;
+      const text = "<@UBOT> and which floor is that on?";
+      await sendEvent({ type: "message", channel: ALLOWED, channel_type: "channel", user: "U1", text, ts, event_ts: ts, thread_ts: thread });
+      await sendEvent({ type: "app_mention", user: "U1", team: "T1", text, ts, event_ts: ts, thread_ts: thread, channel: ALLOWED });
+      const n = await answersAfter(2500);
+      return n === 1 ? null : `answered ${n}×, want once`;
     },
   },
   {
