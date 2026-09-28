@@ -25,6 +25,9 @@ export type Config = {
   logSlackEvents: boolean;
   // Bearer token for GET /status. Unset: /status is closed (404).
   statusToken?: string;
+  // Bearer token for the admin API (/api/v1, src/admin.ts), which returns message text.
+  // Unset: /api/ is closed (404).
+  adminToken?: string;
   // Code tools, on when a sandbox is configured, with GitHub credentials:
   //   runners  sandbox hosts connect in (SANDBOX_RUNNER_TOKEN); see docs/sandbox-runners.md
   //   direct   one sandbox host Lorehouse calls (SANDBOX_URL + SANDBOX_TOKEN), e.g. on the
@@ -96,7 +99,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     },
     logSlackEvents: env.LOG_SLACK_EVENTS === "1",
     statusToken: env.STATUS_TOKEN || undefined,
+    adminToken: env.ADMIN_TOKEN || undefined,
   };
+  // The admin token reads what people wrote: long, and never the status token, which is
+  // the one handed to monitors.
+  if (config.adminToken && config.adminToken.length < 32) missing.push("ADMIN_TOKEN (at least 32 characters)");
+  if (config.adminToken && config.adminToken === config.statusToken) missing.push("ADMIN_TOKEN (must differ from STATUS_TOKEN: the status token only reads counts)");
   // GitHub credentials: an App, or a plain token, never both.
   const app = !!(env.GITHUB_APP_ID || env.GITHUB_APP_PRIVATE_KEY);
   let github: GithubCredentials | undefined;

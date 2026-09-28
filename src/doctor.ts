@@ -13,7 +13,7 @@
 //   github         the App's key and permissions, or the token (code tools only)
 //   sandbox        the direct sandbox host answers (code tools only)
 //   storage        where the SQLite files go
-//   deployment     with --url: /healthz, the signing secret, and /status as it runs
+//   deployment     with --url: /healthz, the signing secret, the admin API, and /status
 //
 // Exit code: 0 when nothing failed (warnings allowed), 1 when something did.
 
@@ -271,6 +271,16 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   else add("deployment", "/slack/events", "fail", verify.res ? `answered ${verify.res.status} to Slack's URL check` : String(verify.error));
   // Slack's side can't be read with a bot token: only the app's settings page shows it.
   add("deployment", "Slack app settings", "info", `Event Subscriptions${sandbox ? " and Interactivity" : ""} must point at ${url}/slack/events` + (sandbox ? " (without Interactivity, Approve and Deny do nothing)" : ""));
+
+  // The admin API (docs/admin-api.md): its cheapest endpoint, only to see who it lets in.
+  if (config.adminToken) {
+    const a = await get(`${url}/api/v1/channels`, { headers: { authorization: `Bearer ${config.adminToken}` } });
+    if (!a.res) add("deployment", "/api/v1", "fail", String(a.error));
+    else if (a.res.ok) add("deployment", "/api/v1", "ok", "the admin API answers to this ADMIN_TOKEN");
+    else if (a.res.status === 404) add("deployment", "/api/v1", "warn", "closed: the running app has no ADMIN_TOKEN");
+    else if (a.res.status === 401) add("deployment", "/api/v1", "fail", "refused: the running app has a different ADMIN_TOKEN");
+    else add("deployment", "/api/v1", "fail", `answered ${a.res.status}`);
+  }
 
   if (!config.statusToken) return checks;
   const s = await get(`${url}/status`, { headers: { authorization: `Bearer ${config.statusToken}` } });

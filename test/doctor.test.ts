@@ -8,6 +8,7 @@ import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 const DB = `${tmpdir()}/doctor-test-lorehouse.db`;
+const ADMIN = "a".repeat(32);
 
 const ENV = {
   SLACK_SIGNING_SECRET: "sign",
@@ -29,7 +30,7 @@ type World = {
   anthropic?: number; // status of GET /v1/models/…
   appPermissions?: Record<string, string>;
   installations?: number | "http_500" | "not_a_list";
-  app?: { secret?: string; status?: object | number | string }; // a string: a non-JSON body, 200
+  app?: { secret?: string; status?: object | number | string; adminToken?: string | null }; // status as a string: a non-JSON body, 200; adminToken null: /api closed
 };
 
 // One fake internet: Slack, Anthropic, GitHub and the running app, by host.
@@ -71,6 +72,11 @@ function world(w: World = {}) {
         const want = "v0=" + createHmac("sha256", w.app?.secret ?? "sign").update(`v0:${h.get("x-slack-request-timestamp")}:${body}`).digest("hex");
         if (h.get("x-slack-signature") !== want) return new Response("bad signature", { status: 401 });
         return Response.json({ challenge: JSON.parse(body).challenge });
+      }
+      if (url.pathname === "/api/v1/channels") {
+        const token = w.app?.adminToken === undefined ? ADMIN : w.app.adminToken;
+        if (token === null) return new Response("not found", { status: 404 });
+        return new Headers(init.headers).get("authorization") === `Bearer ${token}` ? Response.json({ state: "ready", channels: [] }) : new Response("unauthorized", { status: 401 });
       }
       if (url.pathname === "/status") {
         const s = w.app?.status ?? { agent: "scout", knowledge: { state: "ready", documents: 12 } };
@@ -322,6 +328,14 @@ describe("the running deployment (--url)", () => {
     const checks = await run({}, {}, "http://[bad");
     expect(find(checks, "URL")).toMatchObject([{ level: "fail" }]);
     expect(find(checks, "/healthz")).toEqual([]);
+  });
+
+  test("with ADMIN_TOKEN, the running app's admin API is checked: same token, another, or closed", async () => {
+    const withAdmin = { ADMIN_TOKEN: ADMIN };
+    expect(find(await run(withAdmin, {}, "https://app.test"), "/api/v1")[0]?.level).toBe("ok");
+    expect(find(await run(withAdmin, { app: { adminToken: "b".repeat(32) } }, "https://app.test"), "/api/v1")[0]).toMatchObject({ level: "fail", detail: "refused: the running app has a different ADMIN_TOKEN" });
+    expect(find(await run(withAdmin, { app: { adminToken: null } }, "https://app.test"), "/api/v1")[0]?.level).toBe("warn");
+    expect(find(await run({}, {}, "https://app.test"), "/api/v1")).toEqual([]); // not set here: not asked
   });
 
   test("a URL nothing answers at fails without asking further", async () => {

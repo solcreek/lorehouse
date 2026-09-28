@@ -110,7 +110,7 @@ The deploy job pins its actions to commit SHAs, because it holds that token.
 bun install
 SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=xoxb-… ANTHROPIC_API_KEY=… \
 AGENT_CHANNELS=C0123456 \
-bun start                       # POST /slack/events, GET /healthz, GET /status (with STATUS_TOKEN)
+bun start                       # POST /slack/events, GET /healthz, GET /status (with STATUS_TOKEN), /api/v1 (with ADMIN_TOKEN)
 
 bun run build                   # → dist/lorehouse, a single binary
 ```
@@ -146,6 +146,7 @@ To set up Slack:
 | `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never works in private channels |
 | `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call), `ignore`, or `answer` (from public knowledge; not with the code tools). A DM is never indexed |
 | `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). `/healthz` is always open and says only `ok` |
+| `ADMIN_TOKEN` | (none) | bearer token for the read-only [admin API](docs/admin-api.md) under `/api/v1`: the indexed threads and their text, search, the agent's threads, the sandboxes. 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |
 | `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
 | `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |

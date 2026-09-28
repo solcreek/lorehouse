@@ -8,10 +8,11 @@
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
-// STATUS_TOKEN, and per scenario DM_MODE. It must answer GET /healthz (open) once
-// listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
+// STATUS_TOKEN, ADMIN_TOKEN, and per scenario DM_MODE. It must answer GET /healthz (open)
+// once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
-// 404 when STATUS_TOKEN is unset).
+// 404 when STATUS_TOKEN is unset). The admin API under /api/v1 (docs/admin-api.md) answers
+// only to ADMIN_TOKEN, the same way.
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
@@ -88,6 +89,23 @@ const RUNNER_TOKEN = "conformance-runner-token-000000000000";
 const RUNNER_ENV = { SANDBOX_RUNNER_TOKEN: RUNNER_TOKEN, GITHUB_TOKEN: "conformance-github" };
 const statusAs = (auth?: string) => fetch(`http://localhost:${APP_PORT}/status`, { headers: auth ? { authorization: auth } : {} });
 const status = async () => (await (await statusAs(`Bearer ${STATUS_TOKEN}`)).json()) as Status;
+// The admin API (docs/admin-api.md): message text, behind its own token.
+const ADMIN_TOKEN = "conformance-admin-token-000000000000";
+const adminAs = (path: string, auth: string | null = `Bearer ${ADMIN_TOKEN}`, init: RequestInit = {}) =>
+  fetch(`http://localhost:${APP_PORT}${path}`, { ...init, headers: auth ? { authorization: auth } : {} });
+const admin = async <T = Record<string, any>>(path: string) => (await (await adminAs(path)).json()) as T;
+type DocumentList = { documents: { id: string; kind: string; source: string }[]; next: string | null };
+// Every document id the admin API lists, page by page.
+async function allDocumentIds(limit = 50): Promise<string[]> {
+  const ids: string[] = [];
+  let next: string | null = null;
+  do {
+    const page: DocumentList = await admin<DocumentList>(`/api/v1/documents?limit=${limit}${next ? `&cursor=${next}` : ""}`);
+    ids.push(...page.documents.map((d) => d.id));
+    next = page.next;
+  } while (next);
+  return ids;
+}
 
 // A mention that starts a new thread in the allowed channel; resolves once it's answered.
 async function mentionAndWait(question: string): Promise<string> {
@@ -216,6 +234,50 @@ const scenarios: Scenario[] = [
         await stopApp();
         await startApp();
       }
+    },
+  },
+  {
+    name: "the admin API needs ADMIN_TOKEN: the status token doesn't open it, and it only reads",
+    run: async () => {
+      // It returns what people wrote; a monitor holding STATUS_TOKEN must not read it.
+      for (const [auth, what] of [[null, "no token"], ["Bearer wrong", "a wrong token"], [`Bearer ${STATUS_TOKEN}`, "the status token"]] as const) {
+        const r = await adminAs("/api/v1/documents", auth);
+        if (r.status !== 401) return `${what}: got ${r.status}, want 401`;
+        if ((await r.text()).includes("documents")) return `${what}: the refusal leaked documents`;
+      }
+      const post = await adminAs("/api/v1/documents", `Bearer ${ADMIN_TOKEN}`, { method: "POST" });
+      if (post.status !== 405) return `POST: got ${post.status}, want 405`;
+      const ok = await adminAs("/api/v1/documents");
+      return ok.status === 200 ? null : `the admin token: got ${ok.status}, want 200`;
+    },
+  },
+  {
+    name: "the admin API is closed (404) when no ADMIN_TOKEN is set",
+    run: () => inMode({ ADMIN_TOKEN: "" }, async () => {
+      const r = await adminAs("/api/v1/documents");
+      return r.status === 404 ? null : `got ${r.status}, want 404`;
+    }),
+  },
+  {
+    name: "the admin API lists every document /status counts, once, and serves a thread's text",
+    run: async () => {
+      const ids = await allDocumentIds(7); // small pages, so paging is exercised
+      const counted = (await status()).knowledge.documents;
+      if (ids.length !== counted) return `listed ${ids.length}, /status counts ${counted}`;
+      if (new Set(ids).size !== ids.length) return "a document was listed twice";
+      const doc = await admin<{ id: string; source: string; text: string }>(`/api/v1/documents/${WOMBAT_THREAD}`);
+      if (!/wombat review/i.test(doc.text ?? "")) return `the wombat thread's text: ${JSON.stringify(doc.text)?.slice(0, 80)}`;
+      return doc.source === "https://acme.slack.com/archives/C1/p1790000001000100" ? null : `source ${doc.source}`;
+    },
+  },
+  {
+    name: "the admin API's search finds what the agent finds, in Chinese too",
+    run: async () => {
+      const { results } = await admin<{ results: { id: string }[] }>(`/api/v1/search?q=${encodeURIComponent("週會什麼時候開")}`);
+      const want = "slack:C1:1790000065.000100";
+      if (results[0]?.id !== want) return `top result ${results[0]?.id}, want ${want}`;
+      const wombat = await admin<{ results: { id: string }[] }>("/api/v1/search?q=when%20is%20the%20quarterly%20wombat%20review");
+      return wombat.results[0]?.id === WOMBAT_THREAD ? null : `top result ${wombat.results[0]?.id}, want ${WOMBAT_THREAD}`;
     },
   },
   {
@@ -369,6 +431,21 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "the admin API forgets deleted messages too: not served, listed or found",
+    run: async () => {
+      // Deleted above: one live, and one (a pasted password) while the app was down.
+      const ids = await allDocumentIds();
+      for (const [doc, q] of [["slack:C1:1790000055.000100", "temporary emu vault code"], ["slack:C1:1790000010.000100", "staging database password rotates"]] as const) {
+        const r = await adminAs(`/api/v1/documents/${doc}`);
+        if (r.status !== 404) return `${doc}: got ${r.status}, want 404`;
+        if (ids.includes(doc)) return `${doc} is still listed`;
+        const { results } = await admin<{ results: { id: string }[] }>(`/api/v1/search?q=${encodeURIComponent(q)}`);
+        if (results.some((x) => x.id === doc)) return `${doc} is still found by "${q}"`;
+      }
+      return null;
+    },
+  },
+  {
     name: "carries on a thread it was asked into: a plain reply there is answered, without a new mention",
     run: async () => {
       const thread = await mentionAndWait("where is the wombat review");
@@ -376,6 +453,15 @@ const scenarios: Scenario[] = [
       await threadReply(thread, "and which floor is that on?");
       const n = await answersAfter(2500);
       return n === 1 ? null : `answered the follow-up ${n}×, want once`;
+    },
+  },
+  {
+    name: "the admin API lists the threads the agent was asked into, newest first",
+    run: async () => {
+      const thread = await mentionAndWait("what is the wombat review about");
+      const { threads } = await admin<{ threads: { channel: string; threadTs: string }[] }>("/api/v1/threads?limit=5");
+      const first = threads[0];
+      return first?.channel === ALLOWED && first.threadTs === thread ? null : `newest thread ${JSON.stringify(first)}, want ${ALLOWED} ${thread}`;
     },
   },
   {
@@ -618,6 +704,7 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
       INGEST_REFRESH_DAYS: "36500",
       INGEST_DEBOUNCE_MS: "200",
       STATUS_TOKEN,
+      ADMIN_TOKEN,
       ...extraEnv,
     },
     stdout: "ignore",
