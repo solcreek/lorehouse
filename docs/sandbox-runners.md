@@ -145,4 +145,10 @@ lost because a connection dropped while the job ran.
   retry. A listed job stays pending until its result arrives. Only the process a job went
   to can say it never got it: a job sent to a replaced process waits for its result or its
   deadline.
+- **A runner restart keeps all of this.** sandboxd records each job it takes on disk
+  (`<SANDBOXD_STATE>/.runner-jobs/`) before running it, and its result when it finishes.
+  The next process delivers results not yet delivered and never runs a recorded job
+  again. A job that was running when the process stopped went down with its VM, so it is
+  answered with a 500 that says it may have partly run, rather than left to its deadline
+  or retried blindly. A job that can't be recorded first isn't run at all.
 - **A runner that disconnects** has 60 s to come back before its pending jobs fail.

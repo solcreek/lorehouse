@@ -8,7 +8,7 @@
 //! Delivery (the protocol's "Delivery" section): jobs write files and run commands, so a
 //! job id runs once, even if it's handed out again, and a result is kept until it has
 //! been delivered, so a connection that drops while a job runs doesn't lose it. The ledger
-//! below holds both, across connections.
+//! below holds both, across connections and (on disk) across restarts.
 
 use crate::config::Transport;
 use crate::vm::{self, Manager};
@@ -19,6 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,7 +84,7 @@ fn guest_budget(app_deadline: Duration, elapsed: Duration) -> Duration {
     app_deadline.saturating_sub(DEADLINE_MARGIN).saturating_sub(elapsed).min(crate::REQUEST_DEADLINE)
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct JobResult {
     id: String,
     status: u16,
@@ -158,6 +159,11 @@ async fn execute(vms: &Manager, job: Job, arrived: Instant) -> JobResult {
 }
 
 // ── the ledger: which jobs ran, and which results still need delivering ─────────────────
+//
+// Kept on disk as well (one file per held job, in the state directory), so a restart of
+// sandboxd doesn't break the guarantees: a result not yet delivered is delivered by the
+// next process, and a job it was running when it stopped (its VM went with it) is answered
+// as interrupted instead of left pending, and never runs again.
 
 struct Held {
     /// None while the job runs.
@@ -169,19 +175,74 @@ struct Held {
     sent_in: u64,
 }
 
+/// A held job as stored on disk.
+#[derive(Serialize, Deserialize)]
+struct Record {
+    id: String,
+    keep_secs: u64,
+    /// Unix ms.
+    done_at: Option<u64>,
+    result: Option<JobResult>,
+}
+
 #[derive(Default)]
 struct Ledger {
     seen: VecDeque<String>,
     seen_set: HashSet<String>,
     held: HashMap<String, Held>,
+    /// Where held jobs are recorded; None: in memory only (tests).
+    dir: Option<PathBuf>,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// A job id that is safe as a file name. Lorehouse's are `j_<uuid>`.
+fn safe_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Write a record whole or not at all (a crash mid-write leaves the old one).
+fn write_record(path: &Path, record: &Record) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(record).map_err(std::io::Error::other)?)?;
+    std::fs::rename(&tmp, path)
 }
 
 impl Ledger {
-    /// Whether to run this job: false for an id already taken (a redelivery).
-    fn accept(&mut self, id: &str, keep: Duration) -> bool {
-        if self.seen_set.contains(id) {
-            return false;
+    /// The ledger a previous process left in `dir`. Its finished results are delivered as
+    /// usual; a job it was still running was cut off with it, and is answered as such.
+    fn open(dir: PathBuf, now: Instant) -> Ledger {
+        let mut l = Ledger { dir: Some(dir.clone()), ..Ledger::default() };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("sandboxd: runner ledger {}: {e}", dir.display());
         }
+        let Ok(entries) = std::fs::read_dir(&dir) else { return l };
+        let now_ms = unix_ms();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "tmp") {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let Some(mut r) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Record>(&b).ok()) else { continue };
+            if !safe_id(&r.id) {
+                continue;
+            }
+            if r.result.is_none() {
+                r.result = Some(JobResult::error(&r.id, 500, "sandboxd restarted while this job ran, and the sandbox's VM stopped with it: it may have partly run. Check its effects before running it again"));
+                r.done_at = Some(now_ms);
+                let _ = write_record(&path, &r);
+            }
+            let ago = Duration::from_millis(now_ms.saturating_sub(r.done_at.unwrap_or(now_ms)));
+            l.remember(&r.id);
+            l.held.insert(r.id.clone(), Held { result: r.result, done_at: Some(now.checked_sub(ago).unwrap_or(now)), keep: Duration::from_secs(r.keep_secs), sent_in: 0 });
+        }
+        l
+    }
+
+    fn remember(&mut self, id: &str) {
         self.seen.push_back(id.to_string());
         self.seen_set.insert(id.to_string());
         while self.seen.len() > SEEN_IDS {
@@ -189,8 +250,40 @@ impl Ledger {
                 self.seen_set.remove(&old);
             }
         }
-        self.held.insert(id.to_string(), Held { result: None, done_at: None, keep, sent_in: 0 });
-        true
+    }
+
+    fn path(&self, id: &str) -> Option<PathBuf> {
+        self.dir.as_ref().map(|d| d.join(format!("{id}.json")))
+    }
+
+    /// Whether to run this job: false for an id already taken (a redelivery), or one that
+    /// can't be recorded first (it is answered with an error instead: a job that could run
+    /// again after a restart must not run at all).
+    fn accept(&mut self, id: &str, keep: Duration) -> bool {
+        if self.seen_set.contains(id) {
+            return false;
+        }
+        self.remember(id);
+        let refused = match self.path(id) {
+            None => None,
+            Some(_) if !safe_id(id) => Some("a job id is letters, digits, _ and - (at most 128)".to_string()),
+            Some(path) => write_record(&path, &Record { id: id.to_string(), keep_secs: keep.as_secs(), done_at: None, result: None })
+                .err()
+                .map(|e| format!("sandboxd couldn't record the job before running it: {e}")),
+        };
+        let result = refused.as_ref().map(|why| JobResult::error(id, 500, why.as_str()));
+        let done_at = result.as_ref().map(|_| Instant::now());
+        self.held.insert(id.to_string(), Held { result, done_at, keep, sent_in: 0 });
+        refused.is_none()
+    }
+
+    /// Record a finished job's result on disk; call before `finish`, outside the lock (a
+    /// result can be large).
+    fn record_result(path: &Path, result: &JobResult, keep: Duration) {
+        let record = Record { id: result.id.clone(), keep_secs: keep.as_secs(), done_at: Some(unix_ms()), result: Some(result.clone()) };
+        if let Err(e) = write_record(path, &record) {
+            eprintln!("sandboxd: recording the result of {}: {e}", result.id);
+        }
     }
 
     fn finish(&mut self, result: JobResult, now: Instant) {
@@ -214,10 +307,17 @@ impl Ledger {
         out
     }
 
+    fn forget(&mut self, id: &str) {
+        self.held.remove(id);
+        if let Some(path) = self.path(id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Lorehouse confirmed these (an HTTP 204): no need to keep them.
     fn delivered(&mut self, ids: &[String]) {
         for id in ids {
-            self.held.remove(id);
+            self.forget(id);
         }
     }
 
@@ -232,7 +332,10 @@ impl Ledger {
 
     /// Ids held (running, or a result kept for delivery), for the status's `jobs`.
     fn ids(&mut self, now: Instant) -> Vec<String> {
-        self.held.retain(|_, h| h.done_at.is_none_or(|t| now.duration_since(t) < h.keep));
+        let expired: Vec<String> = self.held.iter().filter(|(_, h)| h.done_at.is_some_and(|t| now.duration_since(t) >= h.keep)).map(|(id, _)| id.clone()).collect();
+        for id in expired {
+            self.forget(&id);
+        }
         self.held.keys().cloned().collect()
     }
 }
@@ -263,10 +366,12 @@ enum WsEnd {
 }
 
 impl Runner {
-    pub fn new(vms: Arc<Manager>, app_url: String, token: String, name: String, transport: Transport) -> Arc<Runner> {
-        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    /// `jobs_dir`: where the ledger is kept, across restarts.
+    pub fn new(vms: Arc<Manager>, app_url: String, token: String, name: String, transport: Transport, jobs_dir: PathBuf) -> Arc<Runner> {
+        let started = unix_ms();
         let process = format!("{started:x}-{:x}", std::process::id());
-        Arc::new(Runner { vms, app_url, token, name, transport, ledger: Mutex::default(), finished: Notify::new(), sessions: AtomicU64::new(0), process, started })
+        let ledger = Mutex::new(Ledger::open(jobs_dir, Instant::now()));
+        Arc::new(Runner { vms, app_url, token, name, transport, ledger, finished: Notify::new(), sessions: AtomicU64::new(0), process, started })
     }
 
     fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
@@ -276,12 +381,22 @@ impl Runner {
     /// Run a job handed out by Lorehouse, unless this id already ran here.
     fn take(self: &Arc<Self>, job: Job) {
         let arrived = Instant::now();
-        if !self.ledger().accept(&job.id, keep_for(job.app_deadline())) {
+        let keep = keep_for(job.app_deadline());
+        let (accepted, path) = {
+            let mut l = self.ledger();
+            (l.accept(&job.id, keep), l.path(&job.id))
+        };
+        if !accepted {
+            self.finished.notify_one(); // a refusal is a result to send
             return;
         }
         let me = self.clone();
         tokio::spawn(async move {
             let result = execute(&me.vms, job, arrived).await;
+            if let Some(path) = path {
+                let r = result.clone();
+                let _ = tokio::task::spawn_blocking(move || Ledger::record_result(&path, &r, keep)).await;
+            }
             me.ledger().finish(result, Instant::now());
             me.finished.notify_one();
         });
@@ -496,6 +611,7 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::{allowed, guest_budget, keep_for, Job, JobResult, Ledger, KEEP_RESULTS, SEEN_IDS};
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -570,6 +686,59 @@ mod tests {
         // short jobs keep the floor; no deadline or timeout means the host's backstop
         assert_eq!(keep_for(job(Some(30_000), None).app_deadline()), KEEP_RESULTS);
         assert!(keep_for(job(None, None).app_deadline()) > crate::REQUEST_DEADLINE);
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sandboxd-ledger-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_restart_delivers_kept_results_answers_cut_off_jobs_and_runs_neither_again() {
+        let dir = scratch_dir("restart");
+        let now = Instant::now();
+        {
+            let mut l = Ledger::open(dir.clone(), now);
+            assert!(l.accept("j_running", KEEP_RESULTS));
+            assert!(l.accept("j_done", KEEP_RESULTS));
+            Ledger::record_result(&l.path("j_done").unwrap(), &done("j_done"), KEEP_RESULTS);
+            l.finish(done("j_done"), now);
+            assert!(l.accept("j_delivered", KEEP_RESULTS));
+            Ledger::record_result(&l.path("j_delivered").unwrap(), &done("j_delivered"), KEEP_RESULTS);
+            l.finish(done("j_delivered"), now);
+            l.delivered(&["j_delivered".into()]);
+        } // sandboxd stops (the process, and with it the VM running j_running)
+        let mut l = Ledger::open(dir.clone(), Instant::now());
+        let mut ids = l.ids(Instant::now());
+        ids.sort();
+        assert_eq!(ids, vec!["j_done", "j_running"]); // delivered is gone for good
+        let mut results = l.take_unsent(1);
+        results.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(results[0], done("j_done"));
+        assert_eq!((results[1].id.as_str(), results[1].status), ("j_running", 500));
+        assert!(results[1].error.as_deref().unwrap().contains("may have partly run"));
+        // handed out again, neither runs
+        assert!(!l.accept("j_running", KEEP_RESULTS));
+        assert!(!l.accept("j_done", KEEP_RESULTS));
+        // delivered or expired, the record goes
+        l.delivered(&["j_done".into()]);
+        assert!(!dir.join("j_done.json").exists());
+        assert!(l.ids(Instant::now() + KEEP_RESULTS + Duration::from_secs(1)).is_empty());
+        assert!(!dir.join("j_running.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_job_that_cant_be_recorded_first_doesnt_run() {
+        let dir = scratch_dir("refuse");
+        let mut l = Ledger::open(dir.clone(), Instant::now());
+        assert!(!l.accept("../escape", KEEP_RESULTS)); // not a file name
+        let r = l.take_unsent(1);
+        assert_eq!((r[0].id.as_str(), r[0].status), ("../escape", 500));
+        std::fs::remove_dir_all(&dir).unwrap(); // the directory is gone: nowhere to record
+        assert!(!l.accept("j_1", KEEP_RESULTS));
+        assert!(l.take_unsent(2).iter().any(|r| r.id == "j_1" && r.status == 500));
     }
 
     fn job(deadline_ms: Option<u64>, timeout_ms: Option<u64>) -> Job {

@@ -177,7 +177,7 @@ async fn main() {
     match &cfg.mode {
         config::Mode::Runner { app_url, token, name, transport } => {
             eprintln!("sandboxd: runner {name} for {app_url} ({transport:?}; up to {} VMs, idle stop after {} s)", cfg.max_vms, cfg.idle.as_secs());
-            let runner = runner::Runner::new(vms.clone(), app_url.clone(), token.clone(), name.clone(), *transport);
+            let runner = runner::Runner::new(vms.clone(), app_url.clone(), token.clone(), name.clone(), *transport, cfg.state_dir.join(".runner-jobs"));
             tokio::select! {
                 _ = runner.run() => {}
                 _ = shutdown => {}
