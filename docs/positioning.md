@@ -96,7 +96,7 @@ Use these words the same way in the product, docs and site.
 
 ## Proof we owe before we claim it
 
-- A `LICENSE` file. The site can't say "open source" until the repo has one.
+- ~~A `LICENSE` file.~~ MIT, added 2026-09-27.
 - Real screenshots and a recorded thread. No mocked metrics, logos or testimonials.
 - Dogfooding: Lorehouse opening pull requests on its own repo. Once it has, the site can
   count them (commits carrying the agent's `Co-authored-by` trailer). Today that count is
