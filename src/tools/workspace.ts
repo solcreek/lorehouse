@@ -81,7 +81,7 @@ export function workspaceTools(sandboxFor: SandboxFor): Tool[] {
       },
       run: async (input: { command: string; cwd?: string }, ctx: ToolContext) =>
         orError(async () => {
-          const r = await sandboxFor(ctx).exec(input.command, { cwd: input.cwd ?? WORKDIR, timeoutMs: 10 * 60_000 });
+          const r = await sandboxFor(ctx).exec(input.command, { cwd: input.cwd ?? WORKDIR, timeoutMs: EXEC_TIMEOUT_MS });
           return { exitCode: r.exitCode, stdout: clip(r.stdout), stderr: clip(r.stderr, 4_000) };
         }),
     },
