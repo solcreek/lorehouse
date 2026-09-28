@@ -35,7 +35,7 @@ function fakeRepo(o: { dirty?: boolean; origin?: string } = {}) {
       if (command === "git rev-parse --abbrev-ref origin/HEAD") return ok("origin/main\n");
       if (command === "git rev-parse HEAD") return ok("0123456789abcdef0123456789abcdef01234567\n");
       if (command.startsWith("git diff --stat")) return ok(" src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
-      if (command.includes(" push origin ")) return ok("");
+      if (command.includes(" push https://github.com/")) return ok("");
       return { exitCode: 1, stdout: "", stderr: `unexpected: ${command}` };
     },
     async readFile() { return ""; },
@@ -84,10 +84,12 @@ describe("open_pull_request — the approval gate", () => {
     s.resume(t1, inputId, true);
     expect(await s.result(t1)).toMatchObject({ status: "completed", text: "done" });
 
-    const push = calls.find((c) => c.command.includes(" push origin "))!;
-    expect(push.command).toContain("0123456789abcdef0123456789abcdef01234567:refs/heads/scout/fix-a");
+    const push = calls.find((c) => c.command.includes(" push "))!;
+    // to the repo's github.com URL, not `origin` (whose push URL the checkout could change)
+    expect(push.command).toContain("push https://github.com/acme/widgets.git 0123456789abcdef0123456789abcdef01234567:refs/heads/scout/fix-a");
+    expect(push.command).toContain("-c core.hooksPath=/dev/null"); // no hook sees the token
     expect(push.command).not.toContain("ghs_secret"); // token never in argv…
-    expect(push.opts?.env).toEqual({ LOREHOUSE_GH_TOKEN: "ghs_secret" }); // …only in this command's env
+    expect(push.opts?.env).toMatchObject({ LOREHOUSE_GH_TOKEN: "ghs_secret" }); // …only in this command's env
     expect(calls.filter((c) => c.opts?.env).length).toBe(1); // and in no other command
 
     const post = gh.reqs.find((r) => r.method === "POST")!;

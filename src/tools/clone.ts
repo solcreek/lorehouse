@@ -1,8 +1,8 @@
 // clone.ts — get a GitHub repo into the thread's sandbox, private ones included.
 //
 // A read-only token for the one repo (see github-auth.ts) enters the sandbox for the
-// single git command only, through the same per-command credential helper the push uses:
-// it is never written to .git/config and the remote stays a plain https URL. A repo the
+// single git command only, run the same guarded way the push is (git-credential.ts): it is
+// never written to .git/config and the remote stays a plain https URL. A repo the
 // GitHub App isn't installed on is cloned anonymously, which works when it's public.
 // Already cloned: the checkout is fetched instead, so the tool also refreshes it.
 
@@ -10,9 +10,8 @@ import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import type { GithubAccess, RepoRef } from "../github-auth";
 import { toolDescription } from "../prompts";
 import { parseGithubRemote } from "./pull-request";
+import { gitWithToken, tokenEnv } from "./git-credential";
 import { WORKDIR, type SandboxFor } from "./workspace";
-
-const HELPER = `-c credential.helper='!f() { echo username=x-access-token; echo "password=$LOREHOUSE_GH_TOKEN"; }; f'`;
 
 // "owner/name", or a github.com URL (https or ssh), to a repo reference.
 export function parseRepo(input: string): RepoRef | undefined {
@@ -36,10 +35,10 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
       if (!repo) return { error: `not a GitHub repo: ${input.repo} (use owner/name)` };
       const url = `https://github.com/${repo.owner}/${repo.name}.git`;
       let env: Record<string, string> = {};
-      let auth = "";
+      let git = (args: string) => `git ${args}`;
       try {
-        env = { LOREHOUSE_GH_TOKEN: await github(repo, "read") };
-        auth = `${HELPER} `;
+        env = tokenEnv(await github(repo, "read"));
+        git = gitWithToken;
       } catch (e) {
         // Not installed there: fine for a public repo, which clones anonymously.
         if (!/isn't installed/.test((e as Error).message)) return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
@@ -60,11 +59,11 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
             const holds = current ? `${current.owner}/${current.name}` : "a different repository";
             return { error: `${WORKDIR} already holds ${holds}; this thread's sandbox has one checkout` };
           }
-          const r = await sb.exec(`git ${auth}fetch --prune origin`, { cwd: WORKDIR, env, timeoutMs: 5 * 60_000 });
+          const r = await sb.exec(git("fetch --prune origin"), { cwd: WORKDIR, env, timeoutMs: 5 * 60_000 });
           if (r.exitCode !== 0) return { error: `fetch failed: ${r.stderr.slice(-500)}` };
           return { status: "fetched", repo: `${repo.owner}/${repo.name}`, path: WORKDIR };
         }
-        const r = await sb.exec(`git ${auth}clone ${url} ${WORKDIR}`, { cwd: "/", env, timeoutMs: 10 * 60_000 });
+        const r = await sb.exec(git(`clone ${url} ${WORKDIR}`), { cwd: "/", env, timeoutMs: 10 * 60_000 });
         if (r.exitCode !== 0) return { error: `clone failed: ${r.stderr.slice(-500)}` };
         return { status: "cloned", repo: `${repo.owner}/${repo.name}`, path: WORKDIR };
       } catch (e) {

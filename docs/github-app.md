@@ -11,6 +11,13 @@ holds a long-lived token:
   request in Slack.
 - The token reaches the sandbox only in the environment of the one git command that needs
   it, through a credential helper. It is never in the command line or the remote URL.
+  That command runs with hooks off and every other credential helper dropped, and the
+  helper answers only for `https://github.com`, so nothing the checkout configures (a
+  hook, a helper, an `insteadOf` redirect) can capture it. A push goes to the repo's
+  github.com URL, never to whatever `origin` points at.
+- What that can't stop: code run earlier in the sandbox replacing `git` itself. The
+  sandbox is the model's, so a token handed into it is protected by its scope (one repo,
+  the least permission, an hour) and by the approval before any write token exists.
 - Which repos the agent can touch is decided on GitHub: the repos the App is installed on.
   A repo it isn't installed on can still be cloned if it is public, and never pushed to.
 

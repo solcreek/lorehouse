@@ -8,9 +8,10 @@
 //
 // Credentials: a write token for this one repo is asked for only after the approval (from
 // a GitHub App, a short-lived installation token; see github-auth.ts). It enters the
-// sandbox for the single `git push` command only (per-command env, read by an inline
-// credential helper — never written to .git/config, never in argv), and the PR itself is
-// opened from the worker side over the REST API.
+// sandbox for the single `git push` command only, run guarded (git-credential.ts: env
+// only, hooks off, no other credential helpers, answered only for github.com), to the
+// repo's github.com URL rather than `origin`, whose push URL the checkout could change.
+// The PR itself is opened from the worker side over the REST API.
 //
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
 // is read-only (it recomputes the same summary), requestInput then returns the stored
@@ -22,6 +23,7 @@ import { WORKDIR, type SandboxFor } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
 import type { GithubAccess } from "../github-auth";
+import { gitWithToken, tokenEnv } from "./git-credential";
 
 export type PullRequestOptions = {
   sandboxFor: SandboxFor;
@@ -93,12 +95,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
       }
       try {
-        await sh(
-          // The helper reads the token from THIS command's env — nothing persists in the repo.
-          `git -c credential.helper='!f() { echo username=x-access-token; echo "password=$LOREHOUSE_GH_TOKEN"; }; f' ` +
-            `push origin ${head}:refs/heads/${input.branch}`,
-          { LOREHOUSE_GH_TOKEN: token },
-        );
+        await sh(gitWithToken(`push https://github.com/${repo.owner}/${repo.name}.git ${head}:refs/heads/${input.branch}`), tokenEnv(token));
       } catch (e) {
         return { error: `push failed: ${(e as Error).message}` };
       }

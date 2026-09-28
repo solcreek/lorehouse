@@ -103,7 +103,8 @@ describe("workspace_clone", () => {
     const clone = calls.find((c) => c.command.includes(" clone "))!;
     expect(clone.command).toContain("clone https://github.com/acme/secret.git /workspace/repo");
     expect(clone.command).not.toContain("ghs_read"); // never in argv, so never in the remote URL
-    expect(clone.opts?.env).toEqual({ LOREHOUSE_GH_TOKEN: "ghs_read" });
+    expect(clone.opts?.env).toMatchObject({ LOREHOUSE_GH_TOKEN: "ghs_read" });
+    expect(clone.command).toContain("-c core.hooksPath=/dev/null");
   });
 
   test("already cloned: it fetches the same repo, and refuses to clone a different one over it", async () => {
