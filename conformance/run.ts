@@ -501,6 +501,11 @@ const scenarios: Scenario[] = [
       if (wrong.status !== 401) return `a wrong token: got ${wrong.status}, want 401`;
       const noName = await post({ authorization: `Bearer ${RUNNER_TOKEN}` });
       if (noName.status !== 400) return `no runner name: got ${noName.status}, want 400`;
+      // A malformed job list is refused whole, never read as an empty (authoritative) one.
+      for (const bad of [{ jobs: [1, 2] }, { jobs: "j_1" }, { received: [null] }]) {
+        const r = await fetch(`${APP}/runners/poll`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${RUNNER_TOKEN}`, "x-lorehouse-runner": "r1" }, body: JSON.stringify({ capacity: 1, running: 0, ...bad }) });
+        if (r.status !== 400) return `a status with ${JSON.stringify(bad)}: got ${r.status}, want 400`;
+      }
       const plain = await fetch(`${APP}/runners/connect`, { headers: { authorization: `Bearer ${RUNNER_TOKEN}`, "x-lorehouse-runner": "r1" } });
       return plain.status === 426 ? null : `a GET without an upgrade: got ${plain.status}, want 426 (so a runner knows to fall back to long poll)`;
     }),
