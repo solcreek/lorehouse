@@ -88,7 +88,9 @@ not rechecked on the dev line.
 
 ## Decisions this spike leaves open
 
-1. Deploy to Workers directly, or through Creek.
+1. ~~Deploy to Workers directly, or through Creek.~~ Through Creek (decided 2026-09-27).
+   Creek can't deploy a June build yet; the gaps are tracked in
+   [solcreek/creek#54](https://github.com/solcreek/creek/issues/54).
 2. Create the production D1 database, and decide who can read the early-access list.
 3. Whether the form island is worth ~96 KB, or the form becomes plain HTML posting to a
    route handler.
