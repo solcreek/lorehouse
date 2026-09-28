@@ -12,7 +12,7 @@
 // jobs the runner says it never got (they never ran, so a retry is safe).
 
 import type { Database } from "bun:sqlite";
-import type { ExecOptions, ExecResult, Sandbox } from "../tools/workspace";
+import { EXEC_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox } from "../tools/workspace";
 
 // `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
 // `received` (long poll only): ids from the last poll answer the runner got, so jobs whose
@@ -261,7 +261,9 @@ export class RunnerHub {
     };
     return {
       async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
-        const r = await guest("POST", "/exec", JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs: o.timeoutMs }), o.timeoutMs ?? 60_000);
+        // One timeout for both: the guest's limit, and (plus boot slack) this call's deadline.
+        const timeoutMs = o.timeoutMs ?? EXEC_TIMEOUT_MS;
+        const r = await guest("POST", "/exec", JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs }), timeoutMs);
         return JSON.parse(decode(r)) as ExecResult;
       },
       async readFile(path: string): Promise<string> {

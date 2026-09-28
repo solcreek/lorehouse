@@ -19,8 +19,13 @@ export type ExecOptions = {
   // Per-command env. Secrets go HERE, never into the sandbox's persistent env: a model-run
   // `env` or `cat ~/.config/...` in a later command must not be able to read them back.
   env?: Record<string, string>;
+  // Default: EXEC_TIMEOUT_MS.
   timeoutMs?: number;
 };
+
+// A command's timeout when none is given. Sandbox implementations resolve it themselves and
+// send it, so the guest's limit and the caller's deadline are the same number.
+export const EXEC_TIMEOUT_MS = 10 * 60_000;
 
 export interface Sandbox {
   exec(command: string, opts?: ExecOptions): Promise<ExecResult>;

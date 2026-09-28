@@ -12,7 +12,7 @@
 //
 // Feasibility numbers (boot, exec, persistence): sandbox/spike/.
 
-import type { ExecOptions, ExecResult, Sandbox } from "./tools/workspace";
+import { EXEC_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox } from "./tools/workspace";
 
 export type RemoteSandboxOptions = {
   url: string; // daemon base URL, e.g. https://sandbox.example.com
@@ -38,7 +38,7 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
       const res = await call("/exec", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs: o.timeoutMs }),
+        body: JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs: o.timeoutMs ?? EXEC_TIMEOUT_MS }),
       });
       return (await res.json()) as ExecResult;
     },

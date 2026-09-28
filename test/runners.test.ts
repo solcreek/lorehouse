@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { openKnowledge } from "../src/knowledge";
 import { RunnerHub, type Job, type JobResult } from "../src/runners/hub";
+import { EXEC_TIMEOUT_MS } from "../src/tools/workspace";
 
 const status = (runner: string, capacity = 4, running = 0) => ({ runner, capacity, running });
 const b64 = (s: string) => Buffer.from(s).toString("base64");
@@ -27,6 +28,14 @@ describe("over WebSocket", () => {
     expect(JSON.parse(Buffer.from(sent[0]!.op === "guest" ? sent[0]!.bodyBase64! : "", "base64").toString())).toEqual({ command: "echo hi", cwd: "/w", timeoutMs: 5000 });
     link.result(ok(sent[0]!, { exitCode: 0, stdout: "hi\n", stderr: "" }));
     expect(await done).toEqual({ exitCode: 0, stdout: "hi\n", stderr: "" });
+  });
+
+  test("with no timeout given, the guest and the call's deadline get the same default", async () => {
+    const hub = hubWith();
+    const { sent } = wsRunner(hub, "r1");
+    void hub.sandbox("s1").exec("npm test");
+    expect(sent[0]!.timeoutMs).toBe(EXEC_TIMEOUT_MS);
+    expect(JSON.parse(Buffer.from(sent[0]!.op === "guest" ? sent[0]!.bodyBase64! : "", "base64").toString()).timeoutMs).toBe(EXEC_TIMEOUT_MS);
   });
 
   test("a closed connection's jobs fail if the runner doesn't come back within the grace", async () => {
