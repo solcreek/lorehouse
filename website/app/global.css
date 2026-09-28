@@ -170,6 +170,7 @@ section{padding-block:80px 8px}
 .loop .n::before{counter-increment:s;content:counter(s);width:26px;height:26px;border:1.5px solid var(--ink);border-radius:50%;display:grid;place-items:center;color:var(--ink);font:400 12px/1 var(--mono)}
 .loop h3{font-size:19px;text-transform:uppercase;margin-bottom:8px;letter-spacing:.02em}
 .loop p{font-size:15px;color:var(--muted)}
+.loop .st{margin-top:14px}
 .loop .ring{position:absolute;inset:8px;border:1.8px solid var(--pencil);border-radius:46% 54% 50% 50% / 12% 10% 14% 12%;pointer-events:none;filter:url(#pencil)}
 .loop .ringnote{position:absolute;right:10px;bottom:-30px;background:var(--sheet);padding-inline:6px}
 .back{display:flex;align-items:center;gap:12px;margin-top:44px;font:400 11px/1 var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.06em}

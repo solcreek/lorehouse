@@ -210,27 +210,27 @@ function SectionHead({ no, title, children }: { no: string; title: string; child
 const CAPABILITIES: { title: string; body: string; status: ["b" | "w" | "p", string][] }[] = [
   {
     title: "Knows",
-    body: "Answers from your company's knowledge and cites every claim. When nothing turns up, it says so and doesn't guess.",
+    body: "Answers from your company's Slack history and cites every claim. When nothing turns up, it says so and doesn't guess. Repos and MCP servers come next.",
     status: [["b", "Slack history"], ["w", "Repos, MCP servers"], ["p", "Databases, APIs, wikis"]],
   },
   {
     title: "Builds",
-    body: "Turns a decision into a Linear or GitHub issue, writes the change in its own sandbox, runs the tests, and opens the pull request.",
+    body: "Writes the change in its own sandbox, runs the tests, and opens a pull request once a person approves it. Next: opening the Linear or GitHub issue from the thread.",
     status: [["b", "Sandbox, approved PRs"], ["w", "Issues from threads"]],
   },
   {
     title: "Connects",
-    body: "Sends and reads email, and gains new abilities through connections. The model never holds your credentials.",
+    body: "Planned: sending and reading email, and new abilities through connections whose credentials the model never holds.",
     status: [["p", "Email, MCP and OpenAPI connections"]],
   },
   {
     title: "Shows up",
-    body: "Joins the conversations you already have, in Slack and beyond, and has an app of its own for everything it knows.",
+    body: "Works in Slack, where your team already talks. Planned: other chat tools, and an app of its own for everything it knows.",
     status: [["b", "Slack"], ["p", "Other chat tools, the Lorehouse app"]],
   },
   {
     title: "Keeps learning",
-    body: "Runs routines on a schedule, saves what it learned after each session, and reviews it overnight.",
+    body: "Next: saving what it learned after each session. Planned: routines on a schedule, and reviewing what it learned overnight.",
     status: [["w", "Saving what it learned"], ["p", "Routines, dreaming"]],
   },
 ];
@@ -275,16 +275,17 @@ function HowItLearns() {
         Lore is what your company knows, plus what Lorehouse learns while working for it.
       </SectionHead>
       <ol className="loop">
-        <li><div className="n">Step</div><h3>Ask in public</h3><p>Someone mentions the agent in a channel. Everyone can read along and step in.</p></li>
-        <li><div className="n">Step</div><h3>Do the work</h3><p>It searches the lore, uses its connections, and codes in a sandbox of its own.</p></li>
+        <li><div className="n">Step</div><h3>Ask in public</h3><p>Someone mentions the agent in a channel. Everyone can read along and step in.</p><Status kind="b">Built</Status></li>
+        <li><div className="n">Step</div><h3>Do the work</h3><p>It searches what your company knows and codes in a sandbox of its own.</p><Status kind="b">Built</Status></li>
         <li>
           <span className="ring" aria-hidden="true" />
           <div className="n">Step</div>
           <h3>Save what it learned</h3>
-          <p>What it learned becomes a note the next session starts from, linked to its thread.</p>
+          <p>What it learned will become a note the next session starts from, linked to its thread.</p>
+          <Status kind="w">Under construction</Status>
           <span className="hand ringnote">this is the part that compounds</span>
         </li>
-        <li><div className="n">Overnight</div><h3>Dreaming</h3><p>While nobody is asking, it merges duplicate notes, corrects what went stale and drops what turned out wrong.</p></li>
+        <li><div className="n">Overnight</div><h3>Dreaming</h3><p>While nobody is asking, it will merge duplicate notes, correct what went stale and drop what turned out wrong.</p><Status kind="p">Proposed</Status></li>
       </ol>
       <p className="back">Then back to step 1</p>
     </section>
