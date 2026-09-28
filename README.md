@@ -48,7 +48,7 @@ is enough; no zero-downtime setup is needed. A prototype of the same stack used 
 | where | status | how |
 |---|---|---|
 | **Linux you run**: a server at home, a Hetzner box, any VPS | works today | the compiled binary under systemd; HTTPS from Caddy or a Cloudflare Tunnel. CI builds the Linux binary and runs the full conformance suite against it on every change |
-| **Fly.io** | planned | one always-on machine with a volume for the SQLite file |
+| **Fly.io** | works today | one always-on machine with a volume for the SQLite files ([`fly.toml`](fly.toml), [below](#on-flyio)) |
 | **Render** | planned | a web service with a persistent disk |
 | **Cloudflare Workers** | exploring | needs June's edge host and Durable Object storage instead of a SQLite file |
 | **Your laptop** | works today | `bun start` behind a quick tunnel, for trying it out ([runbook](docs/live-slack.md)) |
@@ -62,6 +62,26 @@ Every host needs the same few things:
 The sandbox is separate. It needs a host with KVM, such as bare metal or a VM with nested
 virtualization, and Lorehouse reaches it over `SANDBOX_URL`. The host running Lorehouse
 itself needs no KVM.
+
+### On Fly.io
+
+The [`Dockerfile`](Dockerfile) packs the binary into a 178 MB image. The SQLite files go
+under `/data`. Set `app` in `fly.toml` to your own name, then:
+
+```bash
+fly apps create <app>
+fly volumes create lorehouse_data --region <region> --size 1 -a <app>
+fly secrets set -a <app> --stage SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=… \
+  ANTHROPIC_API_KEY=… AGENT_CHANNELS=C0123456
+fly deploy
+```
+
+Then point the Slack app's Request URL at `https://<app>.fly.dev/slack/events`. A fresh
+volume backfills from Slack on first start, so nothing needs copying over.
+
+CI deploys every merge to `main` that passes the conformance suite. To do the same, add a
+Fly deploy token as the `FLY_API_TOKEN` repository secret, and change the repository
+check in [`ci.yml`](.github/workflows/ci.yml).
 
 ## Run it
 
