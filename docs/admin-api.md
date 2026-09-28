@@ -130,38 +130,58 @@ found nothing.
 
 ```json
 { "days": 7, "since": "2026-09-21T18:00:00.000Z",
-  "people": 5, "channels": 2, "threads": 9,
+  "asks": 23, "channels": 2, "threads": 9,
   "emptySearches": { "threads": 2, "of": 8, "queries": ["okapi budget"] },
-  "feedback": { "up": 6, "down": 1, "people": 4,
+  "feedback": { "up": 6, "down": 1, "raters": 4,
                 "downMessages": [ { "channel": "C0123", "ts": "1790000009.000100" } ] } }
 ```
 
-How the agent is used in public channels, to see whether it is becoming part of how people
-work together:
+It is there to improve the agent: what its lore is missing, and which answers people
+thought were wrong. How much and how widely it is asked says whether it is becoming part of
+how people work. Who asked is not part of it:
 
-- **`people`, `channels`, `threads`:** who asked it something, and where. An ask is a
-  message it answered: a mention, or a plain reply in a thread it was asked into.
+- **`asks`, `channels`, `threads`:** the messages the agent answered (a mention, or a plain
+  reply in a thread it was asked into), and in how many channels and threads.
 - **`emptySearches`:** threads where every search found nothing, out of the threads that
   searched (`of`), and the latest distinct queries that found nothing (up to 10). It is a
   floor for "couldn't answer", not a count of it: search matches any of the words, so a
   question with no real answer usually still gets hits.
-- **`feedback`:** the 👍 and 👎 people leave on the agent's own messages, how many people
-  left them, and the latest messages given a 👎 (up to 10). A reaction is recorded and
-  never answered.
+- **`feedback`:** the 👍 and 👎 on the agent's own messages, from how many distinct
+  `raters` (one person or many), and the latest messages given a 👎 (up to 10). A reaction
+  is recorded and never answered.
 
 What is recorded, and for how long:
 
+- **Nobody's Slack id, by default.** An ask keeps where it was asked, not by whom. A
+  reaction keeps a keyed hash of the person (an HMAC under the app's signing secret, which
+  isn't in the database), only so each person counts once and taking a reaction back
+  removes the right one.
 - **A DM is never recorded**, whatever `DM_MODE` is.
 - **Rows are kept 90 days,** the longest window this reports, then pruned (on start and
   daily).
 - **A question deleted in Slack is forgotten:** its ask goes, and when it was a thread's
   root, so do the searches run for it. The same as a deleted message leaving the index.
-- **None of it is in `GET /status`,** which holds counts safe for a monitor. This holds
-  who asked and what was searched for.
+- **None of it is in `GET /status`,** which holds counts safe for a monitor. `/status`
+  says only whether askers are recorded (`recordsWhoAsks`).
 
 Feedback needs the `reactions:read` scope and the `reaction_added` and
 `reaction_removed` events ([setup](live-slack.md)); `lorehouse doctor` fails while the
 scope is missing.
+
+#### Recording who asks (off by default)
+
+Lorehouse's view is that usage is for improving the agent, not for seeing who uses it and
+who doesn't. Counting people turns asking into something people are counted on (Goodhart's
+law), and a record of who asks in public makes people think twice before asking there,
+which is the behavior the agent depends on. Some organizations want the numbers anyway, so
+an install can opt in with `USAGE_RECORD_PEOPLE=1`, in the open:
+
+- **Each allowlisted channel is told,** once, that the agent now records who asks. Turning
+  it off tells them again, and erases every asker kept.
+- **The usage adds `people` and `askers`:** how many people asked, and each asker
+  (`{ user, name, asks }`, most asks first). Asks from before opting in have no asker.
+- **Reactions stay anonymous** either way: a named 👎 is one people hold back.
+- **`/status` says `recordsWhoAsks: true`,** and `lorehouse doctor` notes it.
 
 ### Runners and sandboxes
 
