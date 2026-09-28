@@ -111,7 +111,14 @@ describe("workspace_clone", () => {
     expect(await run(cloneTool(() => same.sb, staticToken("t")), "acme/secret")).toMatchObject({ status: "fetched" });
     expect(same.calls.some((c) => c.command.includes("fetch --prune origin"))).toBe(true);
     const other = fakeSandbox("https://github.com/acme/other.git");
-    expect(await run(cloneTool(() => other.sb, staticToken("t")), "acme/secret")).toMatchObject({ error: expect.stringContaining("already holds") });
+    expect(await run(cloneTool(() => other.sb, staticToken("t")), "acme/secret")).toMatchObject({ error: expect.stringContaining("already holds acme/other") });
+  });
+
+  test("a different checkout is never described by its remote URL, which may hold a credential", async () => {
+    const leaky = fakeSandbox("https://x-access-token:ghs_leak@example.com/acme/other.git");
+    const r = (await run(cloneTool(() => leaky.sb, staticToken("t")), "acme/secret")) as { error: string };
+    expect(r.error).toContain("already holds a different repository");
+    expect(r.error).not.toContain("ghs_leak");
   });
 
   test("a repo the App isn't installed on clones anonymously (fine for a public one)", async () => {

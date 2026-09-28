@@ -49,7 +49,9 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
         if (origin.exitCode === 0) {
           const current = parseRepo(origin.stdout);
           if (!current || current.owner !== repo.owner || current.name !== repo.name) {
-            return { error: `${WORKDIR} already holds ${origin.stdout.trim()}; this thread's sandbox has one checkout` };
+            // Named only as owner/name: the remote URL itself may carry a credential.
+            const holds = current ? `${current.owner}/${current.name}` : "a different repository";
+            return { error: `${WORKDIR} already holds ${holds}; this thread's sandbox has one checkout` };
           }
           const r = await sb.exec(`git ${auth}fetch --prune origin`, { cwd: WORKDIR, env, timeoutMs: 5 * 60_000 });
           if (r.exitCode !== 0) return { error: `fetch failed: ${r.stderr.slice(-500)}` };
