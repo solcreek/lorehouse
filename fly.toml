@@ -2,7 +2,8 @@
 # Change `app` to your own app name. Secrets and install-specific settings are not in
 # this file; set them with `fly secrets set`:
 #   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, ANTHROPIC_API_KEY, AGENT_CHANNELS
-# (and optionally AGENT_NAME, DM_MODE, SANDBOX_URL/SANDBOX_TOKEN/GITHUB_TOKEN).
+# (and optionally STATUS_TOKEN to read /status, AGENT_NAME, DM_MODE,
+# SANDBOX_URL/SANDBOX_TOKEN/GITHUB_TOKEN).
 
 app = "lorehouse"
 primary_region = "nrt"

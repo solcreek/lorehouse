@@ -69,7 +69,7 @@ itself needs no KVM.
 bun install
 SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=xoxb-… ANTHROPIC_API_KEY=… \
 AGENT_CHANNELS=C0123456 \
-bun start                       # POST /slack/events, GET /healthz, GET /status
+bun start                       # POST /slack/events, GET /healthz, GET /status (with STATUS_TOKEN)
 
 bun run build                   # → dist/lorehouse, a single binary
 ```
@@ -89,6 +89,7 @@ To set up Slack:
 | `AGENT_NAME` | `scout` | the agent's handle; must match the Slack app's display name |
 | `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never works in private channels |
 | `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call), `ignore`, or `answer` (from public knowledge; not with the code tools). A DM is never indexed |
+| `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). `/healthz` is always open and says only `ok` |
 | `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
 | `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |

@@ -61,7 +61,7 @@ Record what you see next to each item. Each one maps to an assumption in
 
 | # | Do | Expect | Mock assumption it checks |
 |---|---|---|---|
-| 1 | `curl localhost:3000/status` | `state: "ready"`, `documents` = the threads you posted | `auth.test` returns `url`; `conversations.history`/`replies` shapes, pagination |
+| 1 | `curl -H "Authorization: Bearer $STATUS_TOKEN" localhost:3000/status` (set `STATUS_TOKEN` first; without it `/status` is closed) | `state: "ready"`, `documents` = the threads you posted | `auth.test` returns `url`; `conversations.history`/`replies` shapes, pagination |
 | 2 | `@scout` ask about a fact from the history | A streamed reply in the thread, citing the right thread; its permalink opens that thread | `chat.startStream` needs `recipient_team_id`/`recipient_user_id`; the permalink format |
 | 3 | Ask about a fact that only a **reply** holds | Cites the thread | `conversations.replies` returns root + replies |
 | 4 | Post a new fact, wait a few seconds, then ask about it | Cites the new message | the `message` event has `channel_type: "channel"` (the policy needs it) |

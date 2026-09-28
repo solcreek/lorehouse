@@ -78,7 +78,9 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
 }
 
 type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
-const status = async () => (await (await fetch(`http://localhost:${APP_PORT}/status`)).json()) as Status;
+const STATUS_TOKEN = "conformance-status";
+const statusAs = (auth?: string) => fetch(`http://localhost:${APP_PORT}/status`, { headers: auth ? { authorization: auth } : {} });
+const status = async () => (await (await statusAs(`Bearer ${STATUS_TOKEN}`)).json()) as Status;
 
 // A person's DM to the bot, as Slack delivers it: a `message` event with channel_type
 // "im" (a DM never produces an app_mention). Returns its ts.
@@ -156,6 +158,37 @@ const scenarios: Scenario[] = [
       const want = SEED_DOCS + 5;
       if (s.knowledge.state !== "ready") return `state ${s.knowledge.state}, want ready`;
       return s.knowledge.documents === want ? null : `documents ${s.knowledge.documents}, want ${want}`;
+    },
+  },
+  {
+    name: "GET /status needs the bearer token; /healthz stays open",
+    run: async () => {
+      // /status names the channels it reads and when it last saw a message, so it is
+      // closed to anyone without STATUS_TOKEN.
+      for (const [auth, what] of [[undefined, "no token"], ["Bearer wrong", "a wrong token"], [STATUS_TOKEN, "the token without the Bearer scheme"]] as const) {
+        const r = await statusAs(auth);
+        if (r.status !== 401) return `${what}: got ${r.status}, want 401`;
+        if ((await r.text()).includes("knowledge")) return `${what}: the refusal leaked the status`;
+      }
+      const ok = await statusAs(`Bearer ${STATUS_TOKEN}`);
+      if (ok.status !== 200) return `the right token: got ${ok.status}, want 200`;
+      const health = await fetch(`http://localhost:${APP_PORT}/healthz`);
+      return health.status === 200 ? null : `/healthz: got ${health.status}, want 200`;
+    },
+  },
+  {
+    name: "GET /status is closed (404) when no STATUS_TOKEN is set",
+    run: async () => {
+      // A restart without the token: nothing to wait on /status for, so it waits on /healthz.
+      await stopApp();
+      await startApp({ STATUS_TOKEN: "" }, { waitReady: false });
+      try {
+        const r = await statusAs(`Bearer ${STATUS_TOKEN}`);
+        return r.status === 404 ? null : `got ${r.status}, want 404`;
+      } finally {
+        await stopApp();
+        await startApp();
+      }
     },
   },
   {
@@ -447,9 +480,10 @@ removeDb();
 
 let app: ReturnType<typeof Bun.spawn> | undefined;
 
-// Start the app and wait until it listens, owns its port, and has finished its Slack
-// backfill/reconcile (GET /status → ready).
-async function startApp(extraEnv: Record<string, string> = {}): Promise<void> {
+// Start the app and wait until it listens, owns its port, and (unless waitReady is off,
+// for a start where /status is closed) has finished its Slack backfill/reconcile
+// (GET /status → ready).
+async function startApp(extraEnv: Record<string, string> = {}, { waitReady = true } = {}): Promise<void> {
   const proc = Bun.spawn(APP_CMD, {
     // An external app runs from its own directory, so a binary that quietly reads files
     // from this repo (prompts, migrations) fails here instead of passing by accident.
@@ -469,6 +503,7 @@ async function startApp(extraEnv: Record<string, string> = {}): Promise<void> {
       INGEST_BACKFILL_DAYS: "36500",
       INGEST_REFRESH_DAYS: "36500",
       INGEST_DEBOUNCE_MS: "200",
+      STATUS_TOKEN,
       ...extraEnv,
     },
     stdout: "ignore",
@@ -478,6 +513,7 @@ async function startApp(extraEnv: Record<string, string> = {}): Promise<void> {
   if (!(await waitHttp(`http://localhost:${APP_PORT}/healthz`, 15000))) throw new Error(`app never answered /healthz\n${await new Response(proc.stderr as ReadableStream).text()}`);
   const owners = await listenerPids(APP_PORT);
   if (!owners.includes(String(proc.pid))) throw new Error(`:${APP_PORT} is held by ${owners.join(",")}, not the app under test (${proc.pid})`);
+  if (!waitReady) return;
   const t0 = Date.now();
   while ((await status().catch(() => undefined))?.knowledge.state !== "ready") {
     if (Date.now() - t0 > 15000) throw new Error(`ingest never became ready: ${JSON.stringify(await status().catch((e) => String(e)))}`);
