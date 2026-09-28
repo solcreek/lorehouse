@@ -3,7 +3,9 @@
 #
 # Event Subscriptions and Interactivity are left out on purpose: Slack verifies their
 # Request URL with a signed challenge the moment you save, and the app can only answer
-# once it has this app's signing secret. You add them after the app is running.
+# once it has this app's signing secret. You add them after the app is running, both
+# pointing at https://<your app>/slack/events (Interactivity carries the pull request
+# Approve/Deny clicks).
 #
 # Rename `scout` to the name you set in AGENT_NAME; the two must match.
 display_information:
