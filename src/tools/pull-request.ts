@@ -82,6 +82,29 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       }
       if (!stat) return { error: `HEAD has no changes against origin/${base}` };
 
+      // Every commit must be by the account the PR comes from (the App's bot), before anyone
+      // is asked to approve it: a commit made before that was enforced, or with an identity
+      // the model set, would otherwise go out under a made-up name. Without an identity
+      // (the lookup failed) there's nothing to check against.
+      const who = await opts.github.identity?.().catch(() => undefined);
+      if (who) {
+        const want = `${who.name} <${who.email}>`;
+        let lines: string[];
+        try {
+          lines = (await sh(`git log --format='%an <%ae>|%cn <%ce>' origin/${base}..HEAD`)).split("\n").filter(Boolean);
+        } catch (e) {
+          return { error: (e as Error).message };
+        }
+        const off = lines.filter((l) => l !== `${want}|${want}`).length;
+        if (off) {
+          return {
+            error:
+              `${off} of ${lines.length} commit(s) on HEAD aren't by ${want}. Re-author them, then call open_pull_request again: ` +
+              `workspace_exec \`git rebase --exec 'git commit --amend --no-edit --reset-author' origin/${base}\` (commands already run as ${who.name}).`,
+          };
+        }
+      }
+
       const approved = await ctx.requestInput({
         id: `pr:${input.branch}:${head.slice(0, 12)}`,
         prompt:

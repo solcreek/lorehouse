@@ -34,6 +34,18 @@ describe("who commits", () => {
     expect(sh(`git commit -q --allow-empty -m x`, { cwd: dir, env: authorEnv(bot) }).code).toBe(0);
     expect(sh(`git log -1 --format='%an <%ae>|%cn <%ce>'`, { cwd: dir }).out.trim()).toBe(`${bot.name} <${bot.email}>|${bot.name} <${bot.email}>`);
   });
+
+  test("the re-author command open_pull_request suggests fixes every commit since the base", () => {
+    const dir = repo("reauthor");
+    sh(`git branch base && git config user.name Scout && git config user.email scout@made-up.example`, { cwd: dir });
+    sh(`echo a > a && git add a && git commit -qm a && echo b > b && git add b && git commit -qm b`, { cwd: dir });
+    const bot = { name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" };
+    const r = sh(`git rebase --exec 'git commit --amend --no-edit --reset-author' base`, { cwd: dir, env: authorEnv(bot) });
+    expect(r.code).toBe(0);
+    const want = `${bot.name} <${bot.email}>`;
+    expect(sh(`git log --format='%an <%ae>|%cn <%ce>' base..HEAD`, { cwd: dir }).out.trim().split("\n")).toEqual([`${want}|${want}`, `${want}|${want}`]);
+    expect(sh(`git log --format=%s base..HEAD`, { cwd: dir }).out.trim().split("\n")).toEqual(["b", "a"]); // same commits, re-authored
+  });
 });
 
 describe("git with a token", () => {

@@ -7,7 +7,11 @@ import { AgentSession, replyStream, type EventSink, type ModelReply, type Model,
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
 import { pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
-import { staticToken } from "../src/github-auth";
+import { staticToken as tokenWithLookup } from "../src/github-auth";
+
+// A plain token whose identity lookup never leaves the process (it fails, so no author
+// check applies): these tests are about the gate, not who commits.
+const staticToken = (token: string) => tokenWithLookup(token, { fetch: (async () => new Response("offline", { status: 503 })) as unknown as typeof fetch });
 import { parseAllowlist, publicChannelsOnly } from "../src/policy";
 import { directMessage, redirectText } from "../src/dm";
 import { remoteSandbox } from "../src/sandbox-client";
@@ -24,7 +28,7 @@ const scripted = (script: ModelReply[]): Model => (msgs) =>
   replyStream(script[Math.min(msgs.filter((m) => m.role === "assistant").length, script.length - 1)]!);
 
 // A sandbox that answers the git commands open_pull_request issues and records every exec.
-function fakeRepo(o: { dirty?: boolean; origin?: string } = {}) {
+function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[] } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
   const sb: Sandbox = {
     async exec(command, opts) {
@@ -35,6 +39,7 @@ function fakeRepo(o: { dirty?: boolean; origin?: string } = {}) {
       if (command === "git rev-parse --abbrev-ref origin/HEAD") return ok("origin/main\n");
       if (command === "git rev-parse HEAD") return ok("0123456789abcdef0123456789abcdef01234567\n");
       if (command.startsWith("git diff --stat")) return ok(" src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      if (command.startsWith("git log --format=")) return ok((o.authors ?? []).map((a) => `${a}\n`).join(""));
       if (command.includes(" push https://github.com/")) return ok("");
       return { exitCode: 1, stdout: "", stderr: `unexpected: ${command}` };
     },
@@ -138,6 +143,27 @@ describe("open_pull_request — the approval gate", () => {
     expect(String(toolResult()?.result.error)).toContain("not a github.com remote");
     expect(asked).toEqual([]);
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+  });
+
+  test("a commit not by the App's bot is sent back to be re-authored, before anyone is asked to approve", async () => {
+    const bot = "acme-agent[bot] <900+acme-agent[bot]@users.noreply.github.com>";
+    const github = Object.assign(async () => "ghs_secret", { identity: async () => ({ name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" }) });
+    const outcome = async (authors: string[]) => {
+      const { sb, calls } = fakeRepo({ authors });
+      const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+      const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+      return { result: await s.result(t1), tool: toolResult()?.result, pushed: calls.some((c) => c.command.includes("push")) };
+    };
+    // One made-up author among two: no approval card, nothing pushed, and the model is told how to fix it.
+    const wrong = await outcome([`${bot}|${bot}`, `Scout <scout@made-up.example>|${bot}`]);
+    expect(wrong.result).toMatchObject({ status: "completed" });
+    expect(String(wrong.tool?.error)).toContain("1 of 2 commit(s) on HEAD aren't by acme-agent[bot]");
+    expect(String(wrong.tool?.error)).toContain("git rebase --exec 'git commit --amend --no-edit --reset-author' origin/main");
+    expect(wrong.pushed).toBe(false);
+    // A committer that isn't the bot counts too.
+    expect(String((await outcome([`${bot}|Scout <scout@made-up.example>`])).tool?.error)).toContain("aren't by");
+    // All by the bot: on to the approval.
+    expect((await outcome([`${bot}|${bot}`])).result).toMatchObject({ status: "suspended" });
   });
 
   test("Deny pushes nothing", async () => {
