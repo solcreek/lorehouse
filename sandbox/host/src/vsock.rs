@@ -14,6 +14,10 @@ use tokio::net::UnixStream;
 
 pub const GUESTD_PORT: u32 = 1024;
 
+/// Largest guestd response the host buffers. Two 4 MiB output streams, JSON-escaped at
+/// worst (a control byte becomes six), fit.
+const MAX_RESPONSE: usize = 64 << 20;
+
 pub struct Reply {
     pub status: StatusCode,
     pub content_type: Option<String>,
@@ -52,7 +56,13 @@ pub async fn request(uds: &Path, method: Method, path_and_query: &str, body: Byt
     let res = sender.send_request(req).await.map_err(|e| format!("guestd: {e}"))?;
     let status = res.status();
     let content_type = res.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
-    let body = res.into_body().collect().await.map_err(|e| format!("guestd body: {e}"))?.to_bytes();
+    // Bounded before it is buffered: guestd keeps 4 MiB per output stream and serves files
+    // up to 16 MiB, but the host must not trust the guest to hold to that.
+    let body = http_body_util::Limited::new(res.into_body(), MAX_RESPONSE)
+        .collect()
+        .await
+        .map_err(|e| format!("guestd response over {} MiB, or broken: {e}", MAX_RESPONSE >> 20))?
+        .to_bytes();
     Ok(Reply { status, content_type, body })
 }
 
