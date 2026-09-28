@@ -9,6 +9,7 @@
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import type { GithubAccess, RepoRef } from "../github-auth";
 import { toolDescription } from "../prompts";
+import { parseGithubRemote } from "./pull-request";
 import { WORKDIR, type SandboxFor } from "./workspace";
 
 const HELPER = `-c credential.helper='!f() { echo username=x-access-token; echo "password=$LOREHOUSE_GH_TOKEN"; }; f'`;
@@ -47,7 +48,13 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
         const sb = sandboxFor(ctx);
         const origin = await sb.exec(`git -C ${WORKDIR} remote get-url origin 2>/dev/null`, { timeoutMs: 30_000 });
         if (origin.exitCode === 0) {
-          const current = parseRepo(origin.stdout);
+          const current = (() => {
+            try {
+              return parseGithubRemote(origin.stdout);
+            } catch {
+              return undefined;
+            }
+          })();
           if (!current || current.owner !== repo.owner || current.name !== repo.name) {
             // Named only as owner/name: the remote URL itself may carry a credential.
             const holds = current ? `${current.owner}/${current.name}` : "a different repository";

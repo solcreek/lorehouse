@@ -134,9 +134,13 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
   };
 }
 
+// A remote on github.com itself: https://github.com/o/r, git@github.com:o/r or
+// ssh://git@github.com/o/r (with or without .git). The whole URL must match: a token for o/r
+// is asked for on the strength of it, so evil.github.com, github.com.evil.example or a
+// URL with userinfo are refused. The URL isn't echoed back (it may hold a credential).
 export function parseGithubRemote(url: string): { owner: string; name: string } {
-  const m = url.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
-  if (!m) throw new Error(`origin is not a GitHub remote: ${url}`);
+  const m = url.trim().match(/^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/);
+  if (!m || m[1]!.startsWith(".") || m[2]!.startsWith(".")) throw new Error("origin is not a github.com remote");
   return { owner: m[1]!, name: m[2]! };
 }
 

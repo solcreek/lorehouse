@@ -24,14 +24,14 @@ const scripted = (script: ModelReply[]): Model => (msgs) =>
   replyStream(script[Math.min(msgs.filter((m) => m.role === "assistant").length, script.length - 1)]!);
 
 // A sandbox that answers the git commands open_pull_request issues and records every exec.
-function fakeRepo(o: { dirty?: boolean } = {}) {
+function fakeRepo(o: { dirty?: boolean; origin?: string } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
   const sb: Sandbox = {
     async exec(command, opts) {
       calls.push({ command, opts });
       const ok = (stdout: string) => ({ exitCode: 0, stdout, stderr: "" });
       if (command === "git status --porcelain") return ok(o.dirty ? " M src/a.ts\n" : "");
-      if (command === "git remote get-url origin") return ok("https://github.com/acme/widgets.git\n");
+      if (command === "git remote get-url origin") return ok(`${o.origin ?? "https://github.com/acme/widgets.git"}\n`);
       if (command === "git rev-parse --abbrev-ref origin/HEAD") return ok("origin/main\n");
       if (command === "git rev-parse HEAD") return ok("0123456789abcdef0123456789abcdef01234567\n");
       if (command.startsWith("git diff --stat")) return ok(" src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
@@ -126,6 +126,18 @@ describe("open_pull_request — the approval gate", () => {
     expect(String(toolResult()?.result.error)).toContain("isn't installed on acme/widgets");
   });
 
+  test("an origin not on github.com itself (the model can change it) gets no approval, no token, no push", async () => {
+    const { sb, calls } = fakeRepo({ origin: "https://evil.github.com/acme/widgets.git" });
+    const asked: string[] = [];
+    const github = async () => (asked.push("asked"), "ghs_secret");
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    expect(await s.result(t1)).toMatchObject({ status: "completed" }); // never parked for approval
+    expect(String(toolResult()?.result.error)).toContain("not a github.com remote");
+    expect(asked).toEqual([]);
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+  });
+
   test("Deny pushes nothing", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
@@ -168,7 +180,17 @@ describe("open_pull_request — the approval gate", () => {
   test("parseGithubRemote handles https and ssh forms", () => {
     expect(parseGithubRemote("https://github.com/acme/widgets.git")).toEqual({ owner: "acme", name: "widgets" });
     expect(parseGithubRemote("git@github.com:acme/widgets")).toEqual({ owner: "acme", name: "widgets" });
-    expect(() => parseGithubRemote("https://gitlab.com/a/b")).toThrow(/not a GitHub remote/);
+    expect(parseGithubRemote("ssh://git@github.com/acme/widgets.git\n")).toEqual({ owner: "acme", name: "widgets" });
+    // Only github.com itself: the push is handed a token for the repo this names.
+    for (const bad of [
+      "https://gitlab.com/a/b",
+      "https://evil.github.com/acme/widgets.git",
+      "https://github.com.evil.example/acme/widgets.git",
+      "https://evil.example/github.com/acme/widgets.git",
+      "https://x-access-token:t@github.com/acme/widgets.git",
+      "git@evil.example:github.com/acme/widgets.git",
+      "acme/widgets",
+    ]) expect(() => parseGithubRemote(bad)).toThrow(/not a github.com remote/);
   });
 });
 
