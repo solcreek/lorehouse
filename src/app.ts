@@ -17,7 +17,7 @@ import { publicChannelsOnly } from "./policy";
 import { systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
 import { searchKnowledgeTool } from "./tools/search-knowledge";
-import { withNamedThreads } from "./tools/slack-names";
+import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
 import { pullRequestTool } from "./tools/pull-request";
 import { workspaceTools } from "./tools/workspace";
@@ -66,7 +66,7 @@ export async function createApp(config: Config) {
   }
 
   const dm = config.agent.dm;
-  const slack: Channel = withNamedThreads(slackChannel({
+  const slack: Channel = withNamedPeople(slackChannel({
     signingSecret: config.slack.signingSecret,
     botToken: config.slack.botToken,
     apiUrl: config.slack.apiUrl,
