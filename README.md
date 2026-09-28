@@ -108,6 +108,20 @@ bun start                       # POST /slack/events, GET /healthz, GET /status 
 bun run build                   # → dist/lorehouse, a single binary
 ```
 
+Before starting, and whenever something doesn't answer, run the doctor with the same
+environment. It asks Slack, Anthropic, GitHub and the sandbox host directly, and says what
+to fix: a bot not invited to a channel, a missing scope, a model that doesn't exist, a
+GitHub App that can't open pull requests. With `--url` it also checks the running
+deployment: that it answers Slack's URL check with the same signing secret, and what
+`/status` reports.
+
+```bash
+bun run doctor                          # or: lorehouse doctor
+lorehouse doctor --url https://<app>    # also the running deployment
+```
+
+It exits 1 if anything failed, so it can gate a deploy.
+
 To set up Slack:
 
 1. Create the app from [`slack/manifest.yaml`](slack/manifest.yaml). It lists the scopes
@@ -115,6 +129,7 @@ To set up Slack:
 2. Subscribe to the events `app_mention`, `message.channels` and `message.im`.
 3. Invite the bot to each allowed channel. Slack won't serve history to a non-member, so
    the backfill fails with `not_in_channel`, and `GET /status` shows the error.
+   `lorehouse doctor` checks all three before you start.
 
 [`docs/live-slack.md`](docs/live-slack.md) walks through it end to end.
 
