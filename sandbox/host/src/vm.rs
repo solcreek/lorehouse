@@ -134,10 +134,15 @@ impl Manager {
         Ok((guard, sb.uds()))
     }
 
-    /// A sandbox that was refused before it ever got a disk leaves no trace in the listing.
-    async fn forget_if_never_created(&self, sb: &Sandbox) {
-        if !sb.dir.join("rootfs.ext4").exists() {
-            self.sandboxes.lock().await.remove(&sb.id);
+    /// A sandbox that was refused before it ever got a disk leaves no trace in the listing,
+    /// but only when this failed acquisition is its sole user and it is still the entry in
+    /// the map. Removing it under a request that is waiting on the same `running` lock would
+    /// let the next request create a second entry for the same directory and boot it twice.
+    async fn forget_if_never_created(&self, sb: &Arc<Sandbox>) {
+        let mut map = self.sandboxes.lock().await;
+        let current = map.get(&sb.id).is_some_and(|e| Arc::ptr_eq(e, sb));
+        if current && sb.in_flight.load(Ordering::SeqCst) == 1 && !sb.dir.join("rootfs.ext4").exists() {
+            map.remove(&sb.id);
         }
     }
 
@@ -198,6 +203,12 @@ impl Manager {
     /// fall back to a kill if it doesn't go.
     async fn stop(&self, sb: &Sandbox) {
         let mut running = sb.running.lock().await;
+        self.stop_locked(sb, &mut running).await;
+    }
+
+    /// `stop` for a caller already holding the sandbox's `running` lock. Every request
+    /// takes that lock to reach the VM, so while it's held nothing new can start using it.
+    async fn stop_locked(&self, sb: &Sandbox, running: &mut Option<Running>) {
         let Some(mut r) = running.take() else { return };
         let body = Bytes::from_static(br#"{"command":"sync && (sleep 0.2; reboot -f) &","timeoutMs":10000}"#);
         let _ = vsock::request(&sb.uds(), Method::POST, "/exec", body).await;
@@ -212,10 +223,14 @@ impl Manager {
     /// Stop the VM and delete its disk.
     pub async fn destroy(&self, id: &str) -> Result<(), String> {
         let sb = self.get(id).await;
-        if sb.in_flight.load(Ordering::SeqCst) > 0 {
-            return Err("sandbox is busy".into());
+        {
+            // Decide and stop under the lock every request takes, so none slips in between.
+            let mut running = sb.running.lock().await;
+            if sb.in_flight.load(Ordering::SeqCst) > 0 {
+                return Err("sandbox is busy".into());
+            }
+            self.stop_locked(&sb, &mut running).await;
         }
-        self.stop(&sb).await;
         self.sandboxes.lock().await.remove(id);
         match tokio::fs::remove_dir_all(&sb.dir).await {
             Ok(()) => Ok(()),
@@ -229,9 +244,12 @@ impl Manager {
         let list: Vec<Arc<Sandbox>> = self.sandboxes.lock().await.values().cloned().collect();
         let now = now_secs();
         for sb in list {
+            // Check idleness while holding the lock every request takes to reach the VM: a
+            // request that arrives after this point waits, then boots the VM again.
+            let mut running = sb.running.lock().await;
             let idle = now.saturating_sub(sb.last_used.load(Ordering::SeqCst));
-            if sb.in_flight.load(Ordering::SeqCst) == 0 && idle >= self.cfg.idle.as_secs() && sb.running.lock().await.is_some() {
-                self.stop(&sb).await;
+            if running.is_some() && sb.in_flight.load(Ordering::SeqCst) == 0 && idle >= self.cfg.idle.as_secs() {
+                self.stop_locked(&sb, &mut running).await;
             }
         }
     }
