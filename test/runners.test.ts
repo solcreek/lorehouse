@@ -233,6 +233,25 @@ describe("placement", () => {
     expect(full.sent).toHaveLength(1);
   });
 
+  test("new sandboxes placed before the next status count against a runner's room", async () => {
+    const hub = hubWith();
+    const a = wsRunner(hub, "a", 2, 0);
+    const b = wsRunner(hub, "b", 1, 0);
+    const first = hub.sandbox("s1").exec("a"); // a: 2 free, b: 1
+    const second = hub.sandbox("s2").exec("b"); // a: 1 free (s1 counts), b: 1; a by name
+    void hub.sandbox("s3").exec("c"); // a is taken: b
+    expect(a.sent.map((j) => j.sandbox)).toEqual(["s1", "s2"]);
+    expect(b.sent.map((j) => j.sandbox)).toEqual(["s3"]);
+    expect(() => hub.submit("s4", { op: "destroy" }, 1000)).toThrow(/every sandbox runner is full/);
+    // A settled sandbox is in the runner's status from then on, and stops counting as reserved.
+    a.link.result(ok(a.sent[0]!, { exitCode: 0, stdout: "", stderr: "" }));
+    a.link.result(ok(a.sent[1]!, { exitCode: 0, stdout: "", stderr: "" }));
+    await Promise.all([first, second]);
+    a.link.status(status("a", 2, 1)); // one of the two has since been destroyed
+    void hub.submit("s4", { op: "destroy" }, 1000);
+    expect(a.sent.map((j) => j.sandbox)).toEqual(["s1", "s2", "s4"]);
+  });
+
   test("placements survive a restart of Lorehouse (they are in the database)", () => {
     const db = openKnowledge(":memory:");
     const a = new RunnerHub(db);
