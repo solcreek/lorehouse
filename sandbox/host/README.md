@@ -57,8 +57,13 @@ host, plus `GITHUB_TOKEN` for pull requests either way.
 
 [`e2e.ts`](e2e.ts) checks the whole path. It runs Lorehouse in runner mode against the
 conformance mock of Slack and the model, waits for a real sandboxd to connect, and asks for
-a command only a microVM with internet can answer. With `E2E_NO_WS_PROXY=1` it puts a
-proxy in front that strips WebSocket upgrades, so a runner on `auto` has to fall back.
+a command only a microVM with internet can answer. Two options test the hard paths:
+
+- `E2E_NO_WS_PROXY=1` puts a proxy in front that strips WebSocket upgrades, so a runner on
+  `auto` has to fall back to long poll.
+- `E2E_DROP=1` routes the runner through a TCP relay that cuts every connection for 5 s
+  in the middle of a 12 s job. The runner must reconnect and deliver the result it
+  finished while cut off, and the job must run only once.
 
 ## Measured
 
@@ -72,6 +77,7 @@ On a Ryzen 7 8745HS with btrfs, using a 22 GB Ubuntu 24.04 CI image as the golde
 | command on a running VM | 22 ms |
 | golden prepared (reflink + guestd) | 0.13 s |
 | end to end, runner mode: "Slack" mention → command in a cold microVM → answer | 4.6 s over WebSocket, 4.7 s over long poll |
+| every connection cut for 5 s during a 12 s job | the result still arrived after the reconnect, the job ran once: 16.1 s over WebSocket and over long poll |
 
 The end-to-end run (2026-09-28) connected the runner over the tailnet to a Lorehouse on
 another machine. The command's output came from the microVM itself: 2 vCPUs, its own
