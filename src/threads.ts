@@ -37,3 +37,16 @@ export function isFollowUp(e: FollowUpEvent, joined: (channel: string, threadTs:
   if (MENTION.test(e.text ?? "")) return false;
   return joined(e.channelId, e.threadId);
 }
+
+// The threads the agent was asked into, newest first, each with its document when the
+// thread is indexed (a thread holding only a question to the agent isn't knowledge).
+export type JoinedThread = { channel: string; threadTs: string; joinedAt: string; document: string | null; source: string | null; rowid: number };
+
+export function listThreads(db: Database, opts: { limit: number; after?: { joinedAt: string; rowid: number } }): JoinedThread[] {
+  return db.query(
+    `SELECT t.rowid AS rowid, t.channel, t.thread_ts AS threadTs, t.joined_at AS joinedAt, d.doc_id AS document, d.source
+     FROM agent_threads t LEFT JOIN knowledge_documents d ON d.doc_id = 'slack:' || t.channel || ':' || t.thread_ts
+     WHERE (?1 IS NULL OR (t.joined_at, t.rowid) < (?1, ?2))
+     ORDER BY t.joined_at DESC, t.rowid DESC LIMIT ?3`,
+  ).all(opts.after?.joinedAt ?? null, opts.after?.rowid ?? null, opts.limit) as JoinedThread[];
+}

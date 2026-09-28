@@ -156,14 +156,53 @@ export function matchExpression(query: string): string | null {
   return tokens.length ? tokens.map((w) => `"${w}"`).join(" OR ") : null;
 }
 
-export function searcher(db: Database) {
+// The agent's search_knowledge takes the top 5; the admin API may ask for more, in the
+// same order.
+export function searcher(db: Database, limit = 5) {
   const stmt = db.prepare(
     `SELECT d.doc_id AS id, d.title, d.source, d.text
      FROM knowledge_fts JOIN knowledge_documents d ON d.id = knowledge_fts.rowid
-     WHERE knowledge_fts MATCH ? ORDER BY bm25(knowledge_fts) LIMIT 5`,
+     WHERE knowledge_fts MATCH ? ORDER BY bm25(knowledge_fts) LIMIT ${Math.trunc(limit)}`,
   );
   return (query: string): Chunk[] => {
     const expr = matchExpression(query);
     return expr ? (stmt.all(expr) as Chunk[]) : [];
   };
+}
+
+// ── browsing the index (the admin API) ──────────────────────────────────────────
+
+// When a document was last active in its source (Slack: the thread's newest message or
+// edit, a Unix ts), or null when the source has no clock (seeds).
+function activeAt(version: string | null): string | null {
+  const sec = version === null ? NaN : Number(version);
+  return Number.isFinite(sec) ? new Date(sec * 1000).toISOString() : null;
+}
+
+// A document without its text. `rowid` and `updatedAt` are its place in a page.
+export type DocumentSummary = { id: string; kind: string; source: string; title: string; updatedAt: string; activeAt: string | null; chars: number; rowid: number };
+
+// Documents, most recently (re)indexed first. `prefix` narrows by id ("slack:C0123:");
+// `after` continues from the last row of the previous page.
+export function listDocuments(db: Database, opts: { limit: number; prefix?: string; kind?: string; after?: { updatedAt: string; rowid: number } }): DocumentSummary[] {
+  const prefix = opts.prefix ?? "";
+  const rows = db.query(
+    // Qualified: SQLite would read a bare `id` in WHERE or ORDER BY as the doc_id alias.
+    `SELECT d.id AS rowid, d.doc_id AS id, d.kind, d.source, d.title, d.updated_at AS updatedAt, d.source_version AS v, length(d.text) AS chars
+     FROM knowledge_documents d
+     WHERE d.doc_id >= ?1 AND d.doc_id < ?2 AND (?3 IS NULL OR d.kind = ?3) AND (?4 IS NULL OR (d.updated_at, d.id) < (?4, ?5))
+     ORDER BY d.updated_at DESC, d.id DESC LIMIT ?6`,
+  ).all(prefix, `${prefix}￿`, opts.kind ?? null, opts.after?.updatedAt ?? null, opts.after?.rowid ?? null, opts.limit) as (Omit<DocumentSummary, "activeAt"> & { v: string | null })[];
+  return rows.map(({ v, ...d }) => ({ ...d, activeAt: activeAt(v) }));
+}
+
+export type StoredDocument = { id: string; kind: string; source: string; title: string; text: string; updatedAt: string; activeAt: string | null };
+
+export function getDocument(db: Database, docId: string): StoredDocument | undefined {
+  const row = db.query("SELECT doc_id AS id, kind, source, title, text, updated_at AS updatedAt, source_version AS v FROM knowledge_documents WHERE doc_id = ?").get(docId) as
+    | (Omit<StoredDocument, "activeAt"> & { v: string | null })
+    | null;
+  if (!row) return undefined;
+  const { v, ...d } = row;
+  return { ...d, activeAt: activeAt(v) };
 }

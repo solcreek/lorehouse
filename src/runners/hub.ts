@@ -347,3 +347,15 @@ function idle(ms: number, signal?: AbortSignal): Promise<Job[]> {
 function decode(r: JobResult): string {
   return r.bodyBase64 ? Buffer.from(r.bodyBase64, "base64").toString("utf8") : "";
 }
+
+// Where each sandbox lives, newest first (the admin API). A sandbox stays on the runner
+// that first ran it, since its disk is there.
+export type Placement = { sandbox: string; runner: string; placedAt: string; rowid: number };
+
+export function listPlacements(db: Database, opts: { limit: number; after?: { placedAt: string; rowid: number } }): Placement[] {
+  return db.query(
+    `SELECT rowid, sandbox, runner, placed_at AS placedAt FROM sandbox_placements
+     WHERE (?1 IS NULL OR (placed_at, rowid) < (?1, ?2))
+     ORDER BY placed_at DESC, rowid DESC LIMIT ?3`,
+  ).all(opts.after?.placedAt ?? null, opts.after?.rowid ?? null, opts.limit) as Placement[];
+}
