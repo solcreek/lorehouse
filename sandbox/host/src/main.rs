@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Backstop for one proxied request (Lorehouse's longest command is 10 minutes).
-const REQUEST_DEADLINE: Duration = Duration::from_secs(15 * 60 + 30);
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(15 * 60 + 30);
 /// How long requests in flight get after SIGTERM before the VMs are stopped anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 use subtle::ConstantTimeEq;

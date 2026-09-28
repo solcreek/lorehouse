@@ -81,15 +81,17 @@ async fn execute(vms: &Manager, job: Job) -> JobResult {
                 Ok(v) => v,
                 Err((status, msg)) => return JobResult::error(&job.id, status, msg),
             };
-            match vsock::request(&uds, method, p, body).await {
-                Ok(r) => JobResult {
+            // The same host-side backstop as serve mode: the guest can't hold a job forever.
+            match tokio::time::timeout(crate::REQUEST_DEADLINE, vsock::request(&uds, method, p, body)).await {
+                Ok(Ok(r)) => JobResult {
                     id: job.id,
                     status: r.status.as_u16(),
                     content_type: r.content_type,
                     body_base64: Some(B64.encode(&r.body)),
                     error: None,
                 },
-                Err(e) => JobResult::error(&job.id, 502, e),
+                Ok(Err(e)) => JobResult::error(&job.id, 502, e),
+                Err(_) => JobResult::error(&job.id, 504, format!("the guest didn't answer within {} s", crate::REQUEST_DEADLINE.as_secs())),
             }
         }
         other => JobResult::error(&job.id, 400, format!("unknown op {other:?}")),
