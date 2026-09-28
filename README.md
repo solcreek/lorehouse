@@ -4,28 +4,85 @@ An open-source company brain. It lives in your team's public Slack channels. It 
 from what the company already knows, directs agents, and runs proofs of concept in a
 sandbox of its own.
 
-The agent's name is set per install. It defaults to `scout`.
+You name it per install; it defaults to `scout`.
 
-> Status: pre-alpha, not yet usable.
+> Status: pre-alpha. The knowledge side runs against real Slack; the agent and sandbox
+> side is experimental.
+
+## What it does
+
+- **Answers from your team's own Slack, and shows where.** Every thread in the channels
+  you allow becomes knowledge: the root and its replies, from the past 90 days on first
+  start, then live. Each answer cites the thread's permalink.
+- **Stays true to Slack.**
+  - An edit is reflected, and a deleted message stops being quotable, including a secret
+    someone pasted and then removed.
+  - Changes made while it was down are caught up on the next start.
+- **Works in your team's languages.** Chinese, Japanese and Korean are searchable word by
+  word, not only in English. It replies in the language it was asked in.
+- **Knows people by name, and never pings them.**
+  - It credits each message to whoever wrote it, by name.
+  - It names people as plain text. A summary never @-mentions everyone in it.
+- **Public by default.** It works only in public channels, so everyone learns from
+  everyone's questions. A DM gets a one-line pointer to the public channel. It can also be
+  set to answer DMs, or to ignore them. Either way, a DM never becomes knowledge.
+- **Directs agents, in a sandbox** *(experimental)*. With a sandbox attached, it can
+  clone a repo, run the tests and open a pull request. The pull request waits for an
+  Approve in the thread. The sandbox is designed as one Firecracker microVM per thread; so
+  far it has only been proven in a spike.
+
+## Deploy it where you already run things
+
+Lorehouse is meant to be easy to host. It needs:
+
+- **One self-contained binary.** Prompts and database migrations are compiled in.
+- **One SQLite file.** No database server, queue or cache to run beside it.
+- **One HTTPS URL** that Slack can reach.
+
+It tolerates restarts. Slack redelivers events it didn't get an answer to, and on start
+Lorehouse reconciles whatever changed while it was down. A plain single-instance deploy
+is enough; no zero-downtime setup is needed. A prototype of the same stack used about
+70 MB idle and 310 MB with 100 concurrent conversations on Linux
+([measurements](docs/experiments/slack-rag/RESULTS.md)).
+
+| where | status | how |
+|---|---|---|
+| **Linux you run**: a server at home, a Hetzner box, any VPS | works today | the compiled binary under systemd; HTTPS from Caddy or a Cloudflare Tunnel. CI builds the Linux binary and runs the full conformance suite against it on every change |
+| **Fly.io** | planned | one always-on machine with a volume for the SQLite file |
+| **Render** | planned | a web service with a persistent disk |
+| **Cloudflare Workers** | exploring | needs June's edge host and Durable Object storage instead of a SQLite file |
+| **Your laptop** | works today | `bun start` behind a quick tunnel, for trying it out ([runbook](docs/live-slack.md)) |
+
+Every host needs the same few things:
+
+- a writable path for the SQLite file (`LOREHOUSE_DB`, `SESSIONS_DB`)
+- the Slack and Anthropic secrets as environment variables
+- outbound HTTPS to Slack and Anthropic
+
+The sandbox is separate. It needs a host with KVM, such as bare metal or a VM with nested
+virtualization, and Lorehouse reaches it over `SANDBOX_URL`. The host running Lorehouse
+itself needs no KVM.
 
 ## Run it
 
 ```bash
 bun install
 SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=xoxb-… ANTHROPIC_API_KEY=… \
-AGENT_CHANNELS=C0123456 KNOWLEDGE_SEED=./my-docs.jsonl \
+AGENT_CHANNELS=C0123456 \
 bun start                       # POST /slack/events, GET /healthz, GET /status
+
+bun run build                   # → dist/lorehouse, a single binary
 ```
 
-What it knows: every thread in the allowed channels (the root and its replies), read
-back `INGEST_BACKFILL_DAYS` on first start and kept current from live messages, edits
-and deletions. A deleted message stops being quotable. Changes made while the app was
-down are reconciled on the next start. Bot and system messages are left out. Answers
-cite the thread's permalink. The Slack app needs
-the bot scopes `channels:history`, `app_mentions:read` and `chat:write`, and must be
-subscribed to `message.channels` and `app_mention`. Invite the bot to each allowed
-channel first. Slack won't serve history to a non-member, so the backfill fails with
-`not_in_channel`, and `GET /status` shows the error.
+To set up Slack:
+
+1. Create the app from [`slack/manifest.yaml`](slack/manifest.yaml). It lists the scopes
+   and why each is needed.
+2. Subscribe to the events `app_mention`, `message.channels` and `message.im`.
+3. Invite the bot to each allowed channel. Slack won't serve history to a non-member, so
+   the backfill fails with `not_in_channel`, and `GET /status` shows the error.
+
+[`docs/live-slack.md`](docs/live-slack.md) walks through it end to end.
 
 | env | default | |
 |---|---|---|
@@ -40,6 +97,21 @@ channel first. Slack won't serve history to a non-member, so the backfill fails 
 | `INGEST_DEBOUNCE_MS` | `5000` | how long a thread must go quiet before a live change re-indexes it |
 | `SANDBOX_URL` `SANDBOX_TOKEN` `GITHUB_TOKEN` | (off) | set all three to enable the code tools and pull requests |
 
+## One contract, more than one implementation
+
+The behavior is pinned by a black-box conformance suite, not by the code. It drives a
+mocked Slack and a mocked model through the same HTTP interface any implementation
+serves. Examples:
+
+- a Chinese question finds a Chinese message
+- a deleted message stops being cited
+- a DM is never indexed
+- a restart catches up on what it missed
+
+Today's implementation is TypeScript on [June](https://june.build). The suite is what a
+Go or Rust version would have to pass
+([why TypeScript first](docs/adr/0001-typescript-first-conformance-as-contract.md)).
+
 ## Layout
 
 | path | what |
@@ -48,8 +120,9 @@ channel first. Slack won't serve history to a non-member, so the backfill fails 
 | `prompts/` | the system prompt and tool descriptions, as Markdown |
 | `migrations/` | Lorehouse's own data, as plain SQL |
 | `conformance/` | the behavioral contract: a mocked Slack + Anthropic, and black-box scenarios |
+| `slack/` | the Slack app manifest |
 | `sandbox/` | the Firecracker sandbox's in-VM agent (Go) and a feasibility spike |
-| `docs/adr/` | decisions, starting with [why TypeScript first](docs/adr/0001-typescript-first-conformance-as-contract.md) |
+| `docs/` | the live-Slack runbook and its results, decisions (`adr/`) and experiments |
 
 ## Check it
 
