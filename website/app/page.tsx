@@ -469,7 +469,7 @@ export default function Home() {
 
       <footer className="titleblock" aria-label="Title block">
         <div><span className="k">Project</span><span className="big">Lorehouse</span><span className="k" style={{ marginTop: 4 }}>Your company's brain, working in public</span></div>
-        <div><span className="k">Made by</span><span className="v">SolCreek</span></div>
+        <div><span className="k">Made by</span><span className="v">SolCreek</span><a className="k tb-link" href="/privacy">Privacy</a></div>
         <div><span className="k">Drawing no.</span><span className="v">LH-0001</span></div>
         <div>
           <table className="rev" aria-label="Revisions">

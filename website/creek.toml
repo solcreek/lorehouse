@@ -27,3 +27,8 @@ worker = "dist/assets/_worker.mjs"
 [resources]
 # D1 for the early-access list.
 database = true
+
+[triggers]
+# Hourly: delete sign-up attempt counters older than a day (creek-entry.js
+# `scheduled`), the retention /privacy promises.
+cron = ["7 * * * *"]

@@ -53,7 +53,13 @@ export function EarlyAccess() {
         </button>
       </div>
       <p className="note" role={state.kind === "error" ? "alert" : undefined}>
-        {state.kind === "error" ? state.message : "One email when hosted Lorehouse opens. Nothing else."}
+        {state.kind === "error" ? (
+          state.message
+        ) : (
+          <>
+            One email when hosted Lorehouse opens. Nothing else. <a href="/privacy">Privacy</a>
+          </>
+        )}
       </p>
     </form>
   );
