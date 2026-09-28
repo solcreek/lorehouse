@@ -86,12 +86,12 @@ export class RunnerHub {
     if (r?.link.kind !== "poll") r = this.replace(status.runner, { kind: "poll", queue: [] });
     this.touch(status.runner, status);
     const link = r.link as Extract<Link, { kind: "poll" }>;
-    if (link.queue.length) return Promise.resolve(link.queue.splice(0));
+    if (link.queue.length) return Promise.resolve(this.live(link.queue.splice(0)));
     link.waiter?.([]); // a newer poll supersedes an older one still waiting
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (link.waiter === wake) link.waiter = undefined;
-        resolve(link.queue.splice(0));
+        resolve(this.live(link.queue.splice(0)));
       }, this.opts.pollWaitMs ?? 25_000);
       const wake = (jobs: Job[]) => {
         clearTimeout(timer);
@@ -106,6 +106,12 @@ export class RunnerHub {
         resolve([]);
       });
     });
+  }
+
+  // Of queued jobs, those still awaited: one whose caller already gave up (its deadline
+  // passed, or its connection was replaced) is dropped rather than delivered.
+  private live(jobs: Job[]): Job[] {
+    return jobs.filter((j) => this.pending.has(j.id));
   }
 
   // Results posted by a polling runner settle only jobs that went out by poll to it.
@@ -181,6 +187,9 @@ export class RunnerHub {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(job.id);
+        // A job still waiting in a poll queue must never go out after this: the caller
+        // was told it failed, so running it later (a write, say) would be a surprise.
+        if (runner.link.kind === "poll") runner.link.queue = runner.link.queue.filter((j) => j.id !== job.id);
         reject(new Error(`sandbox job timed out on ${runner.name}`));
       }, timeoutMs + BOOT_SLACK_MS);
       this.pending.set(job.id, { runner: runner.name, link: runner.link, resolve, reject, timer });

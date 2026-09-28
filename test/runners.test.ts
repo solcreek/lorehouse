@@ -105,6 +105,14 @@ describe("over long poll", () => {
     await done;
   });
 
+  test("a job that times out while queued is never delivered: the caller was told it failed", async () => {
+    const hub = hubWith({ pollWaitMs: 20 });
+    await hub.poll(status("r1")); // known, but not polling right now
+    const late = hub.submit("s1", { op: "guest", method: "PUT", path: "/file?path=%2Fw%2Fa", bodyBase64: b64("x") }, -59_950); // deadline ≈ 50 ms
+    await expect(late).rejects.toThrow(/timed out/);
+    expect(await hub.poll(status("r1"))).toEqual([]); // the runner comes back: the write is not handed out
+  });
+
   test("a poll aborted while waiting leaves the job queued for the next poll", async () => {
     const hub = hubWith({ pollWaitMs: 5000 });
     const abort = new AbortController();
