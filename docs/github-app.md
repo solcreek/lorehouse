@@ -18,8 +18,13 @@ holds a long-lived token:
 - What that can't stop: code run earlier in the sandbox replacing `git` itself. The
   sandbox is the model's, so a token handed into it is protected by its scope (one repo,
   the least permission, an hour) and by the approval before any write token exists.
-- Commits are by the App's bot too: cloning sets the checkout's git author to
-  `<app>[bot]` at its noreply address, so GitHub links each commit to the bot.
+- Commits are by the App's bot too, `<app>[bot]` at its noreply address, so GitHub links
+  each commit to the bot. Every command the agent runs has git's author and committer
+  set to it (they outrank any git config), and a pull request whose commits are by
+  anyone else is sent back to be re-authored before anyone is asked to approve it.
+  If GitHub can't be reached to look the bot up, commands still run (with git's own
+  configuration), but no pull request goes out: the check before approval fails
+  closed, and the agent is told to try again.
 - Which repos the agent can touch is decided on GitHub: the repos the App is installed on.
   A repo it isn't installed on can still be cloned if it is public, and never pushed to.
 

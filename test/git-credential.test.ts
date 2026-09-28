@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gitWithToken, tokenEnv } from "../src/tools/git-credential";
+import { authorEnv } from "../src/tools/workspace";
 
 const root = mkdtempSync(join(tmpdir(), "git-credential-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -24,6 +25,28 @@ function repo(name: string) {
   sh(`git init -q ${dir} && git -C ${dir} commit -q --allow-empty -m first && git init -q --bare ${dir}.git`);
   return dir;
 }
+
+describe("who commits", () => {
+  test("the author environment outranks an identity the checkout's config was given", () => {
+    const dir = repo("author");
+    sh(`git config user.name Scout && git config user.email scout@made-up.example`, { cwd: dir });
+    const bot = { name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" };
+    expect(sh(`git commit -q --allow-empty -m x`, { cwd: dir, env: authorEnv(bot) }).code).toBe(0);
+    expect(sh(`git log -1 --format='%an <%ae>|%cn <%ce>'`, { cwd: dir }).out.trim()).toBe(`${bot.name} <${bot.email}>|${bot.name} <${bot.email}>`);
+  });
+
+  test("the re-author command open_pull_request suggests fixes every commit since the base", () => {
+    const dir = repo("reauthor");
+    sh(`git branch base && git config user.name Scout && git config user.email scout@made-up.example`, { cwd: dir });
+    sh(`echo a > a && git add a && git commit -qm a && echo b > b && git add b && git commit -qm b`, { cwd: dir });
+    const bot = { name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" };
+    const r = sh(`git rebase --exec 'git commit --amend --no-edit --reset-author' base`, { cwd: dir, env: authorEnv(bot) });
+    expect(r.code).toBe(0);
+    const want = `${bot.name} <${bot.email}>`;
+    expect(sh(`git log --format='%an <%ae>|%cn <%ce>' base..HEAD`, { cwd: dir }).out.trim().split("\n")).toEqual([`${want}|${want}`, `${want}|${want}`]);
+    expect(sh(`git log --format=%s base..HEAD`, { cwd: dir }).out.trim().split("\n")).toEqual(["b", "a"]); // same commits, re-authored
+  });
+});
 
 describe("git with a token", () => {
   test("a hook planted in the checkout doesn't run, so it can't read the token", () => {

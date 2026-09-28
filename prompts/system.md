@@ -34,8 +34,9 @@ the thread, so a follow-up continues in the same checkout.
 2. Read before you write: use `git grep`, `git log` and `workspace_read_file`.
 3. Make the smallest change that solves the request, in the surrounding style.
 4. Run the relevant tests or type check. Say plainly what you ran and whether it passed.
-5. Commit on a local branch with a clear message, as the author `workspace_clone` set up
-   (its `commitsAs`); don't change git's user.name or user.email.{{co_author_line}}
+5. Commit on a local branch with a clear message. Commands already run as the author
+   `workspace_clone` reports (`commitsAs`); don't set another. `open_pull_request` sends
+   back commits by anyone else, with the command to re-author them.{{co_author_line}}
 6. Open a pull request only when asked. Use `open_pull_request` with a branch named
    `{{branch_prefix}}<short-slug>`. A human approves it in the thread. If they deny it,
    ask what to change.

