@@ -3,6 +3,7 @@
 //! nothing else:
 //!   • no private destinations (LAN, tailnet, link-local, other sandboxes)
 //!   • no connections into the host (guestd is reached over vsock, never the network)
+//!   • nothing opens a connection into a sandbox; only replies to its own traffic get in
 //! One nftables table (`ip lorehouse_sbx`) holds the rules; accepts that Docker's
 //! FORWARD chain (policy drop) needs are tagged so they can be removed exactly.
 
@@ -62,15 +63,27 @@ async fn docker_forward_exists() -> bool {
     Command::new("nft").args(["list", "chain", "ip", "filter", "FORWARD"]).output().await.map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// Every lhtapN interface on the host, whatever SANDBOXD_MAX_VMS was when it was made.
+async fn existing_taps() -> Vec<String> {
+    let Ok(out) = Command::new("ip").args(["-o", "link", "show"]).output().await else { return vec![] };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split(": ").nth(1))
+        .map(|name| name.split('@').next().unwrap_or(name).to_string())
+        .filter(|name| name.strip_prefix("lhtap").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+        .collect()
+}
+
 /// Remove everything this daemon ever added: its table, its tagged FORWARD accepts and
-/// every lhtap interface. Safe to run when nothing is there.
-pub async fn teardown_all(max_vms: usize) {
+/// every lhtap interface (found on the host, not assumed from the current limit). Safe to
+/// run when nothing is there.
+pub async fn teardown_all() {
     for h in tagged_forward_handles().await {
         let _ = run(&["nft", "delete", "rule", "ip", "filter", "FORWARD", "handle", &h]).await;
     }
     let _ = run(&["nft", "delete", "table", "ip", TABLE]).await;
-    for i in 0..max_vms {
-        let _ = run(&["ip", "link", "del", &Slot { index: i }.tap()]).await;
+    for tap in existing_taps().await {
+        let _ = run(&["ip", "link", "del", &tap]).await;
     }
 }
 
@@ -82,6 +95,10 @@ pub async fn setup(uplink: &str) -> Result<(), String> {
     nft(&format!("add chain ip {TABLE} forward {{ type filter hook forward priority -1; }}")).await?;
     nft(&format!("add rule ip {TABLE} forward iifname \"lhtap*\" ip daddr {PRIVATE} drop")).await?;
     nft(&format!("add rule ip {TABLE} forward iifname \"lhtap*\" oifname != \"{uplink}\" drop")).await?;
+    // Into a sandbox: only replies to what it started. Nothing may open a connection to a
+    // guest, whatever the host's own FORWARD policy is (Docker's drop is not assumed).
+    nft(&format!("add rule ip {TABLE} forward oifname \"lhtap*\" ct state established,related accept")).await?;
+    nft(&format!("add rule ip {TABLE} forward oifname \"lhtap*\" drop")).await?;
     nft(&format!("add chain ip {TABLE} input {{ type filter hook input priority -1; }}")).await?;
     nft(&format!("add rule ip {TABLE} input iifname \"lhtap*\" drop")).await?;
     nft(&format!("add chain ip {TABLE} post {{ type nat hook postrouting priority srcnat; }}")).await?;

@@ -129,10 +129,10 @@ async fn main() {
         std::process::exit(1);
     }
     // Start clean: whatever a previous run left (a crash, a kill) is removed first.
-    net::teardown_all(cfg.max_vms).await;
+    net::teardown_all().await;
     if let Err(e) = net::setup(&cfg.uplink).await {
         eprintln!("sandboxd: network setup: {e}");
-        net::teardown_all(cfg.max_vms).await;
+        net::teardown_all().await;
         std::process::exit(1);
     }
 
@@ -164,7 +164,7 @@ async fn main() {
         Ok(l) => l,
         Err(e) => {
             eprintln!("sandboxd: listen {}: {e}", cfg.listen);
-            net::teardown_all(cfg.max_vms).await;
+            net::teardown_all().await;
             std::process::exit(1);
         }
     };
@@ -180,5 +180,5 @@ async fn main() {
     let _ = axum::serve(listener, router).with_graceful_shutdown(shutdown).await;
     eprintln!("sandboxd: stopping every VM (disks kept)");
     vms.stop_all().await;
-    net::teardown_all(cfg.max_vms).await;
+    net::teardown_all().await;
 }
