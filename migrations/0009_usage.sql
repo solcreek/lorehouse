@@ -8,8 +8,8 @@ CREATE TABLE agent_asks (
   channel    TEXT NOT NULL,
   ts         TEXT NOT NULL,
   thread_ts  TEXT NOT NULL,
-  user       TEXT NOT NULL,
-  at         TEXT NOT NULL,  -- RFC 3339
+  user_id    TEXT NOT NULL,
+  asked_at   TEXT NOT NULL,  -- RFC 3339
   PRIMARY KEY (channel, ts)
 );
 
@@ -19,21 +19,21 @@ CREATE TABLE agent_searches (
   channel    TEXT NOT NULL,
   thread_ts  TEXT NOT NULL,
   query      TEXT NOT NULL,
-  hits       INTEGER NOT NULL,
-  at         TEXT NOT NULL
+  hits         INTEGER NOT NULL,
+  searched_at  TEXT NOT NULL
 );
 
 -- A 👍/👎 on one of the agent's replies; removing the reaction deletes the row.
 CREATE TABLE agent_feedback (
   channel     TEXT NOT NULL,
   message_ts  TEXT NOT NULL,
-  user        TEXT NOT NULL,
+  user_id     TEXT NOT NULL,
   rating      TEXT NOT NULL CHECK (rating IN ('up', 'down')),
-  at          TEXT NOT NULL,
-  PRIMARY KEY (channel, message_ts, user, rating)
+  reacted_at  TEXT NOT NULL,
+  PRIMARY KEY (channel, message_ts, user_id, rating)
 );
 
 -- GET /status reads each table over a recent window.
-CREATE INDEX agent_asks_at ON agent_asks (at);
-CREATE INDEX agent_searches_at ON agent_searches (at);
-CREATE INDEX agent_feedback_at ON agent_feedback (at);
+CREATE INDEX agent_asks_asked_at ON agent_asks (asked_at);
+CREATE INDEX agent_searches_searched_at ON agent_searches (searched_at);
+CREATE INDEX agent_feedback_reacted_at ON agent_feedback (reacted_at);
