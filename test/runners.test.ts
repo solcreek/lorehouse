@@ -30,6 +30,21 @@ describe("over WebSocket", () => {
     expect(await done).toEqual({ exitCode: 0, stdout: "hi\n", stderr: "" });
   });
 
+  test("a job goes out with the time Lorehouse will still wait for it, so the runner stops it by then", async () => {
+    let now = 1_000_000;
+    const hub = hubWith({ pollWaitMs: 20, now: () => now });
+    const { sent } = wsRunner(hub, "ws1");
+    void hub.sandbox("s1").writeFile("/w/a", "x");
+    expect(sent[0]!.deadlineMs).toBe(30_000 + 60_000); // its timeout plus boot slack
+    // Over long poll, counted when it's handed out: time spent queued is gone.
+    await hub.poll(status("p1", 4, 0));
+    wsRunner(hub, "ws1", 4, 4); // ws1 is full now, so the next sandbox lands on p1
+    void hub.sandbox("s2").writeFile("/w/b", "y");
+    now += 10_000;
+    const [job] = await hub.poll(status("p1", 4, 0));
+    expect(job!.deadlineMs).toBe(80_000);
+  });
+
   test("with no timeout given, the guest and the call's deadline get the same default", async () => {
     const hub = hubWith();
     const { sent } = wsRunner(hub, "r1");

@@ -65,9 +65,13 @@ A **job** is one request to the sandbox's guest agent, or the removal of a sandb
 
 ```json
 { "id": "j_…", "sandbox": "slack_C1_1790000001.000100", "op": "guest",
-  "method": "POST", "path": "/exec", "bodyBase64": "…", "timeoutMs": 660000 }
-{ "id": "j_…", "sandbox": "…", "op": "destroy" }
+  "method": "POST", "path": "/exec", "bodyBase64": "…", "timeoutMs": 600000,
+  "deadlineMs": 659000 }
+{ "id": "j_…", "sandbox": "…", "op": "destroy", "timeoutMs": …, "deadlineMs": … }
 ```
+
+`timeoutMs` is the command's own limit. `deadlineMs` is how long Lorehouse will still wait
+for the result, as of handing the job out. It is relative, so the clocks needn't agree.
 
 A runner accepts only these guest calls: `POST /exec`, `GET /file?path=…` and
 `PUT /file?path=…`. It refuses anything else.
@@ -110,6 +114,11 @@ A **result** answers one job with an HTTP-like status:
     retry can land wherever room appears.
 - **Deadline.** A job has one: its `timeoutMs` plus 60 s for a boot. It fails if no result
   arrives by then. A job that hasn't gone out by its deadline never goes out.
+- **A job stops at its deadline.** Once Lorehouse has told the caller a job timed out, the
+  job must not go on changing the checkout. The runner stops the guest call just before
+  `deadlineMs` runs out and answers 504. Closing the guest connection stops the work: an
+  exec's process group is killed, and a write whose body didn't all arrive isn't made. A
+  call that would start after the deadline isn't made.
 
 ## Delivery
 

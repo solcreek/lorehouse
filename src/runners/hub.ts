@@ -24,7 +24,8 @@ export type RunnerStatus = { runner: string; capacity: number; running: number; 
 type JobBody =
   | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string }
   | { op: "destroy" };
-export type Job = JobBody & { id: string; sandbox: string; timeoutMs: number };
+// `deadlineMs`: set as a job goes out, how long Lorehouse will still wait for it.
+export type Job = JobBody & { id: string; sandbox: string; timeoutMs: number; deadlineMs?: number };
 export type JobResult = { id: string; status: number; contentType?: string; bodyBase64?: string; error?: string };
 
 // How a job reaches the runner: pushed down its WebSocket, or queued for its next poll.
@@ -35,7 +36,7 @@ type Link =
 
 type Runner = { name: string; status: RunnerStatus; link: Link; lastSeen: number; session?: string; started?: number };
 // `gen` is the connection the job went out on; `session`, the runner process it went to.
-type Pending = { runner: string; gen: number; session?: string; resolve: (r: JobResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
+type Pending = { runner: string; gen: number; session?: string; deadline: number; resolve: (r: JobResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 // A boot can precede the work: a job's deadline is its own timeout plus this.
 const BOOT_SLACK_MS = 60_000;
@@ -125,7 +126,7 @@ export class RunnerHub {
     const deliver = (jobs: Job[]) => {
       const out = this.live(jobs);
       for (const j of out) link.unacked.set(j.id, j);
-      return out;
+      return out.map((j) => this.outgoing(j));
     };
     if (link.queue.length) return Promise.resolve(deliver(link.queue.splice(0)));
     link.waiter?.([]); // a newer poll supersedes an older one still waiting
@@ -153,6 +154,13 @@ export class RunnerHub {
   // passed) is dropped rather than delivered.
   private live(jobs: Job[]): Job[] {
     return jobs.filter((j) => this.pending.has(j.id));
+  }
+
+  // A job as it goes out: with the time left until its deadline, so the runner stops it by
+  // then (a relative time, so the two clocks needn't agree).
+  private outgoing(job: Job): Job {
+    const p = this.pending.get(job.id);
+    return p ? { ...job, deadlineMs: Math.max(0, p.deadline - this.now()) } : job;
   }
 
   // Results posted over HTTP arrive on the runner's current connection.
@@ -270,8 +278,9 @@ export class RunnerHub {
         }
         reject(new Error(`sandbox job timed out on ${runner.name}`));
       }, timeoutMs + BOOT_SLACK_MS);
-      this.pending.set(job.id, { runner: runner.name, gen: runner.link.gen, session: runner.session, resolve, reject, timer });
-      if (runner.link.kind === "ws") runner.link.send(job);
+      const deadline = this.now() + timeoutMs + BOOT_SLACK_MS;
+      this.pending.set(job.id, { runner: runner.name, gen: runner.link.gen, session: runner.session, deadline, resolve, reject, timer });
+      if (runner.link.kind === "ws") runner.link.send(this.outgoing(job));
       else if (runner.link.waiter) runner.link.waiter([job]);
       else runner.link.queue.push(job);
     });

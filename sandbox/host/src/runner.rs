@@ -46,15 +46,41 @@ struct Job {
     body_base64: Option<String>,
     #[serde(rename = "timeoutMs")]
     timeout_ms: Option<u64>,
+    /// How long Lorehouse will still wait for this job, as of handing it out.
+    #[serde(rename = "deadlineMs")]
+    deadline_ms: Option<u64>,
+}
+
+/// The guest call stops this much before Lorehouse's deadline, so its answer (a timeout)
+/// can still get there.
+const DEADLINE_MARGIN: Duration = Duration::from_secs(2);
+
+impl Job {
+    /// How long Lorehouse waits for this job from when it arrived here. An older app that
+    /// doesn't send `deadlineMs`: its timeout plus boot slack. Neither: the host's backstop.
+    fn app_deadline(&self) -> Duration {
+        let d = match (self.deadline_ms, self.timeout_ms) {
+            (Some(ms), _) => Duration::from_millis(ms),
+            (None, Some(ms)) => Duration::from_millis(ms) + APP_BOOT_SLACK,
+            (None, None) => crate::REQUEST_DEADLINE,
+        };
+        d.min(Duration::from_secs(24 * 3600))
+    }
 }
 
 /// How long to keep a job's result once it's done: past the job's deadline at Lorehouse
-/// (its timeout plus boot slack, counted from when it was sent, so from when it finished is
-/// more than enough), and never less than KEEP_RESULTS. Lorehouse still waits for it until
-/// then, and a reconnect's `jobs` must still list it. No timeout given: the host's backstop.
-fn keep_for(timeout_ms: Option<u64>) -> Duration {
-    let timeout = timeout_ms.map_or(crate::REQUEST_DEADLINE, Duration::from_millis).min(Duration::from_secs(24 * 3600));
-    (timeout + APP_BOOT_SLACK + Duration::from_secs(60)).max(KEEP_RESULTS)
+/// (counted from when it arrived, so from when it finished is more than enough), and never
+/// less than KEEP_RESULTS. Lorehouse still waits for it until then, and a reconnect's `jobs`
+/// must still list it.
+fn keep_for(app_deadline: Duration) -> Duration {
+    (app_deadline + Duration::from_secs(60)).max(KEEP_RESULTS)
+}
+
+/// How long the guest call may take, `elapsed` after the job arrived (a boot may have come
+/// first): until just before Lorehouse stops waiting, and never past the host's backstop.
+/// Zero: don't start it.
+fn guest_budget(app_deadline: Duration, elapsed: Duration) -> Duration {
+    app_deadline.saturating_sub(DEADLINE_MARGIN).saturating_sub(elapsed).min(crate::REQUEST_DEADLINE)
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -86,7 +112,7 @@ fn allowed(method: &str, path: &str) -> Option<Method> {
     }
 }
 
-async fn execute(vms: &Manager, job: Job) -> JobResult {
+async fn execute(vms: &Manager, job: Job, arrived: Instant) -> JobResult {
     if !vm::valid_id(&job.sandbox) {
         return JobResult::error(&job.id, 400, "bad sandbox id");
     }
@@ -107,8 +133,15 @@ async fn execute(vms: &Manager, job: Job) -> JobResult {
                 Ok(v) => v,
                 Err((status, msg)) => return JobResult::error(&job.id, status, msg),
             };
-            // The same host-side backstop as serve mode: the guest can't hold a job forever.
-            match tokio::time::timeout(crate::REQUEST_DEADLINE, vsock::request(&uds, method, p, body)).await {
+            // Bounded by the job's deadline at Lorehouse: once it has told the caller the job
+            // timed out, the job must not go on changing the checkout. Dropping the request
+            // closes the vsock connection, and guestd stops: an exec's process group is killed
+            // with its request's context, and a write whose body didn't all arrive isn't made.
+            let budget = guest_budget(job.app_deadline(), arrived.elapsed());
+            if budget.is_zero() {
+                return JobResult::error(&job.id, 504, "Lorehouse's deadline for this job passed before it could start");
+            }
+            match tokio::time::timeout(budget, vsock::request(&uds, method, p, body)).await {
                 Ok(Ok(r)) => JobResult {
                     id: job.id,
                     status: r.status.as_u16(),
@@ -117,7 +150,7 @@ async fn execute(vms: &Manager, job: Job) -> JobResult {
                     error: None,
                 },
                 Ok(Err(e)) => JobResult::error(&job.id, 502, e),
-                Err(_) => JobResult::error(&job.id, 504, format!("the guest didn't answer within {} s", crate::REQUEST_DEADLINE.as_secs())),
+                Err(_) => JobResult::error(&job.id, 504, format!("stopped: the guest didn't answer within {} s (the job's deadline)", budget.as_secs())),
             }
         }
         other => JobResult::error(&job.id, 400, format!("unknown op {other:?}")),
@@ -242,12 +275,13 @@ impl Runner {
 
     /// Run a job handed out by Lorehouse, unless this id already ran here.
     fn take(self: &Arc<Self>, job: Job) {
-        if !self.ledger().accept(&job.id, keep_for(job.timeout_ms)) {
+        let arrived = Instant::now();
+        if !self.ledger().accept(&job.id, keep_for(job.app_deadline())) {
             return;
         }
         let me = self.clone();
         tokio::spawn(async move {
-            let result = execute(&me.vms, job).await;
+            let result = execute(&me.vms, job, arrived).await;
             me.ledger().finish(result, Instant::now());
             me.finished.notify_one();
         });
@@ -461,7 +495,7 @@ impl Runner {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed, keep_for, JobResult, Ledger, KEEP_RESULTS, SEEN_IDS};
+    use super::{allowed, guest_budget, keep_for, Job, JobResult, Ledger, KEEP_RESULTS, SEEN_IDS};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -525,7 +559,7 @@ mod tests {
     fn a_result_is_kept_past_its_jobs_deadline_at_the_app() {
         // A 10-minute job Lorehouse waits 11 minutes for: finished at once, its result must
         // still be held (and listed) at 10.5 minutes.
-        let keep = keep_for(Some(10 * 60 * 1000));
+        let keep = keep_for(job(None, Some(10 * 60 * 1000)).app_deadline());
         assert!(keep > Duration::from_secs(11 * 60));
         let mut l = Ledger::default();
         let now = Instant::now();
@@ -533,8 +567,27 @@ mod tests {
         l.finish(done("long"), now);
         assert_eq!(l.ids(now + Duration::from_secs(10 * 60 + 30)), vec!["long"]);
         assert!(l.ids(now + keep + Duration::from_secs(1)).is_empty());
-        // short jobs keep the floor; no timeout means the host's backstop
-        assert_eq!(keep_for(Some(1000)), KEEP_RESULTS);
-        assert!(keep_for(None) > crate::REQUEST_DEADLINE);
+        // short jobs keep the floor; no deadline or timeout means the host's backstop
+        assert_eq!(keep_for(job(Some(30_000), None).app_deadline()), KEEP_RESULTS);
+        assert!(keep_for(job(None, None).app_deadline()) > crate::REQUEST_DEADLINE);
+    }
+
+    fn job(deadline_ms: Option<u64>, timeout_ms: Option<u64>) -> Job {
+        Job { id: "j".into(), sandbox: "s".into(), op: "guest".into(), method: None, path: None, body_base64: None, timeout_ms, deadline_ms }
+    }
+
+    #[test]
+    fn a_guest_call_stops_just_before_lorehouse_stops_waiting() {
+        // A file write Lorehouse waits 90 s for (30 s + boot slack), just handed out.
+        let deadline = job(Some(90_000), Some(30_000)).app_deadline();
+        assert_eq!(guest_budget(deadline, Duration::from_secs(0)), Duration::from_secs(88));
+        // a 20 s boot came first: less is left for the call itself
+        assert_eq!(guest_budget(deadline, Duration::from_secs(20)), Duration::from_secs(68));
+        // the deadline passed while it booted: the call isn't made
+        assert!(guest_budget(deadline, Duration::from_secs(89)).is_zero());
+        // never past the host's backstop
+        assert_eq!(guest_budget(Duration::from_secs(3600), Duration::ZERO), crate::REQUEST_DEADLINE);
+        // an app that sends no deadlineMs: timeout plus boot slack
+        assert_eq!(job(None, Some(30_000)).app_deadline(), Duration::from_secs(90));
     }
 }
