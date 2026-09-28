@@ -31,7 +31,7 @@ export type AdminOptions = {
   ingest: () => IngestStatus | undefined; // undefined: no channels, so no ingest
   sandbox: "off" | "direct" | "runners";
   runners?: () => RunnerSummary[];
-  usage?: (since: Date) => UsageSummary;
+  usage?: (since: Date) => UsageSummary | Promise<UsageSummary>;
 };
 
 const KINDS = new Set(["slack_thread", "seed"]);
@@ -81,7 +81,7 @@ function page<T extends { rowid: number }>(rows: T[], limit: number, key: (row: 
 export function adminRoutes(opts: AdminOptions) {
   const { db } = opts;
 
-  function route(url: URL): Response {
+  async function route(url: URL): Promise<Response> {
     const path = url.pathname.replace(/\/$/, "");
 
     if (path === "/api/v1/documents") {
@@ -148,7 +148,7 @@ export function adminRoutes(opts: AdminOptions) {
 
     if (path === "/api/v1/usage") {
       const days = countParam(url, "days", 7, 90);
-      const summary = opts.usage?.(new Date(Date.now() - days * 86_400_000));
+      const summary = await opts.usage?.(new Date(Date.now() - days * 86_400_000));
       return summary ? json({ days, ...summary }) : json({ error: "usage isn't recorded here" }, 404);
     }
 
@@ -165,7 +165,7 @@ export function adminRoutes(opts: AdminOptions) {
     if (!bearerMatches(req, opts.token)) return json({ error: "unauthorized: send Authorization: Bearer <ADMIN_TOKEN>" }, 401, { "www-authenticate": "Bearer" });
     if (req.method !== "GET") return json({ error: "method not allowed: the admin API only reads" }, 405, { allow: "GET" });
     try {
-      return route(url);
+      return await route(url);
     } catch (e) {
       if (e instanceof BadRequest) return json({ error: e.message }, 400);
       throw e;

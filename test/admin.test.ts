@@ -293,15 +293,15 @@ describe("usage", () => {
   test("who asks, which searches found nothing and the 👍/👎, over the last 7 days by default", async () => {
     const { db, body } = setupUsage();
     const now = new Date();
-    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1", user: "U1" }, now);
-    recordAsk(db, { channel: "C1", ts: "1.2", threadTs: "1.1", user: "U2" }, now);
+    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1" }, now);
+    recordAsk(db, { channel: "C1", ts: "1.2", threadTs: "1.1" }, now);
     recordSearch(db, { channel: "C1", threadTs: "1.1", query: "okapi budget", hits: 0 }, now);
-    recordFeedback(db, { channel: "C1", messageTs: "1.3", user: "U2", rating: "down" }, true, now);
+    recordFeedback(db, { channel: "C1", messageTs: "1.3", rater: "U2", rating: "down" }, true, now);
     const u = await body("/api/v1/usage");
     expect(u).toMatchObject({
-      days: 7, people: 2, channels: 1, threads: 1,
+      days: 7, asks: 2, channels: 1, threads: 1,
       emptySearches: { threads: 1, of: 1, queries: ["okapi budget"] },
-      feedback: { up: 0, down: 1, people: 1, downMessages: [{ channel: "C1", ts: "1.3" }] },
+      feedback: { up: 0, down: 1, raters: 1, downMessages: [{ channel: "C1", ts: "1.3" }] },
     });
     expect(Date.now() - Date.parse(u.since)).toBeGreaterThanOrEqual(7 * 86_400_000 - 1000);
   });
@@ -318,9 +318,9 @@ describe("usage", () => {
 
   test("an older ask is outside a shorter window", async () => {
     const { db, body } = setupUsage();
-    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1", user: "U1" }, new Date(Date.now() - 3 * 86_400_000));
-    expect((await body("/api/v1/usage?days=2")).people).toBe(0);
-    expect((await body("/api/v1/usage?days=4")).people).toBe(1);
+    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1" }, new Date(Date.now() - 3 * 86_400_000));
+    expect((await body("/api/v1/usage?days=2")).asks).toBe(0);
+    expect((await body("/api/v1/usage?days=4")).asks).toBe(1);
   });
 
   test("not wired: a 404, not an empty summary", async () => {
@@ -331,8 +331,8 @@ describe("usage", () => {
   test("each thread says how often it was asked, searched, and searched in vain", async () => {
     const { db, body } = setupUsage();
     joinThread(db, "C1", "1.1");
-    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1", user: "U1" });
-    recordAsk(db, { channel: "C1", ts: "1.2", threadTs: "1.1", user: "U2" });
+    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1" });
+    recordAsk(db, { channel: "C1", ts: "1.2", threadTs: "1.1" });
     recordSearch(db, { channel: "C1", threadTs: "1.1", query: "okapi", hits: 0 });
     recordSearch(db, { channel: "C1", threadTs: "1.1", query: "wombat", hits: 3 });
     recordSearch(db, { channel: "C2", threadTs: "1.1", query: "same ts, another channel", hits: 0 });

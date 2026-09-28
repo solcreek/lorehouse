@@ -104,6 +104,14 @@ describe("configuration", () => {
     expect(seen).toEqual([]);
   });
 
+  test("recording who asks is said out loud when on, and an unknown value is a problem", async () => {
+    expect(find(await run({ USAGE_RECORD_PEOPLE: "1" }), "USAGE_RECORD_PEOPLE")).toMatchObject([{ level: "info" }]);
+    expect(find(await run({}), "USAGE_RECORD_PEOPLE")).toEqual([]);
+    const bad = await run({ USAGE_RECORD_PEOPLE: "yes" });
+    expect(bad[0]).toMatchObject({ section: "configuration", level: "fail" });
+    expect(bad[0]!.detail).toStartWith("USAGE_RECORD_PEOPLE");
+  });
+
   test("a bad agent name is a configuration problem", async () => {
     const checks = await run({ AGENT_NAME: "Not A Handle!" });
     expect(checks[0]).toMatchObject({ section: "configuration", level: "fail" });

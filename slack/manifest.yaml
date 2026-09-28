@@ -28,7 +28,7 @@ oauth_config:
       - channels:history   # reading public channel history (backfill, threads) and message.channels events
       - chat:write         # replying in the thread (streamed)
       - im:history         # message.im events: DMs to the agent (never indexed)
-      - reactions:read     # reaction_added/removed events: 👍/👎 on the agent's replies (usage in /status)
+      - reactions:read     # reaction_added/removed events: 👍/👎 on the agent's replies (usage, GET /api/v1/usage)
       - users:read         # naming people in knowledge ("Wendy: …" instead of a user id)
 settings:
   org_deploy_enabled: false

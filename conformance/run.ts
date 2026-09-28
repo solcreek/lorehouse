@@ -82,9 +82,9 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
 }
 
 type Usage = {
-  since: string; people: number; channels: number; threads: number;
+  since: string; asks: number; channels: number; threads: number;
   emptySearches: { threads: number; of: number; queries: string[] };
-  feedback: { up: number; down: number; people: number; downMessages: { channel: string; ts: string }[] };
+  feedback: { up: number; down: number; raters: number; downMessages: { channel: string; ts: string }[] };
 };
 type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
 const STATUS_TOKEN = "conformance-status";
@@ -509,7 +509,7 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "reports usage at GET /api/v1/usage: two people in one thread are 2 people, 1 thread, 1 channel; an answered DM is not counted",
+    name: "reports usage at GET /api/v1/usage: two asks in one thread are 2 asks, 1 thread, 1 channel; an answered DM is not counted",
     run: () => withFreshDb(async () => {
       const thread = await mentionAndWait("where is the wombat review"); // U1
       await threadReply(thread, "and which floor is that on?", { user: "U2" });
@@ -517,7 +517,7 @@ const scenarios: Scenario[] = [
       await fetch(`${MOCK}/wait?thread_ts=${dm}&timeout_ms=15000`);
       await Bun.sleep(1000);
       const u = await usage();
-      return u.people === 2 && u.threads === 1 && u.channels === 1 ? null : `people ${u.people}, threads ${u.threads}, channels ${u.channels}; want 2, 1, 1`;
+      return u.asks === 2 && u.threads === 1 && u.channels === 1 ? null : `asks ${u.asks}, threads ${u.threads}, channels ${u.channels}; want 2, 1, 1`;
     }, { DM_MODE: "answer" }),
   },
   {
@@ -543,16 +543,57 @@ const scenarios: Scenario[] = [
     }),
   },
   {
+    name: "by default usage never says who asked: no people or askers, and /status says it doesn't record them",
+    run: () => withFreshDb(async () => {
+      await mentionAndWait("where is the wombat review");
+      const u = (await usage()) as Usage & Record<string, unknown>;
+      if (u.asks !== 1) return `asks ${u.asks}, want 1`;
+      if ("people" in u || "askers" in u) return `usage names people: ${JSON.stringify(u).slice(0, 160)}`;
+      const s = (await status()) as unknown as { recordsWhoAsks?: boolean };
+      return s.recordsWhoAsks === false ? null : `/status recordsWhoAsks ${s.recordsWhoAsks}, want false`;
+    }),
+  },
+  {
+    name: "USAGE_RECORD_PEOPLE=1 records who asks and says so in the channel, once; turned off, it says so and erases them",
+    run: async () => {
+      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      const notices = async () => (await stats()).posts.filter((p) => p.channel === ALLOWED && !p.thread_ts).map((p) => p.text);
+      type People = Usage & { people?: number; askers?: { user: string; asks: number }[] };
+      const restart = async (env: Record<string, string>) => { await stopApp(); await reset(); await startApp({ LOREHOUSE_DB: db, ...env }); };
+      try {
+        await restart({ USAGE_RECORD_PEOPLE: "1" });
+        if (!(await notices()).some((t) => t.includes("I now record who asks me things"))) return `turned on, the channel wasn't told: ${JSON.stringify(await notices())}`;
+        await mentionAndWait("where is the wombat review"); // U1
+        let u = (await usage()) as People;
+        if (u.people !== 1 || u.askers?.[0]?.user !== "U1" || u.askers[0].asks !== 1) return `on: people ${u.people}, askers ${JSON.stringify(u.askers)}; want U1 with 1 ask`;
+        if (!((await status()) as unknown as { recordsWhoAsks?: boolean }).recordsWhoAsks) return "on: /status recordsWhoAsks isn't true";
+        await restart({ USAGE_RECORD_PEOPLE: "1" });
+        if ((await notices()).length) return `a restart told the channel again: ${JSON.stringify(await notices())}`;
+        await restart({});
+        if (!(await notices()).some((t) => t.includes("I no longer record who asks me things"))) return `turned off, the channel wasn't told: ${JSON.stringify(await notices())}`;
+        u = (await usage()) as People;
+        if ("people" in u || u.asks !== 1) return `off: ${JSON.stringify(u).slice(0, 160)}; want the ask and no people`;
+        await restart({ USAGE_RECORD_PEOPLE: "1" });
+        u = (await usage()) as People;
+        return u.people === 0 ? null : `on again: people ${u.people}, want 0 (the askers were erased when it was off)`;
+      } finally {
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
     name: "forgets a deleted question in usage: its ask, and as a thread root, the searches run for it",
     run: () => withFreshDb(async () => {
       const ts = await mentionAndWait("qxzv jjkw");
       const before = await usage();
-      if (before.people !== 1 || !before.emptySearches.queries.includes("qxzv jjkw")) return `before deleting: ${JSON.stringify(before)}`;
+      if (before.asks !== 1 || !before.emptySearches.queries.includes("qxzv jjkw")) return `before deleting: ${JSON.stringify(before)}`;
       const now = `${1990000000 + ++seq}.000100`;
       await sendEvent({ type: "message", subtype: "message_deleted", hidden: true, channel: ALLOWED, channel_type: "channel", ts: now, event_ts: now, deleted_ts: ts, previous_message: { ts } });
       await Bun.sleep(500);
       const after = await usage();
-      return after.people === 0 && after.emptySearches.of === 0 && after.emptySearches.queries.length === 0 ? null : `after deleting: ${JSON.stringify(after)}`;
+      return after.asks === 0 && after.emptySearches.of === 0 && after.emptySearches.queries.length === 0 ? null : `after deleting: ${JSON.stringify(after)}`;
     }),
   },
   {

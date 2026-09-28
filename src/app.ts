@@ -26,7 +26,7 @@ import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
-import { feedbackOf, forgetAsk, pruneUsage, recordAsk, recordFeedback, recordSearch, usageSummary } from "./usage";
+import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, pruneUsage, raterKey, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
 import { pullRequestTool } from "./tools/pull-request";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
@@ -76,14 +76,19 @@ export async function createApp(config: Config) {
 
   // Usage is kept USAGE_RETENTION_DAYS: pruned on start, then daily.
   tally(() => pruneUsage(knowledge));
+  // Not recording who asks (the default, or opted out again): forget any asker kept before.
+  const recordPeople = config.usage.recordPeople;
+  if (!recordPeople) tally(() => eraseAskers(knowledge));
   setInterval(() => tally(() => pruneUsage(knowledge)), 86_400_000).unref();
 
   const tools: Tool[] = [
-    // A search is counted in the Slack thread it ran for; DMs aren't counted.
+    // A search is counted in the Slack thread it ran for (a top-level question is its own
+    // thread's root, as for asks); DMs aren't counted.
     searchKnowledgeTool(searcher(knowledge), (query, hits, ctx) => {
       const e = ctx.event as SlackNormalizedEvent | undefined;
-      if (e?.source !== "slack" || !e.channelId || !e.threadId || e.channelType === "im") return;
-      tally(() => recordSearch(knowledge, { channel: e.channelId, threadTs: e.threadId!, query, hits }));
+      if (e?.source !== "slack" || !e.channelId || e.channelType === "im") return;
+      const threadTs = e.threadId ?? e.ts;
+      if (threadTs) tally(() => recordSearch(knowledge, { channel: e.channelId, threadTs, query, hits }));
     }),
     recentKnowledgeTool((o) => recentDocuments(knowledge, o)),
   ];
@@ -108,18 +113,20 @@ export async function createApp(config: Config) {
     e.kind === "app_mention" ||
     (dm === "answer" && e.channelType === "im") ||
     isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread));
-  // A 👍/👎 on one of the agent's replies is feedback, recorded and never answered.
-  // Without the agent's own id no reaction can count, and /status would read as if nobody
-  // reacted: say so, once.
+  // A 👍/👎 on one of the agent's replies is feedback, recorded and never answered, and
+  // kept under a keyed hash of the person, never their Slack id (usage.ts). Without the
+  // agent's own id no reaction can count, and usage would read as if nobody reacted: say
+  // so, once.
+  const rater = raterKey(config.slack.signingSecret);
   let warnedNoBotId = false;
   const onReaction = (e: SlackNormalizedEvent) => {
     const botUserId = ingester?.ownUserId ?? config.slack.botUserId;
     if (!botUserId && !warnedNoBotId) {
       warnedNoBotId = true;
-      console.error("usage: a reaction arrived before the agent's own user id is known (auth.test pending or failed, and no SLACK_BOT_USER_ID); it is not counted, and later ones are once the id is known");
+      console.error("usage: a reaction arrived before the agent's own user id is known (auth.test pending or failed, and no SLACK_BOT_USER_ID); it is not counted; reactions are counted again once the id is known");
     }
     const f = feedbackOf(e, botUserId);
-    if (f) tally(() => recordFeedback(knowledge, f, e.kind === "reaction_added"));
+    if (f) tally(() => recordFeedback(knowledge, { channel: f.channel, messageTs: f.messageTs, rater: rater(f.user), rating: f.rating }, e.kind === "reaction_added"));
   };
   const slack: Channel = withNamedPeople(slackChannel({
     signingSecret: config.slack.signingSecret,
@@ -133,8 +140,9 @@ export async function createApp(config: Config) {
     respondTo: ["app_mention", "message"],
     respondWhen: (e) => {
       const respond = shouldRespond(e);
-      const user = e.user?.id;
-      if (respond && e.channelType !== "im" && user) tally(() => recordAsk(knowledge, { channel: e.channelId, ts: e.ts, threadTs: e.threadId ?? e.ts, user }));
+      // An ask records where; who, only if the install opted in (usage.ts).
+      const user = recordPeople ? e.user?.id : undefined;
+      if (respond && e.channelType !== "im") tally(() => recordAsk(knowledge, { channel: e.channelId, ts: e.ts, threadTs: e.threadId ?? e.ts, user }));
       return respond;
     },
     // A mention asks the agent into its thread. Reactions are observed only: they are not
@@ -189,6 +197,22 @@ export async function createApp(config: Config) {
   });
   const runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions);
   const mounted = mountAgent(agent, runtime);
+  // Recording who asks is never silent: each channel is told when it starts, and again
+  // when it stops (the record erased). Once per change, not on every start.
+  const announceRecordPeople = async () => {
+    const text = recordPeople
+      ? `Heads-up: in this workspace I now record who asks me things here, for usage numbers the admins can see. The record is kept ${USAGE_RETENTION_DAYS} days.`
+      : "I no longer record who asks me things here, and the record I kept is erased.";
+    for (const channel of channelsToNotify(knowledge, config.agent.channels, recordPeople)) {
+      try {
+        await slack.post!({ channelId: channel }, text);
+        markNotified(knowledge, channel, recordPeople);
+      } catch (err) {
+        console.error(`usage: telling ${channel} whether askers are recorded:`, err); // tried again on the next start
+      }
+    }
+  };
+
   // The read-only admin API (/api/v1), behind ADMIN_TOKEN.
   const admin = adminRoutes({
     db: knowledge,
@@ -196,7 +220,13 @@ export async function createApp(config: Config) {
     ingest: () => ingester?.status(),
     sandbox: config.sandbox?.mode ?? "off",
     runners: hub ? () => hub.status() : undefined,
-    usage: (since) => usageSummary(knowledge, { since }),
+    // With askers recorded, each is named as knowledge names people.
+    usage: async (since) => {
+      const summary = usageSummary(knowledge, { since, people: recordPeople });
+      if (!summary.askers?.length) return summary;
+      const names = (await ingester?.names(summary.askers.map((a) => a.user)).catch(() => undefined)) ?? new Map();
+      return { ...summary, askers: summary.askers.map((a) => ({ ...a, name: names.get(a.user)?.full ?? null })) };
+    },
   });
 
   return {
@@ -204,7 +234,10 @@ export async function createApp(config: Config) {
     seeded,
     // Kick off the Slack backfill; call after the server is listening (it runs in the
     // background and never blocks /healthz).
-    startIngest: () => ingester?.start(),
+    startIngest: async () => {
+      await announceRecordPeople();
+      await ingester?.start();
+    },
     // Bun.serve's websocket handlers (sandbox runners), when runners are enabled.
     websocket: runners?.websocket,
     async fetch(req: Request, server?: Server<RunnerSocketData>): Promise<Response> {
@@ -216,6 +249,8 @@ export async function createApp(config: Config) {
         return Response.json({
           agent: identity.name,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
+          // Whether usage records who asks: a setting, not anyone's data.
+          recordsWhoAsks: recordPeople,
           ...(hub ? { runners: hub.status() } : {}),
         });
       }
