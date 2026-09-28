@@ -22,7 +22,7 @@ import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { WORKDIR, type SandboxFor } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
-import type { GithubAccess } from "../github-auth";
+import type { GitIdentity, GithubAccess } from "../github-auth";
 import { gitWithToken, tokenEnv } from "./git-credential";
 
 export type PullRequestOptions = {
@@ -84,9 +84,16 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
 
       // Every commit must be by the account the PR comes from (the App's bot), before anyone
       // is asked to approve it: a commit made before that was enforced, or with an identity
-      // the model set, would otherwise go out under a made-up name. Without an identity
-      // (the lookup failed) there's nothing to check against.
-      const who = await opts.github.identity?.().catch(() => undefined);
+      // the model set, would otherwise go out under a made-up name. It fails closed: when
+      // the account can't be looked up (GitHub unreachable), nobody is asked to approve
+      // commits that can't be checked. Only a credential with no account to commit as
+      // (no identity provider) skips the check.
+      let who: GitIdentity | undefined;
+      try {
+        who = await opts.github.identity?.();
+      } catch (e) {
+        return { error: `can't check who the commits are by: looking up the GitHub account failed (${(e as Error).message}). Nothing was pushed; try again shortly.` };
+      }
       if (who) {
         const want = `${who.name} <${who.email}>`;
         let lines: string[];

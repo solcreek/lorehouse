@@ -22,6 +22,9 @@ holds a long-lived token:
   each commit to the bot. Every command the agent runs has git's author and committer
   set to it (they outrank any git config), and a pull request whose commits are by
   anyone else is sent back to be re-authored before anyone is asked to approve it.
+  If GitHub can't be reached to look the bot up, commands still run (with git's own
+  configuration), but no pull request goes out: the check before approval fails
+  closed, and the agent is told to try again.
 - Which repos the agent can touch is decided on GitHub: the repos the App is installed on.
   A repo it isn't installed on can still be cloned if it is public, and never pushed to.
 

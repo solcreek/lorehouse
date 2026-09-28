@@ -7,11 +7,11 @@ import { AgentSession, replyStream, type EventSink, type ModelReply, type Model,
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
 import { pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
-import { staticToken as tokenWithLookup } from "../src/github-auth";
+import type { GithubAccess } from "../src/github-auth";
 
-// A plain token whose identity lookup never leaves the process (it fails, so no author
-// check applies): these tests are about the gate, not who commits.
-const staticToken = (token: string) => tokenWithLookup(token, { fetch: (async () => new Response("offline", { status: 503 })) as unknown as typeof fetch });
+// A credential with no account to commit as (no identity provider), so no author check
+// applies: these tests are about the approval gate, not who commits.
+const staticToken = (token: string): GithubAccess => async () => token;
 import { parseAllowlist, publicChannelsOnly } from "../src/policy";
 import { directMessage, redirectText } from "../src/dm";
 import { remoteSandbox } from "../src/sandbox-client";
@@ -164,6 +164,18 @@ describe("open_pull_request — the approval gate", () => {
     expect(String((await outcome([`${bot}|Scout <scout@made-up.example>`])).tool?.error)).toContain("aren't by");
     // All by the bot: on to the approval.
     expect((await outcome([`${bot}|${bot}`])).result).toMatchObject({ status: "suspended" });
+  });
+
+  test("when who the commits should be by can't be looked up, nobody is asked to approve them", async () => {
+    const { sb, calls } = fakeRepo({ authors: ["Scout <scout@made-up.example>|Scout <scout@made-up.example>"] });
+    const asked: string[] = [];
+    const github = Object.assign(async () => (asked.push("token"), "ghs_secret"), { identity: async () => { throw new Error("GitHub App: looking up the App: 502"); } });
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    expect(await s.result(t1)).toMatchObject({ status: "completed" }); // never parked
+    expect(String(toolResult()?.result.error)).toContain("can't check who the commits are by");
+    expect(asked).toEqual([]);
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
   });
 
   test("Deny pushes nothing", async () => {
