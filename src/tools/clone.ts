@@ -29,8 +29,8 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
   async function commitAs(sb: ReturnType<SandboxFor>): Promise<{ commitsAs?: string }> {
     const who = await github.identity?.().catch(() => undefined);
     if (!who || !PLAIN.test(who.name) || !PLAIN.test(who.email)) return {};
-    const r = await sb.exec(`git config user.name '${who.name}' && git config user.email '${who.email}'`, { cwd: WORKDIR, timeoutMs: 30_000 });
-    return r.exitCode === 0 ? { commitsAs: `${who.name} <${who.email}>` } : {};
+    const r = await sb.exec(`git config user.name '${who.name}' && git config user.email '${who.email}'`, { cwd: WORKDIR, timeoutMs: 30_000 }).catch(() => undefined);
+    return r?.exitCode === 0 ? { commitsAs: `${who.name} <${who.email}>` } : {};
   }
 
   return {

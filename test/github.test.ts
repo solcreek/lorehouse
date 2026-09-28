@@ -158,6 +158,19 @@ describe("workspace_clone", () => {
     }
   });
 
+  test("setting the author failing (the sandbox call itself throws) doesn't undo a successful clone", async () => {
+    const { sb } = fakeSandbox();
+    const exec = sb.exec.bind(sb);
+    sb.exec = async (command, opts) => {
+      if (command.includes("git config")) throw new Error("sandbox job timed out on r1");
+      return exec(command, opts);
+    };
+    const github = Object.assign(async () => "t", { identity: async () => ({ name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" }) });
+    const r = await run(cloneTool(() => sb, github), "acme/secret");
+    expect(r).toMatchObject({ status: "cloned" });
+    expect(r).not.toHaveProperty("commitsAs");
+  });
+
   test("already cloned: it fetches the same repo, and refuses to clone a different one over it", async () => {
     const same = fakeSandbox("https://github.com/acme/secret.git");
     expect(await run(cloneTool(() => same.sb, offline("t")), "acme/secret")).toMatchObject({ status: "fetched" });
