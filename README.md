@@ -160,3 +160,7 @@ bun run typecheck && bun run test
 bun run conformance                          # against the source
 bun run build && bun run conformance --app ./dist/lorehouse
 ```
+
+## License
+
+[MIT](LICENSE), © SolCreek, Inc.

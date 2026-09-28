@@ -44,6 +44,19 @@ jobs:
       - run: cargo clippy --locked -- -D warnings
       - run: cargo build --locked --release
 
+  # The landing page. Built only: it isn't deployed yet.
+  website:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run build
+
   # A merge to main that passes the contract goes live; pull requests never deploy.
   # Only this repository deploys (a fork has no FLY_API_TOKEN). flyctl waits for the
   # new machine's /healthz before it reports success.
