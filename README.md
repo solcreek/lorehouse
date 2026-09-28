@@ -127,8 +127,10 @@ To set up Slack:
 | `INGEST_BACKFILL_DAYS` | `90` | how far back to read each allowed channel's history on first start (`0` = live only) |
 | `INGEST_REFRESH_DAYS` | `14` | on each start, re-check threads this recent for replies, edits and deletions made while the app was down |
 | `INGEST_DEBOUNCE_MS` | `5000` | how long a thread must go quiet before a live change re-indexes it |
-| `SANDBOX_RUNNER_TOKEN` `GITHUB_TOKEN` | (off) | code tools and pull requests, with sandbox hosts connecting in ([runners](docs/sandbox-runners.md)); the token is 32+ characters |
-| `SANDBOX_URL` `SANDBOX_TOKEN` `GITHUB_TOKEN` | (off) | code tools with one sandbox host Lorehouse calls, e.g. on the same machine; not together with `SANDBOX_RUNNER_TOKEN` |
+| `SANDBOX_RUNNER_TOKEN` | (off) | code tools and pull requests, with sandbox hosts connecting in ([runners](docs/sandbox-runners.md)); 32+ characters |
+| `SANDBOX_URL` `SANDBOX_TOKEN` | (off) | code tools with one sandbox host Lorehouse calls, e.g. on the same machine; not together with `SANDBOX_RUNNER_TOKEN` |
+| `GITHUB_APP_ID` `GITHUB_APP_PRIVATE_KEY` | (none) | the GitHub App the code tools clone and open pull requests as: a short-lived token per repo, and write access only once a pull request is approved ([setup](docs/github-app.md)). Required with a sandbox |
+| `GITHUB_TOKEN` | (none) | instead of an App, for development only: one long-lived token with everything it can reach |
 
 ## One contract, more than one implementation
 
