@@ -38,6 +38,16 @@ describe("over WebSocket", () => {
     expect(JSON.parse(Buffer.from(sent[0]!.op === "guest" ? sent[0]!.bodyBase64! : "", "base64").toString()).timeoutMs).toBe(EXEC_TIMEOUT_MS);
   });
 
+  test("job ids don't repeat across a restart of Lorehouse (the runner would skip a repeat)", () => {
+    const db = openKnowledge(":memory:");
+    const ids: string[] = [];
+    for (const hub of [new RunnerHub(db, { now: () => 1 }), new RunnerHub(db, { now: () => 1 })]) {
+      hub.attachWs("r1", (j) => ids.push(j.id)).status(status("r1"));
+      void hub.sandbox("s1").exec("true").catch(() => {});
+    }
+    expect(new Set(ids).size).toBe(2);
+  });
+
   test("a closed connection's jobs fail if the runner doesn't come back within the grace", async () => {
     const hub = hubWith({ reconnectGraceMs: 30 });
     const { link } = wsRunner(hub, "r1");

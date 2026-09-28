@@ -41,7 +41,6 @@ const BOOT_SLACK_MS = 60_000;
 export class RunnerHub {
   private runners = new Map<string, Runner>();
   private pending = new Map<string, Pending>();
-  private seq = 0;
   private gens = 0;
 
   constructor(
@@ -229,7 +228,9 @@ export class RunnerHub {
 
   submit(sandbox: string, body: JobBody, timeoutMs: number): Promise<JobResult> {
     const runner = this.place(sandbox);
-    const job = { ...body, id: `j_${this.now().toString(36)}_${++this.seq}`, sandbox, timeoutMs } as Job;
+    // Random, not a counter: the runner remembers ids across Lorehouse restarts, and skips
+    // one it has seen as a redelivery.
+    const job = { ...body, id: `j_${crypto.randomUUID()}`, sandbox, timeoutMs } as Job;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(job.id);
