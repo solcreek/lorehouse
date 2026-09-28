@@ -59,6 +59,9 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     }
   };
 
+  // A body that isn't JSON (a proxy's error page, some other server) reads as undefined.
+  const json = async <T>(res: Response): Promise<T | undefined> => ((await res.json().catch(() => undefined)) ?? undefined) as T | undefined;
+
   // ── configuration ──
   let config: Config;
   let identity: AgentIdentity;
@@ -108,11 +111,14 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     // The name people @-mention must be the agent's own name, or the prompt and the
     // workspace disagree about who it is.
     const who = await slack("users.info", { user: botUserId });
-    if (who.body && !who.error) {
+    if (who.error || !who.body) {
+      add("slack", "agent name", "warn", `not checked: users.info: ${who.error}${who.error === "missing_scope" ? " (the app needs users:read)" : ""}`);
+    } else {
       const u = who.body.user as { name?: string; profile?: { display_name?: string; real_name?: string } } | undefined;
       const shown = (u?.profile?.display_name || u?.profile?.real_name || u?.name || "").trim();
-      if (shown && shown.toLowerCase() !== identity.name) add("slack", "agent name", "warn", `the bot shows as "${shown}" in Slack but AGENT_NAME is "${identity.name}"; make them match`);
-      else if (shown) add("slack", "agent name", "ok", `@${identity.name}`);
+      if (!shown) add("slack", "agent name", "warn", "not checked: Slack gave the bot no name");
+      else if (shown.toLowerCase() !== identity.name) add("slack", "agent name", "warn", `the bot shows as "${shown}" in Slack but AGENT_NAME is "${identity.name}"; make them match`);
+      else add("slack", "agent name", "ok", `@${identity.name}`);
     }
   }
 
@@ -159,28 +165,41 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     const api = (opts.githubApiUrl ?? "https://api.github.com").replace(/\/$/, "");
     const headers = { accept: "application/vnd.github+json", "user-agent": "lorehouse" };
     const gh = sandbox.github;
+    // loadConfig checks only the PEM header; signing is what proves the key is one.
+    let jwt: string | undefined;
     if (gh.kind === "app") {
-      const auth = { ...headers, authorization: `Bearer ${appJwt(gh.appId, gh.privateKey, Date.now())}` };
+      try {
+        jwt = appJwt(gh.appId, gh.privateKey, Date.now());
+      } catch (e) {
+        add("github", "App", "fail", `GITHUB_APP_PRIVATE_KEY can't sign (${e instanceof Error ? e.message : e}): paste the App's whole .pem private key`);
+      }
+    }
+    if (gh.kind === "app" && jwt) {
+      const auth = { ...headers, authorization: `Bearer ${jwt}` };
       const { res, error } = await get(`${api}/app`, { headers: auth });
+      const app = res?.ok ? await json<{ slug?: string; permissions?: Record<string, string> }>(res) : undefined;
       if (!res) add("github", "App", "fail", `${api}: ${error}`);
       else if (!res.ok) add("github", "App", "fail", `refused (${res.status}): GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY must be the same App's, and this machine's clock right`);
+      else if (!app?.slug) add("github", "App", "fail", `${api}/app answered ${res.status} without an App`);
       else {
-        const app = (await res.json()) as { slug?: string; permissions?: Record<string, string> };
         add("github", "App", "ok", `${app.slug}[bot]`);
         // Pushing a branch and opening a pull request (docs/github-app.md).
         const short = (["contents", "pull_requests"] as const).filter((p) => app.permissions?.[p] !== "write");
         if (short.length) add("github", "permissions", "fail", `the App needs read and write on ${short.join(" and ")}; change it under the App's Permissions, then accept the change on each installation`);
         else add("github", "permissions", "ok", "contents and pull requests: read and write");
         const inst = await get(`${api}/app/installations`, { headers: auth });
-        const list = inst.res?.ok ? ((await inst.res.json()) as unknown[]) : undefined;
-        if (list && !list.length) add("github", "installations", "warn", "the App isn't installed anywhere yet: install it on the repos the agent may work on");
-        else if (list) add("github", "installations", "ok", `${list.length} installation${list.length === 1 ? "" : "s"}`);
+        const list = inst.res?.ok ? await json<unknown>(inst.res) : undefined;
+        if (!inst.res) add("github", "installations", "fail", `${api}: ${inst.error}`);
+        else if (!inst.res.ok) add("github", "installations", "fail", `${api}/app/installations answered ${inst.res.status}`);
+        else if (!Array.isArray(list)) add("github", "installations", "fail", `${api}/app/installations didn't answer with a list`);
+        else if (!list.length) add("github", "installations", "warn", "the App isn't installed anywhere yet: install it on the repos the agent may work on");
+        else add("github", "installations", "ok", `${list.length} installation${list.length === 1 ? "" : "s"}`);
       }
-    } else {
+    } else if (gh.kind === "token") {
       const { res, error } = await get(`${api}/user`, { headers: { ...headers, authorization: `Bearer ${gh.token}` } });
       if (!res) add("github", "token", "fail", `${api}: ${error}`);
       else if (!res.ok) add("github", "token", "fail", `refused (${res.status}): check GITHUB_TOKEN`);
-      else add("github", "token", "warn", `works, as ${((await res.json()) as { login?: string }).login}; a long-lived token is for development: use a GitHub App (docs/github-app.md)`);
+      else add("github", "token", "warn", `works, as ${(await json<{ login?: string }>(res))?.login ?? "?"}; a long-lived token is for development: use a GitHub App (docs/github-app.md)`);
     }
 
     // ── sandbox ──
@@ -203,11 +222,15 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       add("storage", key, "warn", key === "SESSIONS_DB" ? "in memory: conversation state is lost on every restart; set a file path" : "in memory: the index is rebuilt from Slack on every start; set a file path");
       continue;
     }
+    // SQLite in WAL mode (knowledge.ts) writes -wal and -shm files beside the database,
+    // so its directory must be writable too, not only the file.
     const full = resolve(path);
+    const dir = dirname(full);
     const writable = (p: string) => { try { accessSync(p, constants.W_OK); return true; } catch { return false; } };
-    if (existsSync(full)) add("storage", key, writable(full) ? "ok" : "fail", writable(full) ? full : `${full} isn't writable`);
-    else if (!existsSync(dirname(full))) add("storage", key, "fail", `${dirname(full)} doesn't exist`);
-    else add("storage", key, writable(dirname(full)) ? "ok" : "fail", writable(dirname(full)) ? `${full} (created on first start)` : `can't create ${full}`);
+    if (!existsSync(dir)) add("storage", key, "fail", `${dir} doesn't exist`);
+    else if (existsSync(full) && !writable(full)) add("storage", key, "fail", `${full} isn't writable`);
+    else if (!writable(dir)) add("storage", key, "fail", `${dir} isn't writable: SQLite keeps its -wal and -shm files there`);
+    else add("storage", key, "ok", existsSync(full) ? full : `${full} (created on first start)`);
   }
 
   // ── deployment ──
@@ -241,25 +264,26 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   // Slack's side can't be read with a bot token: only the app's settings page shows it.
   add("deployment", "Slack app settings", "info", `Event Subscriptions${sandbox ? " and Interactivity" : ""} must point at ${url}/slack/events` + (sandbox ? " (without Interactivity, Approve and Deny do nothing)" : ""));
 
-  if (config.statusToken) {
-    const s = await get(`${url}/status`, { headers: { authorization: `Bearer ${config.statusToken}` } });
-    if (!s.res) add("deployment", "/status", "fail", String(s.error));
-    else if (s.res.status === 404) add("deployment", "/status", "warn", "closed: the running app has no STATUS_TOKEN");
-    else if (s.res.status === 401) add("deployment", "/status", "fail", "refused: the running app has a different STATUS_TOKEN");
-    else if (!s.res.ok) add("deployment", "/status", "fail", `answered ${s.res.status}`);
-    else {
-      const status = (await s.res.json()) as RunningStatus;
-      const k = status.knowledge;
-      if (k?.state === "error") add("deployment", "knowledge", "fail", `ingest failed: ${k.error}`);
-      else if (k?.state === "ready") add("deployment", "knowledge", "ok", `ready, ${k.documents} threads indexed`);
-      else add("deployment", "knowledge", "info", `${k?.state ?? "unknown"}, ${k?.documents ?? 0} threads so far`);
-      if (status.agent && status.agent !== identity.name) add("deployment", "agent", "warn", `the running app is @${status.agent}, this environment @${identity.name}: is this the same deployment?`);
-      if (sandbox?.mode === "runners") {
-        const online = (status.runners ?? []).filter((r) => r.online);
-        if (!online.length) add("deployment", "runners", "fail", "no sandbox runner is connected: code tools will fail (sandbox/host/README.md)");
-        else add("deployment", "runners", "ok", online.map((r) => `${r.runner} (${r.transport}, ${r.running}/${r.capacity})`).join(", "));
-      }
-    }
+  if (!config.statusToken) return checks;
+  const s = await get(`${url}/status`, { headers: { authorization: `Bearer ${config.statusToken}` } });
+  const status = s.res?.ok ? await json<RunningStatus>(s.res) : undefined;
+  // A proxy's page, or another server answering 200, is not a status to read from.
+  const k = status && typeof status === "object" && status.knowledge && typeof status.knowledge === "object" ? status.knowledge : undefined;
+  if (!s.res) add("deployment", "/status", "fail", String(s.error));
+  else if (s.res.status === 404) add("deployment", "/status", "warn", "closed: the running app has no STATUS_TOKEN");
+  else if (s.res.status === 401) add("deployment", "/status", "fail", "refused: the running app has a different STATUS_TOKEN");
+  else if (!s.res.ok) add("deployment", "/status", "fail", `answered ${s.res.status}`);
+  else if (!k) add("deployment", "/status", "fail", `answered ${s.res.status}, but not with a lorehouse status: is this the right URL?`);
+  if (!status || !k) return checks;
+
+  if (k.state === "error") add("deployment", "knowledge", "fail", `ingest failed: ${k.error}`);
+  else if (k.state === "ready") add("deployment", "knowledge", "ok", `ready, ${k.documents} threads indexed`);
+  else add("deployment", "knowledge", "info", `${k.state ?? "unknown"}, ${k.documents ?? 0} threads so far`);
+  if (status.agent && status.agent !== identity.name) add("deployment", "agent", "warn", `the running app is @${status.agent}, this environment @${identity.name}: is this the same deployment?`);
+  if (sandbox?.mode === "runners") {
+    const online = (Array.isArray(status.runners) ? status.runners : []).filter((r) => r?.online);
+    if (!online.length) add("deployment", "runners", "fail", "no sandbox runner is connected: code tools will fail (sandbox/host/README.md)");
+    else add("deployment", "runners", "ok", online.map((r) => `${r.runner} (${r.transport}, ${r.running}/${r.capacity})`).join(", "));
   }
   return checks;
 }
@@ -270,9 +294,10 @@ type RunningStatus = {
   runners?: { runner: string; transport: string; online: boolean; capacity: number; running: number }[];
 };
 
+// Only a literal loopback address: a name like 127.0.0.1.example.com is not one.
 function isLoopback(url: string): boolean {
   const host = new URL(url).hostname;
-  return host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host);
+  return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
 const MARK: Record<Level, string> = { ok: "✓", warn: "!", fail: "✗", info: "·" };
@@ -298,11 +323,11 @@ export async function doctorMain(args: string[]): Promise<number> {
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--help" || a === "-h") return console.log(USAGE), 0;
-    if (a === "--url") url = args[++i];
-    else if (a.startsWith("--url=")) url = a.slice("--url=".length);
-    else return console.error(`lorehouse doctor: unknown argument "${a}"\n\n${USAGE}`), 2;
+    if (a === "--url" || a.startsWith("--url=")) {
+      url = a === "--url" ? args[++i] : a.slice("--url=".length);
+      if (!url) return console.error(`lorehouse doctor: --url needs a URL\n\n${USAGE}`), 2;
+    } else return console.error(`lorehouse doctor: unknown argument "${a}"\n\n${USAGE}`), 2;
   }
-  if (args.includes("--url") && !url) return console.error(`lorehouse doctor: --url needs a URL\n\n${USAGE}`), 2;
   if (url && !URL.canParse(url)) return console.error(`lorehouse doctor: "${url}" isn't a URL`), 2;
   const checks = await doctor({ url });
   console.log(report(checks));

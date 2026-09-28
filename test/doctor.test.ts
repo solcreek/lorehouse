@@ -2,8 +2,9 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHmac, generateKeyPairSync } from "node:crypto";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { doctor, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
+import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 const DB = `${tmpdir()}/doctor-test-lorehouse.db`;
@@ -23,11 +24,12 @@ type World = {
   scopes?: string | null; // x-oauth-scopes; null: not sent
   authError?: string;
   displayName?: string;
+  usersInfoError?: string;
   history?: Record<string, string>; // channel → Slack error
   anthropic?: number; // status of GET /v1/models/…
   appPermissions?: Record<string, string>;
-  installations?: number;
-  app?: { secret?: string; status?: object | number };
+  installations?: number | "http_500" | "not_a_list";
+  app?: { secret?: string; status?: object | number | string }; // a string: a non-JSON body, 200
 };
 
 // One fake internet: Slack, Anthropic, GitHub and the running app, by host.
@@ -40,6 +42,7 @@ function world(w: World = {}) {
       const method = url.pathname.replace("/api/", "");
       const headers: Record<string, string> = w.scopes === null ? {} : { "x-oauth-scopes": w.scopes ?? MANIFEST_SCOPES.join(",") };
       if (method === "auth.test") return Response.json(w.authError ? { ok: false, error: w.authError } : { ok: true, team: "Acme", user_id: "UBOT" }, { headers });
+      if (method === "users.info" && w.usersInfoError) return Response.json({ ok: false, error: w.usersInfoError });
       if (method === "users.info") return Response.json({ ok: true, user: { name: "scout", profile: { display_name: w.displayName ?? "scout" } } });
       if (method === "conversations.history") {
         const err = w.history?.[url.searchParams.get("channel")!];
@@ -52,7 +55,11 @@ function world(w: World = {}) {
     }
     if (url.host === "api.github.com") {
       if (url.pathname === "/app") return Response.json({ slug: "acme-agent", permissions: w.appPermissions ?? { contents: "write", pull_requests: "write", metadata: "read" } });
-      if (url.pathname === "/app/installations") return Response.json(Array.from({ length: w.installations ?? 1 }, (_, id) => ({ id })));
+      if (url.pathname === "/app/installations") {
+        if (w.installations === "http_500") return new Response("oops", { status: 500 });
+        if (w.installations === "not_a_list") return Response.json({ message: "hm" });
+        return Response.json(Array.from({ length: w.installations ?? 1 }, (_, id) => ({ id })));
+      }
       if (url.pathname === "/user") return Response.json({ login: "octo" });
     }
     if (url.host === "app.test") {
@@ -67,6 +74,7 @@ function world(w: World = {}) {
       }
       if (url.pathname === "/status") {
         const s = w.app?.status ?? { agent: "scout", knowledge: { state: "ready", documents: 12 } };
+        if (typeof s === "string") return new Response(s, { status: 200 });
         return typeof s === "number" ? new Response("", { status: s }) : Response.json(s);
       }
     }
@@ -135,6 +143,11 @@ describe("slack", () => {
     expect(find(checks, "agent name")[0]).toMatchObject({ level: "warn" });
   });
 
+  test("a users.info failure is reported, not skipped", async () => {
+    const checks = await run({}, { usersInfoError: "missing_scope" });
+    expect(find(checks, "agent name")[0]).toMatchObject({ level: "warn", detail: "not checked: users.info: missing_scope (the app needs users:read)" });
+  });
+
   test("a SLACK_BOT_USER_ID that isn't the token's bot fails", async () => {
     expect(find(await run({ SLACK_BOT_USER_ID: "UOTHER" }), "bot user id")[0]?.level).toBe("fail");
   });
@@ -189,6 +202,20 @@ describe("code tools", () => {
     expect(find(await run(app, { installations: 0 }), "installations")[0]?.level).toBe("warn");
   });
 
+  test("a failed or odd installations answer fails instead of passing silently", async () => {
+    expect(find(await run(app, { installations: "http_500" }), "installations")[0]).toMatchObject({ level: "fail" });
+    expect(find(await run(app, { installations: "not_a_list" }), "installations")[0]).toMatchObject({ level: "fail" });
+  });
+
+  test("a private key with a PEM header that can't sign fails, and GitHub isn't asked", async () => {
+    const { f, seen } = world();
+    const bad = "-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5\n-----END PRIVATE KEY-----";
+    const checks = await doctor({ env: { ...ENV, ...app, GITHUB_APP_PRIVATE_KEY: bad }, fetch: f });
+    expect(find(checks, "App")[0]?.level).toBe("fail");
+    expect(find(checks, "App")[0]!.detail).toStartWith("GITHUB_APP_PRIVATE_KEY can't sign");
+    expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
+  });
+
   test("a plain GitHub token works, with a warning that it's for development", async () => {
     const checks = await run({ SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" });
     expect(find(checks, "token")[0]).toMatchObject({ level: "warn" });
@@ -203,6 +230,20 @@ describe("code tools", () => {
 });
 
 describe("storage", () => {
+  test("a writable database in a read-only directory fails: SQLite's WAL files go beside it", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-ro-`);
+    writeFileSync(`${dir}/lorehouse.db`, "");
+    chmodSync(dir, 0o555);
+    try {
+      const checks = await run({ LOREHOUSE_DB: `${dir}/lorehouse.db` });
+      expect(find(checks, "LOREHOUSE_DB")[0]).toMatchObject({ level: "fail" });
+      expect(find(checks, "LOREHOUSE_DB")[0]!.detail).toContain("-wal");
+    } finally {
+      chmodSync(dir, 0o755);
+      rmSync(dir, { recursive: true });
+    }
+  });
+
   test("a directory that doesn't exist fails; sessions in memory warn", async () => {
     const checks = await run({ LOREHOUSE_DB: "/no/such/dir/lorehouse.db", SESSIONS_DB: ":memory:" });
     expect(find(checks, "LOREHOUSE_DB")[0]?.level).toBe("fail");
@@ -233,10 +274,40 @@ describe("the running deployment (--url)", () => {
     expect(find(await run({}, { app: { status: 404 } }, "https://app.test"), "/status")[0]?.level).toBe("warn");
   });
 
+  test("a 200 /status that isn't a lorehouse status fails instead of crashing", async () => {
+    for (const status of ["<html>proxy</html>", "null", { hello: "world" }]) {
+      const checks = await run({}, { app: { status } }, "https://app.test");
+      expect(find(checks, "/status")[0]).toMatchObject({ level: "fail" });
+      expect(find(checks, "knowledge")).toEqual([]);
+    }
+  });
+
+  test("plain HTTP warns unless the host is literally loopback", async () => {
+    const warned = async (url: string) => find(await run({}, {}, url), "URL").length > 0;
+    expect(await warned("http://127.0.0.1.example.test")).toBe(true);
+    expect(await warned("http://app.test")).toBe(true);
+    expect(await warned("http://127.0.0.1:3000")).toBe(false);
+    expect(await warned("http://localhost:3000")).toBe(false);
+  });
+
   test("a URL nothing answers at fails without asking further", async () => {
     const checks = await doctor({ env: ENV, fetch: (async () => { throw new Error("connection refused"); }) as unknown as typeof fetch, url: "https://down.test" });
     expect(find(checks, "/healthz")[0]).toMatchObject({ level: "fail" });
     expect(find(checks, "/slack/events")).toEqual([]);
+  });
+});
+
+describe("the command line", () => {
+  test("--url without a value is refused, in either spelling", async () => {
+    const err = console.error;
+    console.error = () => {};
+    try {
+      expect(await doctorMain(["--url="])).toBe(2);
+      expect(await doctorMain(["--url"])).toBe(2);
+      expect(await doctorMain(["--nope"])).toBe(2);
+    } finally {
+      console.error = err;
+    }
   });
 });
 
