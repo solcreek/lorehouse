@@ -1,7 +1,8 @@
 # The admin API
 
 A read-only view of what Lorehouse knows and runs: the indexed threads and their text,
-search, each channel's ingest, the threads the agent was asked into, and the sandboxes.
+search, each channel's ingest, the threads the agent was asked into, how people use it,
+and the sandboxes.
 It is for the people who run Lorehouse, and later for the Lorehouse app. Nothing in it
 writes.
 
@@ -44,6 +45,7 @@ keep serving the closed 404 after `ADMIN_TOKEN` is set.
 | `GET /api/v1/threads` | the threads the agent was asked into, newest first |
 | `GET /api/v1/runners` | the connected sandbox runners |
 | `GET /api/v1/sandboxes` | which runner each sandbox lives on, newest first |
+| `GET /api/v1/usage` | who asks the agent things, which searches found nothing, and the 👍/👎 on its replies |
 
 ### Documents
 
@@ -110,13 +112,56 @@ the top 5. Chinese, Japanese and Korean work as they do for the agent. Each resu
 { "threads": [
     { "channel": "C0123", "threadTs": "1790000001.000100", "joinedAt": "2026-09-28T09:00:00.000Z",
       "document": "slack:C0123:1790000001.000100",
-      "source": "https://acme.slack.com/archives/C0123/p1790000001000100" } ],
+      "source": "https://acme.slack.com/archives/C0123/p1790000001000100",
+      "asks": 3, "searches": 4, "emptySearches": 1 } ],
   "next": null }
 ```
 
 A thread joins when someone mentions the agent in it. `document` and `source` are `null`
 when the thread isn't indexed: a thread that holds only a question to the agent isn't
-knowledge.
+knowledge. `asks`, `searches` and `emptySearches` come from [usage](#usage): the messages
+that asked the agent something there, its `search_knowledge` calls, and how many of those
+found nothing.
+
+### Usage
+
+`GET /api/v1/usage?days=` (1–90 whole days, default 7; anything else, such as `3days`,
+`7.9` or `-5`, is a 400)
+
+```json
+{ "days": 7, "since": "2026-09-21T18:00:00.000Z",
+  "people": 5, "channels": 2, "threads": 9,
+  "emptySearches": { "threads": 2, "of": 8, "queries": ["okapi budget"] },
+  "feedback": { "up": 6, "down": 1, "people": 4,
+                "downMessages": [ { "channel": "C0123", "ts": "1790000009.000100" } ] } }
+```
+
+How the agent is used in public channels, to see whether it is becoming part of how people
+work together:
+
+- **`people`, `channels`, `threads`:** who asked it something, and where. An ask is a
+  message it answered: a mention, or a plain reply in a thread it was asked into.
+- **`emptySearches`:** threads where every search found nothing, out of the threads that
+  searched (`of`), and the latest distinct queries that found nothing (up to 10). It is a
+  floor for "couldn't answer", not a count of it: search matches any of the words, so a
+  question with no real answer usually still gets hits.
+- **`feedback`:** the 👍 and 👎 people leave on the agent's own messages, how many people
+  left them, and the latest messages given a 👎 (up to 10). A reaction is recorded and
+  never answered.
+
+What is recorded, and for how long:
+
+- **A DM is never recorded**, whatever `DM_MODE` is.
+- **Rows are kept 90 days,** the longest window this reports, then pruned (on start and
+  daily).
+- **A question deleted in Slack is forgotten:** its ask goes, and when it was a thread's
+  root, so do the searches run for it. The same as a deleted message leaving the index.
+- **None of it is in `GET /status`,** which holds counts safe for a monitor. This holds
+  who asked and what was searched for.
+
+Feedback needs the `reactions:read` scope and the `reaction_added` and
+`reaction_removed` events ([setup](live-slack.md)); `lorehouse doctor` fails while the
+scope is missing.
 
 ### Runners and sandboxes
 
@@ -139,5 +184,6 @@ the front instead of appearing twice.
 
 `lorehouse doctor --url https://<app>`, with `ADMIN_TOKEN` set, checks that the running
 app's admin API answers to the same token. The conformance suite pins the rest: the
-tokens, paging through every document `/status` counts, search, deleted messages, and the
-agent's threads.
+tokens, paging through every document `/status` counts, search, deleted messages, the
+agent's threads, and usage (counted right, forgotten with a deleted question, and never in
+`/status`).

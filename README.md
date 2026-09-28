@@ -133,7 +133,8 @@ To set up Slack:
 
 1. Create the app from [`slack/manifest.yaml`](slack/manifest.yaml). It lists the scopes
    and why each is needed.
-2. Subscribe to the events `app_mention`, `message.channels` and `message.im`.
+2. Subscribe to the events `app_mention`, `message.channels`, `message.im`, and
+   `reaction_added` and `reaction_removed` (the 👍/👎 in [usage](docs/admin-api.md#usage)).
 3. Invite the bot to each allowed channel. Slack won't serve history to a non-member, so
    the backfill fails with `not_in_channel`, and `GET /status` shows the error.
    `lorehouse doctor` checks all three before you start.
