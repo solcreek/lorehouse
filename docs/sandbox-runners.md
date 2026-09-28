@@ -44,8 +44,17 @@ A **status** says who the runner is and how busy it is. Lorehouse uses it to pla
 sandboxes on the runner with the most free room.
 
 ```json
-{ "type": "status", "runner": "starship", "capacity": 4, "running": 1, "version": "0.1.0" }
+{ "type": "status", "runner": "starship", "capacity": 4, "running": 1, "version": "0.1.0",
+  "jobs": ["j_…"], "received": ["j_…"] }
 ```
+
+- `jobs` lists the ids the runner holds: running, or finished with a result not yet
+  delivered. After a reconnect, it tells Lorehouse which jobs survived the drop (see
+  [Delivery](#delivery)).
+- `received` is for long poll only. It lists the ids in the last poll answer the runner
+  got.
+- Both are optional. A runner that omits them loses the guarantees in Delivery but still
+  works.
 
 A **job** is one request to the sandbox's guest agent, or the removal of a sandbox:
 
@@ -73,8 +82,9 @@ A **result** answers one job with an HTTP-like status:
 
 ### Over long poll
 
-- `POST /runners/poll` with a `status` body. Lorehouse holds the request until jobs are
-  waiting (≤ 25 s), then answers `200 { "jobs": [...] }`, which may be empty.
+- `POST /runners/poll` with a `status` body, including `received`. Lorehouse holds the
+  request until jobs are waiting (≤ 25 s), then answers `200 { "jobs": [...] }`, which may
+  be empty.
 - The runner polls again at once and runs the jobs concurrently.
 - `POST /runners/results` with `{ "results": [...] }` returns `204`. The runner posts each
   result as soon as it has it.
@@ -86,8 +96,27 @@ A **result** answers one job with an HTTP-like status:
   each sandbox was placed. Every later job goes to that runner.
 - **Placed runner offline.** The job fails with "the sandbox's host is offline". It is not
   silently moved, because moving it would lose the checkout.
-- **New sandbox.** It goes to the online runner with the most free capacity. With none
-  online, the job fails with "no sandbox runner is connected".
+- **New sandbox.** It goes to the online runner with free capacity, the most first. A
+  runner that hasn't sent a status yet has none.
+  - With none online, the job fails with "no sandbox runner is connected".
+  - With all full, it fails with "every sandbox runner is full". Nothing is recorded, so a
+    retry can land wherever room appears.
 - **Deadline.** A job has one: its `timeoutMs` plus 60 s for a boot. It fails if no result
-  arrives by then.
-- **Lost connection.** A WebSocket that closes fails its runner's jobs in flight at once.
+  arrives by then. A job that hasn't gone out by its deadline never goes out.
+
+## Delivery
+
+Jobs write files and run commands, so a job must not run twice, and a result must not be
+lost because a connection dropped while the job ran.
+
+- **The runner keeps results until delivered.** A result finished on a connection that
+  dropped is sent on the next one. Lorehouse accepts a result from the runner on the job's
+  connection or any newer one, never an older one.
+- **The runner runs a job id once.** It remembers recent job ids and skips one it has
+  already taken, so a job handed out again doesn't run twice.
+- **Long poll acknowledges.** A job in a poll answer the runner never got (missing from its
+  next `received`) is handed out again.
+- **After a reconnect, `jobs` settles the rest.** A job sent on an older connection that
+  isn't listed never reached the runner and never ran, so it fails at once and is safe to
+  retry. A listed job stays pending until its result arrives.
+- **A runner that disconnects** has 60 s to come back before its pending jobs fail.

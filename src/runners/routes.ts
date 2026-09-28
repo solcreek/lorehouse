@@ -25,7 +25,9 @@ function parseStatus(runner: string, v: unknown): RunnerStatus | undefined {
   const o = v as Partial<RunnerStatus> | undefined;
   const whole = (n: unknown) => typeof n === "number" && Number.isInteger(n) && n >= 0 && n <= 10_000;
   if (!o || !whole(o.capacity) || !whole(o.running)) return undefined;
-  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined };
+  // Job id lists: absent means "not reported"; present, only strings, and bounded.
+  const ids = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, 10_000) : undefined);
+  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received) };
 }
 
 function parseResult(v: unknown): JobResult | undefined {

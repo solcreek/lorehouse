@@ -4,11 +4,20 @@
 // and asks for work, so sandbox hosts need no inbound port and the sandbox API is never on
 // the internet. This file is transport-independent: the HTTP/WebSocket plumbing in
 // routes.ts feeds it. Protocol: docs/sandbox-runners.md.
+//
+// Delivery: a job runs at most once, and its result isn't lost to a dropped connection.
+// The runner remembers job ids (so a job handed out twice runs once) and keeps results
+// until delivered, on whatever connection comes next. Lorehouse accepts a result from the
+// runner on the job's connection or a newer one, and after a reconnect fails at once the
+// jobs the runner says it never got (they never ran, so a retry is safe).
 
 import type { Database } from "bun:sqlite";
 import type { ExecOptions, ExecResult, Sandbox } from "../tools/workspace";
 
-export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string };
+// `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
+// `received` (long poll only): ids from the last poll answer the runner got, so jobs whose
+// answer never arrived are handed out again.
+export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[] };
 
 type JobBody =
   | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string }
@@ -17,14 +26,14 @@ export type Job = JobBody & { id: string; sandbox: string; timeoutMs: number };
 export type JobResult = { id: string; status: number; contentType?: string; bodyBase64?: string; error?: string };
 
 // How a job reaches the runner: pushed down its WebSocket, or queued for its next poll.
+// `gen` orders a runner's connections: each new one gets a higher number.
 type Link =
-  | { kind: "ws"; send: (job: Job) => void }
-  | { kind: "poll"; queue: Job[]; waiter?: (jobs: Job[]) => void };
+  | { gen: number; kind: "ws"; send: (job: Job) => void }
+  | { gen: number; kind: "poll"; queue: Job[]; waiter?: (jobs: Job[]) => void; unacked: Map<string, Job> };
 
 type Runner = { name: string; status: RunnerStatus; link: Link; lastSeen: number };
-// `link` is the connection the job went out on: only a result arriving on that same
-// connection settles it, so a replaced socket's late frames can't touch the new one's jobs.
-type Pending = { runner: string; link: Link; resolve: (r: JobResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
+// `gen` is the connection the job went out on.
+type Pending = { runner: string; gen: number; resolve: (r: JobResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 // A boot can precede the work: a job's deadline is its own timeout plus this.
 const BOOT_SLACK_MS = 60_000;
@@ -33,10 +42,11 @@ export class RunnerHub {
   private runners = new Map<string, Runner>();
   private pending = new Map<string, Pending>();
   private seq = 0;
+  private gens = 0;
 
   constructor(
     private readonly db: Database,
-    private readonly opts: { pollWaitMs?: number; onlineMs?: number; now?: () => number; log?: (m: string) => void } = {},
+    private readonly opts: { pollWaitMs?: number; onlineMs?: number; reconnectGraceMs?: number; now?: () => number; log?: (m: string) => void } = {},
   ) {}
 
   private now(): number {
@@ -49,23 +59,29 @@ export class RunnerHub {
 
   // ── WebSocket ──────────────────────────────────────────────────────────────────────
 
-  // A runner's socket opened. Returns what the socket's handlers call. Each handler acts
-  // only while this socket is still the runner's connection: once a newer one with the
-  // same name replaces it, its late frames are ignored.
+  // A runner's socket opened. Returns what the socket's handlers call. Status counts only
+  // while this socket is still the runner's connection; results, from it or later (see
+  // settle).
   attachWs(name: string, send: (job: Job) => void) {
-    const link: Link = { kind: "ws", send };
+    const link: Link = { gen: ++this.gens, kind: "ws", send };
     this.replace(name, link);
     const current = () => this.runners.get(name)?.link === link;
     return {
       status: (s: RunnerStatus) => {
-        if (current()) this.touch(name, s);
+        if (!current()) return;
+        this.touch(name, s);
+        this.reconcile(name, link, s.jobs);
       },
       result: (r: JobResult) => this.settle(name, link, r),
       closed: () => {
         if (!current()) return; // already replaced by a newer connection
         this.runners.delete(name);
-        this.failJobsVia(link, `sandbox runner ${name} disconnected`);
         this.opts.log?.(`runners: ${name} disconnected`);
+        // Its jobs may still be running there, with results to deliver on reconnect: give
+        // it a grace to come back before failing them.
+        setTimeout(() => {
+          if (!this.runners.has(name)) this.failJobsOf(name, `sandbox runner ${name} disconnected and didn't come back`);
+        }, this.opts.reconnectGraceMs ?? 60_000);
       },
     };
   }
@@ -73,8 +89,11 @@ export class RunnerHub {
   // ── long poll ──────────────────────────────────────────────────────────────────────
 
   // One poll: the jobs waiting for this runner, or, after pollWaitMs, none. If the request
-  // is aborted while it waits, jobs stay queued for the next poll rather than going to a
-  // connection that's gone.
+  // is aborted while it waits, jobs stay queued for the next poll.
+  //
+  // Jobs handed out in an answer the runner never got (not in its `received`) go out
+  // again; the runner's record of job ids keeps them from running twice. A runner that
+  // doesn't send `received` is taken to have got everything.
   //
   // A poll never displaces a live WebSocket with the same name (a stale poller from an
   // older process would otherwise kick the runner off): it idles for pollWaitMs and
@@ -83,20 +102,31 @@ export class RunnerHub {
   poll(status: RunnerStatus, signal?: AbortSignal): Promise<Job[]> {
     let r = this.runners.get(status.runner);
     if (r?.link.kind === "ws") return idle(this.opts.pollWaitMs ?? 25_000, signal);
-    if (r?.link.kind !== "poll") r = this.replace(status.runner, { kind: "poll", queue: [] });
+    if (r?.link.kind !== "poll") r = this.replace(status.runner, { gen: ++this.gens, kind: "poll", queue: [], unacked: new Map() });
     this.touch(status.runner, status);
     const link = r.link as Extract<Link, { kind: "poll" }>;
-    if (link.queue.length) return Promise.resolve(this.live(link.queue.splice(0)));
+    this.reconcile(status.runner, link, status.jobs);
+    if (status.received) {
+      for (const id of status.received) link.unacked.delete(id);
+      link.queue.unshift(...link.unacked.values());
+    }
+    link.unacked.clear();
+    const deliver = (jobs: Job[]) => {
+      const out = this.live(jobs);
+      for (const j of out) link.unacked.set(j.id, j);
+      return out;
+    };
+    if (link.queue.length) return Promise.resolve(deliver(link.queue.splice(0)));
     link.waiter?.([]); // a newer poll supersedes an older one still waiting
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (link.waiter === wake) link.waiter = undefined;
-        resolve(this.live(link.queue.splice(0)));
+        resolve(deliver(link.queue.splice(0)));
       }, this.opts.pollWaitMs ?? 25_000);
       const wake = (jobs: Job[]) => {
         clearTimeout(timer);
         link.waiter = undefined;
-        resolve(jobs);
+        resolve(deliver(jobs));
       };
       link.waiter = wake;
       signal?.addEventListener("abort", () => {
@@ -109,26 +139,26 @@ export class RunnerHub {
   }
 
   // Of queued jobs, those still awaited: one whose caller already gave up (its deadline
-  // passed, or its connection was replaced) is dropped rather than delivered.
+  // passed) is dropped rather than delivered.
   private live(jobs: Job[]): Job[] {
     return jobs.filter((j) => this.pending.has(j.id));
   }
 
-  // Results posted by a polling runner settle only jobs that went out by poll to it.
+  // Results posted over HTTP arrive on the runner's current connection.
   results(runner: string, results: JobResult[]): void {
     const link = this.runners.get(runner)?.link;
-    if (link?.kind !== "poll") return;
+    if (!link) return;
     for (const r of results) this.settle(runner, link, r);
   }
 
   // ── both ───────────────────────────────────────────────────────────────────────────
 
-  // A new connection for a name takes over; jobs that went out on the old one can't come
-  // back on it any more, so they fail now rather than at their deadline.
+  // A new connection for a name takes over. Jobs sent on the old one stay pending: the
+  // runner may still be running them, and delivers their results on the new connection.
+  // Its first status says which jobs it holds; the rest were lost in transit (reconcile).
   private replace(name: string, link: Link): Runner {
     const old = this.runners.get(name);
     if (old?.link.kind === "poll") old.link.waiter?.([]);
-    if (old && old.link !== link) this.failJobsVia(old.link, `sandbox runner ${name} reconnected; the job's connection is gone`);
     const r: Runner = { name, link, lastSeen: this.now(), status: old?.status ?? { runner: name, capacity: 0, running: 0 } };
     this.runners.set(name, r);
     if (!old) this.opts.log?.(`runners: ${name} connected (${link.kind})`);
@@ -138,22 +168,38 @@ export class RunnerHub {
   private touch(name: string, status: RunnerStatus): void {
     const r = this.runners.get(name);
     if (!r) return;
-    r.status = { ...status, runner: name };
+    r.status = { runner: name, capacity: status.capacity, running: status.running, version: status.version };
     r.lastSeen = this.now();
   }
 
-  // A result counts only from the runner, and the connection, the job was sent on.
+  // A result counts from the runner the job was sent to, arriving on that connection or a
+  // newer one, never an older one: a replaced socket's late frames can't touch jobs sent
+  // on its successor.
   private settle(runner: string, via: Link, result: JobResult): void {
     const p = this.pending.get(result.id);
-    if (!p || p.runner !== runner || p.link !== via) return;
+    if (!p || p.runner !== runner || via.gen < p.gen) return;
     clearTimeout(p.timer);
     this.pending.delete(result.id);
     p.resolve(result);
   }
 
-  private failJobsVia(link: Link, why: string): void {
+  // A runner's status on `link` lists the jobs it holds. A job sent to it on an older
+  // connection that isn't listed never reached it (lost with that connection), so it never
+  // ran: fail it now, safe to retry, instead of at its deadline.
+  private reconcile(runner: string, link: Link, held?: string[]): void {
+    if (!held) return;
+    const holds = new Set(held);
     for (const [id, p] of this.pending) {
-      if (p.link !== link) continue;
+      if (p.runner !== runner || p.gen >= link.gen || holds.has(id)) continue;
+      clearTimeout(p.timer);
+      this.pending.delete(id);
+      p.reject(new Error(`the job was lost when the connection to ${runner} dropped; it never ran`));
+    }
+  }
+
+  private failJobsOf(runner: string, why: string): void {
+    for (const [id, p] of this.pending) {
+      if (p.runner !== runner) continue;
       clearTimeout(p.timer);
       this.pending.delete(id);
       p.reject(new Error(why));
@@ -187,12 +233,16 @@ export class RunnerHub {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(job.id);
-        // A job still waiting in a poll queue must never go out after this: the caller
-        // was told it failed, so running it later (a write, say) would be a surprise.
-        if (runner.link.kind === "poll") runner.link.queue = runner.link.queue.filter((j) => j.id !== job.id);
+        // A job still waiting to go out must never go out after this: the caller was told
+        // it failed, so running it later (a write, say) would be a surprise.
+        const link = this.runners.get(runner.name)?.link;
+        if (link?.kind === "poll") {
+          link.queue = link.queue.filter((j) => j.id !== job.id);
+          link.unacked.delete(job.id);
+        }
         reject(new Error(`sandbox job timed out on ${runner.name}`));
       }, timeoutMs + BOOT_SLACK_MS);
-      this.pending.set(job.id, { runner: runner.name, link: runner.link, resolve, reject, timer });
+      this.pending.set(job.id, { runner: runner.name, gen: runner.link.gen, resolve, reject, timer });
       if (runner.link.kind === "ws") runner.link.send(job);
       else if (runner.link.waiter) runner.link.waiter([job]);
       else runner.link.queue.push(job);

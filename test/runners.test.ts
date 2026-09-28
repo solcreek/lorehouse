@@ -29,12 +29,23 @@ describe("over WebSocket", () => {
     expect(await done).toEqual({ exitCode: 0, stdout: "hi\n", stderr: "" });
   });
 
-  test("a closed connection fails its jobs in flight at once", async () => {
-    const hub = hubWith();
+  test("a closed connection's jobs fail if the runner doesn't come back within the grace", async () => {
+    const hub = hubWith({ reconnectGraceMs: 30 });
     const { link } = wsRunner(hub, "r1");
     const done = hub.sandbox("s1").exec("sleep 100");
     link.closed();
-    await expect(done).rejects.toThrow(/sandbox runner r1 disconnected/);
+    await expect(done).rejects.toThrow(/r1 disconnected and didn't come back/);
+  });
+
+  test("a runner that comes back within the grace delivers the result of a job from before the drop", async () => {
+    const hub = hubWith({ reconnectGraceMs: 30 });
+    const before = wsRunner(hub, "r1");
+    const done = hub.sandbox("s1").exec("make build");
+    before.link.closed();
+    const after = hub.attachWs("r1", () => {});
+    after.status({ ...status("r1"), jobs: [before.sent[0]!.id] }); // it still holds the job
+    after.result(ok(before.sent[0]!, { exitCode: 0, stdout: "built", stderr: "" }));
+    expect((await done).stdout).toBe("built");
   });
 
   test("a newer connection with the same name replaces the old; the old one closing later changes nothing", async () => {
@@ -62,24 +73,31 @@ describe("a replaced connection", () => {
     expect((await done).stdout).toBe("fresh");
   });
 
-  test("jobs that went out on it fail at once when a new connection takes over, not at their deadline", async () => {
+  test("a job the runner still holds survives the takeover, and its result arrives on the new connection", async () => {
     const hub = hubWith();
-    wsRunner(hub, "r1");
-    const inFlight = hub.sandbox("s1").exec("sleep 100", { timeoutMs: 600_000 });
-    wsRunner(hub, "r1");
-    await expect(inFlight).rejects.toThrow(/reconnected; the job's connection is gone/);
+    const old = wsRunner(hub, "r1");
+    const inFlight = hub.sandbox("s1").exec("npm test", { timeoutMs: 600_000 });
+    const fresh = hub.attachWs("r1", () => {});
+    fresh.status({ ...status("r1"), jobs: [old.sent[0]!.id] });
+    fresh.result(ok(old.sent[0]!, { exitCode: 0, stdout: "ran once", stderr: "" }));
+    expect((await inFlight).stdout).toBe("ran once");
   });
 
-  test("a poll can't displace a live WebSocket, and a poller's results can't settle the socket's jobs", async () => {
+  test("a job the runner doesn't hold after a reconnect was lost in transit, never ran: it fails at once, safe to retry", async () => {
+    const hub = hubWith();
+    wsRunner(hub, "r1");
+    const inFlight = hub.sandbox("s1").exec("npm test", { timeoutMs: 600_000 });
+    hub.attachWs("r1", () => {}).status({ ...status("r1"), jobs: [] });
+    await expect(inFlight).rejects.toThrow(/lost when the connection to r1 dropped; it never ran/);
+  });
+
+  test("a poll can't displace a live WebSocket", async () => {
     const hub = hubWith({ pollWaitMs: 20 });
     const ws = wsRunner(hub, "r1");
     expect(await hub.poll(status("r1"))).toEqual([]); // a stale poller with the same name
     expect(hub.status()[0]).toMatchObject({ transport: "ws" });
-    const done = hub.sandbox("s1").exec("true");
+    void hub.sandbox("s1").exec("true");
     expect(ws.sent).toHaveLength(1); // the socket still gets the work
-    hub.results("r1", [ok(ws.sent[0]!, { exitCode: 0, stdout: "via poll", stderr: "" })]);
-    ws.link.result(ok(ws.sent[0]!, { exitCode: 0, stdout: "via ws", stderr: "" }));
-    expect((await done).stdout).toBe("via ws");
   });
 });
 
@@ -102,6 +120,19 @@ describe("over long poll", () => {
     const jobs = await hub.poll(status("r1"));
     expect(jobs[0]).toMatchObject({ op: "guest", method: "PUT", path: "/file?path=%2Fw%2Fb.txt", bodyBase64: b64("data") });
     hub.results("r1", [{ id: jobs[0]!.id, status: 204 }]);
+    await done;
+  });
+
+  test("a poll answer the runner never got is handed out again; one it acknowledged is not", async () => {
+    const hub = hubWith({ pollWaitMs: 20 });
+    await hub.poll({ ...status("r1"), received: [] });
+    const done = hub.sandbox("s1").exec("true");
+    const first = await hub.poll({ ...status("r1"), received: [] }); // this answer is lost on the way
+    expect(first).toHaveLength(1);
+    const again = await hub.poll({ ...status("r1"), received: [] }); // the runner says it got nothing
+    expect(again.map((j) => j.id)).toEqual([first[0]!.id]);
+    expect(await hub.poll({ ...status("r1"), received: [first[0]!.id] })).toEqual([]); // acknowledged: not again
+    hub.results("r1", [ok(first[0]!, { exitCode: 0, stdout: "", stderr: "" })]);
     await done;
   });
 
