@@ -1,0 +1,29 @@
+# Deploys the website through Creek (https://creek.dev), which runs it on Cloudflare
+# Workers. Creek has no June support yet (solcreek/creek#54), so this ships June's
+# build as a pre-bundled worker:
+# - creek-entry.js wraps June's dist/worker.js to pass Creek's DATABASE binding as
+#   the env.DB June reads, and is bundled into one file inside the asset dir, which
+#   Creek uploads as-is and doesn't serve as a static file.
+# - Static Assets answers every request that matches a file (the prerendered pages,
+#   .md/.json projections, hashed JS/CSS); the worker gets the rest (/mcp, llms.txt).
+# - Creek binds no env.ASSETS (solcreek/creek#56). June's worker checks for it, so
+#   it still works, minus markdown negotiation on page URLs, the Link header on HTML
+#   and immutable caching on hashed files.
+# - Creek only finds migrations in a few directory names, not June's db/migrations,
+#   so the build copies them to migrations/ (gitignored). A sandbox seeds its D1 from
+#   there; production doesn't migrate on deploy: run `npx creek db migrate`.
+
+[project]
+name = "lorehouse-website"
+
+[build]
+command = """
+bun run build \
+&& bun build creek-entry.js --outfile dist/assets/_worker.mjs --format esm --target browser --external 'node:*' \
+&& rm -rf migrations && cp -R db/migrations migrations"""
+output = "dist/assets"
+worker = "dist/assets/_worker.mjs"
+
+[resources]
+# D1 for the early-access list.
+database = true

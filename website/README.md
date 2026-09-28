@@ -26,6 +26,18 @@ done
 bunx wrangler dev --local --persist-to ../.june/wrangler
 ```
 
+## Deploy
+
+Through [Creek](https://creek.dev), which runs it on Cloudflare Workers. `creek.toml`
+explains how June's build is shipped, since Creek has no June support yet
+([solcreek/creek#54](https://github.com/solcreek/creek/issues/54)).
+
+```bash
+npx creek deploy --sandbox        # a 60-minute preview, no account; seeds a fresh D1
+npx creek deploy --prod           # production (after `npx creek login`)
+npx creek db migrate              # production doesn't migrate on deploy
+```
+
 ## Layout
 
 | path | what |
@@ -35,7 +47,8 @@ bunx wrangler dev --local --persist-to ../.june/wrangler
 | `app/EarlyAccess.tsx` | the early-access form, the page's only client JavaScript |
 | `app/_actions.ts` | `join_early_access`: the form's action and an MCP tool at `/mcp` |
 | `app/global.css` | every style on the page |
-| `db/migrations/` | the early-access table |
+| `db/migrations/` | the early-access list and its rate-limit counters |
+| `creek.toml`, `creek-entry.js` | the Creek deploy, and the worker entry that adapts June's build to it |
 
 June versions are pinned to the same dev line as the app (`../package.json`). The npm
 `latest` line can't take a POST on Workers; see the findings.
