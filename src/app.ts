@@ -120,7 +120,7 @@ export async function createApp(config: Config) {
     const botUserId = ingester?.ownUserId ?? config.slack.botUserId;
     if (!botUserId && !warnedNoBotId) {
       warnedNoBotId = true;
-      console.error("usage: a reaction arrived before the agent's own user id is known (auth.test pending or failed, and no SLACK_BOT_USER_ID); feedback is not counted");
+      console.error("usage: a reaction arrived before the agent's own user id is known (auth.test pending or failed, and no SLACK_BOT_USER_ID); it is not counted, and later ones are once the id is known");
     }
     const f = feedbackOf(e, botUserId);
     if (f) tally(() => recordFeedback(knowledge, f, e.kind === "reaction_added"));
