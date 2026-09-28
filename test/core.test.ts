@@ -141,10 +141,19 @@ describe("config", () => {
     expect(() => loadConfig({})).toThrow(/SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, ANTHROPIC_API_KEY/);
   });
 
-  test("code tools need all three sandbox settings, or none", () => {
+  test("direct sandbox mode needs all three settings, or none", () => {
     expect(loadConfig(base).sandbox).toBeUndefined();
     expect(() => loadConfig({ ...base, SANDBOX_URL: "http://x" })).toThrow(/SANDBOX_TOKEN.*GITHUB_TOKEN/);
-    expect(loadConfig({ ...base, SANDBOX_URL: "http://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" }).sandbox).toEqual({ url: "http://x", token: "y", githubToken: "z" });
+    expect(() => loadConfig({ ...base, GITHUB_TOKEN: "z" })).toThrow(/SANDBOX_URL/);
+    expect(loadConfig({ ...base, SANDBOX_URL: "http://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "direct", url: "http://x", token: "y", githubToken: "z" });
+  });
+
+  test("runner mode: a long SANDBOX_RUNNER_TOKEN plus GITHUB_TOKEN; never together with direct mode", () => {
+    const runner = "r".repeat(32);
+    expect(loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "runners", runnerToken: runner, githubToken: "z" });
+    expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner })).toThrow(/GITHUB_TOKEN/);
+    expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: "short", GITHUB_TOKEN: "z" })).toThrow(/at least 32 characters/);
+    expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, SANDBOX_URL: "http://x", GITHUB_TOKEN: "z" })).toThrow(/one sandbox mode, not both/);
   });
 
   test("defaults: port 3000, claude-opus-5, sessions in memory, empty channel allowlist", () => {

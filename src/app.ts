@@ -16,6 +16,10 @@ import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
 import { systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
+import { RunnerHub } from "./runners/hub";
+import { runnerRoutes } from "./runners/routes";
+import type { Server } from "bun";
+import type { RunnerSocketData } from "./runners/routes";
 import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { withNamedPeople } from "./tools/slack-names";
 import { directMessage, redirectText } from "./dm";
@@ -60,11 +64,17 @@ export async function createApp(config: Config) {
     searchKnowledgeTool(searcher(knowledge)),
     recentKnowledgeTool((o) => recentDocuments(knowledge, o)),
   ];
+  // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
+  const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
+  const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
   if (config.sandbox) {
-    const { url, token, githubToken } = config.sandbox;
+    const sb = config.sandbox;
     // One sandbox per thread, keyed off the session (never model input).
-    const sandboxFor = (ctx: ToolContext) => remoteSandbox(ctx.sessionId.replace(/[^\w.-]/g, "_"), { url, token });
-    tools.push(...workspaceTools(sandboxFor), pullRequestTool({ sandboxFor, githubToken: () => githubToken, identity }));
+    const sandboxId = (ctx: ToolContext) => ctx.sessionId.replace(/[^\w.-]/g, "_");
+    const sandboxFor = sb.mode === "runners"
+      ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx))
+      : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
+    tools.push(...workspaceTools(sandboxFor), pullRequestTool({ sandboxFor, githubToken: () => sb.githubToken, identity }));
   }
 
   const dm = config.agent.dm;
@@ -131,7 +141,9 @@ export async function createApp(config: Config) {
     // Kick off the Slack backfill; call after the server is listening (it runs in the
     // background and never blocks /healthz).
     startIngest: () => ingester?.start(),
-    async fetch(req: Request): Promise<Response> {
+    // Bun.serve's websocket handlers (sandbox runners), when runners are enabled.
+    websocket: runners?.websocket,
+    async fetch(req: Request, server?: Server<RunnerSocketData>): Promise<Response> {
       const path = new URL(req.url).pathname;
       if (path === "/healthz") return new Response("ok");
       if (path === "/status" && req.method === "GET") {
@@ -140,8 +152,11 @@ export async function createApp(config: Config) {
         return Response.json({
           agent: identity.name,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
+          ...(hub ? { runners: hub.status() } : {}),
         });
       }
+      const runnerReply = await runners?.handle(req, server);
+      if (runnerReply) return runnerReply;
       return (await mounted.fetch(req)) ?? new Response("not found", { status: 404 });
     },
     close() {
