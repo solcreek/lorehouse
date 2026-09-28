@@ -6,8 +6,8 @@
       "name": "lorehouse",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.128.0",
-        "@junejs/core": "0.2.0-dev.44",
-        "@junejs/server": "1.0.0-dev.24",
+        "@junejs/core": "0.2.0-dev.49",
+        "@junejs/server": "1.0.0-dev.28",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -26,11 +26,11 @@
 
     "@emnapi/wasi-threads": ["@emnapi/wasi-threads@1.2.2", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-c95qOXkHdydNKhscBTebqEC1CVAZpyqOfVfBzQ1qgzyl3gfeldUjIggDbIZgDKsHLgnsM+igH7TJ/eAasaVuMA=="],
 
-    "@junejs/core": ["@junejs/core@0.2.0-dev.44", "", { "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "react": "^19.2.0", "react-dom": "^19.2.0" }, "optionalPeers": ["@anthropic-ai/sdk", "react"] }, "sha512-d97bhHzJO7qFT/3brcWuxH06lRYfckXloWDLUuLvjensf2Wvkz2AnujlbIepHJywu0g9UJE+is7Ff5uJQRBNsQ=="],
+    "@junejs/core": ["@junejs/core@0.2.0-dev.49", "", { "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "react": "^19.2.0", "react-dom": "^19.2.0" }, "optionalPeers": ["@anthropic-ai/sdk", "react"] }, "sha512-htjsYytDmc6o/Ty0IhdHD7pacElqUApefuvON4KhUWq9vlaPDipuX89PGqR9gd41LpTwDvVYTBqaw3j1Hn14/Q=="],
 
     "@junejs/db": ["@junejs/db@0.1.0-dev.2", "", { "dependencies": { "@junejs/core": ">=0.2.0-dev.26" } }, "sha512-N/MMYEsS46TkrSgeZzeGO7NArvysN/kEFJPYBPxA0pg4D1LwKVROKX1yFAzhZRbJJRfKeIA4EHZw+Uz1xO+c7w=="],
 
-    "@junejs/server": ["@junejs/server@1.0.0-dev.24", "", { "dependencies": { "@junejs/db": ">=0.1.0-dev.2", "@momiji-rs/sparkdown": "^0.0.4", "lightningcss": "^1.27.0", "oxc-parser": "^0.137.0", "rolldown": "^1.1.0" }, "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "@junejs/core": ">=0.2.0-dev.44", "@libsql/client": "^0.14.0 || ^0.15.0 || ^0.16.0 || ^0.17.0", "mysql2": "^3.0.0", "pg": "^8.0.0", "react": "^19.2.0", "react-dom": "^19.2.0", "react-server-dom-webpack": "19.2.7" }, "optionalPeers": ["@anthropic-ai/sdk", "@libsql/client", "mysql2", "pg", "react-server-dom-webpack"] }, "sha512-aI+T92RGdZAjgGMcOkYFUeqnmr4J/oePDPFuivPPQgAxBt1MpT/YuKJuHZsqZzIM+YTgFdNn/gYAJ4FKwhsWgA=="],
+    "@junejs/server": ["@junejs/server@1.0.0-dev.28", "", { "dependencies": { "@junejs/db": ">=0.1.0-dev.2", "@momiji-rs/sparkdown": "^0.0.4", "@resvg/resvg-wasm": "^2.6.2", "lightningcss": "^1.27.0", "oxc-parser": "^0.137.0", "rolldown": "^1.1.0" }, "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "@junejs/core": ">=0.2.0-dev.48", "@libsql/client": "^0.14.0 || ^0.15.0 || ^0.16.0 || ^0.17.0", "mysql2": "^3.0.0", "pg": "^8.0.0", "react": "^19.2.0", "react-dom": "^19.2.0", "react-server-dom-webpack": "19.2.7" }, "optionalPeers": ["@anthropic-ai/sdk", "@libsql/client", "mysql2", "pg", "react-server-dom-webpack"] }, "sha512-kMaDT87nAiTO/Jeiyv9zvdOWyE5gxpdYnneZ63XKamDGA4u20pT3Yz3RXFnfCYlO7avY7aqCCqpNPlvUJK2PAA=="],
 
     "@momiji-rs/sparkdown": ["@momiji-rs/sparkdown@0.0.4", "", {}, "sha512-AVy2A/D623xI+wG1HFpNymrJz6onDQlw3HnkaqyLXSgTEA13LVeFgXNGWBaAl4kR1105I3k/YSOWrihpnF+IXA=="],
 
@@ -77,6 +77,8 @@
     "@oxc-parser/binding-win32-x64-msvc": ["@oxc-parser/binding-win32-x64-msvc@0.137.0", "", { "os": "win32", "cpu": "x64" }, "sha512-2AsevxlvNN4WKxpEn3RtqD5zbqMaXF+T7JXblsP4gVuY+vC9dXS4ED/PwfRCliFqoeisYS3Iro4DHzxr0TEvVA=="],
 
     "@oxc-project/types": ["@oxc-project/types@0.137.0", "", {}, "sha512-WT+Gb24i8hmvo85AIv2oEYouEXkRlKAlT9WaCa3TfLgNCN+GhrJOGZuIlMouAh38Qe4QOx26eUOVsq70qXrywA=="],
+
+    "@resvg/resvg-wasm": ["@resvg/resvg-wasm@2.6.2", "", {}, "sha512-FqALmHI8D4o6lk/LRWDnhw95z5eO+eAa6ORjVg09YRR7BkcM6oPHU9uyC0gtQG5vpFLvgpeU4+zEAz2H8APHNw=="],
 
     "@rolldown/binding-android-arm-eabi": ["@rolldown/binding-android-arm-eabi@1.2.11", "", { "os": "android", "cpu": "arm" }, "sha512-A5kXfGKvKWWZE0TtPrfsvT+q4Y5d1QG8gGUzpYjGydM+fARM9MuX90PrXYXe0XbsDVgyxxNzHo6giCj90bsFNw=="],
 
@@ -169,6 +171,8 @@
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
     "undici-types": ["undici-types@8.9.0", "", {}, "sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg=="],
+
+    "@junejs/db/@junejs/core": ["@junejs/core@0.2.0-dev.44", "", { "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "react": "^19.2.0", "react-dom": "^19.2.0" }, "optionalPeers": ["@anthropic-ai/sdk", "react"] }, "sha512-d97bhHzJO7qFT/3brcWuxH06lRYfckXloWDLUuLvjensf2Wvkz2AnujlbIepHJywu0g9UJE+is7Ff5uJQRBNsQ=="],
 
     "rolldown/@oxc-project/types": ["@oxc-project/types@0.151.0", "", {}, "sha512-J1yXrIlNDZVzE3ada310xeAw7nH8yCAyLPuUIsjKatFPmfn5bS1oW+cM+QsGOtVWd5nhSpbwZWx/rue+r5Z+PA=="],
   }
