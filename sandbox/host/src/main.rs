@@ -128,7 +128,9 @@ async fn main() {
         eprintln!("sandboxd: state dir {}: {e}", cfg.state_dir.display());
         std::process::exit(1);
     }
-    // Start clean: whatever a previous run left (a crash, a kill) is removed first.
+    // Start clean: whatever a previous run left (a crash, a kill) is removed first, VMMs
+    // before their taps, and before any request can boot a disk one of them still holds.
+    vm::stop_stale_vmms(&cfg.state_dir).await;
     net::teardown_all().await;
     if let Err(e) = net::setup(&cfg.uplink).await {
         eprintln!("sandboxd: network setup: {e}");

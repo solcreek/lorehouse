@@ -19,6 +19,40 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+/// Firecracker processes a previous run left behind (a crash or SIGKILL gives
+/// kill_on_drop no chance), found by their --api-sock under our state directory. Each is
+/// asked to sync and reboot through its vsock, then killed if it's still there, so a
+/// restarted daemon never boots a disk an old VMM still holds.
+pub async fn stop_stale_vmms(state_dir: &std::path::Path) {
+    let Ok(mut procs) = tokio::fs::read_dir("/proc").await else { return }; // not Linux
+    while let Ok(Some(entry)) = procs.next_entry().await {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Ok(cmdline) = tokio::fs::read(format!("/proc/{pid}/cmdline")).await else { continue };
+        let args: Vec<String> = cmdline.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        if !args.first().is_some_and(|a| a.ends_with("firecracker")) {
+            continue;
+        }
+        let Some(api) = args.iter().position(|a| a == "--api-sock").and_then(|i| args.get(i + 1)) else { continue };
+        let api = std::path::Path::new(api);
+        if !api.starts_with(state_dir) {
+            continue;
+        }
+        let dir = api.parent().unwrap_or(state_dir);
+        eprintln!("sandboxd: stopping a VMM left by a previous run (pid {pid}, {})", dir.display());
+        let body = Bytes::from_static(br#"{"command":"sync && (sleep 0.2; reboot -f) &","timeoutMs":10000}"#);
+        let _ = tokio::time::timeout(Duration::from_secs(10), vsock::request(&dir.join("vsock.sock"), Method::POST, "/exec", body)).await;
+        for _ in 0..50 {
+            if tokio::fs::metadata(format!("/proc/{pid}")).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if tokio::fs::metadata(format!("/proc/{pid}")).await.is_ok() {
+            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status().await;
+        }
+    }
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') && !id.starts_with('.')
 }
