@@ -2,7 +2,16 @@
   "name": "lorehouse",
   "version": "0.0.0",
   "private": true,
+  "description": "An open-source company brain that lives in your team's public Slack channels.",
   "license": "MIT",
+  "homepage": "https://github.com/solcreek/lorehouse#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/solcreek/lorehouse.git"
+  },
+  "bugs": {
+    "url": "https://github.com/solcreek/lorehouse/issues"
+  },
   "type": "module",
   "scripts": {
     "start": "bun src/server.ts",
