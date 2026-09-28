@@ -38,6 +38,13 @@ export type GithubCredentials = { kind: "app"; appId: string; privateKey: string
 
 import { normalizePem } from "./github-auth";
 
+// Every problem with the environment, one per entry; the message lists them all.
+export class ConfigError extends Error {
+  constructor(readonly problems: string[]) {
+    super(`lorehouse: missing or invalid configuration: ${problems.join(", ")}`);
+  }
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const missing: string[] = [];
   const need = (key: string) => {
@@ -119,6 +126,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     missing.push("SANDBOX_RUNNER_TOKEN or SANDBOX_URL + SANDBOX_TOKEN (GitHub credentials are set, but no sandbox)");
   }
   if (config.agent.dm === "answer" && config.sandbox) missing.push("DM_MODE=answer (not with code tools: code work stays in public channels)");
-  if (missing.length) throw new Error(`lorehouse: missing or invalid configuration: ${missing.join(", ")}`);
+  if (missing.length) throw new ConfigError(missing);
   return config;
 }
