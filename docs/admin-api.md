@@ -24,8 +24,14 @@ value, and Lorehouse refuses to start if it is. Anyone holding the admin token c
 every indexed message, the same as a member of those public channels, so keep it with
 the other secrets.
 
-Answers are JSON with `Cache-Control: no-store`. An error is `{ "error": "…" }` saying
-what was wrong. A bad parameter gets a 400.
+Answers are JSON. An error, a 401 or a 405 included, is `{ "error": "…" }` saying what
+was wrong; a 401 also carries `WWW-Authenticate: Bearer` and a 405 `Allow: GET`. A bad
+parameter gets a 400. The one exception is the closed API: its 404 is the same plain
+`not found` as any path the app doesn't serve, so it doesn't say there is an API there.
+
+Every answer, refusals included, carries `Cache-Control: no-store`. An answer holds
+message text, and a cached refusal could outlive the token it was about: a proxy could
+keep serving the closed 404 after `ADMIN_TOKEN` is set.
 
 ## Endpoints
 

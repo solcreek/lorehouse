@@ -61,9 +61,34 @@ describe("who may use it", () => {
     expect(await handle(new Request("http://x/status"))).toBeUndefined();
   });
 
-  test("answers are never kept by a shared cache", async () => {
+  test("nothing it answers is kept by a shared cache, refusals included", async () => {
     const { get } = setup();
-    expect((await get("/api/v1/documents")).headers.get("cache-control")).toBe("no-store");
+    const closed = setup({ token: undefined }).get;
+    for (const r of [
+      await get("/api/v1/documents"), // 200
+      await get("/api/v1/documents?limit=0"), // 400
+      await get("/api/v1/nope"), // 404
+      await get("/api/v1/documents", { token: "wrong" }), // 401
+      await get("/api/v1/documents", { method: "POST" }), // 405
+      await closed("/api/v1/documents"), // 404, closed
+    ]) {
+      expect(`${r.status} ${r.headers.get("cache-control")}`).toBe(`${r.status} no-store`);
+    }
+  });
+
+  test("a refusal is a JSON error, and still says what it wants", async () => {
+    const { get } = setup();
+    const denied = await get("/api/v1/documents", { token: "wrong" });
+    expect(denied.headers.get("www-authenticate")).toBe("Bearer");
+    expect(((await denied.json()) as { error: string }).error).toStartWith("unauthorized");
+    const posted = await get("/api/v1/documents", { method: "POST" });
+    expect(posted.headers.get("allow")).toBe("GET");
+    expect(((await posted.json()) as { error: string }).error).toStartWith("method not allowed");
+  });
+
+  test("closed, it answers like any path the app doesn't serve: a plain 404", async () => {
+    const r = await setup({ token: undefined }).get("/api/v1/documents");
+    expect(await r.text()).toBe("not found");
   });
 
   test("an unknown endpoint is a 404 that says where the list is", async () => {

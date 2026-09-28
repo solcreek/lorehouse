@@ -18,7 +18,7 @@ import type { Database } from "bun:sqlite";
 import type { IngestStatus } from "./ingest/slack";
 import { getDocument, listDocuments, searcher } from "./knowledge";
 import { listPlacements } from "./runners/hub";
-import { bearerMatches, unauthorized } from "./status-auth";
+import { bearerMatches } from "./status-auth";
 import { listThreads } from "./threads";
 
 type RunnerSummary = { runner: string; transport: string; online: boolean; capacity: number; running: number; version?: string; lastSeenSecs: number };
@@ -36,9 +36,13 @@ const EXCERPT = 300;
 
 class BadRequest extends Error {}
 
-const json = (body: unknown, status = 200) =>
-  // Message text: never kept by a shared cache.
-  Response.json(body, { status, headers: { "cache-control": "no-store" } });
+// Every answer, refusals included, is never kept by a shared cache: an answer holds
+// message text, and a cached refusal would outlive the token it was about (a closed 404
+// served on after ADMIN_TOKEN is set).
+const NO_STORE = { "cache-control": "no-store" };
+
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+  Response.json(body, { status, headers: { ...NO_STORE, ...headers } });
 
 function limitParam(url: URL, fallback: number, max: number): number {
   const raw = url.searchParams.get("limit");
@@ -143,9 +147,11 @@ export function adminRoutes(opts: AdminOptions) {
   return async function handle(req: Request): Promise<Response | undefined> {
     const url = new URL(req.url);
     if (url.pathname !== "/api" && !url.pathname.startsWith("/api/")) return undefined;
-    if (!opts.token) return new Response("not found", { status: 404 }); // closed: as if it didn't exist
-    if (!bearerMatches(req, opts.token)) return unauthorized();
-    if (req.method !== "GET") return new Response("method not allowed", { status: 405, headers: { allow: "GET" } });
+    // Closed: the same plain 404 as any path the app doesn't serve, so it doesn't say
+    // there is an API here.
+    if (!opts.token) return new Response("not found", { status: 404, headers: NO_STORE });
+    if (!bearerMatches(req, opts.token)) return json({ error: "unauthorized: send Authorization: Bearer <ADMIN_TOKEN>" }, 401, { "www-authenticate": "Bearer" });
+    if (req.method !== "GET") return json({ error: "method not allowed: the admin API only reads" }, 405, { allow: "GET" });
     try {
       return route(url);
     } catch (e) {
