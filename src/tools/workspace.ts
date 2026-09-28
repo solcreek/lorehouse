@@ -11,6 +11,7 @@
 
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { toolDescription } from "../prompts";
+import type { GitIdentity } from "../github-auth";
 
 export type ExecResult = { exitCode: number; stdout: string; stderr: string };
 
@@ -64,7 +65,16 @@ async function orError<T>(work: () => Promise<T>): Promise<T | { error: string }
   }
 }
 
-export function workspaceTools(sandboxFor: SandboxFor): Tool[] {
+// Who the agent's commits are by, as git's environment: it outranks every git config (the
+// checkout's, the global one, one the model wrote), so every commit made through
+// workspace_exec is by that account, in an old checkout too.
+export function authorEnv(who: GitIdentity): Record<string, string> {
+  return { GIT_AUTHOR_NAME: who.name, GIT_AUTHOR_EMAIL: who.email, GIT_COMMITTER_NAME: who.name, GIT_COMMITTER_EMAIL: who.email };
+}
+
+// commitAs: the account commits are by (the GitHub App's bot). A failed lookup doesn't
+// fail the command; it runs with git's own configuration.
+export function workspaceTools(sandboxFor: SandboxFor, opts: { commitAs?: () => Promise<GitIdentity> } = {}): Tool[] {
   return [
     {
       spec: {
@@ -81,7 +91,9 @@ export function workspaceTools(sandboxFor: SandboxFor): Tool[] {
       },
       run: async (input: { command: string; cwd?: string }, ctx: ToolContext) =>
         orError(async () => {
-          const r = await sandboxFor(ctx).exec(input.command, { cwd: input.cwd ?? WORKDIR, timeoutMs: EXEC_TIMEOUT_MS });
+          const who = await opts.commitAs?.().catch(() => undefined);
+          const env = who ? authorEnv(who) : undefined;
+          const r = await sandboxFor(ctx).exec(input.command, { cwd: input.cwd ?? WORKDIR, env, timeoutMs: EXEC_TIMEOUT_MS });
           return { exitCode: r.exitCode, stdout: clip(r.stdout), stderr: clip(r.stderr, 4_000) };
         }),
     },

@@ -80,7 +80,7 @@ export async function createApp(config: Config) {
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
     const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey }) : staticToken(sb.github.token);
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
-    tools.push(...workspaceTools(sandboxFor), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName }));
+    tools.push(...workspaceTools(sandboxFor, { commitAs: github.identity }), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName }));
   }
 
   const dm = config.agent.dm;

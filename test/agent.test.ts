@@ -197,6 +197,21 @@ describe("open_pull_request — the approval gate", () => {
 });
 
 describe("workspace tools", () => {
+  test("every command runs as the account commits are by; without one (lookup failed), it runs as is", async () => {
+    const seen: (Record<string, string> | undefined)[] = [];
+    const sb: Sandbox = {
+      async exec(_c, opts) { seen.push(opts?.env); return { exitCode: 0, stdout: "", stderr: "" }; },
+      async readFile() { return ""; },
+      async writeFile() {},
+    };
+    const bot = { name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" };
+    const execWith = (commitAs?: () => Promise<typeof bot>) => workspaceTools(() => sb, { commitAs }).find((t) => t.spec.name === "workspace_exec")!;
+    await execWith(async () => bot).run({ command: "git commit -am x" }, {} as never);
+    expect(seen[0]).toEqual({ GIT_AUTHOR_NAME: bot.name, GIT_AUTHOR_EMAIL: bot.email, GIT_COMMITTER_NAME: bot.name, GIT_COMMITTER_EMAIL: bot.email });
+    expect(await execWith(async () => { throw new Error("502"); }).run({ command: "ls" }, {} as never)).toMatchObject({ exitCode: 0 });
+    expect(seen[1]).toBeUndefined();
+  });
+
   test("exec runs in the repo dir and keeps the TAIL of long output", async () => {
     const seen: { command: string; opts?: ExecOptions }[] = [];
     const sb: Sandbox = {
