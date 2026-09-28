@@ -89,6 +89,13 @@ configured to handle interactive responses"). A fresh
 volume backfills from Slack on first start, so nothing needs copying over. Keep the
 `STATUS_TOKEN` you set: without it `/status` is closed to you too.
 
+To check the deployment, run the doctor on the machine itself, where the secrets are
+already in its environment:
+
+```bash
+fly ssh console -a <app> -C "lorehouse doctor --url https://<app>.fly.dev"
+```
+
 CI deploys every merge to `main` that passes the conformance suite. To do the same:
 
 1. Create a token that can deploy only this app: `fly tokens create deploy -a <app>`.
