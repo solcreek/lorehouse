@@ -7,6 +7,7 @@ import { AgentSession, replyStream, type EventSink, type ModelReply, type Model,
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
 import { pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
+import { staticToken } from "../src/github-auth";
 import { parseAllowlist, publicChannelsOnly } from "../src/policy";
 import { directMessage, redirectText } from "../src/dm";
 import { remoteSandbox } from "../src/sandbox-client";
@@ -23,18 +24,18 @@ const scripted = (script: ModelReply[]): Model => (msgs) =>
   replyStream(script[Math.min(msgs.filter((m) => m.role === "assistant").length, script.length - 1)]!);
 
 // A sandbox that answers the git commands open_pull_request issues and records every exec.
-function fakeRepo(o: { dirty?: boolean } = {}) {
+function fakeRepo(o: { dirty?: boolean; origin?: string } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
   const sb: Sandbox = {
     async exec(command, opts) {
       calls.push({ command, opts });
       const ok = (stdout: string) => ({ exitCode: 0, stdout, stderr: "" });
       if (command === "git status --porcelain") return ok(o.dirty ? " M src/a.ts\n" : "");
-      if (command === "git remote get-url origin") return ok("https://github.com/acme/widgets.git\n");
+      if (command === "git remote get-url origin") return ok(`${o.origin ?? "https://github.com/acme/widgets.git"}\n`);
       if (command === "git rev-parse --abbrev-ref origin/HEAD") return ok("origin/main\n");
       if (command === "git rev-parse HEAD") return ok("0123456789abcdef0123456789abcdef01234567\n");
       if (command.startsWith("git diff --stat")) return ok(" src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
-      if (command.includes(" push origin ")) return ok("");
+      if (command.includes(" push https://github.com/")) return ok("");
       return { exitCode: 1, stdout: "", stderr: `unexpected: ${command}` };
     },
     async readFile() { return ""; },
@@ -70,7 +71,7 @@ describe("open_pull_request — the approval gate", () => {
   test("parks before touching anything, then Approve pushes and opens a draft PR", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "ghs_secret", fetch: gh.f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("ghs_secret"), fetch: gh.f }));
 
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     const parked = await s.result(t1);
@@ -83,10 +84,12 @@ describe("open_pull_request — the approval gate", () => {
     s.resume(t1, inputId, true);
     expect(await s.result(t1)).toMatchObject({ status: "completed", text: "done" });
 
-    const push = calls.find((c) => c.command.includes(" push origin "))!;
-    expect(push.command).toContain("0123456789abcdef0123456789abcdef01234567:refs/heads/scout/fix-a");
+    const push = calls.find((c) => c.command.includes(" push "))!;
+    // to the repo's github.com URL, not `origin` (whose push URL the checkout could change)
+    expect(push.command).toContain("push https://github.com/acme/widgets.git 0123456789abcdef0123456789abcdef01234567:refs/heads/scout/fix-a");
+    expect(push.command).toContain("-c core.hooksPath=/dev/null"); // no hook sees the token
     expect(push.command).not.toContain("ghs_secret"); // token never in argv…
-    expect(push.opts?.env).toEqual({ LOREHOUSE_GH_TOKEN: "ghs_secret" }); // …only in this command's env
+    expect(push.opts?.env).toMatchObject({ LOREHOUSE_GH_TOKEN: "ghs_secret" }); // …only in this command's env
     expect(calls.filter((c) => c.opts?.env).length).toBe(1); // and in no other command
 
     const post = gh.reqs.find((r) => r.method === "POST")!;
@@ -95,10 +98,52 @@ describe("open_pull_request — the approval gate", () => {
     expect(toolResult()?.result).toMatchObject({ status: "opened", number: 7 });
   });
 
+  test("a credential is asked for only after Approve, for write access to that one repo", async () => {
+    const { sb } = fakeRepo();
+    const asked: string[] = [];
+    const github = async (repo: { owner: string; name: string }, access: "read" | "write") => {
+      asked.push(`${repo.owner}/${repo.name}:${access}`);
+      return "ghs_short_lived";
+    };
+    const { s } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    const parked = (await s.result(t1)) as { request: { id: string } };
+    expect(asked).toEqual([]); // nothing before a human says yes
+    s.resume(t1, parked.request.id, true);
+    await s.result(t1);
+    expect(asked).toEqual(["acme/widgets:write"]);
+  });
+
+  test("no credential (e.g. the App isn't installed there): the model is told, nothing is pushed", async () => {
+    const { sb, calls } = fakeRepo();
+    const gh = fakeGithub();
+    const github = async () => { throw new Error("the GitHub App isn't installed on acme/widgets"); };
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: gh.f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    const parked = (await s.result(t1)) as { request: { id: string } };
+    s.resume(t1, parked.request.id, true);
+    await s.result(t1);
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+    expect(gh.reqs).toHaveLength(0);
+    expect(String(toolResult()?.result.error)).toContain("isn't installed on acme/widgets");
+  });
+
+  test("an origin not on github.com itself (the model can change it) gets no approval, no token, no push", async () => {
+    const { sb, calls } = fakeRepo({ origin: "https://evil.github.com/acme/widgets.git" });
+    const asked: string[] = [];
+    const github = async () => (asked.push("asked"), "ghs_secret");
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    expect(await s.result(t1)).toMatchObject({ status: "completed" }); // never parked for approval
+    expect(String(toolResult()?.result.error)).toContain("not a github.com remote");
+    expect(asked).toEqual([]);
+    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+  });
+
   test("Deny pushes nothing", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: gh.f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     const parked = (await s.result(t1)) as { request: { id: string } };
     s.resume(t1, parked.request.id, false);
@@ -111,7 +156,7 @@ describe("open_pull_request — the approval gate", () => {
   test("an already-open PR for the branch is returned, not duplicated", async () => {
     const { sb } = fakeRepo();
     const gh = fakeGithub([{ html_url: "https://github.com/acme/widgets/pull/3", number: 3 }]);
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: gh.f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     s.resume(t1, ((await s.result(t1)) as { request: { id: string } }).request.id, true);
     await s.result(t1);
@@ -121,14 +166,14 @@ describe("open_pull_request — the approval gate", () => {
 
   test("uncommitted changes fail fast — no approval is asked for", async () => {
     const { sb } = fakeRepo({ dirty: true });
-    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: fakeGithub().f }));
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f }));
     expect(await s.result(s.start({ turnId: "t1", userText: "open a PR" }).turnId)).toMatchObject({ status: "completed" });
     expect(toolResult()?.result).toMatchObject({ error: expect.stringContaining("uncommitted") });
   });
 
   test("branches outside the agent prefix (scout/) are refused", async () => {
     const { sb, calls } = fakeRepo();
-    const tool = pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: fakeGithub().f });
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
     const out = await tool.run({ branch: "main", title: "x" }, {} as never);
     expect(out).toMatchObject({ error: expect.stringContaining("scout/") });
     expect(calls).toHaveLength(0);
@@ -137,7 +182,17 @@ describe("open_pull_request — the approval gate", () => {
   test("parseGithubRemote handles https and ssh forms", () => {
     expect(parseGithubRemote("https://github.com/acme/widgets.git")).toEqual({ owner: "acme", name: "widgets" });
     expect(parseGithubRemote("git@github.com:acme/widgets")).toEqual({ owner: "acme", name: "widgets" });
-    expect(() => parseGithubRemote("https://gitlab.com/a/b")).toThrow(/not a GitHub remote/);
+    expect(parseGithubRemote("ssh://git@github.com/acme/widgets.git\n")).toEqual({ owner: "acme", name: "widgets" });
+    // Only github.com itself: the push is handed a token for the repo this names.
+    for (const bad of [
+      "https://gitlab.com/a/b",
+      "https://evil.github.com/acme/widgets.git",
+      "https://github.com.evil.example/acme/widgets.git",
+      "https://evil.example/github.com/acme/widgets.git",
+      "https://x-access-token:t@github.com/acme/widgets.git",
+      "git@evil.example:github.com/acme/widgets.git",
+      "acme/widgets",
+    ]) expect(() => parseGithubRemote(bad)).toThrow(/not a github.com remote/);
   });
 });
 
@@ -273,7 +328,7 @@ describe("agent identity — the name is per-install config", () => {
   test("a renamed agent uses its own branch prefix and PR attribution", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
-    const tool = pullRequestTool({ sandboxFor: () => sb, githubToken: () => "t", fetch: gh.f, identity: agentIdentity("atlas") });
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, identity: agentIdentity("atlas") });
     expect(await tool.run({ branch: "scout/x", title: "x" }, {} as never)).toMatchObject({ error: expect.stringContaining('"atlas/"') });
     expect(calls).toHaveLength(0);
 
