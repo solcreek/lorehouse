@@ -169,7 +169,10 @@ impl Manager {
             "drives": [{ "drive_id": "rootfs", "path_on_host": rootfs, "is_root_device": true, "is_read_only": false }],
             "machine-config": { "vcpu_count": self.cfg.vcpus, "mem_size_mib": self.cfg.mem_mib },
             "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": slot.tap(), "guest_mac": slot.guest_mac() }],
-            "vsock": { "guest_cid": 3, "uds_path": sb.uds() },
+            // Firecracker's vsock is a host-side Unix socket per VM, so CIDs never meet on the
+            // host and the same one works for every VM (two ran at once in the acceptance run).
+            // A distinct CID per slot costs nothing and keeps that true under vhost-vsock too.
+            "vsock": { "guest_cid": 3 + slot_index, "uds_path": sb.uds() },
         });
         let config = sb.dir.join("vm.json");
         tokio::fs::write(&config, vm.to_string()).await.map_err(|e| format!("vm.json: {e}"))?;
