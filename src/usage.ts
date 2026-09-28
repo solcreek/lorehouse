@@ -1,8 +1,11 @@
-// usage.ts — how the agent is used, as GET /status reports it: how many people ask it
-// things and where, which searches came back empty, and the 👍/👎 people leave on its
-// replies.
+// usage.ts — how the agent is used: how many people ask it things and where, which
+// searches came back empty, and the 👍/👎 people leave on its replies. Read through the
+// admin API (GET /api/v1/usage), never GET /status: it holds who asked and what was
+// searched for, and the status token is the one handed to monitors.
 //
-// Only public collaboration is counted: app.ts records nothing from a DM.
+// Only public collaboration is counted: app.ts records nothing from a DM. Rows are kept
+// USAGE_RETENTION_DAYS, the longest window the API reports, and a deleted question takes
+// its ask with it (forgetAsk), as a deleted message leaves the knowledge index.
 
 import type { Database } from "bun:sqlite";
 
@@ -15,6 +18,27 @@ export function recordAsk(db: Database, ask: { channel: string; ts: string; thre
 
 export function recordSearch(db: Database, search: { channel: string; threadTs: string; query: string; hits: number }, now = new Date()): void {
   db.query("INSERT INTO agent_searches (channel, thread_ts, query, hits, searched_at) VALUES (?, ?, ?, ?, ?)").run(search.channel, search.threadTs, search.query, search.hits, now.toISOString());
+}
+
+// A question deleted in Slack is forgotten here too. When it was a thread's root, the
+// thread's searches go with it: they were run for it and hold its words.
+export function forgetAsk(db: Database, channel: string, ts: string): void {
+  db.transaction(() => {
+    db.query("DELETE FROM agent_asks WHERE channel = ? AND ts = ?").run(channel, ts);
+    db.query("DELETE FROM agent_searches WHERE channel = ? AND thread_ts = ?").run(channel, ts);
+  })();
+}
+
+export const USAGE_RETENTION_DAYS = 90;
+
+// Drop every usage row older than the retention window. Returns how many went.
+export function pruneUsage(db: Database, now = new Date()): number {
+  const before = new Date(now.getTime() - USAGE_RETENTION_DAYS * 86_400_000).toISOString();
+  return db.transaction(() =>
+    db.query("DELETE FROM agent_asks WHERE asked_at < ?").run(before).changes +
+    db.query("DELETE FROM agent_searches WHERE searched_at < ?").run(before).changes +
+    db.query("DELETE FROM agent_feedback WHERE reacted_at < ?").run(before).changes,
+  )();
 }
 
 export type Rating = "up" | "down";
@@ -54,8 +78,10 @@ export type UsageSummary = {
   channels: number;
   threads: number;
   // Threads where the agent searched and every search came back empty, out of the threads
-  // where it searched at all; and the latest distinct queries that found nothing.
-  notFound: { threads: number; of: number; queries: string[] };
+  // where it searched at all; and the latest distinct queries that found nothing. A floor
+  // for "couldn't answer", not a count of it: search ORs its words, so a question with no
+  // real answer usually still gets hits.
+  emptySearches: { threads: number; of: number; queries: string[] };
   // 👍/👎 on the agent's replies, by how many people, and the latest replies given a 👎.
   feedback: { up: number; down: number; people: number; downMessages: { channel: string; ts: string }[] };
 };
@@ -86,7 +112,7 @@ export function usageSummary(db: Database, { since }: { since: Date }): UsageSum
   return {
     since: at,
     ...asks,
-    notFound: { threads: searched.threads, of: searched.of, queries: queries.map((q) => q.query) },
+    emptySearches: { threads: searched.threads, of: searched.of, queries: queries.map((q) => q.query) },
     feedback: { ...feedback, downMessages },
   };
 }

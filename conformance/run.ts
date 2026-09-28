@@ -83,10 +83,10 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
 
 type Usage = {
   since: string; people: number; channels: number; threads: number;
-  notFound: { threads: number; of: number; queries: string[] };
+  emptySearches: { threads: number; of: number; queries: string[] };
   feedback: { up: number; down: number; people: number; downMessages: { channel: string; ts: string }[] };
 };
-type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } }; usage: Usage };
+type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
 const STATUS_TOKEN = "conformance-status";
 const APP = `http://localhost:${APP_PORT}`;
 // Runner mode: sandbox hosts connect in (docs/sandbox-runners.md).
@@ -99,6 +99,8 @@ const ADMIN_TOKEN = "conformance-admin-token-000000000000";
 const adminAs = (path: string, auth: string | null = `Bearer ${ADMIN_TOKEN}`, init: RequestInit = {}) =>
   fetch(`http://localhost:${APP_PORT}${path}`, { ...init, headers: auth ? { authorization: auth } : {} });
 const admin = async <T = Record<string, any>>(path: string) => (await (await adminAs(path)).json()) as T;
+// Usage is the admin API's (who asked, what was searched), never /status's.
+const usage = () => admin<Usage>("/api/v1/usage");
 type DocumentList = { documents: { id: string; kind: string; source: string }[]; next: string | null };
 // Every document id the admin API lists, page by page.
 async function allDocumentIds(limit = 50): Promise<string[]> {
@@ -507,14 +509,14 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "reports usage at GET /status: two people in one thread are 2 people, 1 thread, 1 channel; an answered DM is not counted",
+    name: "reports usage at GET /api/v1/usage: two people in one thread are 2 people, 1 thread, 1 channel; an answered DM is not counted",
     run: () => withFreshDb(async () => {
       const thread = await mentionAndWait("where is the wombat review"); // U1
       await threadReply(thread, "and which floor is that on?", { user: "U2" });
       const dm = await directMessage(`[q${++seq}] where is the wombat review`, { user: "U3" });
       await fetch(`${MOCK}/wait?thread_ts=${dm}&timeout_ms=15000`);
       await Bun.sleep(1000);
-      const u = (await status()).usage;
+      const u = await usage();
       return u.people === 2 && u.threads === 1 && u.channels === 1 ? null : `people ${u.people}, threads ${u.threads}, channels ${u.channels}; want 2, 1, 1`;
     }, { DM_MODE: "answer" }),
   },
@@ -523,10 +525,34 @@ const scenarios: Scenario[] = [
     run: () => withFreshDb(async () => {
       await mentionAndWait("where is the wombat review");
       await mentionAndWait("qxzv jjkw"); // no document has either word
-      const { notFound } = (await status()).usage;
-      return notFound.threads === 1 && notFound.of === 2 && JSON.stringify(notFound.queries) === JSON.stringify(["qxzv jjkw"])
+      const { emptySearches } = await usage();
+      return emptySearches.threads === 1 && emptySearches.of === 2 && JSON.stringify(emptySearches.queries) === JSON.stringify(["qxzv jjkw"])
         ? null
-        : `notFound ${JSON.stringify(notFound)}, want 1 of 2 threads and the query "qxzv jjkw"`;
+        : `emptySearches ${JSON.stringify(emptySearches)}, want 1 of 2 threads and the query "qxzv jjkw"`;
+    }),
+  },
+  {
+    name: "GET /status carries no usage: who asked and what was searched stay behind ADMIN_TOKEN",
+    run: () => withFreshDb(async () => {
+      await mentionAndWait("qxzv jjkw");
+      const raw = await (await statusAs(`Bearer ${STATUS_TOKEN}`)).text();
+      if (raw.includes("usage") || raw.includes("qxzv")) return `/status holds usage: ${raw.slice(0, 160)}`;
+      const r = await adminAs("/api/v1/usage", `Bearer ${STATUS_TOKEN}`);
+      if (r.status !== 401) return `the status token on /api/v1/usage: got ${r.status}, want 401`;
+      return (await usage()).emptySearches.queries.includes("qxzv jjkw") ? null : "the admin API doesn't have the query either";
+    }),
+  },
+  {
+    name: "forgets a deleted question in usage: its ask, and as a thread root, the searches run for it",
+    run: () => withFreshDb(async () => {
+      const ts = await mentionAndWait("qxzv jjkw");
+      const before = await usage();
+      if (before.people !== 1 || !before.emptySearches.queries.includes("qxzv jjkw")) return `before deleting: ${JSON.stringify(before)}`;
+      const now = `${1990000000 + ++seq}.000100`;
+      await sendEvent({ type: "message", subtype: "message_deleted", hidden: true, channel: ALLOWED, channel_type: "channel", ts: now, event_ts: now, deleted_ts: ts, previous_message: { ts } });
+      await Bun.sleep(500);
+      const after = await usage();
+      return after.people === 0 && after.emptySearches.of === 0 && after.emptySearches.queries.length === 0 ? null : `after deleting: ${JSON.stringify(after)}`;
     }),
   },
   {
@@ -537,7 +563,7 @@ const scenarios: Scenario[] = [
         const ts = `${1995000000 + ++seq}.000100`;
         return { type, user: "U2", reaction: "-1", item_user: "UBOT", item: { type: "message", channel: ALLOWED, ts: "1995000001.000100" }, event_ts: ts, ...extra };
       };
-      const down = async () => { await Bun.sleep(500); return (await status()).usage.feedback.down; };
+      const down = async () => { await Bun.sleep(500); return (await usage()).feedback.down; };
       const before = await down();
       await sendEvent(reaction("reaction_added"));
       let now = await down();

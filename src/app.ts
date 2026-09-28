@@ -26,7 +26,7 @@ import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
-import { feedbackOf, recordAsk, recordFeedback, recordSearch, usageSummary } from "./usage";
+import { feedbackOf, forgetAsk, pruneUsage, recordAsk, recordFeedback, recordSearch, usageSummary } from "./usage";
 import { pullRequestTool } from "./tools/pull-request";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
@@ -74,15 +74,9 @@ export async function createApp(config: Config) {
     }
   };
 
-  // A broken usage read must not take the knowledge and runner status down with it.
-  const usageOrError = (since: Date) => {
-    try {
-      return usageSummary(knowledge, { since });
-    } catch (err) {
-      console.error("usage:", err);
-      return { error: String(err) };
-    }
-  };
+  // Usage is kept USAGE_RETENTION_DAYS: pruned on start, then daily.
+  tally(() => pruneUsage(knowledge));
+  setInterval(() => tally(() => pruneUsage(knowledge)), 86_400_000).unref();
 
   const tools: Tool[] = [
     // A search is counted in the Slack thread it ran for; DMs aren't counted.
@@ -158,6 +152,11 @@ export async function createApp(config: Config) {
           const event = (raw as { event?: Record<string, unknown> }).event;
           if (config.logSlackEvents) console.log(`slack event: ${JSON.stringify(event)}`);
           ingester?.onRawEvent(event);
+          // A question deleted in Slack takes its ask (and, as a thread root, its searches) along.
+          if (event?.subtype === "message_deleted" && event.channel_type !== "im" && typeof event.channel === "string" && typeof event.deleted_ts === "string") {
+            const { channel, deleted_ts } = event;
+            tally(() => forgetAsk(knowledge, channel, deleted_ts));
+          }
           const direct = dm === "redirect" ? directMessage(raw) : undefined;
           if (direct) return slack.post!({ channelId: direct.channel }, redirectText(config.agent.channels)).then(() => undefined);
         }
@@ -197,6 +196,7 @@ export async function createApp(config: Config) {
     ingest: () => ingester?.status(),
     sandbox: config.sandbox?.mode ?? "off",
     runners: hub ? () => hub.status() : undefined,
+    usage: (since) => usageSummary(knowledge, { since }),
   });
 
   return {
@@ -208,18 +208,14 @@ export async function createApp(config: Config) {
     // Bun.serve's websocket handlers (sandbox runners), when runners are enabled.
     websocket: runners?.websocket,
     async fetch(req: Request, server?: Server<RunnerSocketData>): Promise<Response> {
-      const url = new URL(req.url);
-      const path = url.pathname;
+      const path = new URL(req.url).pathname;
       if (path === "/healthz") return new Response("ok");
       if (path === "/status" && req.method === "GET") {
         const refusal = statusRefusal(req, config.statusToken);
         if (refusal) return refusal;
-        const days = Number.parseInt(url.searchParams.get("days") ?? "", 10);
-        const since = new Date(Date.now() - (Number.isNaN(days) ? 7 : Math.min(90, Math.max(1, days))) * 86_400_000);
         return Response.json({
           agent: identity.name,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
-          usage: usageOrError(since),
           ...(hub ? { runners: hub.status() } : {}),
         });
       }

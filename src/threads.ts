@@ -39,12 +39,20 @@ export function isFollowUp(e: FollowUpEvent, joined: (channel: string, threadTs:
 }
 
 // The threads the agent was asked into, newest first, each with its document when the
-// thread is indexed (a thread holding only a question to the agent isn't knowledge).
-export type JoinedThread = { channel: string; threadTs: string; joinedAt: string; document: string | null; source: string | null; rowid: number };
+// thread is indexed (a thread holding only a question to the agent isn't knowledge), and
+// what usage recorded there: the messages that asked it something, its searches, and how
+// many of those found nothing. (Feedback is kept per reply, not per thread.)
+export type JoinedThread = {
+  channel: string; threadTs: string; joinedAt: string; document: string | null; source: string | null;
+  asks: number; searches: number; emptySearches: number; rowid: number;
+};
 
 export function listThreads(db: Database, opts: { limit: number; after?: { joinedAt: string; rowid: number } }): JoinedThread[] {
   return db.query(
-    `SELECT t.rowid AS rowid, t.channel, t.thread_ts AS threadTs, t.joined_at AS joinedAt, d.doc_id AS document, d.source
+    `SELECT t.rowid AS rowid, t.channel, t.thread_ts AS threadTs, t.joined_at AS joinedAt, d.doc_id AS document, d.source,
+       (SELECT count(*) FROM agent_asks a WHERE a.channel = t.channel AND a.thread_ts = t.thread_ts) AS asks,
+       (SELECT count(*) FROM agent_searches s WHERE s.channel = t.channel AND s.thread_ts = t.thread_ts) AS searches,
+       (SELECT count(*) FROM agent_searches s WHERE s.channel = t.channel AND s.thread_ts = t.thread_ts AND s.hits = 0) AS emptySearches
      FROM agent_threads t LEFT JOIN knowledge_documents d ON d.doc_id = 'slack:' || t.channel || ':' || t.thread_ts
      WHERE (?1 IS NULL OR (t.joined_at, t.rowid) < (?1, ?2))
      ORDER BY t.joined_at DESC, t.rowid DESC LIMIT ?3`,

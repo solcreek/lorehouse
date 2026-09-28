@@ -7,6 +7,7 @@ import { ConfigError, loadConfig } from "../src/config";
 import type { IngestStatus } from "../src/ingest/slack";
 import { openKnowledge, searcher, upsertDocument } from "../src/knowledge";
 import { joinThread } from "../src/threads";
+import { recordAsk, recordFeedback, recordSearch, usageSummary } from "../src/usage";
 
 const TOKEN = "a".repeat(32);
 
@@ -252,8 +253,8 @@ describe("channels, threads and sandboxes", () => {
     const { threads, next } = await body("/api/v1/threads");
     expect(next).toBeNull();
     expect(threads).toEqual([
-      { channel: "C1", threadTs: "1795000000.000100", joinedAt: "2026-09-02T00:00:00.000Z", document: null, source: null },
-      { channel: "C1", threadTs: "1790000001.000100", joinedAt: "2026-09-01T00:00:00.000Z", document: "slack:C1:1790000001.000100", source: "https://acme.slack.com/archives/C1/p1790000001000100" },
+      { channel: "C1", threadTs: "1795000000.000100", joinedAt: "2026-09-02T00:00:00.000Z", document: null, source: null, asks: 0, searches: 0, emptySearches: 0 },
+      { channel: "C1", threadTs: "1790000001.000100", joinedAt: "2026-09-01T00:00:00.000Z", document: "slack:C1:1790000001.000100", source: "https://acme.slack.com/archives/C1/p1790000001000100", asks: 0, searches: 0, emptySearches: 0 },
     ]);
     const paged = await body("/api/v1/threads?limit=1");
     expect(paged.threads.length).toBe(1);
@@ -277,5 +278,64 @@ describe("channels, threads and sandboxes", () => {
       ],
       next: null,
     });
+  });
+});
+
+describe("usage", () => {
+  // Wired as the app wires it: usage read from the same database.
+  function setupUsage() {
+    const db = openKnowledge(":memory:");
+    const handle = adminRoutes({ db, token: TOKEN, ingest: () => undefined, sandbox: "off", usage: (since) => usageSummary(db, { since }) });
+    const get = async (path: string) => (await handle(new Request(`http://x${path}`, { headers: { authorization: `Bearer ${TOKEN}` } })))!;
+    return { db, get, body: async (path: string) => (await (await get(path)).json()) as Record<string, any> };
+  }
+
+  test("who asks, which searches found nothing and the 👍/👎, over the last 7 days by default", async () => {
+    const { db, body } = setupUsage();
+    const now = new Date();
+    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1", user: "U1" }, now);
+    recordAsk(db, { channel: "C1", ts: "1.2", threadTs: "1.1", user: "U2" }, now);
+    recordSearch(db, { channel: "C1", threadTs: "1.1", query: "okapi budget", hits: 0 }, now);
+    recordFeedback(db, { channel: "C1", messageTs: "1.3", user: "U2", rating: "down" }, true, now);
+    const u = await body("/api/v1/usage");
+    expect(u).toMatchObject({
+      days: 7, people: 2, channels: 1, threads: 1,
+      emptySearches: { threads: 1, of: 1, queries: ["okapi budget"] },
+      feedback: { up: 0, down: 1, people: 1, downMessages: [{ channel: "C1", ts: "1.3" }] },
+    });
+    expect(Date.now() - Date.parse(u.since)).toBeGreaterThanOrEqual(7 * 86_400_000 - 1000);
+  });
+
+  test("the window is 1 to 90 whole days: anything else is a 400, never read as something else", async () => {
+    const { get, body } = setupUsage();
+    expect((await body("/api/v1/usage?days=1")).days).toBe(1);
+    expect((await body("/api/v1/usage?days=90")).days).toBe(90);
+    for (const days of ["0", "91", "-5", "7.9", "3days", "", "abc"]) {
+      const r = await get(`/api/v1/usage?days=${days}`);
+      expect(`${days} → ${r.status}`).toBe(`${days} → 400`);
+    }
+  });
+
+  test("an older ask is outside a shorter window", async () => {
+    const { db, body } = setupUsage();
+    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1", user: "U1" }, new Date(Date.now() - 3 * 86_400_000));
+    expect((await body("/api/v1/usage?days=2")).people).toBe(0);
+    expect((await body("/api/v1/usage?days=4")).people).toBe(1);
+  });
+
+  test("not wired: a 404, not an empty summary", async () => {
+    const { get } = setup();
+    expect((await get("/api/v1/usage")).status).toBe(404);
+  });
+
+  test("each thread says how often it was asked, searched, and searched in vain", async () => {
+    const { db, body } = setupUsage();
+    joinThread(db, "C1", "1.1");
+    recordAsk(db, { channel: "C1", ts: "1.1", threadTs: "1.1", user: "U1" });
+    recordAsk(db, { channel: "C1", ts: "1.2", threadTs: "1.1", user: "U2" });
+    recordSearch(db, { channel: "C1", threadTs: "1.1", query: "okapi", hits: 0 });
+    recordSearch(db, { channel: "C1", threadTs: "1.1", query: "wombat", hits: 3 });
+    recordSearch(db, { channel: "C2", threadTs: "1.1", query: "same ts, another channel", hits: 0 });
+    expect((await body("/api/v1/threads")).threads[0]).toMatchObject({ channel: "C1", threadTs: "1.1", asks: 2, searches: 2, emptySearches: 1 });
   });
 });
