@@ -14,9 +14,10 @@ ExecStart=/usr/local/bin/sandboxd
 EnvironmentFile=/etc/lorehouse/sandboxd.env
 Restart=on-failure
 RestartSec=5
-# SIGTERM stops every VM cleanly (sync first, disks kept) and removes its network rules.
+# SIGTERM stops every VM cleanly (sync first, disks kept) and removes its network rules:
+# requests in flight get 30 s, then all VMs stop at once (≤ 15 s each), well under this.
 KillSignal=SIGTERM
-TimeoutStopSec=90
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target

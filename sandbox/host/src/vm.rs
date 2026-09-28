@@ -295,11 +295,16 @@ impl Manager {
         }
     }
 
-    pub async fn stop_all(&self) {
+    /// Stop every VM at once, not one after another, so shutdown takes about as long as
+    /// the slowest stop (≤ 15 s) however many are running.
+    pub async fn stop_all(self: &Arc<Self>) {
         let list: Vec<Arc<Sandbox>> = self.sandboxes.lock().await.values().cloned().collect();
+        let mut stops = tokio::task::JoinSet::new();
         for sb in list {
-            self.stop(&sb).await;
+            let me = self.clone();
+            stops.spawn(async move { me.stop(&sb).await });
         }
+        while stops.join_next().await.is_some() {}
     }
 
     /// Every sandbox that exists: those used since this process started, and the disks

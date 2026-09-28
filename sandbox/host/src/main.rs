@@ -30,6 +30,11 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Backstop for one proxied request (Lorehouse's longest command is 10 minutes).
+const REQUEST_DEADLINE: Duration = Duration::from_secs(15 * 60 + 30);
+/// How long requests in flight get after SIGTERM before the VMs are stopped anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 use subtle::ConstantTimeEq;
 use vm::Manager;
 
@@ -73,15 +78,18 @@ async fn forward(app: &App, id: &str, method: Method, guest_path: String, body: 
         Ok(v) => v,
         Err((status, msg)) => return error(status, msg),
     };
-    match vsock::request(&uds, method, &guest_path, body).await {
-        Ok(reply) => {
+    // A host-side deadline, whatever the guest does: Lorehouse's longest command is 10
+    // minutes, and guestd kills it at its own timeout, so this is the backstop.
+    match tokio::time::timeout(REQUEST_DEADLINE, vsock::request(&uds, method, &guest_path, body)).await {
+        Ok(Ok(reply)) => {
             let mut headers = HeaderMap::new();
             if let Some(ct) = reply.content_type.and_then(|v| v.parse().ok()) {
                 headers.insert(header::CONTENT_TYPE, ct);
             }
             (reply.status, headers, reply.body).into_response()
         }
-        Err(e) => error(502, e),
+        Ok(Err(e)) => error(502, e),
+        Err(_) => error(504, format!("the guest didn't answer within {} s", REQUEST_DEADLINE.as_secs())),
     }
 }
 
@@ -172,14 +180,31 @@ async fn main() {
     };
     eprintln!("sandboxd: listening on {} (up to {} VMs, idle stop after {} s)", cfg.listen, cfg.max_vms, cfg.idle.as_secs());
 
-    let shutdown = async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+    // On SIGTERM/SIGINT: stop taking requests, give the ones in flight SHUTDOWN_GRACE,
+    // then stop the VMs anyway. A 10-minute command must not hold the service past
+    // systemd's stop timeout.
+    let signalled = Arc::new(tokio::sync::Notify::new());
+    let shutdown = {
+        let signalled = signalled.clone();
+        async move {
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            signalled.notify_one();
         }
     };
-    let _ = axum::serve(listener, router).with_graceful_shutdown(shutdown).await;
+    let serve = axum::serve(listener, router).with_graceful_shutdown(shutdown);
+    let grace = async {
+        signalled.notified().await;
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+        eprintln!("sandboxd: requests still running after {} s; stopping anyway", SHUTDOWN_GRACE.as_secs());
+    };
+    tokio::select! {
+        _ = serve => {}
+        _ = grace => {}
+    }
     eprintln!("sandboxd: stopping every VM (disks kept)");
     vms.stop_all().await;
     net::teardown_all().await;
