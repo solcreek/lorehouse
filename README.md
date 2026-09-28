@@ -72,16 +72,21 @@ under `/data`. Set `app` in `fly.toml` to your own name, then:
 fly apps create <app>
 fly volumes create lorehouse_data --region <region> --size 1 -a <app>
 fly secrets set -a <app> --stage SLACK_SIGNING_SECRET=… SLACK_BOT_TOKEN=… \
-  ANTHROPIC_API_KEY=… AGENT_CHANNELS=C0123456
+  ANTHROPIC_API_KEY=… AGENT_CHANNELS=C0123456 STATUS_TOKEN="$(openssl rand -hex 32)"
 fly deploy
 ```
 
 Then point the Slack app's Request URL at `https://<app>.fly.dev/slack/events`. A fresh
-volume backfills from Slack on first start, so nothing needs copying over.
+volume backfills from Slack on first start, so nothing needs copying over. Keep the
+`STATUS_TOKEN` you set: without it `/status` is closed to you too.
 
-CI deploys every merge to `main` that passes the conformance suite. To do the same, add a
-Fly deploy token as the `FLY_API_TOKEN` repository secret, and change the repository
-check in [`ci.yml`](.github/workflows/ci.yml).
+CI deploys every merge to `main` that passes the conformance suite. To do the same:
+
+1. Create a token that can deploy only this app: `fly tokens create deploy -a <app>`.
+2. Store it as the `FLY_API_TOKEN` repository secret.
+3. Change the repository check in [`ci.yml`](.github/workflows/ci.yml).
+
+The deploy job pins its actions to commit SHAs, because it holds that token.
 
 ## Run it
 

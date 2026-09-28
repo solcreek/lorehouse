@@ -7,9 +7,11 @@
 //
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
-// LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_DEBOUNCE_MS. It must answer GET /healthz
-// once listening, and GET /status with { knowledge: { state: "ready", … } } once its
-// Slack backfill is done.
+// LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
+// STATUS_TOKEN, and per scenario DM_MODE. It must answer GET /healthz (open) once
+// listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
+// backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
+// 404 when STATUS_TOKEN is unset).
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
