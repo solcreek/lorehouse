@@ -189,7 +189,10 @@ impl Manager {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!("firecracker exited during boot ({status}); see {}/console.log", sb.dir.display()));
             }
-            if sb.uds().exists() && vsock::healthy(&sb.uds()).await {
+            // Each probe is bounded, so a guest that accepts but never answers can't hold
+            // the slot past the deadline.
+            let uds = sb.uds();
+            if uds.exists() && tokio::time::timeout(Duration::from_secs(2), vsock::healthy(&uds)).await.unwrap_or(false) {
                 eprintln!("sandboxd: {} booted in slot {} in {} ms", sb.id, slot_index, t0.elapsed().as_millis());
                 return Ok(child);
             }
@@ -211,7 +214,8 @@ impl Manager {
     async fn stop_locked(&self, sb: &Sandbox, running: &mut Option<Running>) {
         let Some(mut r) = running.take() else { return };
         let body = Bytes::from_static(br#"{"command":"sync && (sleep 0.2; reboot -f) &","timeoutMs":10000}"#);
-        let _ = vsock::request(&sb.uds(), Method::POST, "/exec", body).await;
+        // Bounded too: a hung guest still gets killed below.
+        let _ = tokio::time::timeout(Duration::from_secs(10), vsock::request(&sb.uds(), Method::POST, "/exec", body)).await;
         if tokio::time::timeout(Duration::from_secs(5), r.child.wait()).await.is_err() {
             let _ = r.child.kill().await;
         }
