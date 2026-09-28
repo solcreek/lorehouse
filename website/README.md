@@ -20,8 +20,9 @@ To run the built worker the way Cloudflare will (workerd, local D1):
 
 ```bash
 cd dist
-bunx wrangler d1 execute lorehouse-website-db --local --persist-to ../.june/wrangler \
-  --file ../db/migrations/0001_early_access.sql
+for f in ../db/migrations/*.sql; do
+  bunx wrangler d1 execute lorehouse-website-db --local --persist-to ../.june/wrangler --file "$f"
+done
 bunx wrangler dev --local --persist-to ../.june/wrangler
 ```
 
