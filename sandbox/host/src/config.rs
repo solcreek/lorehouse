@@ -57,8 +57,14 @@ impl Config {
             if token.len() < 32 {
                 problems.push("SANDBOXD_RUNNER_TOKEN is required with SANDBOXD_APP_URL (32+ characters, the app's SANDBOX_RUNNER_TOKEN)".into());
             }
-            if !(app_url.starts_with("https://") || app_url.starts_with("http://")) {
-                problems.push(format!("SANDBOXD_APP_URL must be http(s)://…, got {app_url:?}"));
+            // The runner token travels with every request, and whoever holds it can take
+            // this host's jobs, so plain HTTP is refused unless explicitly allowed (a
+            // loopback or an already-encrypted link, e.g. a WireGuard tailnet, in development).
+            let insecure_ok = var("SANDBOXD_ALLOW_INSECURE_HTTP").as_deref() == Some("1");
+            if app_url.starts_with("http://") && !insecure_ok {
+                problems.push(format!("SANDBOXD_APP_URL must be https:// (it carries the runner token), got {app_url:?}; set SANDBOXD_ALLOW_INSECURE_HTTP=1 only for loopback or an encrypted private link"));
+            } else if !(app_url.starts_with("https://") || app_url.starts_with("http://")) {
+                problems.push(format!("SANDBOXD_APP_URL must be https://…, got {app_url:?}"));
             }
             let name = var("SANDBOXD_RUNNER_NAME").or_else(|| var("HOSTNAME")).unwrap_or_else(|| "sandboxd".into());
             if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
@@ -139,5 +145,20 @@ mod tests {
         std::env::set_var("SANDBOXD_MEM_MIB", "4294969344"); // would wrap to 2048
         assert!(Config::from_env().unwrap_err().contains("SANDBOXD_MEM_MIB"));
         std::env::remove_var("SANDBOXD_MEM_MIB");
+
+        // Runner mode: the token only travels over HTTPS, unless plain HTTP is opted into.
+        std::env::set_var("SANDBOXD_RUNNER_TOKEN", &token);
+        std::env::set_var("SANDBOXD_RUNNER_NAME", "r1");
+        std::env::set_var("SANDBOXD_APP_URL", "https://lorehouse.example.com/");
+        assert!(matches!(Config::from_env().expect("https is fine").mode, super::Mode::Runner { .. }));
+        std::env::set_var("SANDBOXD_APP_URL", "http://10.0.0.5:3000");
+        assert!(Config::from_env().unwrap_err().contains("must be https://"));
+        std::env::set_var("SANDBOXD_ALLOW_INSECURE_HTTP", "1");
+        assert!(Config::from_env().is_ok());
+        std::env::set_var("SANDBOXD_ALLOW_INSECURE_HTTP", "yes"); // only "1" opts in
+        assert!(Config::from_env().is_err());
+        for k in ["SANDBOXD_APP_URL", "SANDBOXD_ALLOW_INSECURE_HTTP", "SANDBOXD_RUNNER_TOKEN", "SANDBOXD_RUNNER_NAME"] {
+            std::env::remove_var(k);
+        }
     }
 }

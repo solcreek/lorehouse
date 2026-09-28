@@ -5,7 +5,8 @@
 // answer. Run sandboxd elsewhere, pointed at this machine:
 //
 //   bun sandbox/host/e2e.ts                       # prints the runner token and URL to use
-//   # on the KVM host: SANDBOXD_APP_URL=http://<this host>:8850 SANDBOXD_RUNNER_TOKEN=<token> sandboxd
+//   # on the KVM host, over an encrypted private link (plain HTTP must be opted into):
+//   SANDBOXD_APP_URL=http://<this host>:8850 SANDBOXD_ALLOW_INSECURE_HTTP=1 SANDBOXD_RUNNER_TOKEN=<token> sandboxd
 //
 // Env: E2E_TOKEN or E2E_TOKEN_FILE (default: random), E2E_TRANSPORT (expected transport, ws|poll; default ws).
 

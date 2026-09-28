@@ -36,7 +36,8 @@ sudo SOURCE=<ubuntu-rootfs.ext4> GUESTD=../guest/guestd ./prepare-golden.sh /var
 
 | env | default | |
 |---|---|---|
-| `SANDBOXD_APP_URL` | (none) | runner mode: Lorehouse's URL, e.g. `https://lorehouse.example.com` |
+| `SANDBOXD_APP_URL` | (none) | runner mode: Lorehouse's URL, e.g. `https://lorehouse.example.com`. Must be HTTPS: the runner token travels with every request |
+| `SANDBOXD_ALLOW_INSECURE_HTTP` | (off) | `1` allows an `http://` app URL, only for loopback or an already-encrypted private link (e.g. a WireGuard tailnet) in development |
 | `SANDBOXD_RUNNER_TOKEN` | (required with `SANDBOXD_APP_URL`) | Lorehouse's `SANDBOX_RUNNER_TOKEN` |
 | `SANDBOXD_RUNNER_NAME` | the hostname | how Lorehouse knows this host (sandboxes stick to it) |
 | `SANDBOXD_TRANSPORT` | `auto` | `ws`, `poll`, or `auto`: WebSocket, falling back to long poll when an upgrade is refused |
