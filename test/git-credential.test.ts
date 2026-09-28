@@ -48,6 +48,20 @@ describe("who commits", () => {
   });
 });
 
+describe("a pull request based on a branch the checkout pushed", () => {
+  test("a push to the URL leaves origin/<branch> unknown; recording it makes the stacked diff work", () => {
+    const dir = repo("stacked");
+    sh(`git remote add origin ${dir}.git && git push -q origin HEAD:refs/heads/main && git fetch -q origin`, { cwd: dir });
+    sh(`echo a > a && git add a && git commit -qm a`, { cwd: dir });
+    const first = sh(`git rev-parse HEAD`, { cwd: dir }).out.trim();
+    sh(`git push -q ${dir}.git ${first}:refs/heads/scout/one`, { cwd: dir }); // as open_pull_request pushes: to the URL
+    expect(sh(`git rev-parse --verify --quiet origin/scout/one`, { cwd: dir }).code).not.toBe(0);
+    sh(`git update-ref refs/remotes/origin/scout/one ${first}`, { cwd: dir }); // what it now records
+    sh(`echo b > b && git add b && git commit -qm b`, { cwd: dir });
+    expect(sh(`git diff --stat origin/scout/one...HEAD`, { cwd: dir }).out).toMatch(/^ b \| 1 \+\n 1 file changed/);
+  });
+});
+
 describe("git with a token", () => {
   test("a hook planted in the checkout doesn't run, so it can't read the token", () => {
     const dir = repo("hooks");

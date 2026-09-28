@@ -139,6 +139,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       } catch (e) {
         return { error: `push failed: ${(e as Error).message}` };
       }
+      // A push to the URL (not to `origin`) doesn't update origin/<branch>: record it, so the
+      // checkout knows what it pushed and a later PR can be based on this branch. Local only;
+      // if it fails, a fetch (workspace_clone) brings it in anyway.
+      await sb.exec(`git update-ref refs/remotes/origin/${input.branch} ${head}`, { cwd: WORKDIR, timeoutMs: 30_000 }).catch(() => undefined);
 
       const gh = (path: string, init?: RequestInit) =>
         f(`https://api.github.com/repos/${repo.owner}/${repo.name}${path}`, {
