@@ -14,12 +14,14 @@
 //   • message events carry channel_type: "channel" (public) | "group" | "im" | "mpim"
 //   • app_mention events carry NO channel_type — so a mention is admitted only in a
 //     channel on the explicit allowlist.
+//   • reaction events carry neither channel_type nor `channel`: the reacted-to message's
+//     channel is `item.channel`, and like a mention it must be on the allowlist.
 // An async accept (or a cached conversations.info lookup) in @junejs/core would let this
 // drop the allowlist for mentions. June has neither yet.
 
 type SlackEnvelope = {
   type?: string;
-  event?: { type?: string; channel?: string; channel_type?: string };
+  event?: { type?: string; channel?: string; channel_type?: string; item?: { channel?: string } };
 };
 
 export function publicChannelsOnly(allowlist: ReadonlySet<string>, opts: { dms?: boolean } = {}) {
@@ -28,7 +30,8 @@ export function publicChannelsOnly(allowlist: ReadonlySet<string>, opts: { dms?:
     // slackChannel only consults accept for event_callback deliveries (Approve/Deny clicks
     // never reach it); anything else passing through here is not ours to gate.
     if (env?.type !== "event_callback" || !env.event) return true;
-    const { channel, channel_type } = env.event;
+    const { type, channel, channel_type, item } = env.event;
+    if (type === "reaction_added" || type === "reaction_removed") return !!item?.channel && allowlist.has(item.channel);
     if (!channel) return false;
     if (channel_type === "im") return opts.dms === true;
     if (channel_type) return channel_type === "channel" && (allowlist.size === 0 || allowlist.has(channel));

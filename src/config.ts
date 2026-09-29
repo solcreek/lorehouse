@@ -28,6 +28,9 @@ export type Config = {
   // Bearer token for the admin API (/api/v1, src/admin.ts), which returns message text.
   // Unset: /api/ is closed (404).
   adminToken?: string;
+  // Whether usage records who asked (USAGE_RECORD_PEOPLE=1). Off by default: usage is for
+  // improving the agent, not for seeing who uses it (src/usage.ts).
+  usage: { recordPeople: boolean };
   // Code tools, on when a sandbox is configured, with GitHub credentials:
   //   runners  sandbox hosts connect in (SANDBOX_RUNNER_TOKEN); see docs/sandbox-runners.md
   //   direct   one sandbox host Lorehouse calls (SANDBOX_URL + SANDBOX_TOKEN), e.g. on the
@@ -100,7 +103,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     logSlackEvents: env.LOG_SLACK_EVENTS === "1",
     statusToken: env.STATUS_TOKEN || undefined,
     adminToken: env.ADMIN_TOKEN || undefined,
+    usage: { recordPeople: env.USAGE_RECORD_PEOPLE === "1" },
   };
+  if (![undefined, "", "0", "1"].includes(env.USAGE_RECORD_PEOPLE)) missing.push(`USAGE_RECORD_PEOPLE (1 to record who asks, or unset; got "${env.USAGE_RECORD_PEOPLE}")`);
   // The admin token reads what people wrote: long, and never the status token, which is
   // the one handed to monitors.
   if (config.adminToken && config.adminToken.length < 32) missing.push("ADMIN_TOKEN (at least 32 characters)");

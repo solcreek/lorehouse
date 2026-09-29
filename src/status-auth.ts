@@ -2,8 +2,9 @@
 //
 // /status tells whoever asks which channels the agent reads, how much it knows, when it
 // last saw a message and any ingest error, so it is closed unless STATUS_TOKEN is set,
-// and then needs `Authorization: Bearer <token>`. /healthz stays open (it says only
-// "ok", and a platform's health check needs it).
+// and then needs `Authorization: Bearer <token>`. It holds counts only, never who asked or
+// what anyone wrote (that is the admin API's, behind ADMIN_TOKEN), so the token can go to
+// a monitor. /healthz stays open (it says only "ok", and a platform's health check needs it).
 
 import { createHash, timingSafeEqual } from "node:crypto";
 

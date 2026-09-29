@@ -150,6 +150,10 @@ export type IngestOptions = {
   debounceMs: number;
   now?: () => number;
   log?: (msg: string) => void;
+  // After a channel's start-up reconcile: what Slack still has at the top level since
+  // `oldestSec` (live roots, not tombstones), for others that must forget what was
+  // deleted while the app was down (usage's asks).
+  onReconciled?: (channel: string, oldestSec: number, roots: ReadonlySet<string>) => Promise<void>;
 };
 
 // Bump whenever threadDocument renders differently (what it leaves out, how it names
@@ -172,6 +176,11 @@ export class SlackIngester {
     private readonly opts: IngestOptions,
   ) {
     this.users = new SlackUsers(api, db, { log: opts.log, now: opts.now });
+  }
+
+  // The bot's own user id, once start() has asked auth.test.
+  get ownUserId(): string | undefined {
+    return this.botUserId;
   }
 
   // People's names, as knowledge names them (and from the same cache).
@@ -243,10 +252,12 @@ export class SlackIngester {
   private async reconcile(channel: string): Promise<void> {
     const oldest = Math.floor(this.nowSec() - this.opts.refreshDays * 86400);
     const seen = new Set<string>();
+    const live = new Set<string>(); // top-level messages still there, for onReconciled
     for await (const root of this.api.paginate<SlackMessage>("conversations.history", { channel, oldest: String(oldest), limit: 200 }, "messages")) {
       if (root.thread_ts && root.thread_ts !== root.ts) continue;
       const docId = threadDocId(channel, root.ts);
       seen.add(docId);
+      if (root.subtype !== "tombstone") live.add(root.ts);
       const stored = documentVersion(this.db, docId);
       const stale =
         root.subtype === "tombstone" // the root was deleted; its replies live on
@@ -260,6 +271,17 @@ export class SlackIngester {
     for (const docId of docIdsWithPrefix(this.db, `slack:${channel}:`)) {
       const rootTs = docId.slice(`slack:${channel}:`.length);
       if (Number(rootTs) >= oldest && !seen.has(docId)) await this.refreshThread(channel, rootTs, "reconcile");
+    }
+    await this.opts.onReconciled?.(channel, oldest, live);
+  }
+
+  // The ts of every message in a thread as Slack has it now (empty when the thread is gone).
+  async threadMessageTs(channel: string, threadTs: string): Promise<Set<string>> {
+    try {
+      return new Set((await this.readThread(channel, threadTs)).filter((m) => m.subtype !== "tombstone").map((m) => m.ts));
+    } catch (err) {
+      if (err instanceof SlackApiError && (err.code === "thread_not_found" || err.code === "message_not_found")) return new Set();
+      throw err;
     }
   }
 

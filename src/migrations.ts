@@ -8,6 +8,7 @@ import m0005 from "../migrations/0005_slack_users.sql" with { type: "text" };
 import m0006 from "../migrations/0006_slack_user_names.sql" with { type: "text" };
 import m0007 from "../migrations/0007_agent_threads.sql" with { type: "text" };
 import m0008 from "../migrations/0008_sandbox_placements.sql" with { type: "text" };
+import m0009 from "../migrations/0009_usage.sql" with { type: "text" };
 
 export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   { version: 1, name: "0001_knowledge.sql", sql: m0001 },
@@ -18,4 +19,5 @@ export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   { version: 6, name: "0006_slack_user_names.sql", sql: m0006 },
   { version: 7, name: "0007_agent_threads.sql", sql: m0007 },
   { version: 8, name: "0008_sandbox_placements.sql", sql: m0008 },
+  { version: 9, name: "0009_usage.sql", sql: m0009 },
 ];

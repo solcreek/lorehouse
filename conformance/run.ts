@@ -81,6 +81,11 @@ async function ask(question: string): Promise<{ cite?: string; src?: string; tex
   return { cite: text.match(/\[cite:([^\]\s]+)\]/)?.[1], src: text.match(/\[src:([^\]\s]+)\]/)?.[1], text };
 }
 
+type Usage = {
+  since: string; asks: number; channels: number; threads: number;
+  emptySearches: { threads: number; of: number; queries: string[] };
+  feedback: { up: number; down: number; raters: number; downMessages: { channel: string; ts: string }[] };
+};
 type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
 const STATUS_TOKEN = "conformance-status";
 const APP = `http://localhost:${APP_PORT}`;
@@ -94,6 +99,8 @@ const ADMIN_TOKEN = "conformance-admin-token-000000000000";
 const adminAs = (path: string, auth: string | null = `Bearer ${ADMIN_TOKEN}`, init: RequestInit = {}) =>
   fetch(`http://localhost:${APP_PORT}${path}`, { ...init, headers: auth ? { authorization: auth } : {} });
 const admin = async <T = Record<string, any>>(path: string) => (await (await adminAs(path)).json()) as T;
+// Usage is the admin API's (who asked, what was searched), never /status's.
+const usage = () => admin<Usage>("/api/v1/usage");
 type DocumentList = { documents: { id: string; kind: string; source: string }[]; next: string | null };
 // Every document id the admin API lists, page by page.
 async function allDocumentIds(limit = 50): Promise<string[]> {
@@ -108,9 +115,12 @@ async function allDocumentIds(limit = 50): Promise<string[]> {
 }
 
 // A mention that starts a new thread in the allowed channel; resolves once it's answered.
-async function mentionAndWait(question: string): Promise<string> {
+async function mentionAndWait(question: string, { inHistory = false } = {}): Promise<string> {
   const ts = `${1995000000 + ++seq}.000100`;
-  await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${seq}] ${question}`, ts, event_ts: ts, channel: ALLOWED });
+  const text = `<@UBOT> [q${seq}] ${question}`;
+  // In Slack's history too, as a real mention is: a restart's reconcile then finds it still there.
+  if (inHistory) await fetch(`${MOCK}/fixtures/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: ALLOWED, message: { ts, user: "U1", text } }) });
+  await sendEvent({ type: "app_mention", user: "U1", team: "T1", text, ts, event_ts: ts, channel: ALLOWED });
   await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`);
   return ts;
 }
@@ -145,6 +155,17 @@ async function inMode(env: Record<string, string>, run: () => Promise<string | n
   } finally {
     await stopApp();
     await startApp();
+  }
+}
+
+// Run a usage scenario from zero: the app restarted on a database of its own, deleted
+// after, and then restarted on the usual one.
+async function withFreshDb(run: () => Promise<string | null>, env: Record<string, string> = {}): Promise<string | null> {
+  const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+  try {
+    return await inMode({ ...env, LOREHOUSE_DB: db }, run);
+  } finally {
+    removeDb(db);
   }
 }
 
@@ -491,6 +512,142 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "reports usage at GET /api/v1/usage: two asks in one thread are 2 asks, 1 thread, 1 channel; an answered DM is not counted",
+    run: () => withFreshDb(async () => {
+      const thread = await mentionAndWait("where is the wombat review"); // U1
+      await threadReply(thread, "and which floor is that on?", { user: "U2" });
+      const dm = await directMessage(`[q${++seq}] where is the wombat review`, { user: "U3" });
+      await fetch(`${MOCK}/wait?thread_ts=${dm}&timeout_ms=15000`);
+      await Bun.sleep(1000);
+      const u = await usage();
+      return u.asks === 2 && u.threads === 1 && u.channels === 1 ? null : `asks ${u.asks}, threads ${u.threads}, channels ${u.channels}; want 2, 1, 1`;
+    }, { DM_MODE: "answer" }),
+  },
+  {
+    name: "reports empty searches: the thread whose every search found nothing, and its query",
+    run: () => withFreshDb(async () => {
+      await mentionAndWait("where is the wombat review");
+      await mentionAndWait("qxzv jjkw"); // no document has either word
+      const { emptySearches } = await usage();
+      return emptySearches.threads === 1 && emptySearches.of === 2 && JSON.stringify(emptySearches.queries) === JSON.stringify(["qxzv jjkw"])
+        ? null
+        : `emptySearches ${JSON.stringify(emptySearches)}, want 1 of 2 threads and the query "qxzv jjkw"`;
+    }),
+  },
+  {
+    name: "GET /status carries no usage: who asked and what was searched stay behind ADMIN_TOKEN",
+    run: () => withFreshDb(async () => {
+      await mentionAndWait("qxzv jjkw");
+      const raw = await (await statusAs(`Bearer ${STATUS_TOKEN}`)).text();
+      if (raw.includes("usage") || raw.includes("qxzv")) return `/status holds usage: ${raw.slice(0, 160)}`;
+      const r = await adminAs("/api/v1/usage", `Bearer ${STATUS_TOKEN}`);
+      if (r.status !== 401) return `the status token on /api/v1/usage: got ${r.status}, want 401`;
+      return (await usage()).emptySearches.queries.includes("qxzv jjkw") ? null : "the admin API doesn't have the query either";
+    }),
+  },
+  {
+    name: "by default usage never says who asked: no people or askers, and /status says it doesn't record them",
+    run: () => withFreshDb(async () => {
+      await mentionAndWait("where is the wombat review");
+      const u = (await usage()) as Usage & Record<string, unknown>;
+      if (u.asks !== 1) return `asks ${u.asks}, want 1`;
+      if ("people" in u || "askers" in u) return `usage names people: ${JSON.stringify(u).slice(0, 160)}`;
+      const s = (await status()) as unknown as { recordsWhoAsks?: boolean };
+      return s.recordsWhoAsks === false ? null : `/status recordsWhoAsks ${s.recordsWhoAsks}, want false`;
+    }),
+  },
+  {
+    name: "USAGE_RECORD_PEOPLE=1 records who asks and says so in the channel, once; turned off, it says so and erases them",
+    run: async () => {
+      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      const notices = async () => (await stats()).posts.filter((p) => p.channel === ALLOWED && !p.thread_ts).map((p) => p.text);
+      type People = Usage & { people?: number; askers?: { user: string; asks: number }[] };
+      const restart = async (env: Record<string, string>) => { await stopApp(); await reset(); await startApp({ LOREHOUSE_DB: db, ...env }); };
+      try {
+        await restart({ USAGE_RECORD_PEOPLE: "1" });
+        if (!(await notices()).some((t) => t.includes("I now record who asks me things"))) return `turned on, the channel wasn't told: ${JSON.stringify(await notices())}`;
+        await mentionAndWait("where is the wombat review", { inHistory: true }); // U1, still in Slack after restarts
+        let u = (await usage()) as People;
+        if (u.people !== 1 || u.askers?.[0]?.user !== "U1" || u.askers[0].asks !== 1) return `on: people ${u.people}, askers ${JSON.stringify(u.askers)}; want U1 with 1 ask`;
+        if (!((await status()) as unknown as { recordsWhoAsks?: boolean }).recordsWhoAsks) return "on: /status recordsWhoAsks isn't true";
+        await restart({ USAGE_RECORD_PEOPLE: "1" });
+        if ((await notices()).length) return `a restart told the channel again: ${JSON.stringify(await notices())}`;
+        await restart({});
+        if (!(await notices()).some((t) => t.includes("I no longer record who asks me things"))) return `turned off, the channel wasn't told: ${JSON.stringify(await notices())}`;
+        u = (await usage()) as People;
+        if ("people" in u || u.asks !== 1) return `off: ${JSON.stringify(u).slice(0, 160)}; want the ask and no people`;
+        await restart({ USAGE_RECORD_PEOPLE: "1" });
+        u = (await usage()) as People;
+        return u.people === 0 ? null : `on again: people ${u.people}, want 0 (the askers were erased when it was off)`;
+      } finally {
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
+    name: "forgets in usage a question deleted while it was down; one still in Slack stays",
+    run: async () => {
+      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      try {
+        await stopApp();
+        await startApp({ LOREHOUSE_DB: db });
+        const kept = await mentionAndWait("where is the wombat review", { inHistory: true });
+        const gone = await mentionAndWait("qxzv jjkw", { inHistory: true });
+        const before = await usage();
+        if (before.asks !== 2 || !before.emptySearches.queries.includes("qxzv jjkw")) return `before: ${JSON.stringify(before).slice(0, 200)}`;
+        await stopApp();
+        await post("/fixtures/delete", { channel: ALLOWED, ts: gone }); // deleted while down: no event
+        await startApp({ LOREHOUSE_DB: db });
+        const after = await usage();
+        if (after.asks !== 1) return `after the restart: asks ${after.asks}, want 1 (the deleted one forgotten, ${kept} kept)`;
+        return after.emptySearches.queries.includes("qxzv jjkw") ? "the deleted question's search is still listed" : null;
+      } finally {
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
+    name: "forgets a deleted question in usage: its ask, and as a thread root, the searches run for it",
+    run: () => withFreshDb(async () => {
+      const ts = await mentionAndWait("qxzv jjkw");
+      const before = await usage();
+      if (before.asks !== 1 || !before.emptySearches.queries.includes("qxzv jjkw")) return `before deleting: ${JSON.stringify(before)}`;
+      const now = `${1990000000 + ++seq}.000100`;
+      await sendEvent({ type: "message", subtype: "message_deleted", hidden: true, channel: ALLOWED, channel_type: "channel", ts: now, event_ts: now, deleted_ts: ts, previous_message: { ts } });
+      await Bun.sleep(500);
+      const after = await usage();
+      return after.asks === 0 && after.emptySearches.of === 0 && after.emptySearches.queries.length === 0 ? null : `after deleting: ${JSON.stringify(after)}`;
+    }),
+  },
+  {
+    name: "counts a 👎 on its own reply as feedback, not one on a person's message or outside the allowlist, and answers no reaction",
+    run: async () => {
+      await reset();
+      const reaction = (type: string, extra: Record<string, unknown> = {}) => {
+        const ts = `${1995000000 + ++seq}.000100`;
+        return { type, user: "U2", reaction: "-1", item_user: "UBOT", item: { type: "message", channel: ALLOWED, ts: "1995000001.000100" }, event_ts: ts, ...extra };
+      };
+      const down = async () => { await Bun.sleep(500); return (await usage()).feedback.down; };
+      const before = await down();
+      await sendEvent(reaction("reaction_added"));
+      let now = await down();
+      if (now !== before + 1) return `a 👎 on its reply: down ${now}, want ${before + 1}`;
+      await sendEvent(reaction("reaction_removed"));
+      now = await down();
+      if (now !== before) return `the 👎 taken back: down ${now}, want ${before}`;
+      await sendEvent(reaction("reaction_added", { item_user: "U1" })); // a person's message
+      await sendEvent(reaction("reaction_added", { item: { type: "message", channel: "C9", ts: "1995000001.000100" } })); // not allowlisted
+      now = await down();
+      if (now !== before) return `down ${now}, want ${before}: counted a 👎 on a person's message or outside the allowlist`;
+      const s = await stats();
+      return s.modelCalls || s.slackCalls ? `a reaction got a response: ${JSON.stringify(s)}` : null;
+    },
+  },
+  {
     name: "points a DM to the public channel: one reply, no model call, nothing read or indexed (DM_MODE=redirect, the default)",
     run: async () => {
       await reset();
@@ -675,7 +832,7 @@ const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], {
 });
 // A file, not :memory:, so the restart scenario comes back to the same knowledge.
 const DB = join(tmpdir(), `lorehouse-conformance-${process.pid}.db`);
-const removeDb = () => { for (const s of ["", "-wal", "-shm"]) rmSync(DB + s, { force: true }); };
+const removeDb = (path = DB) => { for (const s of ["", "-wal", "-shm"]) rmSync(path + s, { force: true }); };
 removeDb();
 
 let app: ReturnType<typeof Bun.spawn> | undefined;

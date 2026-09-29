@@ -8,6 +8,7 @@
 //   GET /api/v1/threads?limit=&cursor=                   the threads the agent was asked into
 //   GET /api/v1/runners                                  connected sandbox runners
 //   GET /api/v1/sandboxes?limit=&cursor=                 which runner each sandbox lives on
+//   GET /api/v1/usage?days=                              who asks, empty searches, 👍/👎
 //
 // It returns what people wrote, so it has its own token, ADMIN_TOKEN, apart from
 // STATUS_TOKEN's counts: a monitor holding the status token can't read messages. Unset,
@@ -20,6 +21,7 @@ import { getDocument, listDocuments, searcher } from "./knowledge";
 import { listPlacements } from "./runners/hub";
 import { bearerMatches } from "./status-auth";
 import { listThreads } from "./threads";
+import type { UsageSummary } from "./usage";
 
 type RunnerSummary = { runner: string; transport: string; online: boolean; capacity: number; running: number; version?: string; lastSeenSecs: number };
 
@@ -29,6 +31,7 @@ export type AdminOptions = {
   ingest: () => IngestStatus | undefined; // undefined: no channels, so no ingest
   sandbox: "off" | "direct" | "runners";
   runners?: () => RunnerSummary[];
+  usage?: (since: Date) => UsageSummary | Promise<UsageSummary>;
 };
 
 const KINDS = new Set(["slack_thread", "seed"]);
@@ -44,13 +47,16 @@ const NO_STORE = { "cache-control": "no-store" };
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   Response.json(body, { status, headers: { ...NO_STORE, ...headers } });
 
-function limitParam(url: URL, fallback: number, max: number): number {
-  const raw = url.searchParams.get("limit");
+// A whole number from 1 to max, or the fallback when absent. Strict: "3days", "7.9" or
+// "-5" are a 400, never read as something else.
+function countParam(url: URL, name: string, fallback: number, max: number): number {
+  const raw = url.searchParams.get(name);
   if (raw === null) return fallback;
   const n = /^\d{1,4}$/.test(raw) ? Number(raw) : NaN;
-  if (!(n >= 1 && n <= max)) throw new BadRequest(`limit: a whole number from 1 to ${max}`);
+  if (!(n >= 1 && n <= max)) throw new BadRequest(`${name}: a whole number from 1 to ${max}`);
   return n;
 }
+const limitParam = (url: URL, fallback: number, max: number) => countParam(url, "limit", fallback, max);
 
 // A page position: the last row's sort key and rowid, opaque to the client.
 function cursorParam(url: URL): { key: string; rowid: number } | undefined {
@@ -75,7 +81,7 @@ function page<T extends { rowid: number }>(rows: T[], limit: number, key: (row: 
 export function adminRoutes(opts: AdminOptions) {
   const { db } = opts;
 
-  function route(url: URL): Response {
+  async function route(url: URL): Promise<Response> {
     const path = url.pathname.replace(/\/$/, "");
 
     if (path === "/api/v1/documents") {
@@ -140,6 +146,12 @@ export function adminRoutes(opts: AdminOptions) {
       return json({ sandboxes: items, next });
     }
 
+    if (path === "/api/v1/usage") {
+      const days = countParam(url, "days", 7, 90);
+      const summary = await opts.usage?.(new Date(Date.now() - days * 86_400_000));
+      return summary ? json({ days, ...summary }) : json({ error: "usage isn't recorded here" }, 404);
+    }
+
     return json({ error: "no such endpoint (docs/admin-api.md)" }, 404);
   }
 
@@ -153,7 +165,7 @@ export function adminRoutes(opts: AdminOptions) {
     if (!bearerMatches(req, opts.token)) return json({ error: "unauthorized: send Authorization: Bearer <ADMIN_TOKEN>" }, 401, { "www-authenticate": "Bearer" });
     if (req.method !== "GET") return json({ error: "method not allowed: the admin API only reads" }, 405, { allow: "GET" });
     try {
-      return route(url);
+      return await route(url);
     } catch (e) {
       if (e instanceof BadRequest) return json({ error: e.message }, 400);
       throw e;

@@ -344,6 +344,14 @@ describe("publicChannelsOnly", () => {
     expect(listed(ev({ type: "app_mention", channel: "C3" }))).toBe(false);
   });
 
+  test("a reaction names its channel under item and carries no channel_type, so only an allowlisted channel admits it", () => {
+    const reaction = (type: string, channel: string) => ev({ type, user: "U2", reaction: "+1", item: { type: "message", channel, ts: "1.1" } });
+    expect(listed(reaction("reaction_added", "C1"))).toBe(true);
+    expect(listed(reaction("reaction_removed", "C2"))).toBe(true);
+    expect(listed(reaction("reaction_added", "C3"))).toBe(false);
+    expect(open(reaction("reaction_added", "C1"))).toBe(false);
+  });
+
   test("with an allowlist, a public channel outside it is refused too", () => {
     expect(listed(ev({ type: "message", channel: "C3", channel_type: "channel" }))).toBe(false);
   });

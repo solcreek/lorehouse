@@ -31,6 +31,19 @@ export function personName(p: { display?: string; real?: string; handle?: string
 type UserInfo = { user?: { name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } } };
 type Row = { name: string; display_name: string | null; real_name: string | null; updated_at: string };
 
+// Names already cached, without asking Slack or writing anything: for readers that must
+// stay read-only (the admin API). Ids not cached are left out.
+export function cachedNames(db: Database, ids: Iterable<string>): Map<string, PersonName> {
+  const out = new Map<string, PersonName>();
+  const stmt = db.query("SELECT name, display_name, real_name FROM slack_users WHERE user_id = ?");
+  for (const id of new Set(ids)) {
+    const row = stmt.get(id) as Omit<Row, "updated_at"> | null;
+    const n = row && personName({ display: row.display_name ?? undefined, real: row.real_name ?? undefined, handle: row.name });
+    if (n) out.set(id, n);
+  }
+  return out;
+}
+
 export class SlackUsers {
   private memo = new Map<string, PersonName>();
   private disabled = false;

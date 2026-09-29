@@ -118,6 +118,8 @@ function slack(method: string, body: Record<string, unknown>): Response {
     for (const w of waiters.get(thread) ?? []) w(threadCalls(thread));
     waiters.delete(thread);
   }
+  // As real Slack does: the posted message's channel and ts (June checks for the ts).
+  if (method === "chat.postMessage") return Response.json({ ok: true, channel: body.channel, ts: `${++nextTs}.000100` });
   if (method === "auth.test") return Response.json({ ok: true, url: "https://acme.slack.com/", user_id: "UBOT", team_id: "T1", bot_id: "B1" });
   if (method === "conversations.history" || method === "conversations.replies") return conversations(method, body);
   if (method === "users.info") {

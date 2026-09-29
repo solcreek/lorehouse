@@ -75,6 +75,8 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     return checks;
   }
   add("configuration", "environment", "ok", `every required setting is present; agent @${identity.name}, code tools ${config.sandbox ? `on (${config.sandbox.mode})` : "off"}`);
+  // Not a problem, but never a surprise: the agent tells each channel, and so does this.
+  if (config.usage.recordPeople) add("configuration", "USAGE_RECORD_PEOPLE", "info", "on: usage records who asks the agent things, and each channel is told so");
 
   // ── slack ──
   const slackBase = (config.slack.apiUrl ?? "https://slack.com/api").replace(/\/$/, "");
