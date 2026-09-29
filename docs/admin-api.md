@@ -160,7 +160,9 @@ What is recorded, and for how long:
 - **Rows are kept 90 days,** the longest window this reports, then pruned (on start and
   daily).
 - **A question deleted in Slack is forgotten:** its ask goes, and when it was a thread's
-  root, so do the searches run for it. The same as a deleted message leaving the index.
+  root, so do the searches run for it. The same as a deleted message leaving the index,
+  and the same after downtime: on start, a question in the refresh window
+  (`INGEST_REFRESH_DAYS`) that Slack no longer has is forgotten too.
 - **None of it is in `GET /status`,** which holds counts safe for a monitor. `/status`
   says only whether askers are recorded (`recordsWhoAsks`).
 
@@ -176,10 +178,14 @@ law), and a record of who asks in public makes people think twice before asking 
 which is the behavior the agent depends on. Some organizations want the numbers anyway, so
 an install can opt in with `USAGE_RECORD_PEOPLE=1`, in the open:
 
-- **Each allowlisted channel is told,** once, that the agent now records who asks. Turning
-  it off tells them again, and erases every asker kept.
+- **Each allowlisted channel is told,** once, that the agent now records who asks, and
+  **its askers are recorded only after that notice is posted**: a question asked while the
+  notices are still going out keeps no asker. Turning it off tells them again, and erases
+  every asker kept.
 - **The usage adds `people` and `askers`:** how many people asked, and each asker
   (`{ user, name, asks }`, most asks first). Asks from before opting in have no asker.
+  `name` comes from the names Lorehouse has already cached (it caches an asker's when
+  recording them), so reading usage never calls Slack; it is `null` when none is cached.
 - **Reactions stay anonymous** either way: a named 👎 is one people hold back.
 - **`/status` says `recordsWhoAsks: true`,** and `lorehouse doctor` notes it.
 
