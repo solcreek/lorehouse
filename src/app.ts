@@ -26,7 +26,8 @@ import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
-import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, pruneUsage, raterKey, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
+import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, reconcileAsks, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
+import { cachedNames } from "./ingest/slack-users";
 import { pullRequestTool } from "./tools/pull-request";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
@@ -62,6 +63,15 @@ export async function createApp(config: Config) {
         refreshDays: config.ingest.refreshDays,
         debounceMs: config.ingest.debounceMs,
         log: (m) => console.log(m),
+        // Questions deleted while the app was down are forgotten in usage too, as live.
+        onReconciled: async (channel, oldestSec, roots) => {
+          try {
+            const n = await reconcileAsks(knowledge, channel, oldestSec, { roots, thread: (ts) => ingester!.threadMessageTs(channel, ts) });
+            if (n) console.log(`usage: ${channel}: forgot ${n} question(s) deleted while down`);
+          } catch (err) {
+            console.error("usage:", err); // bookkeeping: never fails the ingest
+          }
+        },
       })
     : undefined;
 
@@ -79,6 +89,9 @@ export async function createApp(config: Config) {
   // Not recording who asks (the default, or opted out again): forget any asker kept before.
   const recordPeople = config.usage.recordPeople;
   if (!recordPeople) tally(() => eraseAskers(knowledge));
+  // Opted in, a channel's askers are recorded only once it has been told (the notices go
+  // out after the server is up, so the first asks may come before them).
+  const told = recordPeople ? notifiedChannels(knowledge) : new Set<string>();
   setInterval(() => tally(() => pruneUsage(knowledge)), 86_400_000).unref();
 
   const tools: Tool[] = [
@@ -140,9 +153,11 @@ export async function createApp(config: Config) {
     respondTo: ["app_mention", "message"],
     respondWhen: (e) => {
       const respond = shouldRespond(e);
-      // An ask records where; who, only if the install opted in (usage.ts).
-      const user = recordPeople ? e.user?.id : undefined;
+      // An ask records where; who, only if the install opted in and the channel was told
+      // (usage.ts). A recorded asker's name is cached now, so reading usage never asks Slack.
+      const user = told.has(e.channelId) ? e.user?.id : undefined;
       if (respond && e.channelType !== "im") tally(() => recordAsk(knowledge, { channel: e.channelId, ts: e.ts, threadTs: e.threadId ?? e.ts, user }));
+      if (respond && user) void ingester?.names([user]).catch(() => undefined);
       return respond;
     },
     // A mention asks the agent into its thread. Reactions are observed only: they are not
@@ -207,6 +222,7 @@ export async function createApp(config: Config) {
       try {
         await slack.post!({ channelId: channel }, text);
         markNotified(knowledge, channel, recordPeople);
+        if (recordPeople) told.add(channel);
       } catch (err) {
         console.error(`usage: telling ${channel} whether askers are recorded:`, err); // tried again on the next start
       }
@@ -220,11 +236,12 @@ export async function createApp(config: Config) {
     ingest: () => ingester?.status(),
     sandbox: config.sandbox?.mode ?? "off",
     runners: hub ? () => hub.status() : undefined,
-    // With askers recorded, each is named as knowledge names people.
-    usage: async (since) => {
+    // With askers recorded, each is named as knowledge names people, from the names already
+    // cached: the admin API only reads (no Slack call, no write). Uncached: name null.
+    usage: (since) => {
       const summary = usageSummary(knowledge, { since, people: recordPeople });
       if (!summary.askers?.length) return summary;
-      const names = (await ingester?.names(summary.askers.map((a) => a.user)).catch(() => undefined)) ?? new Map();
+      const names = cachedNames(knowledge, summary.askers.map((a) => a.user));
       return { ...summary, askers: summary.askers.map((a) => ({ ...a, name: names.get(a.user)?.full ?? null })) };
     },
   });

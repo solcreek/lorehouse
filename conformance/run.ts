@@ -115,9 +115,12 @@ async function allDocumentIds(limit = 50): Promise<string[]> {
 }
 
 // A mention that starts a new thread in the allowed channel; resolves once it's answered.
-async function mentionAndWait(question: string): Promise<string> {
+async function mentionAndWait(question: string, { inHistory = false } = {}): Promise<string> {
   const ts = `${1995000000 + ++seq}.000100`;
-  await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${seq}] ${question}`, ts, event_ts: ts, channel: ALLOWED });
+  const text = `<@UBOT> [q${seq}] ${question}`;
+  // In Slack's history too, as a real mention is: a restart's reconcile then finds it still there.
+  if (inHistory) await fetch(`${MOCK}/fixtures/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: ALLOWED, message: { ts, user: "U1", text } }) });
+  await sendEvent({ type: "app_mention", user: "U1", team: "T1", text, ts, event_ts: ts, channel: ALLOWED });
   await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`);
   return ts;
 }
@@ -563,7 +566,7 @@ const scenarios: Scenario[] = [
       try {
         await restart({ USAGE_RECORD_PEOPLE: "1" });
         if (!(await notices()).some((t) => t.includes("I now record who asks me things"))) return `turned on, the channel wasn't told: ${JSON.stringify(await notices())}`;
-        await mentionAndWait("where is the wombat review"); // U1
+        await mentionAndWait("where is the wombat review", { inHistory: true }); // U1, still in Slack after restarts
         let u = (await usage()) as People;
         if (u.people !== 1 || u.askers?.[0]?.user !== "U1" || u.askers[0].asks !== 1) return `on: people ${u.people}, askers ${JSON.stringify(u.askers)}; want U1 with 1 ask`;
         if (!((await status()) as unknown as { recordsWhoAsks?: boolean }).recordsWhoAsks) return "on: /status recordsWhoAsks isn't true";
@@ -576,6 +579,30 @@ const scenarios: Scenario[] = [
         await restart({ USAGE_RECORD_PEOPLE: "1" });
         u = (await usage()) as People;
         return u.people === 0 ? null : `on again: people ${u.people}, want 0 (the askers were erased when it was off)`;
+      } finally {
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
+    name: "forgets in usage a question deleted while it was down; one still in Slack stays",
+    run: async () => {
+      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      try {
+        await stopApp();
+        await startApp({ LOREHOUSE_DB: db });
+        const kept = await mentionAndWait("where is the wombat review", { inHistory: true });
+        const gone = await mentionAndWait("qxzv jjkw", { inHistory: true });
+        const before = await usage();
+        if (before.asks !== 2 || !before.emptySearches.queries.includes("qxzv jjkw")) return `before: ${JSON.stringify(before).slice(0, 200)}`;
+        await stopApp();
+        await post("/fixtures/delete", { channel: ALLOWED, ts: gone }); // deleted while down: no event
+        await startApp({ LOREHOUSE_DB: db });
+        const after = await usage();
+        if (after.asks !== 1) return `after the restart: asks ${after.asks}, want 1 (the deleted one forgotten, ${kept} kept)`;
+        return after.emptySearches.queries.includes("qxzv jjkw") ? "the deleted question's search is still listed" : null;
       } finally {
         await stopApp();
         removeDb(db);

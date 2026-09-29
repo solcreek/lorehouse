@@ -38,6 +38,34 @@ export function channelsToNotify(db: Database, channels: Iterable<string>, recor
   return recording ? [...channels].filter((c) => !told.has(c)) : [...told];
 }
 
+// The channels told that askers are recorded. Until a channel has been told, its askers
+// aren't recorded, even opted in: the notice comes first.
+export function notifiedChannels(db: Database): Set<string> {
+  return new Set((db.query("SELECT channel FROM usage_people_notices").all() as { channel: string }[]).map((r) => r.channel));
+}
+
+// Asks deleted while the app was down, found on start from what Slack still has: the
+// top-level messages since `oldestSec` (a deleted root with replies reads as a tombstone,
+// so it isn't among them), and each thread's messages, read only for threads with a reply
+// that asked. Each ask gone from Slack is forgotten as if deleted live. Returns how many.
+export async function reconcileAsks(
+  db: Database,
+  channel: string,
+  oldestSec: number,
+  present: { roots: ReadonlySet<string>; thread: (threadTs: string) => Promise<ReadonlySet<string>> },
+): Promise<number> {
+  const asks = db.query("SELECT ts, thread_ts AS threadTs FROM agent_asks WHERE channel = ? AND CAST(ts AS REAL) >= ?").all(channel, oldestSec) as { ts: string; threadTs: string }[];
+  const gone: string[] = asks.filter((a) => a.ts === a.threadTs && !present.roots.has(a.ts)).map((a) => a.ts);
+  const replies = new Map<string, string[]>();
+  for (const a of asks) if (a.ts !== a.threadTs) replies.set(a.threadTs, [...(replies.get(a.threadTs) ?? []), a.ts]);
+  for (const [threadTs, tss] of replies) {
+    const inThread = await present.thread(threadTs);
+    gone.push(...tss.filter((ts) => !inThread.has(ts)));
+  }
+  for (const ts of gone) forgetAsk(db, channel, ts);
+  return gone.length;
+}
+
 export function markNotified(db: Database, channel: string, recording: boolean, now = new Date()): void {
   if (recording) db.query("INSERT OR IGNORE INTO usage_people_notices (channel, notified_at) VALUES (?, ?)").run(channel, now.toISOString());
   else db.query("DELETE FROM usage_people_notices WHERE channel = ?").run(channel);

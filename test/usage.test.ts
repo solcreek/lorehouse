@@ -1,8 +1,9 @@
-// Usage: who asks the agent things, what its searches find, and the 👍/👎 on its replies.
+// Usage: where the agent is asked things, what its searches find, and the 👍/👎 on its replies.
 
 import { describe, expect, test } from "bun:test";
 import { openKnowledge } from "../src/knowledge";
-import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, pruneUsage, raterKey, rating, recordAsk, recordFeedback, recordSearch, USAGE_RETENTION_DAYS, usageSummary } from "../src/usage";
+import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, rating, reconcileAsks, recordAsk, recordFeedback, recordSearch, USAGE_RETENTION_DAYS, usageSummary } from "../src/usage";
+import { cachedNames } from "../src/ingest/slack-users";
 
 const since = new Date("2026-09-01T00:00:00Z");
 const inWindow = new Date("2026-09-10T00:00:00Z");
@@ -183,5 +184,56 @@ describe("opted in to recording askers", () => {
     markNotified(db, "C1", false);
     markNotified(db, "C2", false);
     expect(channelsToNotify(db, ["C1"], false)).toEqual([]);
+  });
+
+  test("the channels told are the ones whose askers may be recorded", () => {
+    const db = openKnowledge(":memory:");
+    expect(notifiedChannels(db)).toEqual(new Set());
+    markNotified(db, "C1", true);
+    expect(notifiedChannels(db)).toEqual(new Set(["C1"]));
+  });
+
+  test("an asker's name comes from the names already cached, without asking Slack; uncached is left out", () => {
+    const db = openKnowledge(":memory:");
+    db.query("INSERT INTO slack_users (user_id, name, display_name, real_name, updated_at) VALUES (?, ?, ?, ?, ?)").run("U1", "wendy", "Wendy", "Wendy Wu", "2020-01-01T00:00:00Z");
+    const names = cachedNames(db, ["U1", "U9"]);
+    expect([...names.keys()]).toEqual(["U1"]);
+    expect(names.get("U1")?.full).toBe("Wendy (Wendy Wu)");
+    expect((db.query("SELECT COUNT(*) AS n FROM slack_users").get() as { n: number }).n).toBe(1); // nothing written
+  });
+});
+
+describe("questions deleted while down", () => {
+  const rows = (db: ReturnType<typeof openKnowledge>) => (db.query("SELECT ts FROM agent_asks ORDER BY ts").all() as { ts: string }[]).map((r) => r.ts);
+
+  test("a root question Slack no longer lists is forgotten, with its thread's searches; one still there stays", async () => {
+    const db = openKnowledge(":memory:");
+    recordAsk(db, { channel: "C1", ts: "100.1", threadTs: "100.1" });
+    recordAsk(db, { channel: "C1", ts: "200.1", threadTs: "200.1" });
+    recordSearch(db, { channel: "C1", threadTs: "100.1", query: "gone", hits: 0 });
+    const thread = async () => { throw new Error("no thread is read for root questions"); };
+    expect(await reconcileAsks(db, "C1", 50, { roots: new Set(["200.1"]), thread })).toBe(1);
+    expect(rows(db)).toEqual(["200.1"]);
+    expect((db.query("SELECT COUNT(*) AS n FROM agent_searches").get() as { n: number }).n).toBe(0);
+  });
+
+  test("a follow-up gone from its thread is forgotten; the thread is read once, only when a follow-up asked", async () => {
+    const db = openKnowledge(":memory:");
+    recordAsk(db, { channel: "C1", ts: "100.1", threadTs: "100.1" });
+    recordAsk(db, { channel: "C1", ts: "100.2", threadTs: "100.1" });
+    recordAsk(db, { channel: "C1", ts: "100.3", threadTs: "100.1" });
+    const reads: string[] = [];
+    const n = await reconcileAsks(db, "C1", 50, { roots: new Set(["100.1"]), thread: async (ts) => (reads.push(ts), new Set(["100.1", "100.3"])) });
+    expect(n).toBe(1);
+    expect(reads).toEqual(["100.1"]);
+    expect(rows(db)).toEqual(["100.1", "100.3"]);
+  });
+
+  test("asks older than the reconcile window, or in another channel, are left alone", async () => {
+    const db = openKnowledge(":memory:");
+    recordAsk(db, { channel: "C1", ts: "10.1", threadTs: "10.1" }); // before the window
+    recordAsk(db, { channel: "C2", ts: "100.1", threadTs: "100.1" }); // another channel
+    expect(await reconcileAsks(db, "C1", 50, { roots: new Set(), thread: async () => new Set() })).toBe(0);
+    expect(rows(db)).toEqual(["10.1", "100.1"]);
   });
 });
