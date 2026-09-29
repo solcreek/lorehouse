@@ -129,6 +129,12 @@ lorehouse doctor --url https://<app>    # also the running deployment
 
 It exits 1 if anything failed, so it can gate a deploy.
 
+**After upgrading, run it again.** A new version can need more from Slack than the app you
+installed was granted. When `slack/manifest.yaml` gains a scope (as `reactions:read` came
+with usage feedback), the doctor fails on it until you add the scope under **OAuth &
+Permissions** and reinstall the app. The doctor can't see event subscriptions with a bot
+token, so compare yours with the events in step 2 below, too.
+
 To set up Slack:
 
 1. Create the app from [`slack/manifest.yaml`](slack/manifest.yaml). It lists the scopes
