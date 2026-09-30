@@ -190,18 +190,24 @@ export async function publicUrl(env: Env, port: number): Promise<string | undefi
   return undefined;
 }
 
-// After the server is up: record the URL, and point Slack at it. Never throws: a failure is
-// logged, and the app keeps serving at the old URL's mercy.
-export async function announceUrl(settingsFile: string, url: string | undefined): Promise<void> {
+// After the server is up: record the URL, and point Slack at it. Never throws. A failure
+// (the URL not reachable yet, Slack's API) is retried until it works, backing off to every
+// 10 minutes: a quick tunnel's previous URL is dead, so giving up would leave Slack sending
+// every event nowhere. The URL stays current for the life of the process: only a restart
+// changes it.
+export async function announceUrl(settingsFile: string, url: string | undefined, retryMs = 30_000): Promise<void> {
   if (!url) return;
   updateSettings(settingsFile, (s) => void (s.runtime = { ...s.runtime, publicUrl: url }));
   console.log(`lorehouse: reachable at ${url}`);
-  try {
-    if (!readSettings(settingsFile).slack?.appId) return;
-    if (!(await waitReachable(url))) return console.error(`lorehouse: ${url} isn't reachable yet; Slack not updated`);
-    console.log(`lorehouse: ${await syncSlackUrls(settingsFile, url)}`);
-  } catch (e) {
-    console.error(`lorehouse: couldn't update Slack's URLs: ${(e as Error).message}`);
+  for (let wait = retryMs; ; wait = Math.min(wait * 2, 10 * 60_000)) {
+    try {
+      if (!readSettings(settingsFile).slack?.appId) return;
+      if (await waitReachable(url)) return console.log(`lorehouse: ${await syncSlackUrls(settingsFile, url)}`);
+      console.error(`lorehouse: ${url} isn't reachable yet; Slack not updated, retrying in ${wait / 1000} s`);
+    } catch (e) {
+      console.error(`lorehouse: couldn't update Slack's URLs: ${(e as Error).message}; retrying in ${wait / 1000} s`);
+    }
+    await Bun.sleep(wait);
   }
 }
 
@@ -309,7 +315,7 @@ export async function serveSetupMode(port: number, settingsFile: string, problem
   }, 2000);
   console.log(`lorehouse: setup required (missing ${problems.join(", ")}). Serving setup on :${server.port}. Next: sudo lorehouse setup`);
   url = await publicUrl(env, server.port!).catch((e) => (console.error(`lorehouse: ${(e as Error).message}`), undefined));
-  await announceUrl(settingsFile, url);
+  void announceUrl(settingsFile, url); // retries in the background until Slack follows
 }
 
 // ── lorehouse setup ──────────────────────────────────────────────────────────────────────
