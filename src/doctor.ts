@@ -25,7 +25,7 @@ import { ConfigError, loadConfig, type Config } from "./config";
 import { appJwt } from "./github-auth";
 import { agentIdentity, type AgentIdentity } from "./identity";
 import { loadEnv, readSettings } from "./settings";
-import { configToken, slackCall } from "./setup";
+import { configToken, slackCall, urlMismatch, type ManagedManifest } from "./setup";
 
 export type Level = "ok" | "warn" | "fail" | "info";
 export type Check = { section: string; name: string; level: Level; detail: string };
@@ -281,10 +281,10 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   if (managed?.appId && managed.configRefreshToken) {
     try {
       const token = await configToken(opts.settingsPath!);
-      const m = (await slackCall("apps.manifest.export", token, { app_id: managed.appId })).manifest as { settings?: { event_subscriptions?: { request_url?: string } } };
-      const points = m.settings?.event_subscriptions?.request_url;
-      if (points === `${url}/slack/events`) add("deployment", "Slack Request URL", "ok", `Slack sends events to ${points}`);
-      else add("deployment", "Slack Request URL", "fail", `Slack sends events to ${points ?? "nowhere"}, not here: restart lorehouse to repoint it, or check LOREHOUSE_PUBLIC_URL`);
+      const m = (await slackCall("apps.manifest.export", token, { app_id: managed.appId })).manifest as ManagedManifest;
+      const wrong = urlMismatch(m, url);
+      if (!wrong) add("deployment", "Slack Request URL", "ok", `Slack sends events and interactivity to ${url}/slack/events`);
+      else add("deployment", "Slack Request URL", "fail", `${wrong}, not ${url}/slack/events: restart lorehouse to repoint it, or check LOREHOUSE_PUBLIC_URL`);
     } catch (e) {
       add("deployment", "Slack Request URL", "warn", `couldn't read the Slack app's settings: ${(e as Error).message}`);
     }

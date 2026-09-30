@@ -20,7 +20,11 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import manifestTemplate from "../slack/manifest.yaml";
 import { loadEnv, readSettings, updateSettings, type Env, type Settings } from "./settings";
 
-export const BOT_EVENTS = ["app_mention", "message.channels", "message.im", "reaction_added", "reaction_removed"];
+// The required settings `lorehouse setup` and the install fill in. Setup mode waits for
+// these, and only these, to be missing.
+export const SETUP_PROVIDES = ["SLACK_SIGNING_SECRET", "SLACK_BOT_TOKEN", "ANTHROPIC_API_KEY"];
+
+export const BOT_EVENTS =["app_mention", "message.channels", "message.im", "reaction_added", "reaction_removed"];
 const SLACK_API = "https://slack.com/api";
 
 type SlackBody = { ok: boolean; error?: string; errors?: unknown } & Record<string, unknown>;
@@ -59,7 +63,8 @@ export async function configToken(settingsFile: string, force = false): Promise<
 }
 
 // slack/manifest.yaml, named for this agent, pointed at `url`. Events only once the app can
-// answer Slack's URL check, that is, once it holds the signing secret.
+// answer Slack's URL check, that is, once it holds the signing secret. Interactivity (the
+// pull request Approve/Deny clicks) goes to the same URL, so it moves with it.
 export function appManifest(name: string, url: string, events: boolean): Record<string, unknown> {
   const m = structuredClone(manifestTemplate) as {
     display_information: { name: string };
@@ -70,29 +75,58 @@ export function appManifest(name: string, url: string, events: boolean): Record<
   m.display_information.name = name;
   m.features.bot_user.display_name = name;
   m.oauth_config.redirect_urls = [`${url}/slack/oauth/callback`];
-  if (events) m.settings.event_subscriptions = { request_url: `${url}/slack/events`, bot_events: BOT_EVENTS };
+  if (events) {
+    m.settings.event_subscriptions = { request_url: `${url}/slack/events`, bot_events: BOT_EVENTS };
+    m.settings.interactivity = { is_enabled: true, request_url: `${url}/slack/events` };
+  }
   return m;
 }
 
-// Point the app's Request URL and OAuth redirect at `url`, if they aren't already. Returns
-// what it did, for the log.
+// The parts of an exported manifest that follow the server's URL.
+export type ManagedManifest = {
+  settings?: {
+    event_subscriptions?: { request_url?: string; bot_events?: string[] };
+    interactivity?: { is_enabled?: boolean; request_url?: string };
+  } & Record<string, unknown>;
+  oauth_config?: { redirect_urls?: string[] } & Record<string, unknown>;
+};
+
+// What's wrong with where the app's events and interactivity point, compared with `url`:
+// "" when both are right. For the log and the doctor.
+export function urlMismatch(m: ManagedManifest, url: string): string {
+  const want = `${url}/slack/events`;
+  const ev = m.settings?.event_subscriptions?.request_url;
+  const ia = m.settings?.interactivity;
+  const wrong: string[] = [];
+  if (ev !== want) wrong.push(`events go to ${ev ?? "nowhere"}`);
+  if (!ia?.is_enabled || ia.request_url !== want) wrong.push(`interactivity goes to ${ia?.is_enabled ? (ia.request_url ?? "nowhere") : "nowhere (off)"}`);
+  return wrong.join("; ");
+}
+
+// Point the app's Request URLs (events and interactivity) and OAuth redirect at `url`, if
+// they aren't already, recreating a block that was removed in Slack. Returns what it did,
+// for the log.
 export async function syncSlackUrls(settingsFile: string, url: string): Promise<string> {
   const s = readSettings(settingsFile);
   const appId = s.slack?.appId;
   if (!appId || !s.slack?.configRefreshToken) return "no managed Slack app: Slack's Request URL is yours to keep current";
   const token = await configToken(settingsFile);
   const exported = await slackCall("apps.manifest.export", token, { app_id: appId });
-  const m = exported.manifest as { settings?: { event_subscriptions?: { request_url?: string } }; oauth_config?: { redirect_urls?: string[] } };
+  const m = exported.manifest as ManagedManifest;
   const events = `${url}/slack/events`;
   const redirect = `${url}/slack/oauth/callback`;
   const was = m.settings?.event_subscriptions?.request_url;
-  const eventsOk = !m.settings?.event_subscriptions || was === events;
+  const eventsOk = !urlMismatch(m, url);
   // The OAuth redirect matters only until the install finishes. Changing it afterwards made
   // Slack report permissions_updated (2026-09-30) though the bot's scopes stayed the same.
   const installing = !s.env.SLACK_BOT_TOKEN || !!s.slack.oauthState;
   const redirectOk = !installing || (m.oauth_config?.redirect_urls?.includes(redirect) ?? false);
   if (eventsOk && redirectOk) return `Slack already points at ${url}`;
-  if (m.settings?.event_subscriptions) m.settings.event_subscriptions.request_url = events;
+  m.settings = {
+    ...m.settings,
+    event_subscriptions: { ...m.settings?.event_subscriptions, request_url: events, bot_events: m.settings?.event_subscriptions?.bot_events ?? BOT_EVENTS },
+    interactivity: { ...m.settings?.interactivity, is_enabled: true, request_url: events },
+  };
   if (installing) m.oauth_config = { ...m.oauth_config, redirect_urls: [redirect] };
   const r = await slackCall("apps.manifest.update", token, { app_id: appId, manifest: JSON.stringify(m) });
   return `Slack now points at ${url}` + (was && was !== events ? ` (was ${new URL(was).origin})` : "") + (r.permissions_updated ? "; Slack reports its permissions changed: run lorehouse doctor to check the scopes" : "");
@@ -101,7 +135,8 @@ export async function syncSlackUrls(settingsFile: string, url: string): Promise<
 // ── public URL ───────────────────────────────────────────────────────────────────────────
 
 // cloudflared as a child process; resolves with its https://…trycloudflare.com URL. If
-// the tunnel exits, so does lorehouse, and the service manager restarts both.
+// the tunnel exits, so does lorehouse, and the service manager restarts both. That includes
+// the 30 s deadline: a cloudflared that stays silent is killed, and the restart tries again.
 export async function startQuickTunnel(port: number): Promise<string> {
   const child = Bun.spawn(["cloudflared", "tunnel", "--no-autoupdate", "--url", `http://localhost:${port}`], { stdout: "ignore", stderr: "pipe" });
   void child.exited.then((code) => {
@@ -111,13 +146,20 @@ export async function startQuickTunnel(port: number): Promise<string> {
   const reader = child.stderr.getReader();
   const decoder = new TextDecoder();
   let seen = "";
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    const { value, done } = await reader.read();
+  let timer: Timer | undefined;
+  const timeout = new Promise<"timeout">((r) => (timer = setTimeout(() => r("timeout"), 30_000)));
+  for (;;) {
+    const next = await Promise.race([reader.read(), timeout]);
+    if (next === "timeout") {
+      child.kill();
+      break;
+    }
+    const { value, done } = next;
     if (done) break;
     seen += decoder.decode(value);
     const m = seen.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
     if (m) {
+      clearTimeout(timer);
       void (async () => {
         for (;;) if ((await reader.read()).done) return; // keep draining so cloudflared never blocks
       })();
@@ -171,8 +213,12 @@ function verifiedSlackBody(req: Request, raw: string, signingSecret: string): bo
   return sig.length === want.length && timingSafeEqual(Buffer.from(sig), Buffer.from(want));
 }
 
-const page = (title: string, text: string, status = 200) =>
-  new Response(`<!doctype html><meta charset="utf-8"><title>${title}</title><body style="font:16px system-ui;max-width:36em;margin:4em auto"><h1>${title}</h1><p>${text}</p>`, {
+const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+// `html` is markup: anything in it from the request, from Slack or from an exception goes
+// through esc().
+const page = (title: string, html: string, status = 200) =>
+  new Response(`<!doctype html><meta charset="utf-8"><title>${title}</title><body style="font:16px system-ui;max-width:36em;margin:4em auto"><h1>${title}</h1><p>${html}</p>`, {
     status,
     headers: { "content-type": "text/html; charset=utf-8" },
   });
@@ -182,7 +228,7 @@ const page = (title: string, text: string, status = 200) =>
 async function oauthCallback(req: Request, settingsFile: string, url: string | undefined, onInstalled: () => void): Promise<Response> {
   const q = new URL(req.url).searchParams;
   const s = readSettings(settingsFile);
-  if (q.get("error")) return page("Not installed", `Slack says: ${q.get("error")}. Run <code>lorehouse setup</code> again for a new link.`, 400);
+  if (q.get("error")) return page("Not installed", `Slack says: ${esc(q.get("error")!)}. Run <code>lorehouse setup</code> again for a new link.`, 400);
   if (!s.slack?.oauthState || q.get("state") !== s.slack.oauthState) return page("Link expired", "This install link isn't the current one. Run <code>lorehouse setup</code> again.", 400);
   if (!s.slack.clientId || !s.slack.clientSecret || !url) return page("Not ready", "Run <code>lorehouse setup</code> first.", 409);
   try {
@@ -196,12 +242,17 @@ async function oauthCallback(req: Request, settingsFile: string, url: string | u
     const joined: string[] = [];
     const wanted = new Set((s.slack.channels ?? []).map((c) => c.replace(/^#/, "")));
     if (wanted.size) {
-      const list = await slackCall("conversations.list", bot, { types: "public_channel", exclude_archived: "true", limit: "1000" });
-      for (const c of list.channels as { id: string; name: string }[]) {
-        if (!wanted.has(c.name) && !wanted.has(c.id)) continue;
-        await slackCall("conversations.join", bot, { channel: c.id });
-        joined.push(c.id);
-      }
+      // Slack may return fewer than `limit` per page, with the rest behind next_cursor.
+      let cursor = "";
+      do {
+        const list = await slackCall("conversations.list", bot, { types: "public_channel", exclude_archived: "true", limit: "1000", ...(cursor ? { cursor } : {}) });
+        for (const c of list.channels as { id: string; name: string }[]) {
+          if (!wanted.has(c.name) && !wanted.has(c.id)) continue;
+          await slackCall("conversations.join", bot, { channel: c.id });
+          joined.push(c.id);
+        }
+        cursor = (list.response_metadata as { next_cursor?: string } | undefined)?.next_cursor ?? "";
+      } while (cursor);
     }
     updateSettings(settingsFile, (s) => {
       s.env.SLACK_BOT_TOKEN = bot;
@@ -213,9 +264,9 @@ async function oauthCallback(req: Request, settingsFile: string, url: string | u
     console.log(`lorehouse: installed in ${(r.team as { name?: string })?.name ?? "the workspace"}; joined ${joined.length} channel(s)`);
     onInstalled();
     const missing = [...wanted].length - joined.length;
-    return page("Installed", `Lorehouse is in ${(r.team as { name?: string })?.name ?? "your workspace"}` + (joined.length ? ` and joined ${joined.length} channel(s)` : "") + (missing > 0 ? `. ${missing} channel(s) weren't found` : "") + ". It starts answering in a few seconds. You can close this tab.");
+    return page("Installed", `Lorehouse is in ${esc((r.team as { name?: string })?.name ?? "your workspace")}` + (joined.length ? ` and joined ${joined.length} channel(s)` : "") + (missing > 0 ? `. ${missing} channel(s) weren't found` : "") + ". It starts answering in a few seconds. You can close this tab.");
   } catch (e) {
-    return page("Not installed", `Slack refused the install: ${(e as Error).message}`, 502);
+    return page("Not installed", `Slack refused the install: ${esc((e as Error).message)}`, 502);
   }
 }
 
@@ -233,7 +284,8 @@ export async function serveSetupMode(port: number, settingsFile: string, problem
         const raw = await req.text();
         const secret = readSettings(settingsFile).env.SLACK_SIGNING_SECRET;
         if (!secret || !verifiedSlackBody(req, raw, secret)) return new Response("unauthorized", { status: 401 });
-        const body = JSON.parse(raw) as { type?: string; challenge?: string };
+        // Interactivity arrives form-encoded, not JSON: before the install, dropped like events.
+        const body = (() => { try { return JSON.parse(raw) as { type?: string; challenge?: string }; } catch { return {}; } })();
         if (body.type === "url_verification") return Response.json({ challenge: body.challenge });
         return new Response("ok"); // an event before the install finished: acknowledged, dropped
       }
