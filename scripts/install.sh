@@ -145,11 +145,13 @@ if [ "$unit" != "$(cat "$UNIT" 2>/dev/null)" ]; then
   step "installed $UNIT"
 fi
 
+# Cloudflare's static binary, not the .deb: it runs on any Linux, not only Debian's family.
 if [ "$tunnel" = quick ] && ! command -v cloudflared >/dev/null; then
   step "installing cloudflared"
-  deb_arch=amd64; [ "$arch" = arm64 ] && deb_arch=arm64
-  curl -fsSL -o "$tmp/cloudflared.deb" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$deb_arch.deb"
-  dpkg -i "$tmp/cloudflared.deb" >/dev/null
+  cf_arch=amd64; [ "$arch" = arm64 ] && cf_arch=arm64
+  curl -fsSL -o "$tmp/cloudflared" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cf_arch" ||
+    die "download failed: cloudflared-linux-$cf_arch"
+  install -m 755 "$tmp/cloudflared" /usr/local/bin/cloudflared
 fi
 # Earlier versions ran the tunnel as its own unit; the app runs it now.
 if [ -f "$TUNNEL_UNIT" ]; then
