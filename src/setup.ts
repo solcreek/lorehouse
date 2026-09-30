@@ -18,6 +18,7 @@
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import manifestTemplate from "../slack/manifest.yaml";
+import { loadConfig } from "./config";
 import { agentIdentity } from "./identity";
 import { loadEnv, readSettings, updateSettings, type Env, type Settings } from "./settings";
 
@@ -225,8 +226,8 @@ const page = (title: string, html: string, status = 200) =>
   });
 
 // Slack sends the browser here after Allow: exchange the code for the bot token, join the
-// channels asked for, store both, and restart into normal mode.
-async function oauthCallback(req: Request, settingsFile: string, url: string | undefined, onInstalled: () => void): Promise<Response> {
+// channels asked for, and store both; setup mode then sees the settings complete and restarts.
+async function oauthCallback(req: Request, settingsFile: string, url: string | undefined): Promise<Response> {
   const q = new URL(req.url).searchParams;
   const s = readSettings(settingsFile);
   if (q.get("error")) return page("Not installed", `Slack says: ${esc(q.get("error")!)}. Run <code>lorehouse setup</code> again for a new link.`, 400);
@@ -263,7 +264,6 @@ async function oauthCallback(req: Request, settingsFile: string, url: string | u
       delete s.slack.oauthState;
     });
     console.log(`lorehouse: installed in ${(r.team as { name?: string })?.name ?? "the workspace"}; joined ${joined.length} channel(s)`);
-    onInstalled();
     const missing = [...wanted].length - joined.length;
     return page("Installed", `Lorehouse is in ${esc((r.team as { name?: string })?.name ?? "your workspace")}` + (joined.length ? ` and joined ${joined.length} channel(s)` : "") + (missing > 0 ? `. ${missing} channel(s) weren't found` : "") + ". It starts answering in a few seconds. You can close this tab.");
   } catch (e) {
@@ -290,15 +290,23 @@ export async function serveSetupMode(port: number, settingsFile: string, problem
         if (body.type === "url_verification") return Response.json({ challenge: body.challenge });
         return new Response("ok"); // an event before the install finished: acknowledged, dropped
       }
-      if (path === "/slack/oauth/callback") {
-        return oauthCallback(req, settingsFile, url, () => setTimeout(() => {
-          console.log("lorehouse: settings complete; restarting into normal mode");
-          process.exit(0); // the unit's Restart=always brings it back configured
-        }, 1000));
-      }
+      if (path === "/slack/oauth/callback") return oauthCallback(req, settingsFile, url);
       return Response.json({ state: "setup", missing: problems }, { status: 503 });
     },
   });
+  // However the missing settings arrive (the Slack install, `lorehouse setup` storing a key,
+  // an edited lorehouse.env), restart into normal mode once they're all there.
+  const poll = setInterval(() => {
+    try {
+      loadConfig(loadEnv().env);
+    } catch {
+      return;
+    }
+    clearInterval(poll);
+    console.log("lorehouse: settings complete; restarting into normal mode");
+    // The unit's Restart=always brings it back configured; the second lets a response finish.
+    setTimeout(() => process.exit(0), 1000);
+  }, 2000);
   console.log(`lorehouse: setup required (missing ${problems.join(", ")}). Serving setup on :${server.port}. Next: sudo lorehouse setup`);
   url = await publicUrl(env, server.port!).catch((e) => (console.error(`lorehouse: ${(e as Error).message}`), undefined));
   await announceUrl(settingsFile, url);
@@ -366,13 +374,35 @@ export async function setupMain(args: string[]): Promise<number> {
   const health = await fetch(`http://localhost:${port}/healthz`, { signal: AbortSignal.timeout(5000) }).then((r) => r.text(), () => undefined);
   if (health === undefined) return console.error(`✗ nothing answers on :${port}: start the service first (sudo systemctl start lorehouse)`), done("error", " reason=not-running");
   if (health === "ok") return step("lorehouse is already set up and running"), done("ready");
-  const url = (JSON.parse(health) as { url?: string }).url ?? readSettings(file).runtime?.publicUrl;
-  if (!url) return console.error("✗ the server has no public URL: set LOREHOUSE_PUBLIC_URL, or LOREHOUSE_TUNNEL=quick"), done("error", " reason=no-url");
 
-  if (!(await waitReachable(url))) return console.error(`✗ ${url} doesn't answer from outside yet; try again in a minute`), done("error", " reason=unreachable");
-
+  // Slack credentials set by hand (the environment or lorehouse.env) outrank settings.json, so
+  // an app created now would be shadowed by them. Both set is a Slack app someone manages
+  // themselves: setup fills in only the rest. One of the two is a mistake to fix first.
   const s0 = readSettings(file);
-  const needed = [...(s0.slack?.configRefreshToken ? [] : ["SLACK_CONFIG_TOKEN", "SLACK_CONFIG_REFRESH_TOKEN"]), ...(env.ANTHROPIC_API_KEY ? [] : ["ANTHROPIC_API_KEY"])];
+  const manual = ["SLACK_SIGNING_SECRET", "SLACK_BOT_TOKEN"].filter((k) => env[k] && env[k] !== s0.env[k]);
+  if (manual.length === 1) {
+    const other = manual[0] === "SLACK_BOT_TOKEN" ? "SLACK_SIGNING_SECRET" : "SLACK_BOT_TOKEN";
+    return console.error(`✗ ${manual[0]} is set by hand but ${other} isn't: set both (your own Slack app), or remove it and let setup create the app`), done("error", " reason=partial-slack-credentials");
+  }
+  const manualApp = manual.length === 2;
+
+  // Whether the service restarted into normal mode within `ms`.
+  const answering = async (ms: number): Promise<boolean> => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      await Bun.sleep(3000);
+      const h = await fetch(`http://localhost:${port}/healthz`, { signal: AbortSignal.timeout(5000) }).then((r) => r.text(), () => undefined);
+      if (h === "ok") return true;
+    }
+    return false;
+  };
+
+  // A managed app needs this server reachable, for Slack's URL check and the OAuth redirect.
+  const url = manualApp ? undefined : ((JSON.parse(health) as { url?: string }).url ?? s0.runtime?.publicUrl);
+  if (!manualApp && !url) return console.error("✗ the server has no public URL: set LOREHOUSE_PUBLIC_URL, or LOREHOUSE_TUNNEL=quick"), done("error", " reason=no-url");
+  if (url && !(await waitReachable(url))) return console.error(`✗ ${url} doesn't answer from outside yet; try again in a minute`), done("error", " reason=unreachable");
+
+  const needed = [...(manualApp || s0.slack?.configRefreshToken ? [] : ["SLACK_CONFIG_TOKEN", "SLACK_CONFIG_REFRESH_TOKEN"]), ...(env.ANTHROPIC_API_KEY ? [] : ["ANTHROPIC_API_KEY"])];
   const input = needed.length ? await readInputs(needed) : {};
   for (const k of needed) if (!input[k]) return console.error(`✗ ${k} is required\n\n${SETUP_USAGE}`), done("error", ` reason=missing-${k}`);
 
@@ -386,8 +416,15 @@ export async function setupMain(args: string[]): Promise<number> {
       if (input.ANTHROPIC_API_KEY) s.env.ANTHROPIC_API_KEY = input.ANTHROPIC_API_KEY;
       s.env.STATUS_TOKEN ||= randomBytes(32).toString("hex");
       if (input.SLACK_CONFIG_REFRESH_TOKEN) s.slack = { ...s.slack, configToken: input.SLACK_CONFIG_TOKEN, configRefreshToken: input.SLACK_CONFIG_REFRESH_TOKEN, configExpiresAt: 0 };
-      if (channels.length) s.slack = { ...s.slack, channels };
+      if (channels.length && !manualApp) s.slack = { ...s.slack, channels };
     });
+    if (manualApp) {
+      step("Slack: your own app, from SLACK_SIGNING_SECRET and SLACK_BOT_TOKEN" + (channels.length ? " (--channels ignored: set AGENT_CHANNELS)" : ""));
+      if (!(await answering(60_000))) return console.error("✗ lorehouse didn't restart into normal mode: check sudo lorehouse doctor"), done("error", " reason=not-ready");
+      step("lorehouse restarted and is answering");
+      return done("ready");
+    }
+    if (!url) return done("error", " reason=no-url"); // checked above; narrows for the managed app
     const token = await configToken(file, true);
     step("Slack configuration token works (rotated and stored)");
 
@@ -414,14 +451,9 @@ export async function setupMain(args: string[]): Promise<number> {
     if (!wait) return done("needs-human", ` action=open-link url=${link}`);
 
     console.log("Waiting for the Allow click…");
-    const deadline = Date.now() + 15 * 60_000;
-    while (Date.now() < deadline) {
-      await Bun.sleep(3000);
-      const h = await fetch(`http://localhost:${port}/healthz`, { signal: AbortSignal.timeout(5000) }).then((r) => r.text(), () => undefined);
-      if (h === "ok") {
-        step("installed; lorehouse restarted and is answering");
-        return done("ready", ` url=${url}`);
-      }
+    if (await answering(15 * 60_000)) {
+      step("installed; lorehouse restarted and is answering");
+      return done("ready", ` url=${url}`);
     }
     return console.error("✗ no Allow within 15 minutes; run lorehouse setup again for a new link"), done("error", " reason=timeout");
   } catch (e) {
