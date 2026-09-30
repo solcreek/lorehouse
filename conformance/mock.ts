@@ -13,8 +13,9 @@
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
 // question (or, when the question contains "[recent]", a recent_knowledge tool_use with
-// no input; "[thread]", a slack_read_thread tool_use with no input; "[whois]", a
-// slack_resolve_user tool_use for the first person mentioned); turn 2 (tool_result
+// no input; "[thread]", a slack_read_thread tool_use with no input, or "[thread:<channel>]"
+// for a thread in that channel; "[whois]", a slack_resolve_user tool_use for the first
+// person mentioned); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), or for
 // a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
@@ -214,16 +215,17 @@ async function anthropic(req: Request): Promise<Response> {
   if (!result) {
     const question = firstUserText(body.messages);
     // "[recent]" in the question → an overview question: list recent threads instead of searching
-    // "[thread]" → read the thread the question was asked in
+    // "[thread]" → read the thread the question was asked in; "[thread:<channel>]" → a thread there
     // "[whois]" → look up the first person the question mentions (other than the bot)
     // "[exec] <command>" → run the command in the thread's sandbox (workspace_exec)
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
     const recent = question.includes("[recent]");
-    const thread = question.includes("[thread]");
+    const threadIn = /\[thread:([A-Z0-9]+)\]/.exec(question)?.[1];
+    const thread = question.includes("[thread]") || threadIn !== undefined;
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
     const toolName = execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = execCommand ? { command: execCommand } : whois ? { userId: whois } : recent || thread ? {} : { query };
+    const input = execCommand ? { command: execCommand } : whois ? { userId: whois } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));

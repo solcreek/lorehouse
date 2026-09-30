@@ -47,6 +47,16 @@ describe("namedThreadTool", () => {
     expect(asked).toBe(false);
   });
 
+  test("reads a thread only in the channel it is answering in or in one it reads", async () => {
+    const tool = namedThreadTool(rawThreadTool({ messages: [{ user: "U5", text: "x", ts: "1.1" }] }), names, (c) => c === "C1");
+    const inC9 = { event: { channelId: "C9" } } as ToolContext;
+    expect(await tool.run({ channelId: "D1", threadId: "1.1" }, inC9)).toEqual({ error: "not a channel I read: D1" });
+    expect(await tool.run({ channelId: "C2", threadId: "1.1" }, inC9)).toEqual({ error: "not a channel I read: C2" });
+    expect(await tool.run({ channelId: "C1", threadId: "1.1" }, inC9)).toEqual({ messages: [{ author: "hkato (Hana Kato)", user: "U5", text: "x", ts: "1.1" }] });
+    expect(await tool.run({ channelId: "C9", threadId: "1.1" }, inC9)).toEqual({ messages: [{ author: "hkato (Hana Kato)", user: "U5", text: "x", ts: "1.1" }] });
+    expect(await tool.run({ channelId: "C9", threadId: "1.1" }, ctx)).toEqual({ error: "not a channel I read: C9" });
+  });
+
   test("keeps the tool's name and input; the description says replies are named", () => {
     const tool = namedThreadTool(rawThreadTool({ messages: [] }), names);
     expect(tool.spec.name).toBe("slack_read_thread");

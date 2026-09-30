@@ -16,8 +16,13 @@ import type { PersonName } from "../ingest/slack-users";
 
 type Names = (ids: string[]) => Promise<Map<string, PersonName>>;
 type Reply = { user?: string; text?: string; ts: string };
+// Whether the agent may read threads in a channel other than the one it is answering in.
+type Readable = (channelId: string) => boolean;
 
-export function namedThreadTool(tool: Tool, names: Names): Tool {
+// June's tool reads any channel id it is given, and the model gets ids from knowledge
+// results, so a planted id could pull a DM or private thread into a public reply. Only the
+// current channel and the ones the agent reads are allowed.
+export function namedThreadTool(tool: Tool, names: Names, readable: Readable = () => false): Tool {
   return {
     ...tool,
     spec: {
@@ -26,6 +31,8 @@ export function namedThreadTool(tool: Tool, names: Names): Tool {
         "Read the replies in a Slack thread (defaults to the current thread). Returns each reply's author (the person who wrote it), their user id, the text (mentions shown as @name), and ts.",
     },
     run: async (input, ctx) => {
+      const channelId = (input as { channelId?: string } | undefined)?.channelId;
+      if (channelId && channelId !== ctx.event?.channelId && !readable(channelId)) return { error: `not a channel I read: ${channelId}` };
       const r = (await tool.run(input, ctx)) as { messages?: Reply[] } | undefined;
       if (!r?.messages) return r; // an error or no target: pass it through
       const known = await names(userIdsIn(r.messages));
@@ -59,11 +66,14 @@ export function namedUserTool(tool: Tool, names: Names): Tool {
 }
 
 // Swap the channel's people tools for the named ones; its other tools are unchanged.
-export function withNamedPeople<C extends { tools?: () => Tool[] }>(channel: C, names: Names): C {
+export function withNamedPeople<C extends { tools?: () => Tool[] }>(channel: C, names: Names, readable?: Readable): C {
   const tools = channel.tools;
   if (!tools) return channel;
-  const named: Record<string, (t: Tool, n: Names) => Tool> = { slack_read_thread: namedThreadTool, slack_resolve_user: namedUserTool };
+  const named: Record<string, (t: Tool) => Tool> = {
+    slack_read_thread: (t) => namedThreadTool(t, names, readable),
+    slack_resolve_user: (t) => namedUserTool(t, names),
+  };
   return Object.assign(channel, {
-    tools: () => tools().map((t) => named[t.spec.name]?.(t, names) ?? t),
+    tools: () => tools().map((t) => named[t.spec.name]?.(t) ?? t),
   });
 }

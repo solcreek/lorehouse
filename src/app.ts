@@ -191,7 +191,7 @@ export async function createApp(config: Config) {
     intermediateText: "status",
     tasks: (call) => TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`,
     onError: (err) => console.error("slack:", err),
-  }), async (ids) => (await ingester?.names(ids)) ?? new Map());
+  }), async (ids) => (await ingester?.names(ids)) ?? new Map(), (c) => config.agent.channels.has(c));
 
   const agent = defineAgent({
     name: AGENT_ID,
