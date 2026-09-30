@@ -148,9 +148,11 @@ function firstUserText(messages: Msg[]): string {
   return m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
 }
 
-// The first search hit in a tool_result.
+// The first search hit in a tool_result: search_knowledge returns the hits, recent_knowledge
+// returns them under `threads`.
 function firstHit(content: unknown): { id?: string; source?: string } {
-  const v = resultValue(content);
+  const r = resultValue(content);
+  const v = r && typeof r === "object" && "threads" in r ? (r as { threads: unknown }).threads : r;
   if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
   return {};
 }
