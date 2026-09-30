@@ -29,4 +29,4 @@ Preconditions:
 - `ask` adds `[qN]` in front of the question. The scripted model cites the first search hit for the question with that nonce removed. Assert `cite` and `src`, not the filler words after them.
 - A `cite` without the admin document only proves the scripted model was willing to print an id. Read the document too.
 - The permalink host `acme.slack.com` comes from the stand-in's `auth.test`. A different host means this run is not using that stand-in.
-- A search for the nonce does not prove the mention was left out. The query parser drops a one-character token, so `[q1]` matches nothing even when the text is indexed. Read the document id instead.
+- Read the mention's document id to show it was left out of the index. A search for `[q1]` is not that proof: the query keeps tokens of two or more characters, so `[q1]` is the token `q1` and can match any indexed text that contains it.
