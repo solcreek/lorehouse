@@ -2,7 +2,7 @@ import { createApp } from "./app";
 import { ConfigError, loadConfig } from "./config";
 import { doctorMain } from "./doctor";
 import { loadEnv } from "./settings";
-import { announceUrl, configToken, publicUrl, serveSetupMode, setupMain } from "./setup";
+import { announceUrl, configToken, publicUrl, serveSetupMode, SETUP_PROVIDES, setupMain } from "./setup";
 
 // `lorehouse` serves; `lorehouse setup` creates and installs the Slack app; `lorehouse
 // doctor` checks the setup and exits.
@@ -24,7 +24,10 @@ try {
   config = loadConfig(env);
 } catch (e) {
   if (!(e instanceof ConfigError)) throw e;
-  // Missing settings are a state to finish, not a crash: serve setup until they arrive.
+  // Missing settings that `lorehouse setup` provides are a state to finish, not a crash:
+  // serve setup until they arrive. Anything else (an invalid value, conflicting credentials)
+  // setup can't fix, so it still fails fast.
+  if (!e.problems.every((p) => SETUP_PROVIDES.includes(p))) throw e;
   await serveSetupMode(Number(env.PORT ?? 3000), settingsPath, e.problems, env);
 }
 
@@ -46,5 +49,8 @@ if (config) {
     (e) => console.error(`lorehouse: ${(e as Error).message}`),
   );
   // Keep the configuration token alive: it lasts 12 hours, and a restart needs a live one.
-  setInterval(() => void configToken(settingsPath).catch(() => {}), 60 * 60_000).unref();
+  // configToken rotates inside 10 minutes of expiry, so check now and more often than that.
+  const keepAlive = () => void configToken(settingsPath).catch(() => {});
+  keepAlive();
+  setInterval(keepAlive, 5 * 60_000).unref();
 }
