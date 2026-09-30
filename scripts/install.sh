@@ -15,6 +15,8 @@
 #   --tunnel quick    reach Slack through a Cloudflare quick tunnel, for a server with no
 #                     domain. The app runs it, and repoints Slack at its new URL on each start.
 #   --public-url URL  the server's fixed HTTPS URL instead (behind your own proxy)
+#   --tunnel none     neither: forget the tunnel or public URL an earlier run set
+#                     (without --tunnel or --public-url, a re-run keeps what was set)
 #   --no-start        install and enable, but don't start
 #
 # Environment:
@@ -57,7 +59,8 @@ case $(uname -m) in
   *) die "unsupported CPU: $(uname -m)" ;;
 esac
 [ -z "$env_src" ] || [ -r "$env_src" ] || die "can't read $env_src"
-case $tunnel in "" | quick) ;; *) die "--tunnel takes: quick" ;; esac
+case $tunnel in "" | quick | none) ;; *) die "--tunnel takes: quick, none" ;; esac
+[ -z "$tunnel" ] || [ -z "$public_url" ] || die "--tunnel and --public-url are alternatives: pick one"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -84,6 +87,13 @@ install -d -o root -g lorehouse -m 750 "$ETC"
 # The user's settings (from --env-file, or the file already there), then the lines this
 # script owns. The binary reads this file itself, so `sudo lorehouse doctor` needs nothing else.
 if [ -n "$env_src" ]; then src=$env_src; elif [ -f "$ENV_FILE" ]; then src=$ENV_FILE; else src=/dev/null; fi
+# Without --tunnel or --public-url, keep how the last run reached Slack: dropping it would
+# restart the service with no public URL, and leave Slack pointed at a dead one.
+prev() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -n 1; }
+if [ -z "$tunnel" ] && [ -z "$public_url" ]; then
+  tunnel=$(prev LOREHOUSE_TUNNEL)
+  public_url=$(prev LOREHOUSE_PUBLIC_URL)
+fi
 {
   grep -v -E "^($MANAGED)=|^# managed by install.sh" "$src" || true
   echo "# managed by install.sh"
@@ -152,9 +162,11 @@ if [ -n "$changed" ] || ! systemctl is-active -q lorehouse; then
   systemctl restart lorehouse
   step "started lorehouse"
 fi
+# The port the service listens on: PORT in its settings, else the binary's default.
+port=$(prev PORT | tr -d "\"' ")
 health=
 for _ in $(seq 30); do
-  health=$(curl -fsS http://localhost:3000/healthz 2>/dev/null) && break
+  health=$(curl -fsS "http://localhost:${port:-3000}/healthz" 2>/dev/null) && break
   sleep 1
 done
 [ -n "$health" ] || { journalctl -u lorehouse -n 20 --no-pager >&2; die "lorehouse did not come up; logs above"; }
