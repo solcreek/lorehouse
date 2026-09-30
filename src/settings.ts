@@ -10,7 +10,8 @@
 // An empty value (`SLACK_BOT_TOKEN=` in a template) counts as unset, so it never hides one
 // the app wrote.
 
-import { chownSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, constants, existsSync, fchownSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 export type Env = Record<string, string | undefined>;
@@ -70,9 +71,17 @@ export function settingsPath(env: Env): string {
   return env.LOREHOUSE_SETTINGS || join(dirname(resolve(env.LOREHOUSE_DB || "lorehouse.db")), "settings.json");
 }
 
+// Opened with O_NOFOLLOW: as root, a symlink planted here must not read another file in.
 export function readSettings(path: string): Settings {
   try {
-    const s = JSON.parse(readFileSync(path, "utf8")) as Settings;
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let text: string;
+    try {
+      text = readFileSync(fd, "utf8");
+    } finally {
+      closeSync(fd);
+    }
+    const s = JSON.parse(text) as Settings;
     return { ...s, env: s.env ?? {} };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return { env: {} };
@@ -82,11 +91,22 @@ export function readSettings(path: string): Settings {
 
 // Replaces the file atomically, readable by its owner only. Run as root (sudo lorehouse
 // setup), it hands the file to whoever owns the directory, so the service can still write it.
+// That directory is the service account's, so as root nothing here follows a path it could
+// plant a symlink at: the temp name is random and created exclusively (O_EXCL never follows
+// a link), and it is written and chowned through its descriptor.
 export function writeSettings(path: string, s: Settings): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(s, null, 2) + "\n", { mode: 0o600 });
-  const dir = statSync(dirname(path));
-  if (process.getuid?.() === 0 && dir.uid !== 0) chownSync(tmp, dir.uid, dir.gid);
+  const tmp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(s, null, 2) + "\n");
+    const dir = statSync(dirname(path));
+    if (process.getuid?.() === 0 && dir.uid !== 0) fchownSync(fd, dir.uid, dir.gid);
+  } catch (e) {
+    closeSync(fd);
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+  closeSync(fd);
   renameSync(tmp, path);
 }
 
