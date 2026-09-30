@@ -26,6 +26,13 @@ You name it per install; it defaults to `scout`.
 - **Carries on the conversation.** Once it's mentioned in a thread, a plain reply there
   gets an answer, no new mention needed. It stays out of threads it wasn't asked into,
   and out of replies that mention someone else, a group, or @channel / @here.
+- **Learns procedures you review.** A skill is a Markdown file in `prompts/skills/`:
+  frontmatter with `name`, `description` and `when-to-use`, then the steps. The agent sees
+  every skill's name, description and when-to-use, and loads the steps with `read_skill`
+  when a request fits. Add one in a pull request, with its import in the `SKILLS` map of
+  `src/prompts.ts` (a test fails when a file is missing there); it goes live with the next
+  deploy. The first, `channel-digest`, fixes the shape of a "what's been discussed lately"
+  report.
 - **Public by default.** It works only in public channels, so everyone learns from
   everyone's questions. A DM gets a one-line pointer to the public channel. It can also be
   set to answer DMs, or to ignore them. Either way, a DM never becomes knowledge.
@@ -186,7 +193,7 @@ Go or Rust version would have to pass
 | path | what |
 |---|---|
 | `src/` | the TypeScript implementation (on [June](https://june.build)) |
-| `prompts/` | the system prompt and tool descriptions, as Markdown |
+| `prompts/` | the system prompt, tool descriptions and skills (`skills/`), as Markdown |
 | `migrations/` | Lorehouse's own data, as plain SQL |
 | `conformance/` | the behavioral contract: a mocked Slack + Anthropic, and black-box scenarios |
 | `slack/` | the Slack app manifest |
