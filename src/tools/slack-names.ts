@@ -16,12 +16,10 @@ import type { PersonName } from "../ingest/slack-users";
 
 type Names = (ids: string[]) => Promise<Map<string, PersonName>>;
 type Reply = { user?: string; text?: string; ts: string };
-// Whether the agent may read threads in a channel other than the one it is answering in.
 type Readable = (channelId: string) => boolean;
 
 // June's tool reads any channel id it is given, and the model gets ids from knowledge
-// results, so a planted id could pull a DM or private thread into a public reply. Only the
-// current channel and the ones the agent reads are allowed.
+// results, so a planted id could pull a DM or private thread into a public reply.
 export function namedThreadTool(tool: Tool, names: Names, readable: Readable = () => false): Tool {
   return {
     ...tool,
