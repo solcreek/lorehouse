@@ -89,13 +89,18 @@ install -d -o root -g lorehouse -m 750 "$ETC"
 if [ -n "$env_src" ]; then src=$env_src; elif [ -f "$ENV_FILE" ]; then src=$ENV_FILE; else src=/dev/null; fi
 # Without --tunnel or --public-url, keep how the last run reached Slack: dropping it would
 # restart the service with no public URL, and leave Slack pointed at a dead one.
-prev() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -n 1; }
+# Read the way the binary's parseEnvFile does: optional `export`, spaces around `=`, one
+# layer of quotes.
+prev() {
+  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*//p" "$ENV_FILE" 2>/dev/null | tail -n 1 |
+    sed -E -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e t -e "s/^'(.*)'\$/\\1/"
+}
 if [ -z "$tunnel" ] && [ -z "$public_url" ]; then
   tunnel=$(prev LOREHOUSE_TUNNEL)
   public_url=$(prev LOREHOUSE_PUBLIC_URL)
 fi
 {
-  grep -v -E "^($MANAGED)=|^# managed by install.sh" "$src" || true
+  grep -v -E "^[[:space:]]*(export[[:space:]]+)?($MANAGED)[[:space:]]*=|^# managed by install.sh" "$src" || true
   echo "# managed by install.sh"
   echo "LOREHOUSE_DB=$DATA/lorehouse.db"
   echo "SESSIONS_DB=$DATA/sessions.db"
@@ -163,7 +168,7 @@ if [ -n "$changed" ] || ! systemctl is-active -q lorehouse; then
   step "started lorehouse"
 fi
 # The port the service listens on: PORT in its settings, else the binary's default.
-port=$(prev PORT | tr -d "\"' ")
+port=$(prev PORT)
 health=
 for _ in $(seq 30); do
   health=$(curl -fsS "http://localhost:${port:-3000}/healthz" 2>/dev/null) && break
