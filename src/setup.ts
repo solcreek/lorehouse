@@ -18,6 +18,7 @@
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import manifestTemplate from "../slack/manifest.yaml";
+import { agentIdentity } from "./identity";
 import { loadEnv, readSettings, updateSettings, type Env, type Settings } from "./settings";
 
 // The required settings `lorehouse setup` and the install fill in. Setup mode waits for
@@ -352,7 +353,14 @@ export async function setupMain(args: string[]): Promise<number> {
 
   const { env, settingsPath: file } = loadEnv();
   const port = Number(env.PORT ?? 3000);
-  const name = env.AGENT_NAME || "scout";
+  // The same check the server makes on start: a name Slack accepts but agentIdentity doesn't
+  // would install fine, then crash-loop on the restart into normal mode.
+  let name: string;
+  try {
+    name = agentIdentity(env.AGENT_NAME).name;
+  } catch (e) {
+    return console.error(`✗ AGENT_NAME: ${(e as Error).message}`), done("error", " reason=agent-name");
+  }
 
   // The running server knows where Slack can reach it.
   const health = await fetch(`http://localhost:${port}/healthz`, { signal: AbortSignal.timeout(5000) }).then((r) => r.text(), () => undefined);
