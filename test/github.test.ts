@@ -6,6 +6,9 @@ import { appJwt, githubApp, normalizePem, staticToken } from "../src/github-auth
 import { cloneTool, parseRepo } from "../src/tools/clone";
 import type { ExecOptions, Sandbox } from "../src/tools/workspace";
 
+// Sandboxes in these tests don't publish.
+const noPublish = { stage: async (): Promise<never> => { throw new Error("no publishing here"); }, push: async (): Promise<never> => { throw new Error("no publishing here"); } };
+
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 const NOW = Date.parse("2026-09-28T00:00:00Z");
 
@@ -119,6 +122,7 @@ function fakeSandbox(origin?: string) {
     },
     async readFile() { return ""; },
     async writeFile() {},
+    ...noPublish,
   };
   return { sb, calls };
 }

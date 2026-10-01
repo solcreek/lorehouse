@@ -12,7 +12,7 @@
 //
 // Feasibility numbers (boot, exec, persistence): sandbox/spike/.
 
-import { EXEC_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox } from "./tools/workspace";
+import { EXEC_TIMEOUT_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "./tools/workspace";
 
 export type RemoteSandboxOptions = {
   url: string; // daemon base URL, e.g. https://sandbox.example.com
@@ -50,5 +50,25 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
     async writeFile(path: string, content: string): Promise<void> {
       await call(`/file?path=${encodeURIComponent(path)}`, { method: "PUT", body: content });
     },
+    async stage(o): Promise<Staged> {
+      return publish("stage", { owner: o.repo.owner, name: o.repo.name, base: o.base, token: o.token }, STAGE_TIMEOUT_MS) as Promise<Staged>;
+    },
+    async push(o) {
+      return publish("push", { owner: o.repo.owner, name: o.repo.name, sha: o.sha, branch: o.branch, token: o.token }, PUSH_TIMEOUT_MS) as Promise<{ sha: string; branch: string }>;
+    },
   };
+
+  // A publish call: every non-2xx (404 included: the base isn't on GitHub, nothing staged)
+  // is an error with the daemon's reason.
+  async function publish(op: "stage" | "push", request: object, timeoutMs: number): Promise<unknown> {
+    const res = await f(`${base}/${op}`, {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`${op}: ${res.status} ${((JSON.parse(text || "{}") as { error?: string }).error ?? text).slice(0, 500)}`);
+    return JSON.parse(text);
+  }
 }

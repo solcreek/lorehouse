@@ -18,6 +18,9 @@ import { remoteSandbox } from "../src/sandbox-client";
 import { agentIdentity, DEFAULT_AGENT_NAME } from "../src/identity";
 import { systemPrompt } from "../src/prompts";
 
+// Sandboxes in these tests don't publish.
+const noPublish = { stage: async (): Promise<never> => { throw new Error("no publishing here"); }, push: async (): Promise<never> => { throw new Error("no publishing here"); } };
+
 class Sink implements EventSink {
   subs = new Set<(e: TurnEvent) => void>();
   emit(e: TurnEvent) { this.subs.forEach((cb) => cb(e)); }
@@ -47,6 +50,7 @@ function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; kno
     },
     async readFile() { return ""; },
     async writeFile() {},
+    ...noPublish,
   };
   return { sb, calls };
 }
@@ -274,6 +278,7 @@ describe("workspace tools", () => {
       async exec(_c, opts) { seen.push(opts?.env); return { exitCode: 0, stdout: "", stderr: "" }; },
       async readFile() { return ""; },
       async writeFile() {},
+      ...noPublish,
     };
     const bot = { name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" };
     const execWith = (commitAs?: () => Promise<typeof bot>) => workspaceTools(() => sb, { commitAs }).find((t) => t.spec.name === "workspace_exec")!;
@@ -289,6 +294,7 @@ describe("workspace tools", () => {
       async exec(command, opts) { seen.push({ command, opts }); return { exitCode: 1, stdout: "x".repeat(20_000) + "FAILED: 2 tests", stderr: "" }; },
       async readFile() { return ""; },
       async writeFile() {},
+      ...noPublish,
     };
     const exec = workspaceTools(() => sb).find((t) => t.spec.name === "workspace_exec")!;
     const out = (await exec.run({ command: "bun test" }, {} as never)) as { stdout: string; exitCode: number };
@@ -300,7 +306,7 @@ describe("workspace tools", () => {
 
   test("the sandbox is resolved per session, from ctx — not from model input", async () => {
     const ids: string[] = [];
-    const tools = workspaceTools((ctx) => { ids.push(ctx.sessionId); return { exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }), readFile: async () => "", writeFile: async () => {} }; });
+    const tools = workspaceTools((ctx) => { ids.push(ctx.sessionId); return { exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }), readFile: async () => "", writeFile: async () => {}, ...noPublish }; });
     await tools[0]!.run({ command: "ls", sessionId: "slack:EVIL:1" }, { sessionId: "slack:C1:1.1" } as never);
     expect(ids).toEqual(["slack:C1:1.1"]);
   });
@@ -310,6 +316,7 @@ describe("workspace tools", () => {
       async exec() { throw new Error("no sandbox runner is connected"); },
       async readFile(path) { throw new Error(`no such file: ${path}`); },
       async writeFile() { throw new Error("sandbox PUT /file: 503 busy"); },
+      ...noPublish,
     };
     const [exec, read, write] = workspaceTools(() => down);
     expect(await exec!.run({ command: "ls" }, {} as never)).toEqual({ error: "no sandbox runner is connected" });
@@ -404,6 +411,21 @@ describe("remoteSandbox client", () => {
     expect(JSON.parse(reqs[0]!.body!)).toEqual({ command: "ls", cwd: "/w", timeoutMs: 5 });
     expect(reqs[1]!.url).toBe("https://fb.example/v1/sandboxes/slack_C1_1.1/file?path=%2Fw%2Fa.ts");
     expect(reqs[2]).toMatchObject({ method: "PUT", body: "x" });
+  });
+
+  test("stage and push are POSTs with the request as JSON; any non-2xx is the daemon's reason", async () => {
+    const reqs: { url: string; body: unknown }[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      reqs.push({ url, body: JSON.parse(init.body as string) });
+      if (url.endsWith("/stage")) return Response.json({ sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: "", authors: [], files: [], patch: "", patchTruncated: false });
+      return Response.json({ error: "a".repeat(40) + " wasn't staged here; stage it first" }, { status: 404 });
+    }) as typeof fetch;
+    const sb = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f });
+    expect((await sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", token: "r" })).commits).toBe(1);
+    await expect(sb.push({ repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "w" })).rejects.toThrow("push: 404 " + "a".repeat(40) + " wasn't staged here");
+    expect(reqs.map((r) => r.url)).toEqual(["https://fb.example/v1/sandboxes/s1/stage", "https://fb.example/v1/sandboxes/s1/push"]);
+    expect(reqs[0]!.body).toEqual({ owner: "acme", name: "widgets", base: "main", token: "r" });
+    expect(reqs[1]!.body).toEqual({ owner: "acme", name: "widgets", sha: "a".repeat(40), branch: "scout/x", token: "w" });
   });
 
   test("a daemon error surfaces with its status", async () => {

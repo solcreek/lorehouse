@@ -12,7 +12,7 @@
 // jobs the runner says it never got (they never ran, so a retry is safe).
 
 import type { Database } from "bun:sqlite";
-import { EXEC_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox } from "../tools/workspace";
+import { EXEC_TIMEOUT_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
 
 // `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
 // `received` (long poll only): ids from the last poll answer the runner got, so jobs whose
@@ -24,7 +24,9 @@ export type RunnerStatus = { runner: string; capacity: number; running: number; 
 
 type JobBody =
   | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string }
-  | { op: "destroy" };
+  | { op: "destroy" }
+  // Publishing (sandbox/host/src/publish.rs): the request as JSON, answered with JSON.
+  | { op: "stage" | "push"; bodyBase64: string };
 // `deadlineMs`: set as a job goes out, how long Lorehouse will still wait for it.
 export type Job = JobBody & { id: string; sandbox: string; timeoutMs: number; deadlineMs?: number };
 export type JobResult = { id: string; status: number; contentType?: string; bodyBase64?: string; error?: string };
@@ -301,6 +303,13 @@ export class RunnerHub {
       }
       return r;
     };
+    // A publish op: the request (tokens included, so never logged) as JSON; the host's
+    // answer as JSON, or its reason as the error.
+    const publish = async (op: "stage" | "push", request: object, timeoutMs: number): Promise<unknown> => {
+      const r = await this.submit(id, { op, bodyBase64: Buffer.from(JSON.stringify(request)).toString("base64") }, timeoutMs);
+      if (r.status < 200 || r.status > 299) throw new Error(`${op}: ${r.status} ${r.error ?? decode(r)}`);
+      return JSON.parse(decode(r));
+    };
     return {
       async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
         // One timeout for both: the guest's limit, and (plus boot slack) this call's deadline.
@@ -315,6 +324,14 @@ export class RunnerHub {
       },
       async writeFile(path: string, content: string): Promise<void> {
         await guest("PUT", `/file?path=${encodeURIComponent(path)}`, content, 30_000);
+      },
+      async stage(o): Promise<Staged> {
+        const body = { owner: o.repo.owner, name: o.repo.name, base: o.base, token: o.token };
+        return publish("stage", body, STAGE_TIMEOUT_MS) as Promise<Staged>;
+      },
+      async push(o) {
+        const body = { owner: o.repo.owner, name: o.repo.name, sha: o.sha, branch: o.branch, token: o.token };
+        return publish("push", body, PUSH_TIMEOUT_MS) as Promise<{ sha: string; branch: string }>;
       },
     };
   }
