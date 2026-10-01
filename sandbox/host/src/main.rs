@@ -8,6 +8,8 @@
 //!   PUT    /v1/sandboxes/{id}/file?path=…                         → 204
 //!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone)
 //!   GET    /v1/sandboxes                                          → what exists, running or not
+//!   POST   /v1/sandboxes/{id}/stage  {owner, name, base, token?} → the commits to publish, verified
+//!   POST   /v1/sandboxes/{id}/push   {owner, name, sha, branch, token} → pushed (see publish.rs)
 //!   GET    /healthz                                               → ok (no auth)
 //!
 //! Every /v1 request needs `Authorization: Bearer <SANDBOXD_TOKEN>`. Requests for a
@@ -15,6 +17,7 @@
 
 mod config;
 mod net;
+mod publish;
 mod runner;
 mod vm;
 mod vsock;
@@ -42,6 +45,7 @@ use vm::Manager;
 #[derive(Clone)]
 struct App {
     vms: Arc<Manager>,
+    publisher: Arc<publish::Publisher>,
     token_digest: [u8; 32],
 }
 
@@ -120,6 +124,20 @@ async fn destroy(State(app): State<App>, Path(id): Path<String>) -> Response {
     }
 }
 
+async fn stage(State(app): State<App>, Path(id): Path<String>, Json(req): Json<publish::StageRequest>) -> Response {
+    match app.publisher.stage(&app.vms, &id, req).await {
+        Ok(staged) => Json(staged).into_response(),
+        Err((status, msg)) => error(status, msg),
+    }
+}
+
+async fn push(State(app): State<App>, Json(req): Json<publish::PushRequest>) -> Response {
+    match app.publisher.push(req).await {
+        Ok(pushed) => Json(pushed).into_response(),
+        Err((status, msg)) => error(status, msg),
+    }
+}
+
 async fn list(State(app): State<App>) -> Response {
     Json(app.vms.list().await).into_response()
 }
@@ -148,6 +166,8 @@ async fn main() {
     }
 
     let vms = Manager::new(cfg.clone());
+    // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
+    let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()));
 
     let reaper = vms.clone();
     tokio::spawn(async move {
@@ -177,7 +197,7 @@ async fn main() {
     match &cfg.mode {
         config::Mode::Runner { app_url, token, name, transport } => {
             eprintln!("sandboxd: runner {name} for {app_url} ({transport:?}; up to {} VMs, idle stop after {} s)", cfg.max_vms, cfg.idle.as_secs());
-            let runner = runner::Runner::new(vms.clone(), app_url.clone(), token.clone(), name.clone(), *transport, cfg.state_dir.join(".runner-jobs"));
+            let runner = runner::Runner::new(vms.clone(), publisher.clone(), app_url.clone(), token.clone(), name.clone(), *transport, cfg.state_dir.join(".runner-jobs"));
             tokio::select! {
                 _ = runner.run() => {}
                 _ = shutdown => {}
@@ -189,12 +209,14 @@ async fn main() {
             }
         }
         config::Mode::Serve { listen, token } => {
-            let app = App { vms: vms.clone(), token_digest: digest(token) };
+            let app = App { vms: vms.clone(), publisher: publisher.clone(), token_digest: digest(token) };
             let v1 = Router::new()
                 .route("/v1/sandboxes", get(list))
                 .route("/v1/sandboxes/{id}", axum::routing::delete(destroy))
                 .route("/v1/sandboxes/{id}/exec", post(exec))
                 .route("/v1/sandboxes/{id}/file", get(read_file).put(write_file))
+                .route("/v1/sandboxes/{id}/stage", post(stage))
+                .route("/v1/sandboxes/{id}/push", post(push))
                 .layer(middleware::from_fn_with_state(app.clone(), auth));
             let router = Router::new()
                 .route("/healthz", get(|| async { "ok" }))

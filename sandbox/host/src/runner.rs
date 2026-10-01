@@ -11,6 +11,7 @@
 //! below holds both, across connections and (on disk) across restarts.
 
 use crate::config::Transport;
+use crate::publish::{self, Publisher};
 use crate::vm::{self, Manager};
 use crate::vsock;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -113,7 +114,7 @@ fn allowed(method: &str, path: &str) -> Option<Method> {
     }
 }
 
-async fn execute(vms: &Manager, job: Job, arrived: Instant) -> JobResult {
+async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instant) -> JobResult {
     if !vm::valid_id(&job.sandbox) {
         return JobResult::error(&job.id, 400, "bad sandbox id");
     }
@@ -152,6 +153,36 @@ async fn execute(vms: &Manager, job: Job, arrived: Instant) -> JobResult {
                 },
                 Ok(Err(e)) => JobResult::error(&job.id, 502, e),
                 Err(_) => JobResult::error(&job.id, 504, format!("stopped: the guest didn't answer within {} s (the job's deadline)", budget.as_secs())),
+            }
+        }
+        // Publishing (publish.rs): the body is the request as JSON; the answer, JSON. Bounded
+        // by the job's deadline at Lorehouse, like a guest call.
+        "stage" | "push" => {
+            let Some(body) = job.body_base64.as_deref().and_then(|b| B64.decode(b).ok()) else {
+                return JobResult::error(&job.id, 400, "bodyBase64: the request as base64 JSON");
+            };
+            let budget = guest_budget(job.app_deadline(), arrived.elapsed());
+            let work = async {
+                let answer = if job.op == "stage" {
+                    match serde_json::from_slice::<publish::StageRequest>(&body) {
+                        Ok(req) => publisher.stage(vms, &job.sandbox, req).await.map(|s| serde_json::to_vec(&s)),
+                        Err(e) => Err((400, format!("stage request: {e}"))),
+                    }
+                } else {
+                    match serde_json::from_slice::<publish::PushRequest>(&body) {
+                        Ok(req) => publisher.push(req).await.map(|p| serde_json::to_vec(&p)),
+                        Err(e) => Err((400, format!("push request: {e}"))),
+                    }
+                };
+                match answer {
+                    Ok(Ok(json)) => JobResult { id: job.id.clone(), status: 200, content_type: Some("application/json".into()), body_base64: Some(B64.encode(json)), error: None },
+                    Ok(Err(e)) => JobResult::error(&job.id, 500, e.to_string()),
+                    Err((status, msg)) => JobResult::error(&job.id, status, msg),
+                }
+            };
+            match tokio::time::timeout(budget, work).await {
+                Ok(r) => r,
+                Err(_) => JobResult::error(&job.id, 504, format!("{} didn't finish within the job's deadline ({} s)", job.op, budget.as_secs())),
             }
         }
         other => JobResult::error(&job.id, 400, format!("unknown op {other:?}")),
@@ -344,6 +375,7 @@ impl Ledger {
 
 pub struct Runner {
     vms: Arc<Manager>,
+    publisher: Arc<Publisher>,
     app_url: String,
     token: String,
     name: String,
@@ -367,11 +399,11 @@ enum WsEnd {
 
 impl Runner {
     /// `jobs_dir`: where the ledger is kept, across restarts.
-    pub fn new(vms: Arc<Manager>, app_url: String, token: String, name: String, transport: Transport, jobs_dir: PathBuf) -> Arc<Runner> {
+    pub fn new(vms: Arc<Manager>, publisher: Arc<Publisher>, app_url: String, token: String, name: String, transport: Transport, jobs_dir: PathBuf) -> Arc<Runner> {
         let started = unix_ms();
         let process = format!("{started:x}-{:x}", std::process::id());
         let ledger = Mutex::new(Ledger::open(jobs_dir, Instant::now()));
-        Arc::new(Runner { vms, app_url, token, name, transport, ledger, finished: Notify::new(), sessions: AtomicU64::new(0), process, started })
+        Arc::new(Runner { vms, publisher, app_url, token, name, transport, ledger, finished: Notify::new(), sessions: AtomicU64::new(0), process, started })
     }
 
     fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
@@ -392,7 +424,7 @@ impl Runner {
         }
         let me = self.clone();
         tokio::spawn(async move {
-            let result = execute(&me.vms, job, arrived).await;
+            let result = execute(&me.vms, &me.publisher, job, arrived).await;
             if let Some(path) = path {
                 let r = result.clone();
                 let _ = tokio::task::spawn_blocking(move || Ledger::record_result(&path, &r, keep)).await;
