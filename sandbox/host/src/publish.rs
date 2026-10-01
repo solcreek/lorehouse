@@ -325,6 +325,9 @@ async fn bundle_from(vms: &Manager, sandbox: &str, to: &Path) -> Result<(), Fail
         if r.stderr.contains("empty bundle") {
             return Err((409, "no commits to publish: HEAD has nothing that isn't on GitHub already (commit first?)".into()));
         }
+        if r.exit_code == 3 {
+            return Err((413, tail(r.stderr.as_bytes())));
+        }
         return Err((422, format!("bundling in the sandbox failed: {}", tail(r.stderr.as_bytes()))));
     }
     // The parts, in order, named exactly as split names them.
