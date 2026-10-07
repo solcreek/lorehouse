@@ -19,13 +19,13 @@ Preconditions:
 - `doctor` exits 0 for this run.
 - No message in this run already says `kangaroo deploy freeze`. The fixture history does not.
 
-- **Post the reminder.** Run `bun .cursor/skills/verify-lorehouse/control.ts post --text "Reminder: the kangaroo deploy freeze starts Friday at noon" --evidence live-knowledge/post.json`. `ok` is true. Keep `ts`.
-- **Let ingest catch up.** Run `bun .cursor/skills/verify-lorehouse/control.ts settle --ms 1000 --evidence live-knowledge/settled.json`. `status.knowledge.state` is `ready`.
-- **Ask.** Run `bun .cursor/skills/verify-lorehouse/control.ts ask --text "when does the kangaroo deploy freeze start" --evidence live-knowledge/ask.json`. `reply.cite` is `slack:C1:` plus the posted `ts`.
-- **Delete it.** Run `bun .cursor/skills/verify-lorehouse/control.ts delete --ts <ts> --evidence live-knowledge/delete.json`. `ok` is true.
-- **Let the deletion catch up.** Run `bun .cursor/skills/verify-lorehouse/control.ts settle --ms 1000 --evidence live-knowledge/deleted-settled.json`. `status.knowledge.state` is `ready`.
-- **Ask again.** Run `bun .cursor/skills/verify-lorehouse/control.ts ask --text "when does the kangaroo deploy freeze start" --evidence live-knowledge/ask-after.json`. `reply.cite` is not `slack:C1:` plus that `ts`.
-- **Confirm it is gone.** Run `bun .cursor/skills/verify-lorehouse/control.ts admin --path /api/v1/documents/slack:C1:<ts> --evidence live-knowledge/gone.json`. `status` is 404.
+- **Post the reminder.** Run `bun .claude/skills/verify-lorehouse/control.ts post --text "Reminder: the kangaroo deploy freeze starts Friday at noon" --evidence live-knowledge/post.json`. `ok` is true. Keep `ts`.
+- **Let ingest catch up.** Run `bun .claude/skills/verify-lorehouse/control.ts settle --ms 1000 --evidence live-knowledge/settled.json`. `status.knowledge.state` is `ready`.
+- **Ask.** Run `bun .claude/skills/verify-lorehouse/control.ts ask --text "when does the kangaroo deploy freeze start" --evidence live-knowledge/ask.json`. `reply.cite` is `slack:C1:` plus the posted `ts`.
+- **Delete it.** Run `bun .claude/skills/verify-lorehouse/control.ts delete --ts <ts> --evidence live-knowledge/delete.json`. `ok` is true.
+- **Let the deletion catch up.** Run `bun .claude/skills/verify-lorehouse/control.ts settle --ms 1000 --evidence live-knowledge/deleted-settled.json`. `status.knowledge.state` is `ready`.
+- **Ask again.** Run `bun .claude/skills/verify-lorehouse/control.ts ask --text "when does the kangaroo deploy freeze start" --evidence live-knowledge/ask-after.json`. `reply.cite` is not `slack:C1:` plus that `ts`.
+- **Confirm it is gone.** Run `bun .claude/skills/verify-lorehouse/control.ts admin --path /api/v1/documents/slack:C1:<ts> --evidence live-knowledge/gone.json`. `status` is 404.
 
 ## Gotchas
 
