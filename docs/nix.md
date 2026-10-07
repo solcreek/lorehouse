@@ -6,6 +6,10 @@ doesn't replace `bun install` / `bun run build` or the [`Dockerfile`](../Dockerf
 those keep working. It's there so that a new machine, a new contributor or a new host
 gets the same toolchain in one command.
 
+It covers Linux (x86_64 and arm64) and Apple Silicon Macs. Intel Macs aren't covered:
+nixpkgs dropped `x86_64-darwin` in 26.11, so there is no toolchain to pin there. On an
+Intel Mac, use `bun` and the Dockerfile as before, or a Linux machine.
+
 ## Develop
 
 ```bash
@@ -28,9 +32,9 @@ Then the usual `bun install`, `bun run test`, `bun run conformance` and so on.
 The image matches the Dockerfile's: the binary, TLS roots, `PORT=3000`, and the SQLite
 files under `/data`. It adds a busybox shell for `fly ssh console` and the like.
 
-On macOS, `.#image` needs a Linux builder (for example Determinate Nix's native Linux
-builder, or a remote builder). CI builds it on every change, runs it, and waits for
-`/healthz`.
+On a Mac, `.#image` needs a Linux builder (for example Determinate Nix's native Linux
+builder, or a remote builder). CI builds it on every change (on x86_64; arm64 Linux is
+not checked in CI yet), runs it, and waits for `/healthz`.
 
 The Nix-built binary links against the Nix store, so it runs where Nix (or the image)
 is. The portable binaries `install.sh` downloads still come from `release.yml`.
