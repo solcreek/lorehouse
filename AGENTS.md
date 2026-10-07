@@ -79,8 +79,9 @@ and the OAuth install).
 `src/runners/`, over WebSocket or long poll; `docs/sandbox-runners.md`) or
 `SANDBOX_URL`/`SANDBOX_TOKEN` (direct, `src/sandbox-client.ts`). `sandbox/host` is the
 Rust `sandboxd` (one Firecracker microVM per thread); `sandbox/guest` is the Go in-VM
-agent over vsock. GitHub access is via a GitHub App (`src/github-auth.ts`), with write
-access only after an Approve in the thread.
+agent over vsock. GitHub access (`src/github-auth.ts`) is a GitHub App, with a
+short-lived token per repo and write access only after an Approve in the thread; or, for
+development only, one long-lived `GITHUB_TOKEN`. `src/config.ts` rejects both together.
 
 `website/` is a separate June app (the landing page) with its own `package.json`; see
 `website/README.md`.
