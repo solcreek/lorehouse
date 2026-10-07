@@ -166,9 +166,18 @@ let
         "LOREHOUSE_DB=/data/lorehouse.db"
         "SESSIONS_DB=/data/sessions.db"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        # So `lorehouse doctor` and the shell resolve in `fly ssh console` and the like.
+        "PATH=/bin"
       ];
       ExposedPorts."3000/tcp" = { };
       Volumes."/data" = { };
+      # The source label links the package on ghcr.io to this repository.
+      Labels = {
+        "org.opencontainers.image.source" = "https://github.com/solcreek/lorehouse";
+        "org.opencontainers.image.description" = lorehouse.meta.description;
+        "org.opencontainers.image.licenses" = "MIT";
+        "org.opencontainers.image.revision" = self.rev or "dirty";
+      };
     };
   };
 
