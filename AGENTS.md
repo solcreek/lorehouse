@@ -46,9 +46,10 @@ that wires June (agent definition, Slack channel, routes for `/slack/events`, `/
 `/api/v1` admin, sandbox runners). Tools, policy, prompts and the knowledge store must not
 import June session internals.
 
-**Embedded assets.** `prompts/*.md`, `migrations/*.sql` and `slack/manifest.yaml` are
-imported as text/YAML (`with { type: "text" }`) so `bun build --compile` embeds them; the
-binary conformance run proves it. Consequences:
+**Embedded assets.** `prompts/*.md` and `migrations/*.sql` are imported as text
+(`with { type: "text" }`); `slack/manifest.yaml` is imported with no attribute, and Bun
+parses it into an object (`src/text-imports.d.ts`). Either way `bun build --compile`
+embeds them; the binary conformance run proves it. Consequences:
 - A new migration must be added to the list in `src/migrations.ts`; never edit an applied one.
 - A new tool prompt must be registered in `src/prompts.ts`. Templates use
   `{{placeholder}}`; an unknown placeholder throws.
