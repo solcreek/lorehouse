@@ -45,6 +45,27 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked --release
 
+  # The same contract through the Nix build (flake.nix): the binary, the conformance
+  # suite against it, the sandbox binaries and the container image, then the image
+  # itself has to come up and answer /healthz. On both Linux architectures: each has its
+  # own pinned node_modules hash in nix/packages.nix.
+  nix:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check -L
+      - run: nix build .#image
+      - name: the image answers /healthz
+        run: |
+          docker load < result
+          docker run -d --name lorehouse -p 3000:3000 lorehouse:latest
+          for _ in $(seq 30); do curl -fsS localhost:3000/healthz && exit 0; sleep 1; done
+          docker logs lorehouse; exit 1
+
   # The landing page. Built only: it isn't deployed yet.
   website:
     runs-on: ubuntu-latest

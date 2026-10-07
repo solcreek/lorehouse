@@ -192,8 +192,12 @@ Go or Rust version would have to pass
 | `slack/` | the Slack app manifest |
 | `sandbox/` | the sandbox: the host daemon ([`host/`](sandbox/host/README.md), Rust), the in-VM agent (`guest/`, Go) and the feasibility spike |
 | `docs/` | the live-Slack runbook and its results, decisions (`adr/`) and experiments |
+| `flake.nix`, `nix/` | the pinned toolchain (`nix develop`), the binary and the container image ([Nix](docs/nix.md)) |
 
 ## Check it
+
+With [Nix](docs/nix.md), `nix develop` gives the toolchain, and `nix flake check` runs
+the contract against the binary Nix builds.
 
 ```bash
 bun run typecheck && bun run test
