@@ -68,15 +68,39 @@ done
 
 ## Hosts
 
-The image is the unit every container host runs. What each one needs beyond it:
+CI publishes the image to `ghcr.io/solcreek/lorehouse` for x86_64 and arm64:
 
-| host | runs the image | the SQLite files |
+| tag | when |
+|---|---|
+| `:main`, `:sha-<commit>` | every merge to `main` that passes the contract |
+| `:vX.Y.Z`, `:latest` | every release tag |
+
+That image is the unit every container host runs. What each one needs beyond it:
+
+| host | how | the SQLite files |
 |---|---|---|
-| **Fly.io** | yes (`fly deploy --image`, or the Dockerfile as today) | a volume at `/data` ([`fly.toml`](../fly.toml)) |
-| **Render** | yes, from a registry | a persistent disk at `/data` |
-| **Railway** | yes, from a registry | a volume at `/data` |
-| **Cloudflare Containers** | yes, pushed with `wrangler` | ✗ the container's disk doesn't survive a restart, so the SQLite files would be lost. Cloudflare stays on the Workers route in the README |
-| **Linux you run** | yes, or `nix build` / the release binary under systemd | a local directory |
+| **Fly.io** | the Dockerfile, as CI deploys today ([`fly.toml`](../fly.toml)); `fly deploy --image ghcr.io/solcreek/lorehouse:latest` runs the published one | a volume at `/data` |
+| **Render** | the [`render.yaml`](../render.yaml) Blueprint: a web service from the image, on a paid instance type | a disk at `/data`, in the Blueprint |
+| **Railway** | the CLI, below | a volume at `/data` |
+| **Cloudflare Containers** | ✗ | the container's disk doesn't survive a restart, so the SQLite files would be lost. Cloudflare stays on the Workers route in the README |
+| **Linux you run** | the release binary under systemd (`install.sh`), or the image | a local directory |
 
 Every one of them is a single always-on instance (Lorehouse holds a SQLite file and has
 to answer Slack within 3 s), with the secrets from the README as environment variables.
+Render and Railway set `PORT` themselves; Lorehouse listens on it.
+
+### Railway
+
+```bash
+railway init --name lorehouse
+railway add --service lorehouse --image ghcr.io/solcreek/lorehouse:latest \
+  --variables "SLACK_SIGNING_SECRET=…" --variables "SLACK_BOT_TOKEN=…" \
+  --variables "ANTHROPIC_API_KEY=…" --variables "AGENT_CHANNELS=C0123456" \
+  --variables "STATUS_TOKEN=$(openssl rand -hex 32)"
+railway service link lorehouse
+railway volume add --mount-path /data
+railway domain                  # the public URL to give Slack
+```
+
+In the service's settings, set the healthcheck path to `/healthz` and keep it at one
+replica.

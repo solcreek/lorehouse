@@ -52,7 +52,8 @@ is enough; no zero-downtime setup is needed. A prototype of the same stack used 
 |---|---|---|
 | **Linux you run**: a server at home, a Hetzner box, any VPS | works today | the compiled binary under systemd; HTTPS from Caddy or a Cloudflare Tunnel. CI builds the Linux binary and runs the full conformance suite against it on every change |
 | **Fly.io** | works today | one always-on machine with a volume for the SQLite files ([`fly.toml`](fly.toml), [below](#on-flyio)) |
-| **Render** | planned | a web service with a persistent disk |
+| **Render** | ready, not yet tried | the [`render.yaml`](render.yaml) Blueprint: the published image and a disk ([Nix](docs/nix.md#hosts)) |
+| **Railway** | ready, not yet tried | the published image and a volume, with the CLI ([steps](docs/nix.md#railway)) |
 | **Cloudflare Workers** | exploring | needs June's edge host and Durable Object storage instead of a SQLite file |
 | **Your laptop** | works today | `bun start` behind a quick tunnel, for trying it out ([runbook](docs/live-slack.md)) |
 
