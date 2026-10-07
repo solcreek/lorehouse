@@ -33,8 +33,8 @@ The image matches the Dockerfile's: the binary, TLS roots, `PORT=3000`, and the 
 files under `/data`. It adds a busybox shell for `fly ssh console` and the like.
 
 On a Mac, `.#image` needs a Linux builder (for example Determinate Nix's native Linux
-builder, or a remote builder). CI builds it on every change (on x86_64; arm64 Linux is
-not checked in CI yet), runs it, and waits for `/healthz`.
+builder, or a remote builder). CI builds it on every change, on x86_64 and arm64, runs
+it, and waits for `/healthz`.
 
 The Nix-built binary links against the Nix store, so it runs where Nix (or the image)
 is. The portable binaries `install.sh` downloads still come from `release.yml`.
