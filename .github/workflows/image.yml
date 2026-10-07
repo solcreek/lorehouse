@@ -1,0 +1,66 @@
+name: image
+
+# Publishes the container image (flake.nix, .#image) to ghcr.io/<owner>/<repo>, for
+# x86_64 and arm64 under one multi-arch tag per entry in `tags`. Called by ci.yml (a
+# merge to main) and release.yml (a version tag); never on a pull request.
+#
+# These jobs can write packages, so every action is pinned to a full commit SHA, as in
+# ci.yml's deploy job.
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: space-separated tags to publish, e.g. "main sha-<commit>"
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - run: nix build .#image
+      # One tag per architecture and commit; the manifest job below joins them.
+      - name: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          nix run --inputs-from . nixpkgs#skopeo -- copy \
+            --dest-creds "${GITHUB_ACTOR}:${GH_TOKEN}" \
+            docker-archive:result "docker://${IMAGE}:build-${GITHUB_SHA}-${ARCH}"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: tag both architectures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          set --
+          for t in $TAGS; do set -- "$@" -t "$IMAGE:$t"; done
+          docker buildx imagetools create "$@" \
+            "$IMAGE:build-${GITHUB_SHA}-amd64" "$IMAGE:build-${GITHUB_SHA}-arm64"
+          docker buildx imagetools inspect "$IMAGE:${TAGS%% *}"

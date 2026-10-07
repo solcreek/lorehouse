@@ -79,6 +79,18 @@ jobs:
       - run: bun run typecheck
       - run: bun run build
 
+  # A merge to main that passes the contract publishes the image every container host
+  # runs (Render, Railway, …): ghcr.io/solcreek/lorehouse:main and :sha-<commit>.
+  image:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
+    needs: [check, nix, sandbox-guest, sandbox-host]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      tags: main sha-${{ github.sha }}
+
   # A merge to main that passes the contract goes live; pull requests never deploy.
   # Only this repository deploys (a fork has no FLY_API_TOKEN). flyctl waits for the
   # new machine's /healthz before it reports success.
