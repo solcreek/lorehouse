@@ -65,6 +65,10 @@ jobs:
           docker run -d --name lorehouse -p 3000:3000 lorehouse:latest
           for _ in $(seq 30); do curl -fsS localhost:3000/healthz && exit 0; sleep 1; done
           docker logs lorehouse; exit 1
+      # Fly's SSH server (fly ssh console, and so `lorehouse doctor` there) needs a root
+      # user and a shell, and `lorehouse` on PATH.
+      - name: the image has what fly ssh needs
+        run: docker run --rm lorehouse:latest sh -c 'grep -q "^root:" /etc/passwd && command -v lorehouse'
 
   # The landing page. Built only: it isn't deployed yet.
   website:
@@ -91,12 +95,12 @@ jobs:
     with:
       tags: main sha-${{ github.sha }}
 
-  # A merge to main that passes the contract goes live; pull requests never deploy.
-  # Only this repository deploys (a fork has no FLY_API_TOKEN). flyctl waits for the
-  # new machine's /healthz before it reports success.
+  # A merge to main that passes the contract goes live, as the image just published for
+  # it; pull requests never deploy. Only this repository deploys (a fork has no
+  # FLY_API_TOKEN). flyctl waits for the new machine's /healthz before it reports success.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
-    needs: [check, sandbox-guest, sandbox-host]
+    needs: [image]
     runs-on: ubuntu-latest
     concurrency:
       group: deploy
@@ -106,6 +110,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
-      - run: flyctl deploy --remote-only
+      # A run that finishes after a newer merge must not roll production back to it: deploy
+      # only while this commit is still main's head, as image.yml does for :main. If that
+      # newer merge then fails, production stays where it is until the next one passes.
+      - name: deploy, unless main has moved on
+        run: |
+          head=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" refs/heads/main | cut -f1)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main is at $head now; not deploying $GITHUB_SHA"
+            exit 0
+          fi
+          flyctl deploy --image "ghcr.io/$GITHUB_REPOSITORY:sha-$GITHUB_SHA"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

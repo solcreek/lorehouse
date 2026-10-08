@@ -146,7 +146,8 @@ let
 
   # The container image every host runs. Same contract as the Dockerfile: the binary,
   # TLS roots, port 3000, and everything it keeps under /data (mount a volume there).
-  # A busybox shell is in it for `fly ssh console` and the like.
+  # A busybox shell is in it for `fly ssh console` and the like, and an /etc/passwd with
+  # root: Fly's SSH server refuses every login without one.
   image = pkgs.dockerTools.buildLayeredImage {
     name = "lorehouse";
     tag = "latest";
@@ -154,6 +155,7 @@ let
       lorehouse
       pkgs.cacert
       pkgs.busybox
+      pkgs.dockerTools.fakeNss
     ];
     extraCommands = ''
       mkdir -p data tmp
