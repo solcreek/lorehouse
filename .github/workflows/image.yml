@@ -10,7 +10,10 @@ on:
   workflow_call:
     inputs:
       tags:
-        description: space-separated tags to publish, e.g. "main sha-<commit>"
+        description: >-
+          space-separated tags to publish, e.g. "main sha-<commit>". The two that move,
+          main and latest, are applied only while this commit is main's head and this
+          tag is the newest release, so a late or re-run job never moves them back.
         type: string
         required: true
 
@@ -59,8 +62,20 @@ jobs:
           TAGS: ${{ inputs.tags }}
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          repo="https://github.com/$GITHUB_REPOSITORY"
+          head=$(git ls-remote "$repo" refs/heads/main | cut -f1)
+          # Releases only: vX.Y.Z, not a pre-release like v2.0.0-rc.1.
+          newest=$(git ls-remote --tags --refs "$repo" 'v*' | sed 's|.*refs/tags/||' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
           set --
-          for t in $TAGS; do set -- "$@" -t "$IMAGE:$t"; done
+          for t in $TAGS; do
+            case $t in
+              main) [ "$head" = "$GITHUB_SHA" ] || { echo "main is at $head now; not moving :main"; continue; } ;;
+              latest) [ "$newest" = "$GITHUB_REF_NAME" ] || { echo "$newest is the newest release; not moving :latest"; continue; } ;;
+            esac
+            set -- "$@" -t "$IMAGE:$t"
+            applied=$t
+          done
           docker buildx imagetools create "$@" \
             "$IMAGE:build-${GITHUB_SHA}-amd64" "$IMAGE:build-${GITHUB_SHA}-arm64"
-          docker buildx imagetools inspect "$IMAGE:${TAGS%% *}"
+          docker buildx imagetools inspect "$IMAGE:$applied"
