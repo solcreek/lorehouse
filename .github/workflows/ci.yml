@@ -110,6 +110,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
-      - run: flyctl deploy --image "ghcr.io/solcreek/lorehouse:sha-$GITHUB_SHA"
+      # A run that finishes after a newer merge must not roll production back to it: deploy
+      # only while this commit is still main's head, as image.yml does for :main. If that
+      # newer merge then fails, production stays where it is until the next one passes.
+      - name: deploy, unless main has moved on
+        run: |
+          head=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" refs/heads/main | cut -f1)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main is at $head now; not deploying $GITHUB_SHA"
+            exit 0
+          fi
+          flyctl deploy --image "ghcr.io/solcreek/lorehouse:sha-$GITHUB_SHA"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
