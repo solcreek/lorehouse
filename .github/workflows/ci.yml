@@ -95,12 +95,12 @@ jobs:
     with:
       tags: main sha-${{ github.sha }}
 
-  # A merge to main that passes the contract goes live; pull requests never deploy.
-  # Only this repository deploys (a fork has no FLY_API_TOKEN). flyctl waits for the
-  # new machine's /healthz before it reports success.
+  # A merge to main that passes the contract goes live, as the image just published for
+  # it; pull requests never deploy. Only this repository deploys (a fork has no
+  # FLY_API_TOKEN). flyctl waits for the new machine's /healthz before it reports success.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
-    needs: [check, sandbox-guest, sandbox-host]
+    needs: [image]
     runs-on: ubuntu-latest
     concurrency:
       group: deploy
@@ -110,6 +110,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
-      - run: flyctl deploy --remote-only
+      - run: flyctl deploy --image "ghcr.io/solcreek/lorehouse:sha-$GITHUB_SHA"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

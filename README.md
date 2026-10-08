@@ -72,8 +72,9 @@ behind NAT. The host running Lorehouse itself needs no KVM. See
 
 ### On Fly.io
 
-The [`Dockerfile`](Dockerfile) packs the binary into a 178 MB image. The SQLite files go
-under `/data`. Set `app` in `fly.toml` to your own name, then:
+[`fly.toml`](fly.toml) runs the published image, `ghcr.io/solcreek/lorehouse:latest` (about
+50 MB to pull; [Nix](docs/nix.md#hosts)), so nothing is built. The SQLite files go under
+`/data`. Set `app` in `fly.toml` to your own name, then:
 
 ```bash
 fly apps create <app>
