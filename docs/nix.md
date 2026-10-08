@@ -93,7 +93,7 @@ That image is the unit every container host runs. What each one needs beyond it:
 
 | host | how | the SQLite files |
 |---|---|---|
-| **Fly.io** | [`fly.toml`](../fly.toml) runs `:latest`; CI deploys each merge's `:sha-<commit>` | a volume at `/data` |
+| **Fly.io** | [`fly.toml`](../fly.toml) runs `:main` (`:latest` for your own install); CI deploys each merge's `:sha-<commit>` | a volume at `/data` |
 | **Render** | the [`render.yaml`](../render.yaml) Blueprint: a web service from the image, on a paid instance type | a disk at `/data`, in the Blueprint |
 | **Railway** | the CLI, below | a volume at `/data` |
 | **Cloudflare Containers** | ✗ | the container's disk doesn't survive a restart, so the SQLite files would be lost. Cloudflare stays on the Workers route in the README |

@@ -72,8 +72,9 @@ behind NAT. The host running Lorehouse itself needs no KVM. See
 
 ### On Fly.io
 
-[`fly.toml`](fly.toml) runs the published image, `ghcr.io/solcreek/lorehouse:latest` (about
-50 MB to pull; [Nix](docs/nix.md#hosts)), so nothing is built. The SQLite files go under
+[`fly.toml`](fly.toml) runs the published image, `ghcr.io/solcreek/lorehouse:main` (about
+50 MB to pull; [Nix](docs/nix.md#hosts)), so nothing is built. For your own install,
+`:latest`, the newest release, is the steadier choice. The SQLite files go under
 `/data`. Set `app` in `fly.toml` to your own name, then:
 
 ```bash
@@ -102,7 +103,11 @@ CI deploys every merge to `main` that passes the conformance suite. To do the sa
 
 1. Create a token that can deploy only this app: `fly tokens create deploy -a <app>`.
 2. Store it as the `FLY_API_TOKEN` repository secret.
-3. Change the repository check in [`ci.yml`](.github/workflows/ci.yml).
+3. In [`ci.yml`](.github/workflows/ci.yml), change the repository check on both the
+   `image` and the `deploy` job: deploy runs the image that the `image` job publishes
+   to your repository's `ghcr.io/<owner>/<repo>`.
+4. After the first publish, make that package public
+   ([how](docs/nix.md#hosts)), so Fly can pull it.
 
 The deploy job pins its actions to commit SHAs, because it holds that token.
 
