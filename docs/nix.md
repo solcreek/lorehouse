@@ -72,8 +72,10 @@ CI publishes the image to `ghcr.io/solcreek/lorehouse` for x86_64 and arm64:
 
 | tag | when |
 |---|---|
-| `:main`, `:sha-<commit>` | every merge to `main` that passes the contract |
-| `:vX.Y.Z`, `:latest` | every release tag |
+| `:sha-<commit>` | every merge to `main` that passes the contract |
+| `:main` | the same, if that commit is still `main`'s head when its image is published, so it never moves back to an older commit. A merge that lands meanwhile and then fails leaves `:main` behind until the next one passes |
+| `:vX.Y.Z` | every release tag |
+| `:latest` | the highest `vX.Y.Z`: a backport or a pre-release (`-rc.1`) doesn't move it |
 
 The hosts below pull it without credentials, so the package must be public. A new
 package on ghcr.io can start out private: after the first publish, check from a machine

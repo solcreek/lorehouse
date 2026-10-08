@@ -84,11 +84,6 @@ jobs:
   image:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
     needs: [check, nix, sandbox-guest, sandbox-host]
-    # One publish at a time, in merge order; image.yml also refuses to move :main
-    # unless this commit is still main's head.
-    concurrency:
-      group: image-main
-      cancel-in-progress: false
     permissions:
       contents: read
       packages: write

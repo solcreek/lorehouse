@@ -49,10 +49,6 @@ jobs:
   image:
     if: github.repository == 'solcreek/lorehouse'
     needs: release
-    # One release's image at a time; image.yml moves :latest only for the newest release.
-    concurrency:
-      group: image-release
-      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
