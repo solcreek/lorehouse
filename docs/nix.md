@@ -75,6 +75,18 @@ CI publishes the image to `ghcr.io/solcreek/lorehouse` for x86_64 and arm64:
 | `:main`, `:sha-<commit>` | every merge to `main` that passes the contract |
 | `:vX.Y.Z`, `:latest` | every release tag |
 
+The hosts below pull it without credentials, so the package must be public. A new
+package on ghcr.io can start out private: after the first publish, check from a machine
+that isn't logged in to ghcr.io,
+
+```bash
+docker pull ghcr.io/solcreek/lorehouse:main
+```
+
+and if it is refused, open the package from the repository's **Packages** sidebar →
+**Package settings** → **Change visibility** → Public. A fork that publishes its own
+image does the same for its package.
+
 That image is the unit every container host runs. What each one needs beyond it:
 
 | host | how | the SQLite files |
