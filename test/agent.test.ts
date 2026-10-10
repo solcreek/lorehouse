@@ -254,6 +254,23 @@ describe("open_pull_request — the approval gate", () => {
     expect(fenced.match(/```/g)!.length % 2).toBe(0);
   });
 
+  test("nothing the sandbox or the model wrote can add markup to the card", () => {
+    const staged = {
+      sha: SHA, baseSha: "f".repeat(40), commits: 1, authors: [],
+      stat: " .github/x`y | 1 +\n``````\n<!here> | 1 +\n",
+      files: [".github/a`<@U1>`b"],
+      patch: "+<https://evil.example|click> &lt; ``````\n",
+      patchTruncated: false,
+    };
+    const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix <!channel>\n*Approved by security*", staged });
+    expect(card).not.toMatch(/<[!@#]|<https?:/); // no mention, @channel or link
+    expect(card).toContain("&lt;!channel&gt;");
+    expect(card).toContain("&amp;lt;"); // an entity in the patch is shown as written
+    expect(card.match(/```/g)).toHaveLength(4); // only the two blocks' own fences
+    expect(card).toContain("`.github/aˋ&lt;@U1&gt;ˋb`"); // a path can't close its code span
+    expect(card).toContain("*Fix &lt;!channel&gt; *Approved by security**"); // the title stays on its line
+  });
+
   test("the card flags CODEOWNERS wherever GitHub reads it", () => {
     const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });

@@ -203,21 +203,30 @@ export function parseGithubRemote(url: string): { owner: string; name: string } 
 // CODEOWNERS from .github/, the root, or docs/).
 const SENSITIVE = /^(\.github\/|(docs\/)?CODEOWNERS$)/;
 
+// Text from the sandbox or the model, made inert in Slack mrkdwn: & < > escaped, so it can
+// hold no mention, @channel or link.
+const escapeSlack = (s: string) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+// …and for a code block, every run of backticks broken up so none can close the block.
+const inBlock = (s: string) => escapeSlack(s).replace(/`{3,}/g, (run) => run.split("").join("\u200b"));
+// …and for an inline code span, no backtick to close it.
+const inSpan = (s: string) => escapeSlack(s).replaceAll("`", "\u02cb");
+
 // What the approver sees, all from the host's staging: the stat, any sensitive paths, and as
-// much of the patch as fits. A Slack section caps at 3000 characters.
+// much of the patch as fits. A Slack section caps at 3000 characters. Everything the sandbox
+// or the model wrote (title, stat, paths, patch) is escaped: it can't add markup to the card.
 export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged }): string {
   const { staged } = o;
   const head =
     `*Open a pull request?*\n${o.repo.owner}/${o.repo.name}: \`${o.branch}\` → \`${o.base}\` (${staged.sha.slice(0, 8)}, ` +
-    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${o.title}*\n`;
-  const statLines = staged.stat.trimEnd().split("\n");
+    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${escapeSlack(o.title.replace(/\s+/g, " ").trim())}*\n`;
+  const statLines = inBlock(staged.stat.trimEnd()).split("\n");
   const stat = statLines.length <= 15 ? statLines.join("\n") : [...statLines.slice(0, 12), "…", statLines.at(-1)!].join("\n");
   const sensitive = staged.files.filter((f) => SENSITIVE.test(f));
-  const warn = sensitive.length ? `:warning: Changes ${sensitive.slice(0, 5).map((f) => `\`${f}\``).join(", ")}${sensitive.length > 5 ? " …" : ""}: check these closely.\n` : "";
+  const warn = sensitive.length ? `:warning: Changes ${sensitive.slice(0, 5).map((f) => `\`${inSpan(f)}\``).join(", ")}${sensitive.length > 5 ? " …" : ""}: check these closely.\n` : "";
   const room = 2900 - head.length - stat.length - warn.length - 40;
-  let patch = staged.patch.replaceAll("```", "``​`");
+  let patch = inBlock(staged.patch);
   const cut = patch.length > room || staged.patchTruncated;
-  if (patch.length > room) patch = patch.slice(0, Math.max(0, room));
+  if (patch.length > room) patch = patch.slice(0, Math.max(0, room)).replace(/&[a-z]*$/, "");
   const excerpt = room > 200 ? `\`\`\`${patch.trimEnd()}${cut ? "\n… (truncated)" : ""}\`\`\`` : "";
   return `${head}\`\`\`${stat}\`\`\`\n${warn}${excerpt}`;
 }
