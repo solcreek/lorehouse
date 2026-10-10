@@ -3,7 +3,7 @@ name: write-a-skill
 description: Turn a thread into a draft skill, the steps you should follow next time a request like it comes up
 when-to-use: someone asks you to turn a thread into a skill, to change a skill, to remember how to handle this kind of request, or to 把這串整理成 skill / 記住這個流程
 ---
-Draft a skill a reviewer can merge as it stands: steps you will load before a request it
+Draft a skill a reviewer can merge as it stands: steps you will load before handling a request it
 covers, learned from what people corrected in the thread. It goes live only through a pull
 request.
 
