@@ -44,4 +44,14 @@ describe("skills", () => {
     expect(text).not.toMatch(new RegExp(String.raw`\b${atLeast2}\+? or more topics?\b`, "i"));
     expect(text).toContain("say plainly that the period held few topics");
   });
+
+  test("channel-digest reads \"this week\" as a calendar week, not a `days` window", () => {
+    // "this week" asked on a Monday is one day old; `days: 7` would reach into last week.
+    const text = SKILLS["channel-digest"]!.replace(/\s+/g, " ");
+    const rolling = /counted back from today \(([^)]*)\)/.exec(text)?.[1];
+    const calendar = /For a calendar period \(([^)]*)\)/.exec(text)?.[1];
+    expect(rolling).toBeDefined();
+    expect(rolling).not.toMatch(/this week/i);
+    expect(calendar).toMatch(/this week/i);
+  });
 });
