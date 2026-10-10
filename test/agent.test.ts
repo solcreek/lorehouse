@@ -178,6 +178,7 @@ describe("open_pull_request — the approval gate", () => {
     expect(wrong.result).toMatchObject({ status: "completed" });
     expect(String(wrong.tool?.error)).toContain("1 of 2 commit(s) on HEAD aren't by acme-agent[bot]");
     expect(String(wrong.tool?.error)).toContain("git rebase --exec 'git commit --amend --no-edit --reset-author' origin/main");
+    expect(String(wrong.tool?.error)).toContain("if origin/main isn't in this checkout, fetch it with workspace_clone first");
     expect(wrong.pushed).toBe(false);
     // A committer that isn't the bot counts too.
     expect(String((await outcome([`${bot}|Scout <scout@made-up.example>`])).tool?.error)).toContain("aren't by");

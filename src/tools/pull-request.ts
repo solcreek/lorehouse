@@ -120,7 +120,8 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
           return {
             error:
               `${off} of ${staged.authors.length} commit(s) on HEAD aren't by ${want}. Re-author them, then call open_pull_request again: ` +
-              `workspace_exec \`git rebase --exec 'git commit --amend --no-edit --reset-author' origin/${base}\` (commands already run as ${who.name}).`,
+              `workspace_exec \`git rebase --exec 'git commit --amend --no-edit --reset-author' origin/${base}\` (commands already run as ${who.name}; ` +
+              `if origin/${base} isn't in this checkout, fetch it with workspace_clone first).`,
           };
         }
       }
