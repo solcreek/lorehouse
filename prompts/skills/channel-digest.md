@@ -18,12 +18,15 @@ compare one digest with the next.
    read all of it with `slack_read_thread`. A result's id is `slack:<channelId>:<threadId>`.
    Your own replies and the questions people put to you in that thread are not what people
    discussed: leave them out. If it refuses the channel, work from the excerpt.
-3. Group the threads into 3 to 6 topics by what they are about, not by channel or date. Put
-   each thread under one topic only. Order the topics by how many threads they hold.
+3. Group the threads into topics by what they are about, not by channel or date: as many
+   topics as the threads honestly hold, at most 6. One or two threads may make only one or
+   two topics; never split a thread or invent a topic to reach a number. Put each thread
+   under one topic only. Order the topics by how many threads they hold.
 4. Write the report in the language of the question, in this shape:
 
    - First line: the dates the threads were last active (the oldest and newest `activeAt`)
-     and how many topics follow.
+     and how many topics follow. When there are only one or two, say plainly that
+     the period held few topics, and how many threads.
    - One numbered section per topic. Its title is bold: the topic, then a few words on its
      gist. Under it, one to four sentences: who said or decided what, and what happens next.
      Put each claim's thread link (the result's `source`) right after it, with the link
