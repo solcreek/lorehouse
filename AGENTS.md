@@ -30,6 +30,8 @@ dropped the platform in 26.11. On an Intel Mac, install Bun from Homebrew
 (`brew install bun`) or bun.sh and run the commands above directly. Run them through
 `bun`, never `node`/`npx`: a Mac with both nvm and Homebrew Node can have two Node ABIs
 on the `PATH`, and a run under the wrong one fails in ways that look like regressions.
+(`bun run typecheck` still runs `tsc` under the first `node` on the `PATH`, as its
+shebang asks; `tsc` has no native modules, so either Node gives the same result.)
 
 CI (`.github/workflows/ci.yml`) runs typecheck, tests, conformance on source, build, and
 conformance on the binary; plus the sandbox guest (`go vet/test/build` in
