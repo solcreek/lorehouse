@@ -24,6 +24,13 @@ bun start                            # serve (needs Slack/Anthropic env, see REA
 bun run doctor                       # check Slack/Anthropic/GitHub/sandbox setup; exits 1 on failure
 ```
 
+The Nix flake (`nix develop`, `nix build`; see `docs/nix.md`) covers Linux and Apple
+Silicon only. **Intel Macs (`x86_64-darwin`) are not supported by the flake**: nixpkgs
+dropped the platform in 26.11. On an Intel Mac, install Bun from Homebrew
+(`brew install bun`) or bun.sh and run the commands above directly. Run them through
+`bun`, never `node`/`npx`: a Mac with both nvm and Homebrew Node can have two Node ABIs
+on the `PATH`, and a run under the wrong one fails in ways that look like regressions.
+
 CI (`.github/workflows/ci.yml`) runs typecheck, tests, conformance on source, build, and
 conformance on the binary; plus the sandbox guest (`go vet/test/build` in
 `sandbox/guest`), host (`cargo clippy -D warnings`, `cargo test --locked` in
