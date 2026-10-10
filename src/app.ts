@@ -2,7 +2,7 @@
 // the tools, policy, prompts and knowledge store around it don't depend on it.
 
 import Anthropic from "@anthropic-ai/sdk";
-import { anthropic, type AnthropicClient } from "@junejs/core/agent-models";
+import { anthropic } from "@junejs/core/agent-models";
 import { slackChannel, type SlackNormalizedEvent } from "@junejs/core/channels";
 import { defineAgent, type Channel } from "@junejs/core/agent-config";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
@@ -205,11 +205,8 @@ export async function createApp(config: Config) {
     model: config.anthropic.model,
     maxTokens: 4096,
     // Injected: bundlers can't see June's lazy SDK import, so a compiled binary needs it.
-    // The cast works around a June typing gap: its AnthropicStreamEvent.delta is an
-    // all-optional ("weak") type, and @anthropic-ai/sdk 0.128's message_delta shares none
-    // of its keys, so tsc rejects the real SDK. Runtime behavior is fine. Drop the cast
-    // when junebuild/june#195 ships.
-    client: new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl }) as unknown as AnthropicClient,
+    // No cast: tsc checks the real SDK client against June's AnthropicClient here.
+    client: new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl }),
   });
   const runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions);
   const mounted = mountAgent(agent, runtime);

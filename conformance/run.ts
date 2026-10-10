@@ -4,6 +4,7 @@
 //
 //   bun conformance/run.ts                        # runs `bun src/server.ts`
 //   bun conformance/run.ts --app ./dist/lorehouse # or any executable
+//   bun conformance/run.ts --only usage           # only scenarios named like it (select.ts)
 //
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
@@ -23,13 +24,23 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pollRunner, wsRunner } from "./fake-runner";
+import { parseArgs, selectScenarios, UsageError, type Args } from "./select";
 
 const ROOT = join(import.meta.dir, "..");
 const HERE = import.meta.dir;
-const argv = process.argv.slice(2);
-const appIdx = argv.indexOf("--app");
+// A bad command line exits 2 before anything starts.
+const orExit2 = <T>(f: () => T): T => {
+  try {
+    return f();
+  } catch (e) {
+    if (!(e instanceof UsageError)) throw e;
+    console.error(`conformance: ${e.message}`);
+    process.exit(2);
+  }
+};
+const ARGS: Args = orExit2(() => parseArgs(process.argv.slice(2)));
 // Absolute, because an external app runs with its own directory as cwd (see below).
-const APP_CMD = appIdx >= 0 ? [resolve(argv[appIdx + 1]!)] : ["bun", join(ROOT, "src/server.ts")];
+const APP_CMD = ARGS.app ? [resolve(ARGS.app)] : ["bun", join(ROOT, "src/server.ts")];
 
 const SECRET = "conformance-signing-secret";
 const MOCK_PORT = 18000 + Math.floor(Math.random() * 1000);
@@ -227,7 +238,9 @@ const WOMBAT_THREAD = "slack:C1:1790000001.000100";
 
 // ── scenarios ───────────────────────────────────────────────────────────────
 
-type Scenario = { name: string; run: () => Promise<string | null> }; // null = pass, string = why it failed
+// null = pass, string = why it failed. `needs` names earlier scenarios whose leftovers this
+// one checks; `--only` runs them first, so a scenario run alone is judged as in a full run.
+type Scenario = { name: string; needs?: string[]; run: () => Promise<string | null> };
 
 const scenarios: Scenario[] = [
   {
@@ -483,6 +496,7 @@ const scenarios: Scenario[] = [
   },
   {
     name: "the admin API forgets deleted messages too: not served, listed or found",
+    needs: ["forgets a deleted message: it is no longer cited or counted", "catches up after a restart on changes made while it was down"],
     run: async () => {
       // Deleted above: one live, and one (a pasted password) while the app was down.
       const ids = await allDocumentIds();
@@ -899,6 +913,13 @@ const scenarios: Scenario[] = [
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
+// Chosen before anything starts, so a pattern matching nothing fails at once.
+const { run: selected, prerequisites } = orExit2(() => selectScenarios(scenarios, ARGS.only));
+if (ARGS.only !== undefined) {
+  const extra = prerequisites.size ? `, ${prerequisites.size} of them only because the others need them` : "";
+  console.log(`--only ${JSON.stringify(ARGS.only)}: running ${selected.length} of ${scenarios.length} scenarios${extra}\n`);
+}
+
 const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], {
   env: { ...process.env, PORT: String(MOCK_PORT), TTFT_MS: "50", TOKEN_DELAY_MS: "2", SLACK_FIXTURES: join(HERE, "fixtures/slack-history.json") },
   stdout: "ignore",
@@ -925,7 +946,7 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
   const proc = Bun.spawn(APP_CMD, {
     // An external app runs from its own directory, so a binary that quietly reads files
     // from this repo (prompts, migrations) fails here instead of passing by accident.
-    cwd: appIdx >= 0 ? dirname(APP_CMD[0]!) : ROOT,
+    cwd: ARGS.app ? dirname(APP_CMD[0]!) : ROOT,
     env: {
       ...inherited,
       PORT: String(APP_PORT),
@@ -976,11 +997,11 @@ try {
   if (!(await waitHttp(`${MOCK}/stats`, 5000))) throw new Error("mock never came up");
   await startApp();
 
-  for (const s of scenarios) {
+  for (const s of selected) {
     const t0 = Date.now();
     const why = await s.run().catch((e) => String(e));
     if (why) failed++;
-    console.log(`${why ? "✗" : "✓"} ${s.name} (${Date.now() - t0} ms)${why ? `\n    ${why}` : ""}`);
+    console.log(`${why ? "✗" : "✓"} ${s.name} (${Date.now() - t0} ms)${prerequisites.has(s) ? " [needed]" : ""}${why ? `\n    ${why}` : ""}`);
   }
 } catch (e) {
   failed++;
@@ -990,5 +1011,7 @@ try {
   mock.kill();
   removeDb();
 }
-console.log(failed ? `\n${failed} failed` : `\nall ${scenarios.length} scenarios passed`);
+// A filtered run never reads as a full one.
+const skipped = scenarios.length - selected.length;
+console.log(failed ? `\n${failed} failed` : skipped ? `\n${selected.length} of ${scenarios.length} scenarios passed (${skipped} not run: --only)` : `\nall ${scenarios.length} scenarios passed`);
 process.exit(failed ? 1 : 0);

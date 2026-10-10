@@ -16,6 +16,8 @@
   outputs =
     { self, nixpkgs }:
     let
+      # No x86_64-darwin: nixpkgs dropped it in 26.11. Intel Macs use bun directly;
+      # see docs/nix.md.
       systems = [
         "x86_64-linux"
         "aarch64-linux"

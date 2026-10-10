@@ -6,9 +6,35 @@ doesn't replace `bun install` / `bun run build` or the [`Dockerfile`](../Dockerf
 those keep working. It's there so that a new machine, a new contributor or a new host
 gets the same toolchain in one command.
 
-It covers Linux (x86_64 and arm64) and Apple Silicon Macs. Intel Macs aren't covered:
-nixpkgs dropped `x86_64-darwin` in 26.11, so there is no toolchain to pin there. On an
-Intel Mac, use `bun` and the Dockerfile as before, or a Linux machine.
+It covers Linux (x86_64 and arm64) and Apple Silicon Macs.
+
+### Intel Macs (`x86_64-darwin`) aren't supported
+
+nixpkgs dropped `x86_64-darwin` in 26.11: it no longer builds packages for it or
+supports building them from source (`doc/release-notes/rl-2611.section.md`). The
+`nixos-unstable` this flake pins is past that, so there is no toolchain to pin, and
+`nix develop` / `nix build` on an Intel Mac have no outputs to use. The 26.05 stable
+branch still carries the platform, but only until it goes out of support at the end of
+2026, so it isn't worth pinning a second nixpkgs for.
+
+On an Intel Mac, work without Nix:
+
+- **Bun from Homebrew** (`brew install bun`) or the official installer
+  (`curl -fsSL https://bun.sh/install | bash`). Then `bun install`, `bun run typecheck`,
+  `bun run test`, `bun run conformance`, `bun run build`, as in
+  [`AGENTS.md`](../AGENTS.md). Nothing in the app needs Node: `start`, `test`,
+  `conformance`, `build` and `doctor` run on Bun's own runtime. `typecheck` is `tsc`,
+  whose `#!/usr/bin/env node` shebang `bun run` honors: it runs under the first `node`
+  on the `PATH`, or under Bun when there is none.
+- **Run everything through `bun`, not `node`/`npx`.** A Mac with both nvm and Homebrew
+  Node can have two Node ABIs on the `PATH` (`node` from one, `#!/usr/bin/env node` from
+  the other), and a test run under the wrong one fails with `NODE_MODULE_VERSION`
+  mismatches that look like regressions. The Bun-native scripts sidestep that; `tsc` is
+  plain JavaScript with no native modules, so either Node runs it the same.
+- **The sandbox** (`sandbox/guest`, `sandbox/host`) needs Linux (KVM, vsock) to run on
+  any Mac; work on it on a Linux machine, where the flake applies.
+- **The container image**: the [`Dockerfile`](../Dockerfile), or `nix build .#image` on
+  a Linux machine. CI builds and publishes it either way.
 
 ## Develop
 
