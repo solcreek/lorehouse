@@ -3,8 +3,8 @@
 // Everything else the agent does happens in a throwaway sandbox. Pushing a branch and opening
 // a PR is visible to the whole org, so this tool parks the turn on ctx.requestInput: the
 // Slack channel posts Approve / Deny, the Durable Object can hibernate meanwhile, and the
-// click resumes the turn with the clicker's verified id. Only then does anything leave
-// the sandbox.
+// click resumes the turn with the clicker's verified id. Only then does anything reach
+// GitHub. (Before it, the commits leave the sandbox only for the sandbox host, to be staged.)
 //
 // Publishing goes through the sandbox host, not the sandbox (Sandbox.stage/push, see
 // sandbox/host/src/publish.rs). Before approval, the host stages the commits: it verifies
