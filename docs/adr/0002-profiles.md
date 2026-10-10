@@ -154,13 +154,15 @@ sandbox.
 
 From now on the sandbox id includes the profile. The `lorehouse` profile keeps today's
 sanitized session id, so existing sandboxes still resolve. Every other profile's sandbox id must
-fit `sandboxd`'s rules, including the 128-character limit, and must never equal an id
-another profile can produce.
-Joining profile and session with a separator does not guarantee that, since sanitizing
-already maps `:` to `_`. One form that does: `<profile>-<hash of the session id>`, where
-the hash is fixed-length hex and `<profile>` is never `lorehouse`. With the §1 grammar it
-is at most 32 + 1 + 64 characters, whatever the session id's length. The exact form is
-settled in its implementation, with a test for the collision. Two profiles may work in
+fit `sandboxd`'s rules, including the 128-character limit, and must not resolve to a
+sandbox another profile owns. Joining profile and session with a separator is not enough,
+since sanitizing already maps `:` to `_`. The form is `<profile>-<sha256>`: the full
+64-hex SHA-256 of a domain-separated input (`lorehouse-sandbox`, the profile and the
+session id, each length-prefixed), and `<profile>` is never `lorehouse`. With the §1
+grammar that is at most 32 + 1 + 64 characters, whatever the session id's length. A hash
+makes a collision improbable, not impossible, so it is also detected: the place that
+hands out sandboxes records which profile owns each id and refuses a request from any
+other. Two profiles may work in
 the same thread; each keeps its own session and sandbox.
 
 ### 8. Sessions persist by default
