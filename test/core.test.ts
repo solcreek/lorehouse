@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
 import { countDocuments, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
@@ -197,6 +198,25 @@ describe("config", () => {
   test("SESSIONS_DB never shares LOREHOUSE_DB's file, defaulted or explicit", () => {
     expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/sessions.db" })).toThrow(/SESSIONS_DB \(must be a different file from LOREHOUSE_DB/);
     expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/x.db", SESSIONS_DB: "/data/../data/x.db" })).toThrow(/SESSIONS_DB/);
+  });
+
+  test("SESSIONS_DB never reaches LOREHOUSE_DB's file by another name: a symlink, a hard link, a linked directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lorehouse-config-"));
+    try {
+      const db = join(dir, "lorehouse.db");
+      writeFileSync(db, "");
+      symlinkSync(db, join(dir, "symlink.db"));
+      linkSync(db, join(dir, "hardlink.db"));
+      mkdirSync(join(dir, "real"));
+      symlinkSync(join(dir, "real"), join(dir, "linked"));
+      expect(() => loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "symlink.db") })).toThrow(/SESSIONS_DB \(must be a different file/);
+      expect(() => loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "hardlink.db") })).toThrow(/SESSIONS_DB \(must be a different file/);
+      // Neither file exists yet: the directories they name are the same one.
+      expect(() => loadConfig({ ...base, LOREHOUSE_DB: join(dir, "real", "x.db"), SESSIONS_DB: join(dir, "linked", "x.db") })).toThrow(/SESSIONS_DB \(must be a different file/);
+      expect(loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "linked", "sessions.db") }).db.sessions).toBe(join(dir, "linked", "sessions.db"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("DM_MODE is redirect, ignore or answer; anything else is reported", () => {

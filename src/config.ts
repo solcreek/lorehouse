@@ -45,7 +45,8 @@ export type Config = {
 // identity, owned by the org. Or a plain token (GITHUB_TOKEN), for development.
 export type GithubCredentials = { kind: "app"; appId: string; privateKey: string } | { kind: "token"; token: string };
 
-import { dirname, join, resolve } from "node:path";
+import { realpathSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { normalizePem } from "./github-auth";
 
 // Where the framework's sessions live when SESSIONS_DB is unset: sessions.db beside
@@ -54,6 +55,29 @@ import { normalizePem } from "./github-auth";
 // test): its sessions stay in memory too.
 export function sessionsDbFor(lorehouseDb: string): string {
   return lorehouseDb === ":memory:" ? ":memory:" : join(dirname(lorehouseDb), "sessions.db");
+}
+
+// Whether two paths name one file: equal once normalized, through a symlink (to the file
+// or a directory above it, the file existing or not), or as hard links to one inode.
+function sameFile(a: string, b: string): boolean {
+  const canonical = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      try {
+        return join(realpathSync(dirname(resolve(p))), basename(p));
+      } catch {
+        return resolve(p);
+      }
+    }
+  };
+  if (canonical(a) === canonical(b)) return true;
+  try {
+    const x = statSync(a), y = statSync(b);
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch {
+    return false;
+  }
 }
 
 // Every problem with the environment, one per entry; the message lists them all.
@@ -119,8 +143,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     githubApiUrl: env.GITHUB_API_URL || undefined,
   };
   // One file for both would put June's session tables in Lorehouse's database: say so,
-  // rather than let a LOREHOUSE_DB named sessions.db quietly share it.
-  if (config.db.sessions !== ":memory:" && resolve(config.db.sessions) === resolve(config.db.lorehouse)) missing.push(`SESSIONS_DB (must be a different file from LOREHOUSE_DB, got "${config.db.sessions}" for both)`);
+  // rather than let a LOREHOUSE_DB named sessions.db, or a link to it, quietly share it.
+  if (config.db.sessions !== ":memory:" && sameFile(config.db.sessions, config.db.lorehouse)) missing.push(`SESSIONS_DB (must be a different file from LOREHOUSE_DB, got "${config.db.sessions}" for both)`);
   if (![undefined, "", "0", "1"].includes(env.USAGE_RECORD_PEOPLE)) missing.push(`USAGE_RECORD_PEOPLE (1 to record who asks, or unset; got "${env.USAGE_RECORD_PEOPLE}")`);
   // The admin token reads what people wrote: long, and never the status token, which is
   // the one handed to monitors.
