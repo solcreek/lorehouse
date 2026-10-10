@@ -234,12 +234,12 @@ describe("open_pull_request — the approval gate", () => {
       expect(calls).toHaveLength(0);
     }
     // nor does a default branch the sandbox reports that isn't one
-    const { sb, calls } = fakeRepo();
+    const { sb, published } = fakeRepo();
     const exec = sb.exec.bind(sb);
     sb.exec = async (command, opts) => (command === "git rev-parse --abbrev-ref origin/HEAD" ? { exitCode: 0, stdout: "origin/main;id\n", stderr: "" } : exec(command, opts));
     const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
     expect(await tool.run({ branch: "scout/x", title: "x" }, {} as never)).toMatchObject({ error: expect.stringContaining("isn't a plain branch name") });
-    expect(calls.some((c) => c.command.startsWith("git diff") || c.command.startsWith("git log"))).toBe(false); // stopped before any command uses it
+    expect(published).toEqual([]); // stopped before the host is asked to stage against it
   });
 
   test("isPlainRef: ordinary branch names only", () => {
