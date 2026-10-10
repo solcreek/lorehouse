@@ -8,7 +8,8 @@
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
-// STATUS_TOKEN, ADMIN_TOKEN, and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
+// STATUS_TOKEN, ADMIN_TOKEN, LOREHOUSE_ENV_FILE (a missing file, so no installed settings
+// leak in), and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
 // and GITHUB_API_URL (GitHub's REST API, mocked). SESSIONS_DB is never set: the app
 // keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
@@ -908,7 +909,10 @@ const removeDb = (path = DB) => rmSync(dirname(path), { recursive: true, force: 
 
 let app: ReturnType<typeof Bun.spawn> | undefined;
 // Never this shell's SESSIONS_DB: where sessions go by default is part of the contract.
-const { SESSIONS_DB: _sessions, ...inherited } = process.env;
+// Nor its settings files, which the app reads after the environment and could fill
+// SESSIONS_DB back in: LOREHOUSE_ENV_FILE points at a missing file beside the database
+// (startApp), and LOREHOUSE_SETTINGS is left to its default, also beside the database.
+const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, ...inherited } = process.env;
 
 // Start the app and wait until it listens, owns its port, and (unless waitReady is off,
 // for a start where /status is closed) has finished its Slack backfill/reconcile
@@ -935,6 +939,7 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
       INGEST_DEBOUNCE_MS: "200",
       STATUS_TOKEN,
       ADMIN_TOKEN,
+      LOREHOUSE_ENV_FILE: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "lorehouse.env"),
       ...extraEnv,
     },
     stdout: "ignore",
