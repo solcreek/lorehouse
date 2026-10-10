@@ -126,10 +126,15 @@ These are Lorehouse's position, not settings:
   from public knowledge and without code tools. A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread.
 - People are named as plain text, never @-mentioned.
-- A write token never enters a sandbox (the direction of #31).
 - Answers cite their sources.
 
 A profile can narrow its tools, knowledge and credentials. It cannot widen past these.
+
+One more rule is decided here but **not enforced yet**: a write token never enters a
+sandbox. Today `open_pull_request` still pushes from inside the sandbox with the write
+token in the command's environment (`src/tools/pull-request.ts`). #31 and #32 move the
+push to the sandbox host; the rule holds once they land, and no profile with
+`sandbox: write` ships before then.
 
 ### 7. Sessions and sandboxes are keyed by profile
 
