@@ -16,13 +16,15 @@
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
 // question (or, when the question contains "[recent]", a recent_knowledge tool_use with
-// no input; "[thread]", a slack_read_thread tool_use with no input; "[whois]", a
-// slack_resolve_user tool_use for the first person mentioned; "[pr] <branch>", an
-// open_pull_request tool_use for that branch); turn 2 (tool_result
+// no input; "[thread]", a slack_read_thread tool_use with no input, or "[thread:<channel>]"
+// for a thread in that channel; "[whois]", a slack_resolve_user tool_use for the first
+// person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
+// an open_pull_request tool_use for that branch); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), or for
 // a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
-// or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for
+// or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for a
+// skill, its name and the first words of its body ("[q7] [skill:<name>:<words>] …"), or for
 // "[exec] <command>" (a workspace_exec tool_use), the exit code and output
 // ("[q7] [exec:0:<stdout>] …"), for a pull request, what came of it
 // ("[q7] [pr:opened:<url>] …"), and for a tool that failed, its error text
@@ -156,9 +158,11 @@ function firstUserText(messages: Msg[]): string {
   return m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
 }
 
-// The first search hit in a tool_result.
+// The first search hit in a tool_result: search_knowledge returns the hits, recent_knowledge
+// returns them under `threads`.
 function firstHit(content: unknown): { id?: string; source?: string } {
-  const v = resultValue(content);
+  const r = resultValue(content);
+  const v = r && typeof r === "object" && "threads" in r ? (r as { threads: unknown }).threads : r;
   if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
   return {};
 }
@@ -186,6 +190,8 @@ function answerFor(messages: Msg[], result: Block): string {
   const raw: unknown = resultValue(result.content);
   const failure = typeof raw === "string" && /error/i.test(raw) ? raw : (raw as { error?: unknown } | undefined)?.error;
   if (typeof failure === "string") return `${nonce} [toolerror:${failure.replace(/[\[\]\n]/g, " ").slice(0, 200)}] ${words.join(" ")}`;
+  const skill = value as { name?: string; body?: string } | undefined;
+  if (typeof skill?.body === "string") return `${nonce} [skill:${skill.name}:${skill.body.split(/\s+/).slice(0, 4).join(" ").replace(/[\[\]]/g, " ")}] ${words.join(" ")}`;
   const thread = value?.messages;
   if (thread) {
     const first = thread[0] ?? {};
@@ -225,18 +231,21 @@ async function anthropic(req: Request): Promise<Response> {
   if (!result) {
     const question = firstUserText(body.messages);
     // "[recent]" in the question → an overview question: list recent threads instead of searching
-    // "[thread]" → read the thread the question was asked in
+    // "[thread]" → read the thread the question was asked in; "[thread:<channel>]" → a thread there
     // "[whois]" → look up the first person the question mentions (other than the bot)
     // "[exec] <command>" → run the command in the thread's sandbox (workspace_exec)
+    // "[skill:<name>]" → load that skill (read_skill)
     // "[pr] <branch>" → open a pull request from that branch (open_pull_request)
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
     const prBranch = /\[pr\] (\S+)/.exec(question)?.[1];
     const recent = question.includes("[recent]");
-    const thread = question.includes("[thread]");
+    const threadIn = /\[thread:([A-Z0-9]+)\]/.exec(question)?.[1];
+    const thread = question.includes("[thread]") || threadIn !== undefined;
+    const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : recent || thread ? {} : { query };
+    const input = skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));

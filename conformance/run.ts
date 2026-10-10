@@ -396,6 +396,16 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "loads a skill: read_skill hands the model the skill's own instructions",
+    run: async () => {
+      // Skills are prompts/skills/*.md, embedded like the other prompts; the model asks for
+      // one by name and must get its body, from source and from the compiled binary alike.
+      const { text } = await ask("[skill:channel-digest] what has been discussed lately");
+      const got = text.match(/\[skill:([^\]]*)\]/)?.[1];
+      return got === "channel-digest:Report what the company" ? null : `read_skill gave ${JSON.stringify(got ?? text.slice(0, 120))}`;
+    },
+  },
+  {
     name: "answers an overview question from the most recently active thread",
     run: async () => {
       // "what's been discussed lately?" has no keywords to search for; the answer is the
@@ -448,6 +458,17 @@ const scenarios: Scenario[] = [
       if (s.readChannels.includes("G1")) return "read the private channel's history";
       const a = await ask("echidna merger talks");
       return a.cite?.startsWith("slack:G1") ? `cited ${a.cite}` : null;
+    },
+  },
+  {
+    name: "reads a thread only in a channel it reads: asked for a DM's thread, it reads nothing there",
+    run: async () => {
+      // The model takes channel ids from what it reads, so a planted id must not pull a
+      // DM or an unlisted channel into a public reply.
+      await reset();
+      const a = await ask("[thread:D1] what did they say");
+      if (!a.text.includes("[toolerror:not a channel I read: D1]")) return `the model was told ${JSON.stringify(a.text.slice(0, 120))}`;
+      return (await stats()).readChannels.includes("D1") ? "read the DM's thread" : null;
     },
   },
   {

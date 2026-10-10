@@ -4,7 +4,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { anthropic } from "@junejs/core/agent-models";
 import { slackChannel, type SlackNormalizedEvent } from "@junejs/core/channels";
-import { defineAgent, type Channel } from "@junejs/core/agent-config";
+import { defineAgent, parseSkill, type Channel } from "@junejs/core/agent-config";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import { assertDistinctDatabases, type Config } from "./config";
@@ -14,7 +14,7 @@ import { recentKnowledgeTool } from "./tools/recent-knowledge";
 import { SlackIngester } from "./ingest/slack";
 import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
-import { systemPrompt } from "./prompts";
+import { SKILLS, systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
 import { runnerRoutes } from "./runners/routes";
@@ -38,6 +38,7 @@ const TASK_LABELS: Record<string, string> = {
   search_knowledge: "Searching what the company knows",
   recent_knowledge: "Looking at recent discussions",
   slack_read_thread: "Reading the thread",
+  read_skill: "Reading a skill",
   workspace_clone: "Getting the repo",
   workspace_exec: "Running a command in the sandbox",
   workspace_read_file: "Reading a file",
@@ -199,12 +200,13 @@ export async function createApp(config: Config) {
     intermediateText: "status",
     tasks: (call) => TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`,
     onError: (err) => console.error("slack:", err),
-  }), async (ids) => (await ingester?.names(ids)) ?? new Map());
+  }), async (ids) => (await ingester?.names(ids)) ?? new Map(), (c) => config.agent.channels.has(c));
 
   const agent = defineAgent({
     name: AGENT_ID,
     instructions: systemPrompt(identity),
     tools,
+    skills: Object.entries(SKILLS).map(([name, text]) => parseSkill(name, text)),
     channels: [slack],
   });
 
