@@ -8,7 +8,8 @@
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
-// STATUS_TOKEN, ADMIN_TOKEN, and per scenario DM_MODE. It must answer GET /healthz (open)
+// STATUS_TOKEN, ADMIN_TOKEN, and per scenario DM_MODE. SESSIONS_DB is never set: the app
+// keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
 // 404 when STATUS_TOKEN is unset). The admin API under /api/v1 (docs/admin-api.md) answers
@@ -16,7 +17,7 @@
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pollRunner, wsRunner } from "./fake-runner";
@@ -161,7 +162,7 @@ async function inMode(env: Record<string, string>, run: () => Promise<string | n
 // Run a usage scenario from zero: the app restarted on a database of its own, deleted
 // after, and then restarted on the usual one.
 async function withFreshDb(run: () => Promise<string | null>, env: Record<string, string> = {}): Promise<string | null> {
-  const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+  const db = freshDb();
   try {
     return await inMode({ ...env, LOREHOUSE_DB: db }, run);
   } finally {
@@ -559,7 +560,7 @@ const scenarios: Scenario[] = [
   {
     name: "USAGE_RECORD_PEOPLE=1 records who asks and says so in the channel, once; turned off, it says so and erases them",
     run: async () => {
-      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      const db = freshDb();
       const notices = async () => (await stats()).posts.filter((p) => p.channel === ALLOWED && !p.thread_ts).map((p) => p.text);
       type People = Usage & { people?: number; askers?: { user: string; asks: number }[] };
       const restart = async (env: Record<string, string>) => { await stopApp(); await reset(); await startApp({ LOREHOUSE_DB: db, ...env }); };
@@ -589,7 +590,7 @@ const scenarios: Scenario[] = [
   {
     name: "forgets in usage a question deleted while it was down; one still in Slack stays",
     run: async () => {
-      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      const db = freshDb();
       try {
         await stopApp();
         await startApp({ LOREHOUSE_DB: db });
@@ -830,12 +831,16 @@ const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], {
   stdout: "ignore",
   stderr: "inherit",
 });
-// A file, not :memory:, so the restart scenario comes back to the same knowledge.
-const DB = join(tmpdir(), `lorehouse-conformance-${process.pid}.db`);
-const removeDb = (path = DB) => { for (const s of ["", "-wal", "-shm"]) rmSync(path + s, { force: true }); };
-removeDb();
+// A file, not :memory:, so the restart scenario comes back to the same knowledge. Each
+// database gets a directory of its own: SESSIONS_DB is left unset, so the app keeps its
+// sessions beside it, and no two runs (or two databases in one run) share them.
+const freshDb = () => join(mkdtempSync(join(tmpdir(), "lorehouse-conformance-")), "lorehouse.db");
+const DB = freshDb();
+const removeDb = (path = DB) => rmSync(dirname(path), { recursive: true, force: true });
 
 let app: ReturnType<typeof Bun.spawn> | undefined;
+// Never this shell's SESSIONS_DB: where sessions go by default is part of the contract.
+const { SESSIONS_DB: _sessions, ...inherited } = process.env;
 
 // Start the app and wait until it listens, owns its port, and (unless waitReady is off,
 // for a start where /status is closed) has finished its Slack backfill/reconcile
@@ -846,7 +851,7 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
     // from this repo (prompts, migrations) fails here instead of passing by accident.
     cwd: appIdx >= 0 ? dirname(APP_CMD[0]!) : ROOT,
     env: {
-      ...process.env,
+      ...inherited,
       PORT: String(APP_PORT),
       SLACK_SIGNING_SECRET: SECRET,
       SLACK_BOT_TOKEN: "xoxb-conformance",
