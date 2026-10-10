@@ -22,12 +22,15 @@ On an Intel Mac, work without Nix:
 - **Bun from Homebrew** (`brew install bun`) or the official installer
   (`curl -fsSL https://bun.sh/install | bash`). Then `bun install`, `bun run typecheck`,
   `bun run test`, `bun run conformance`, `bun run build`, as in
-  [`AGENTS.md`](../AGENTS.md). All of these run on Bun; nothing in the app needs Node.
+  [`AGENTS.md`](../AGENTS.md). Nothing in the app needs Node: `start`, `test`,
+  `conformance`, `build` and `doctor` run on Bun's own runtime. `typecheck` is `tsc`,
+  whose `#!/usr/bin/env node` shebang `bun run` honors: it runs under the first `node`
+  on the `PATH`, or under Bun when there is none.
 - **Run everything through `bun`, not `node`/`npx`.** A Mac with both nvm and Homebrew
   Node can have two Node ABIs on the `PATH` (`node` from one, `#!/usr/bin/env node` from
   the other), and a test run under the wrong one fails with `NODE_MODULE_VERSION`
-  mismatches that look like regressions. `bun run …` uses Bun's own runtime and
-  sidesteps that.
+  mismatches that look like regressions. The Bun-native scripts sidestep that; `tsc` is
+  plain JavaScript with no native modules, so either Node runs it the same.
 - **The sandbox** (`sandbox/guest`, `sandbox/host`) needs Linux (KVM, vsock) to run on
   any Mac; work on it on a Linux machine, where the flake applies.
 - **The container image**: the [`Dockerfile`](../Dockerfile), or `nix build .#image` on
