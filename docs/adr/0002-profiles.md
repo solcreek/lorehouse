@@ -132,11 +132,20 @@ A profile can narrow its tools, knowledge and credentials. It cannot widen past 
 ### 7. Sessions and sandboxes are keyed by profile
 
 A session already belongs to one agent (`runtime.session(agent, id)`). The sandbox id is
-derived from the session id alone today (`sandboxId` in `src/app.ts`), so two profiles
-working on the same thread would share a sandbox. From now on a sandbox id is
-`<profile>:<session>`. The `lorehouse` profile keeps the bare session id, so existing
-sandboxes still resolve. Two profiles may work in the same thread; each keeps its own
-session and sandbox.
+derived from the session id alone today: `sandboxId` in `src/app.ts` replaces every
+character outside `[\w.-]` with `_`, because `sandboxd` accepts only
+`[A-Za-z0-9_.-]`, 1–128 characters, not starting with `.` (`valid_id` in
+`sandbox/host/src/vm.rs`). Two profiles working on the same thread would share a
+sandbox.
+
+From now on the sandbox id includes the profile. The `lorehouse` profile keeps today's
+sanitized session id, so existing sandboxes still resolve. Every other profile's id must
+fit `sandboxd`'s character set and must never equal an id another profile can produce.
+Joining profile and session with a separator does not guarantee that, since sanitizing
+already maps `:` to `_`. One form that does: `<profile>-<hash of the session id>`, where
+the hash is fixed-length hex and `<profile>` is never `lorehouse`; the exact form is
+settled in its implementation, with a test for the collision. Two profiles may work in
+the same thread; each keeps its own session and sandbox.
 
 ### 8. Sessions persist by default
 
