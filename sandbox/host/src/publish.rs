@@ -261,7 +261,9 @@ impl Publisher {
         let dir = self.mirror(&req.owner, &req.name);
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
-        // Only what a stage produced (what an approval was about) goes out.
+        // Only what a stage produced (what an approval was about) goes out, and only while
+        // it is fresh: an expired stage is dropped here, not just at the next stage.
+        self.prune_stale(&dir).await;
         let staged = git(&dir, &["for-each-ref", "--format=%(objectname)", "refs/stage/"], None, GIT_LOCAL).await.unwrap_or_default();
         if !staged.lines().any(|l| l == req.sha) {
             return Err((404, format!("{} wasn't staged here; stage it first", req.sha)));
@@ -387,6 +389,11 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// A stage id made now, as stage() makes them (an id's leading number is its age).
+    fn fresh(tag: &str) -> String {
+        format!("{}-{tag}", unix_secs())
+    }
+
     fn scratch(name: &str) -> Scratch {
         let root = std::env::temp_dir().join(format!("publish-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -418,7 +425,7 @@ mod tests {
     async fn stage_describes_the_commits_and_push_sends_exactly_the_staged_one() {
         let s = scratch("happy");
         let head = sh(&s.vm, "echo hello > POC.md && git add POC.md && git commit -qm poc && git rev-parse HEAD");
-        let staged = s.stage("1-a").await.unwrap();
+        let staged = s.stage(&fresh("a")).await.unwrap();
         assert_eq!(staged.sha, head);
         assert_eq!(staged.commits, 1);
         assert_eq!(staged.files, vec!["POC.md"]);
@@ -440,15 +447,16 @@ mod tests {
         sh(&s.vm, &format!("git bundle create -q {} --all --not --remotes=origin", bundle.display()));
         let dir = s.publisher.mirror("acme", "widgets");
         s.publisher.refresh(&dir, "acme", "widgets", None).await.unwrap();
-        s.publisher.stage_bundle(&dir, &bundle, "main", "1-b").await.unwrap();
-        assert_eq!(s.refs(), vec!["refs/heads/main", "refs/stage/1-b"]);
+        let id = fresh("b");
+        s.publisher.stage_bundle(&dir, &bundle, "main", &id).await.unwrap();
+        assert_eq!(s.refs(), vec!["refs/heads/main".to_string(), format!("refs/stage/{id}")]);
     }
 
     #[tokio::test]
     async fn a_tree_entry_named_dot_git_is_refused() {
         let s = scratch("dotgit");
         sh(&s.vm, "b=$(echo x | git hash-object -w --stdin) && t=$(printf '100644 blob %s\\t.git\\n' $b | git mktree) && c=$(git commit-tree $t -p HEAD -m dotgit) && git update-ref HEAD $c");
-        let err = s.stage("1-c").await.unwrap_err();
+        let err = s.stage(&fresh("c")).await.unwrap_err();
         assert_eq!(err.0, 422);
         assert!(err.1.contains("hasDotgit"), "{}", err.1);
         assert_eq!(s.refs(), vec!["refs/heads/main"]);
@@ -463,7 +471,7 @@ mod tests {
         sh(&s.vm, &format!("git bundle create -q {} HEAD ^origin/main~1", bundle.display()));
         let dir = s.publisher.mirror("acme", "widgets");
         s.publisher.refresh(&dir, "acme", "widgets", None).await.unwrap();
-        let err = s.publisher.stage_bundle(&dir, &bundle, "main", "1-d").await.unwrap_err();
+        let err = s.publisher.stage_bundle(&dir, &bundle, "main", &fresh("d")).await.unwrap_err();
         assert_eq!(err.0, 409);
         assert!(s.refs().iter().all(|r| !r.starts_with("refs/stage/")));
     }
@@ -478,13 +486,24 @@ mod tests {
         assert_eq!(s.publisher.push(s.push(&main, "scout/x")).await.unwrap_err().0, 404);
         // Stage and push one commit, then a diverged one to the same branch: refused, not forced.
         let first = sh(&s.vm, "echo 1 > one && git add one && git commit -qm one && git rev-parse HEAD");
-        s.stage("1-e").await.unwrap();
+        s.stage(&fresh("e")).await.unwrap();
         s.publisher.push(s.push(&first, "scout/x")).await.unwrap();
         let other = sh(&s.vm, "git reset -q --hard origin/main && echo 2 > two && git add two && git commit -qm two && git rev-parse HEAD");
-        s.stage("1-f").await.unwrap();
+        s.stage(&fresh("f")).await.unwrap();
         let err = s.publisher.push(s.push(&other, "scout/x")).await.unwrap_err();
         assert_eq!(err.0, 409, "{}", err.1);
         assert_eq!(sh(&s.root, "git -C acme/widgets.git rev-parse scout/x"), first);
+    }
+
+    #[tokio::test]
+    async fn a_stage_past_its_ttl_is_not_pushed_even_with_no_stage_since() {
+        let s = scratch("ttl");
+        let head = sh(&s.vm, "echo old > old && git add old && git commit -qm old && git rev-parse HEAD");
+        let old = format!("{}-old", unix_secs() - STAGE_TTL.as_secs() - 60);
+        s.stage(&old).await.unwrap();
+        let err = s.publisher.push(s.push(&head, "scout/old")).await.unwrap_err();
+        assert_eq!(err.0, 404, "{}", err.1);
+        assert!(s.refs().iter().all(|r| !r.starts_with("refs/stage/")), "the expired stage is dropped");
     }
 
     #[test]
