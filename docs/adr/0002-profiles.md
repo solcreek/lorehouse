@@ -115,7 +115,8 @@ conformance suite.
 
 Gaps found on the way are filed against June rather than worked around for good. Known
 now: `accept` is synchronous, so it can't look up whether a channel is private
-(`src/policy.ts`); the `AnthropicClient` typing gap (junebuild/june#195).
+(`src/policy.ts`). The `AnthropicClient` cast in `src/app.ts` is a dev.49 workaround for
+junebuild/june#195, already fixed in June; it goes with the upgrade (#38).
 
 ### 6. Rules no profile can change
 
