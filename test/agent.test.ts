@@ -271,6 +271,19 @@ describe("open_pull_request — the approval gate", () => {
     expect(card).toContain("*Fix &lt;!channel&gt; *Approved by security**"); // the title stays on its line
   });
 
+  test("the card fits Slack's 3000 characters whatever the title, branch, stat and paths", () => {
+    const long = (n: number) => "a".repeat(n);
+    const staged = {
+      sha: SHA, baseSha: "f".repeat(40), commits: 2, authors: [], patch: "+x\n".repeat(5000), patchTruncated: true,
+      stat: Array.from({ length: 30 }, (_, i) => ` ${long(500)}${i} | 1 +`).join("\n") + "\n",
+      files: Array.from({ length: 10 }, (_, i) => `.github/${long(500)}${i}`),
+    };
+    const card = approvalCard({ repo: { owner: long(39), name: long(100) }, branch: `scout/${long(194)}`, base: long(200), title: "<".repeat(5000), staged });
+    expect(card.length).toBeLessThanOrEqual(3000);
+    expect(card.match(/```/g)!.length % 2).toBe(0);
+    expect(card).toContain(":warning: Changes");
+  });
+
   test("the card flags CODEOWNERS wherever GitHub reads it", () => {
     const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });

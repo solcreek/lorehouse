@@ -211,18 +211,23 @@ const inBlock = (s: string) => escapeSlack(s).replace(/`{3,}/g, (run) => run.spl
 // …and for an inline code span, no backtick to close it.
 const inSpan = (s: string) => escapeSlack(s).replaceAll("`", "\u02cb");
 
+// At most n characters, never ending inside an escape.
+const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1).replace(/&[a-z]*$/, "")}…`);
+
 // What the approver sees, all from the host's staging: the stat, any sensitive paths, and as
-// much of the patch as fits. A Slack section caps at 3000 characters. Everything the sandbox
-// or the model wrote (title, stat, paths, patch) is escaped: it can't add markup to the card.
+// much of the patch as fits. A Slack section caps at 3000 characters: the title, each stat
+// line and each path are clipped so the rest always fits, and the patch gets what is left.
+// Everything the sandbox or the model wrote (title, stat, paths, patch) is escaped: it can't
+// add markup to the card.
 export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged }): string {
   const { staged } = o;
   const head =
     `*Open a pull request?*\n${o.repo.owner}/${o.repo.name}: \`${o.branch}\` → \`${o.base}\` (${staged.sha.slice(0, 8)}, ` +
-    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${escapeSlack(o.title.replace(/\s+/g, " ").trim())}*\n`;
-  const statLines = inBlock(staged.stat.trimEnd()).split("\n");
+    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${clip(escapeSlack(o.title.replace(/\s+/g, " ").trim()), 150)}*\n`;
+  const statLines = inBlock(staged.stat.trimEnd()).split("\n").map((l) => clip(l, 100));
   const stat = statLines.length <= 15 ? statLines.join("\n") : [...statLines.slice(0, 12), "…", statLines.at(-1)!].join("\n");
   const sensitive = staged.files.filter((f) => SENSITIVE.test(f));
-  const warn = sensitive.length ? `:warning: Changes ${sensitive.slice(0, 5).map((f) => `\`${inSpan(f)}\``).join(", ")}${sensitive.length > 5 ? " …" : ""}: check these closely.\n` : "";
+  const warn = sensitive.length ? `:warning: Changes ${sensitive.slice(0, 5).map((f) => `\`${clip(inSpan(f), 100)}\``).join(", ")}${sensitive.length > 5 ? " …" : ""}: check these closely.\n` : "";
   const room = 2900 - head.length - stat.length - warn.length - 40;
   let patch = inBlock(staged.patch);
   const cut = patch.length > room || staged.patchTruncated;
