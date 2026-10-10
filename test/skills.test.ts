@@ -32,4 +32,16 @@ describe("skills", () => {
     expect(await readSkill.run({ name: "channel-digest" }, {} as never)).toEqual({ name: "channel-digest", body });
     expect(buildSystemPrompt(agent)).toContain("channel-digest: Summarize what has been discussed lately across the channels you read");
   });
+
+  test("channel-digest sets no minimum number of topics, and says when there are few", () => {
+    // One or two matching threads can't honestly make three topics; a minimum forces the
+    // model to invent or split one. Whitespace is collapsed so a wrapped line can't hide it.
+    const text = SKILLS["channel-digest"]!.replace(/\s+/g, " ");
+    const atLeast2 = String.raw`(?:[2-9]|\d{2,}|two|three|four|five|six)`;
+    const n = String.raw`(?:\d+|one|two|three|four|five|six)`;
+    expect(text).not.toMatch(new RegExp(String.raw`\b(?:at least|a minimum of|no fewer than|minimum) ${atLeast2} topics?\b`, "i"));
+    expect(text).not.toMatch(new RegExp(String.raw`\b${atLeast2} ?(?:to|-|–) ?${n} topics?\b`, "i"));
+    expect(text).not.toMatch(new RegExp(String.raw`\b${atLeast2}\+? or more topics?\b`, "i"));
+    expect(text).toContain("say plainly that the period held few topics");
+  });
 });

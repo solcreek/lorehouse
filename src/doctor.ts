@@ -24,6 +24,8 @@ import manifest from "../slack/manifest.yaml";
 import { ConfigError, loadConfig, type Config } from "./config";
 import { appJwt } from "./github-auth";
 import { agentIdentity, type AgentIdentity } from "./identity";
+import { loadEnv, readSettings } from "./settings";
+import { configToken, slackCall, urlMismatch, type ManagedManifest } from "./setup";
 
 export type Level = "ok" | "warn" | "fail" | "info";
 export type Check = { section: string; name: string; level: Level; detail: string };
@@ -34,12 +36,14 @@ export type DoctorOptions = {
   fetch?: typeof fetch;
   githubApiUrl?: string; // default https://api.github.com
   timeoutMs?: number; // per request, default 10 s
+  settingsPath?: string; // settings.json: with a managed Slack app, Slack's side can be read too
 };
 
 const USAGE = `usage: lorehouse doctor [--url https://<your app>]
 
-Checks the environment lorehouse would start with: configuration, Slack, the model,
-GitHub and the sandbox. With --url, also checks the running deployment.`;
+Checks the settings lorehouse would start with (the environment, /etc/lorehouse/lorehouse.env,
+and what \`lorehouse setup\` stored): configuration, Slack, the model, GitHub and the sandbox.
+It also checks the running deployment, at --url or wherever the app last said it was reachable.`;
 
 // The bot scopes the app is installed with: slack/manifest.yaml is the one list.
 export const MANIFEST_SCOPES: string[] = (manifest as { oauth_config: { scopes: { bot: string[] } } }).oauth_config.scopes.bot;
@@ -71,7 +75,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   } catch (e) {
     const problems = e instanceof ConfigError ? e.problems : [String(e instanceof Error ? e.message : e)];
     for (const p of problems) add("configuration", "environment", "fail", p);
-    add("configuration", "environment", "info", "the other checks need a valid configuration; fix the above first");
+    add("configuration", "environment", "info", "the other checks need a valid configuration: run `sudo lorehouse setup`, or set these in /etc/lorehouse/lorehouse.env");
     return checks;
   }
   add("configuration", "environment", "ok", `every required setting is present; agent @${identity.name}, code tools ${config.sandbox ? `on (${config.sandbox.mode})` : "off"}`);
@@ -271,8 +275,20 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   if (answered === challenge) add("deployment", "/slack/events", "ok", "answers Slack's URL check with this SLACK_SIGNING_SECRET");
   else if (verify.res?.status === 401) add("deployment", "/slack/events", "fail", "the running app has a different SLACK_SIGNING_SECRET than this environment");
   else add("deployment", "/slack/events", "fail", verify.res ? `answered ${verify.res.status} to Slack's URL check` : String(verify.error));
-  // Slack's side can't be read with a bot token: only the app's settings page shows it.
-  add("deployment", "Slack app settings", "info", `Event Subscriptions${sandbox ? " and Interactivity" : ""} must point at ${url}/slack/events` + (sandbox ? " (without Interactivity, Approve and Deny do nothing)" : ""));
+  // Slack's side can't be read with a bot token. With the app's configuration token (a
+  // managed app, from `lorehouse setup`), it can: compare where Slack sends events.
+  const managed = opts.settingsPath ? readSettings(opts.settingsPath).slack : undefined;
+  if (managed?.appId && managed.configRefreshToken) {
+    try {
+      const token = await configToken(opts.settingsPath!);
+      const m = (await slackCall("apps.manifest.export", token, { app_id: managed.appId })).manifest as ManagedManifest;
+      const wrong = urlMismatch(m, url);
+      if (!wrong) add("deployment", "Slack Request URL", "ok", `Slack sends events and interactivity to ${url}/slack/events`);
+      else add("deployment", "Slack Request URL", "fail", `${wrong}, not ${url}/slack/events: restart lorehouse to repoint it, or check LOREHOUSE_PUBLIC_URL`);
+    } catch (e) {
+      add("deployment", "Slack Request URL", "warn", `couldn't read the Slack app's settings: ${(e as Error).message}`);
+    }
+  } else add("deployment", "Slack app settings", "info", `Event Subscriptions${sandbox ? " and Interactivity" : ""} must point at ${url}/slack/events` + (sandbox ? " (without Interactivity, Approve and Deny do nothing)" : ""));
 
   // The admin API (docs/admin-api.md): its cheapest endpoint, only to see who it lets in.
   if (config.adminToken) {
@@ -351,7 +367,8 @@ export async function doctorMain(args: string[]): Promise<number> {
     } else return console.error(`lorehouse doctor: unknown argument "${a}"\n\n${USAGE}`), 2;
   }
   if (url && !URL.canParse(url)) return console.error(`lorehouse doctor: "${url}" isn't a URL`), 2;
-  const checks = await doctor({ url });
+  const loaded = loadEnv();
+  const checks = await doctor({ env: loaded.env, settingsPath: loaded.settingsPath, url: url ?? loaded.settings.runtime?.publicUrl });
   console.log(report(checks));
   return checks.some((c) => c.level === "fail") ? 1 : 0;
 }

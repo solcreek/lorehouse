@@ -14,3 +14,10 @@ dist/
 
 # Rust build output (sandbox/host)
 target/
+
+# Proof from .claude/skills/verify-lorehouse. Cleanup leaves these in place.
+.claude/skills/verify-lorehouse/artifacts/
+
+# nix build output
+/result
+/result-*
