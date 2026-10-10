@@ -265,7 +265,16 @@ impl Publisher {
         git(dir, &["fetch", "-q", "--no-tags", &bundle, &format!("HEAD:{staged_ref}")], None, GIT_LOCAL)
             .await
             .map_err(|e| (422, format!("the sandbox's commits were refused: {e}")))?;
-        let sha = git(dir, &["rev-parse", "--verify", &format!("{staged_ref}^{{commit}}")], None, GIT_LOCAL).await.map_err(|e| (422, e))?.trim().to_string();
+        let sha = match git(dir, &["rev-parse", "--verify", &format!("{staged_ref}^{{commit}}")], None, GIT_LOCAL).await {
+            Ok(sha) => sha.trim().to_string(),
+            Err(e) => {
+                let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
+                return Err((422, format!("the sandbox's HEAD isn't a commit: {e}")));
+            }
+        };
+        // The ref names the commit itself, not a tag that peels to it: push looks it up by
+        // the commit id this stage reports.
+        git(dir, &["update-ref", &staged_ref, &sha], None, GIT_LOCAL).await.map_err(|e| (500, e))?;
         let base_ref = format!("refs/heads/{base}");
         let Ok(base_sha) = git(dir, &["rev-parse", "--verify", "-q", &format!("{base_ref}^{{commit}}")], None, GIT_LOCAL).await else {
             let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
@@ -580,6 +589,43 @@ mod tests {
         sh(&s.vm, "git reset -q --hard origin/main && seq 1 200000 > big && git add big && git commit -qm big");
         let staged = s.stage(&fresh("h")).await.unwrap();
         assert!(staged.patch_truncated && staged.patch.len() <= MAX_PATCH && staged.patch.contains("+1\n"));
+    }
+
+    /// Rename a ref in a bundle's header to HEAD, as a forged bundle could.
+    fn advertise_as_head(bundle: &Path, name: &str) {
+        let bytes = std::fs::read(bundle).unwrap();
+        let from = format!("{name}\n").into_bytes();
+        let at = bytes.windows(from.len()).position(|w| w == from.as_slice()).expect("ref in the header");
+        let mut out = bytes[..at].to_vec();
+        out.extend_from_slice(b"HEAD\n");
+        out.extend_from_slice(&bytes[at + from.len()..]);
+        std::fs::write(bundle, out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_head_that_is_a_tag_stages_its_commit_and_a_non_commit_leaves_nothing() {
+        let s = scratch("tag");
+        let dir = s.publisher.mirror("acme", "widgets");
+        s.publisher.refresh(&dir, "acme", "widgets", None).await.unwrap();
+        // A bundle whose HEAD is an annotated tag that peels to a new commit.
+        let head = sh(&s.vm, "echo t > t && git add t && git commit -qm t && git tag -a t1 -m t1 && git rev-parse HEAD");
+        let bundle = s.root.join("tag.bundle");
+        let b = bundle.display();
+        sh(&s.vm, &format!("git bundle create -q {b} refs/tags/t1 --not --remotes=origin"));
+        advertise_as_head(&bundle, "refs/tags/t1");
+        let id = fresh("i");
+        let staged = s.publisher.stage_bundle(&dir, &bundle, "main", &id).await.unwrap();
+        assert_eq!(staged.sha, head);
+        assert_eq!(sh(&dir, &format!("git rev-parse refs/stage/{id}")), head, "the stage ref is the commit, not the tag");
+        s.publisher.push(s.push(&head, "scout/tag")).await.unwrap();
+        // A HEAD that peels to a blob: refused, and no stage ref left behind.
+        let blob = s.root.join("blob.bundle");
+        let b = blob.display();
+        sh(&s.vm, &format!("x=$(echo x | git hash-object -w --stdin) && git tag -a tb -m tb $x && git bundle create -q {b} refs/tags/tb"));
+        advertise_as_head(&blob, "refs/tags/tb");
+        let err = s.publisher.stage_bundle(&dir, &blob, "main", &fresh("j")).await.unwrap_err();
+        assert_eq!(err.0, 422, "{}", err.1);
+        assert!(s.refs().iter().all(|r| !r.starts_with("refs/stage/")), "{:?}", s.refs());
     }
 
     #[test]
