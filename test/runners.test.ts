@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { openKnowledge } from "../src/knowledge";
 import { RunnerHub, type Job, type JobResult } from "../src/runners/hub";
-import { EXEC_TIMEOUT_MS } from "../src/tools/workspace";
+import { EXEC_TIMEOUT_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS } from "../src/tools/workspace";
 
 const status = (runner: string, capacity = 4, running = 0) => ({ runner, capacity, running });
 const b64 = (s: string) => Buffer.from(s).toString("base64");
@@ -43,6 +43,23 @@ describe("over WebSocket", () => {
     now += 10_000;
     const [job] = await hub.poll(status("p1", 4, 0));
     expect(job!.deadlineMs).toBe(80_000);
+  });
+
+  test("stage and push are jobs carrying the request as JSON; the host's answer comes back, or its reason", async () => {
+    const hub = hubWith();
+    const { sent, link } = wsRunner(hub, "r1");
+    const sb = hub.sandbox("s1");
+    const staged = sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", token: "ghs_read" });
+    expect(sent[0]).toMatchObject({ op: "stage", sandbox: "s1", timeoutMs: STAGE_TIMEOUT_MS });
+    expect(JSON.parse(Buffer.from(sent[0]!.op === "stage" ? sent[0]!.bodyBase64 : "", "base64").toString())).toEqual({ owner: "acme", name: "widgets", base: "main", token: "ghs_read" });
+    const facts = { sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: " x | 1 +", authors: ["bot <b@x>|bot <b@x>"], files: ["x"], patch: "+x", patchTruncated: false };
+    link.result(ok(sent[0]!, facts));
+    expect(await staged).toEqual(facts);
+
+    const pushed = sb.push({ repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "ghs_write" });
+    expect(sent[1]).toMatchObject({ op: "push", timeoutMs: PUSH_TIMEOUT_MS });
+    link.result({ id: sent[1]!.id, status: 409, error: "push to scout/x: [rejected] (non-fast-forward)" });
+    await expect(pushed).rejects.toThrow("push: 409 push to scout/x: [rejected] (non-fast-forward)");
   });
 
   test("with no timeout given, the guest and the call's deadline get the same default", async () => {

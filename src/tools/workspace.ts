@@ -11,7 +11,7 @@
 
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { toolDescription } from "../prompts";
-import type { GitIdentity } from "../github-auth";
+import type { GitIdentity, RepoRef } from "../github-auth";
 
 export type ExecResult = { exitCode: number; stdout: string; stderr: string };
 
@@ -32,7 +32,21 @@ export interface Sandbox {
   exec(command: string, opts?: ExecOptions): Promise<ExecResult>;
   readFile(path: string): Promise<string>;
   writeFile(path: string, content: string): Promise<void>;
+  // Publishing, done by the sandbox host so a write token never enters the sandbox
+  // (sandbox/host/src/publish.rs). stage: verify the commits the checkout has that GitHub
+  // doesn't, and describe them against `base`. push: push a staged commit to one branch.
+  // Both throw with the host's reason (no commits, the base isn't on GitHub, refused…).
+  stage(o: { repo: RepoRef; base: string; token?: string }): Promise<Staged>;
+  push(o: { repo: RepoRef; sha: string; branch: string; token: string }): Promise<{ sha: string; branch: string }>;
 }
+
+// What a stage found, all computed on the host from the verified commits. `authors`:
+// "author <email>|committer <email>", one per commit.
+export type Staged = { sha: string; baseSha: string; commits: number; stat: string; authors: string[]; files: string[]; patch: string; patchTruncated: boolean };
+
+// How long publishing may take: a first mirror of a big repo is a full clone.
+export const STAGE_TIMEOUT_MS = 10 * 60_000;
+export const PUSH_TIMEOUT_MS = 5 * 60_000;
 
 // Resolves the sandbox for the turn's session. Keyed off ctx.sessionId, never off model
 // input — the model cannot steer a tool into another thread's checkout.
