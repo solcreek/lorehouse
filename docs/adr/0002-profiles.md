@@ -100,7 +100,8 @@ when the trigger fires, not chosen by the model.
   requests (#25).
 - **An install's own skills**: files in a directory the install names (`SKILLS_DIR`),
   read at start. They go through whatever review that directory has: for a git checkout,
-  its pull requests. Lorehouse never loads a skill from a Slack message. `write-a-skill`
+  its pull requests. A name defined both here and among the built-ins fails startup;
+  neither source shadows the other. Lorehouse never loads a skill from a Slack message. `write-a-skill`
   (#26) drafts one; a person, or the agent behind an Approve, commits it.
 - **Per profile**: a profile lists the skills it gets. A skill it doesn't list is not in
   its index and `read_skill` refuses it.
