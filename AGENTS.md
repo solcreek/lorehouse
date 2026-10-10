@@ -18,6 +18,8 @@ bun run test                         # bun test test/
 bun test test/core.test.ts           # one file
 bun test test/core.test.ts -t "migrations apply"   # one test by name
 bun run conformance                  # black-box contract against `bun src/server.ts`
+bun run conformance --only usage     # scenarios whose name contains "usage" (any case)
+bun run conformance --only '/^GET /' # or whose name a /regex/ matches (any case)
 bun run build                        # → dist/lorehouse (single compiled binary)
 bun run conformance --app ./dist/lorehouse          # the same contract against the binary
 bun start                            # serve (needs Slack/Anthropic env, see README)
@@ -28,7 +30,11 @@ CI (`.github/workflows/ci.yml`) runs typecheck, tests, conformance on source, bu
 conformance on the binary; plus the sandbox guest (`go vet/test/build` in
 `sandbox/guest`), host (`cargo clippy -D warnings`, `cargo test --locked` in
 `sandbox/host`) and the website build. A merge to `main` deploys to Fly.io.
-`conformance/run.ts` has no scenario filter; it runs everything.
+CI always runs every conformance scenario. Locally, `--only <pattern>` (combinable with
+`--app`) runs the matching ones in their usual order, plus any earlier scenario a match
+lists in `needs` (marked `[needed]`). A pattern matching nothing, or a bad argument, exits
+2 before anything starts. A new scenario that checks what an earlier one left behind must
+name it in `needs`, or it will fail when run alone.
 
 ## Architecture
 
