@@ -196,6 +196,10 @@ let
       ];
     };
     cargoLock.lockFile = ../sandbox/host/Cargo.lock;
+    # publish.rs runs git: its tests need it, and so does the daemon at run time.
+    nativeCheckInputs = [ pkgs.git ];
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postFixup = "wrapProgram $out/bin/sandboxd --prefix PATH : ${lib.makeBinPath [ pkgs.git ]}";
     meta.platforms = lib.platforms.linux;
     meta.mainProgram = "sandboxd";
   };
