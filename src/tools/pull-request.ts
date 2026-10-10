@@ -201,8 +201,9 @@ export function parseGithubRemote(url: string): { owner: string; name: string } 
 }
 
 // Paths a reviewer should look at twice: what runs in CI, and who owns what (GitHub reads
-// CODEOWNERS from .github/, the root, or docs/).
-const SENSITIVE = /^(\.github\/|(docs\/)?CODEOWNERS$)/;
+// CODEOWNERS from .github/, the root, or docs/). git quotes a path with unusual characters
+// (".github/\303\251.yml" with the quotes), so a leading quote is allowed.
+const SENSITIVE = /^"?(\.github\/|(docs\/)?CODEOWNERS$)/;
 
 // Text from the sandbox or the model, escaped for Slack mrkdwn: & < >, so it can hold no
 // mention, @channel or link. (Formatting such as *bold* in a title still renders.)

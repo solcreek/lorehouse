@@ -285,6 +285,12 @@ describe("open_pull_request — the approval gate", () => {
     expect(card).toContain(":warning: Changes");
   });
 
+  test("the card flags a .github/ path that git quoted", () => {
+    const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: ['".github/workflows/\\303\\251.yml"'], patch: "", patchTruncated: false };
+    const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
+    expect(card).toContain(":warning: Changes");
+  });
+
   test("the card flags CODEOWNERS wherever GitHub reads it", () => {
     const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
