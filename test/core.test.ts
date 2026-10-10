@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../src/config";
+import { assertDistinctDatabases, loadConfig } from "../src/config";
 import { countDocuments, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 import { render, systemPrompt, toolDescription } from "../src/prompts";
@@ -198,6 +198,30 @@ describe("config", () => {
   test("SESSIONS_DB never shares LOREHOUSE_DB's file, defaulted or explicit", () => {
     expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/sessions.db" })).toThrow(/SESSIONS_DB \(must be a different file from LOREHOUSE_DB/);
     expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/x.db", SESSIONS_DB: "/data/../data/x.db" })).toThrow(/SESSIONS_DB/);
+  });
+
+  test("SESSIONS_DB and LOREHOUSE_DB are compared as files once both exist, where paths can't tell", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lorehouse-identity-"));
+    try {
+      const db = join(dir, "lorehouse.db");
+      // A link to a LOREHOUSE_DB not created yet: its path check can't see it…
+      symlinkSync(db, join(dir, "dangling.db"));
+      expect(loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "dangling.db") }).db.sessions).toBe(join(dir, "dangling.db"));
+      // …once the knowledge store has created it, the identity check does.
+      writeFileSync(db, "");
+      expect(() => assertDistinctDatabases(db, join(dir, "dangling.db"))).toThrow(/SESSIONS_DB \(must be a different file from LOREHOUSE_DB; .* are one file\)/);
+      // Two different files pass, and a SESSIONS_DB not created yet is created empty.
+      expect(() => assertDistinctDatabases(db, join(dir, "sessions.db"))).not.toThrow();
+      expect(existsSync(join(dir, "sessions.db"))).toBe(true);
+      expect(() => assertDistinctDatabases(db, ":memory:")).not.toThrow();
+      expect(() => assertDistinctDatabases(":memory:", join(dir, "other.db"))).not.toThrow();
+      // On a case-insensitive filesystem (macOS by default) a differently cased name is the same file.
+      if (existsSync(join(dir, "LOREHOUSE.DB"))) {
+        expect(() => assertDistinctDatabases(db, join(dir, "LOREHOUSE.DB"))).toThrow(/are one file/);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("SESSIONS_DB never reaches LOREHOUSE_DB's file by another name: a symlink, a hard link, a linked directory", () => {

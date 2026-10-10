@@ -45,7 +45,7 @@ export type Config = {
 // identity, owned by the org. Or a plain token (GITHUB_TOKEN), for development.
 export type GithubCredentials = { kind: "app"; appId: string; privateKey: string } | { kind: "token"; token: string };
 
-import { realpathSync, statSync } from "node:fs";
+import { closeSync, openSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { normalizePem } from "./github-auth";
 
@@ -59,7 +59,9 @@ export function sessionsDbFor(lorehouseDb: string): string {
 
 // Whether two paths name one file: equal once normalized, through a symlinked directory
 // above it (the file existing or not), through a symlink to the file once the file exists,
-// or as hard links to one inode. A link to a file not yet created isn't seen.
+// or as hard links to one inode. A link to a file not yet created isn't seen, nor a name
+// that differs only in case on a case-insensitive filesystem: assertDistinctDatabases
+// catches those at startup. This check is here to fail early with a clear message.
 function sameFile(a: string, b: string): boolean {
   const canonical = (p: string): string => {
     try {
@@ -78,6 +80,20 @@ function sameFile(a: string, b: string): boolean {
     return x.dev === y.dev && x.ino === y.ino;
   } catch {
     return false;
+  }
+}
+
+// Whether the two databases are one file, checked by identity once both exist. sameFile
+// above works on paths, before either file exists, and so can't see every way two paths
+// meet (a link to a file not yet created, a case-insensitive filesystem): this is the
+// check that holds. Creates an empty SESSIONS_DB file if needed, which the session store
+// would create a moment later anyway.
+export function assertDistinctDatabases(lorehouseDb: string, sessionsDb: string): void {
+  if (lorehouseDb === ":memory:" || sessionsDb === ":memory:") return;
+  closeSync(openSync(sessionsDb, "a"));
+  const a = statSync(lorehouseDb), b = statSync(sessionsDb);
+  if (a.dev === b.dev && a.ino === b.ino) {
+    throw new ConfigError([`SESSIONS_DB (must be a different file from LOREHOUSE_DB; "${sessionsDb}" and "${lorehouseDb}" are one file)`]);
   }
 }
 
