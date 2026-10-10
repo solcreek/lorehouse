@@ -4,8 +4,11 @@
 //   /slack/api/<method>        Slack Web API (JSON, form or query params). Records every call.
 //                              Serves conversations.history/replies from its fixtures.
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
+//   /github/…                  GitHub's REST API, as much as open_pull_request uses: the
+//                              token's user, and listing and opening pull requests.
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
 //   GET  /stats                recorded Slack calls, model call count, channels read, posts
+//                              (with their blocks), message updates, GitHub requests
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
@@ -13,14 +16,18 @@
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
 // question (or, when the question contains "[recent]", a recent_knowledge tool_use with
-// no input; "[thread]", a slack_read_thread tool_use with no input; "[whois]", a
-// slack_resolve_user tool_use for the first person mentioned); turn 2 (tool_result
+// no input; "[thread]", a slack_read_thread tool_use with no input, or "[thread:<channel>]"
+// for a thread in that channel; "[whois]", a slack_resolve_user tool_use for the first
+// person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
+// an open_pull_request tool_use for that branch); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), or for
 // a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
-// or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for
+// or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for a
+// skill, its name and the first words of its body ("[q7] [skill:<name>:<words>] …"), or for
 // "[exec] <command>" (a workspace_exec tool_use), the exit code and output
-// ("[q7] [exec:0:<stdout>] …"), and for a tool that failed, its error text
+// ("[q7] [exec:0:<stdout>] …"), for a pull request, what came of it
+// ("[q7] [pr:opened:<url>] …"), and for a tool that failed, its error text
 // ("[q7] [toolerror:<text>] …"), so the harness can check what the tool actually
 // handed the model.
 //
@@ -38,6 +45,7 @@ const TOKEN_DELAY_MS = Number(process.env.TOKEN_DELAY_MS ?? 15);
 type SlackCall = { t: number; method: string; body: Record<string, unknown> };
 let calls: SlackCall[] = [];
 let modelCalls = 0;
+let githubCalls: { method: string; path: string; body?: unknown }[] = [];
 const waiters = new Map<string, ((c: SlackCall[]) => void)[]>();
 let nextTs = 1_700_000_000;
 
@@ -119,7 +127,10 @@ function slack(method: string, body: Record<string, unknown>): Response {
     waiters.delete(thread);
   }
   // As real Slack does: the posted message's channel and ts (June checks for the ts).
-  if (method === "chat.postMessage") return Response.json({ ok: true, channel: body.channel, ts: `${++nextTs}.000100` });
+  if (method === "chat.postMessage") {
+    call.body.__ts = `${++nextTs}.000100`;
+    return Response.json({ ok: true, channel: body.channel, ts: call.body.__ts });
+  }
   if (method === "auth.test") return Response.json({ ok: true, url: "https://acme.slack.com/", user_id: "UBOT", team_id: "T1", bot_id: "B1" });
   if (method === "conversations.history" || method === "conversations.replies") return conversations(method, body);
   if (method === "users.info") {
@@ -147,9 +158,11 @@ function firstUserText(messages: Msg[]): string {
   return m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
 }
 
-// The first search hit in a tool_result.
+// The first search hit in a tool_result: search_knowledge returns the hits, recent_knowledge
+// returns them under `threads`.
 function firstHit(content: unknown): { id?: string; source?: string } {
-  const v = resultValue(content);
+  const r = resultValue(content);
+  const v = r && typeof r === "object" && "threads" in r ? (r as { threads: unknown }).threads : r;
   if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
   return {};
 }
@@ -171,10 +184,14 @@ function answerFor(messages: Msg[], result: Block): string {
   if (value?.id) return `${nonce} [whois:${JSON.stringify({ name: value.name, realName: value.realName })}] ${words.join(" ")}`;
   const exec = value as { exitCode?: number; stdout?: string } | undefined;
   if (typeof exec?.exitCode === "number") return `${nonce} [exec:${exec.exitCode}:${(exec.stdout ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
+  const pr = value as { status?: string; url?: string } | undefined;
+  if (typeof pr?.status === "string" && !(pr as { error?: unknown }).error) return `${nonce} [pr:${pr.status}:${pr.url ?? ""}] ${words.join(" ")}`;
   // A tool that failed: its error text, so the harness can check what the model was told.
   const raw: unknown = resultValue(result.content);
   const failure = typeof raw === "string" && /error/i.test(raw) ? raw : (raw as { error?: unknown } | undefined)?.error;
   if (typeof failure === "string") return `${nonce} [toolerror:${failure.replace(/[\[\]\n]/g, " ").slice(0, 200)}] ${words.join(" ")}`;
+  const skill = value as { name?: string; body?: string } | undefined;
+  if (typeof skill?.body === "string") return `${nonce} [skill:${skill.name}:${skill.body.split(/\s+/).slice(0, 4).join(" ").replace(/[\[\]]/g, " ")}] ${words.join(" ")}`;
   const thread = value?.messages;
   if (thread) {
     const first = thread[0] ?? {};
@@ -214,16 +231,21 @@ async function anthropic(req: Request): Promise<Response> {
   if (!result) {
     const question = firstUserText(body.messages);
     // "[recent]" in the question → an overview question: list recent threads instead of searching
-    // "[thread]" → read the thread the question was asked in
+    // "[thread]" → read the thread the question was asked in; "[thread:<channel>]" → a thread there
     // "[whois]" → look up the first person the question mentions (other than the bot)
     // "[exec] <command>" → run the command in the thread's sandbox (workspace_exec)
+    // "[skill:<name>]" → load that skill (read_skill)
+    // "[pr] <branch>" → open a pull request from that branch (open_pull_request)
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
+    const prBranch = /\[pr\] (\S+)/.exec(question)?.[1];
     const recent = question.includes("[recent]");
-    const thread = question.includes("[thread]");
+    const threadIn = /\[thread:([A-Z0-9]+)\]/.exec(question)?.[1];
+    const thread = question.includes("[thread]") || threadIn !== undefined;
+    const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = execCommand ? { command: execCommand } : whois ? { userId: whois } : recent || thread ? {} : { query };
+    const input = skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));
@@ -256,6 +278,21 @@ async function anthropic(req: Request): Promise<Response> {
   ];
   const firstDelta = 2, lastDelta = 2 + pieces.length - 1;
   return sse(events, TTFT_MS, (i) => (i >= firstDelta && i < lastDelta ? TOKEN_DELAY_MS : 0));
+}
+
+// ── GitHub ───────────────────────────────────────────────────────────────────
+
+// The token's user (who the commits must be by), and pull requests: none open yet, and
+// a new one is always number 7. Records every request.
+async function github(req: Request, url: URL): Promise<Response> {
+  const path = url.pathname.slice("/github".length) + url.search;
+  const raw = await req.text();
+  githubCalls.push({ method: req.method, path, body: raw ? safeJson(raw) : undefined });
+  if (url.pathname === "/github/user") return Response.json({ id: 1, login: "octo" });
+  const pulls = /^\/github\/repos\/([^/]+)\/([^/]+)\/pulls$/.exec(url.pathname);
+  if (pulls && req.method === "GET") return Response.json([]);
+  if (pulls && req.method === "POST") return Response.json({ html_url: `https://github.com/${pulls[1]}/${pulls[2]}/pull/7`, number: 7 }, { status: 201 });
+  return Response.json({ message: "Not Found" }, { status: 404 });
 }
 
 // ── server ───────────────────────────────────────────────────────────────────
@@ -294,6 +331,7 @@ Bun.serve({
       return Response.json({ ok: true });
     }
     if (url.pathname === "/anthropic/v1/messages" && req.method === "POST") return anthropic(req);
+    if (url.pathname.startsWith("/github/")) return github(req, url);
     if (url.pathname === "/wait") {
       const thread = url.searchParams.get("thread_ts") ?? "";
       const timeout = Number(url.searchParams.get("timeout_ms") ?? 30000);
@@ -307,10 +345,11 @@ Bun.serve({
     }
     if (url.pathname === "/stats") {
       const readChannels = [...new Set(calls.filter((c) => c.method.startsWith("conversations.")).map((c) => String(c.body.channel)))];
-      const posts = calls.filter((c) => c.method === "chat.postMessage").map((c) => ({ channel: c.body.channel, thread_ts: c.body.thread_ts, text: c.body.text }));
-      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, posts });
+      const posts = calls.filter((c) => c.method === "chat.postMessage").map((c) => ({ channel: c.body.channel, thread_ts: c.body.thread_ts, text: c.body.text, blocks: c.body.blocks, ts: c.body.__ts }));
+      const updates = calls.filter((c) => c.method === "chat.update").map((c) => ({ channel: c.body.channel, ts: c.body.ts, text: c.body.text }));
+      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, posts, updates, github: githubCalls });
     }
-    if (url.pathname === "/reset") { calls = []; modelCalls = 0; return Response.json({ ok: true }); }
+    if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });
   },
 });

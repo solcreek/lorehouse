@@ -4,11 +4,15 @@
 //
 //   bun conformance/run.ts                        # runs `bun src/server.ts`
 //   bun conformance/run.ts --app ./dist/lorehouse # or any executable
+//   bun conformance/run.ts --only usage           # only scenarios named like it (select.ts)
 //
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
-// STATUS_TOKEN, ADMIN_TOKEN, and per scenario DM_MODE. It must answer GET /healthz (open)
+// STATUS_TOKEN, ADMIN_TOKEN, LOREHOUSE_ENV_FILE (a missing file, so no installed settings
+// leak in), and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
+// and GITHUB_API_URL (GitHub's REST API, mocked). SESSIONS_DB is never set: the app
+// keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
 // 404 when STATUS_TOKEN is unset). The admin API under /api/v1 (docs/admin-api.md) answers
@@ -16,17 +20,27 @@
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pollRunner, wsRunner } from "./fake-runner";
+import { parseArgs, selectScenarios, UsageError, type Args } from "./select";
 
 const ROOT = join(import.meta.dir, "..");
 const HERE = import.meta.dir;
-const argv = process.argv.slice(2);
-const appIdx = argv.indexOf("--app");
+// A bad command line exits 2 before anything starts.
+const orExit2 = <T>(f: () => T): T => {
+  try {
+    return f();
+  } catch (e) {
+    if (!(e instanceof UsageError)) throw e;
+    console.error(`conformance: ${e.message}`);
+    process.exit(2);
+  }
+};
+const ARGS: Args = orExit2(() => parseArgs(process.argv.slice(2)));
 // Absolute, because an external app runs with its own directory as cwd (see below).
-const APP_CMD = appIdx >= 0 ? [resolve(argv[appIdx + 1]!)] : ["bun", join(ROOT, "src/server.ts")];
+const APP_CMD = ARGS.app ? [resolve(ARGS.app)] : ["bun", join(ROOT, "src/server.ts")];
 
 const SECRET = "conformance-signing-secret";
 const MOCK_PORT = 18000 + Math.floor(Math.random() * 1000);
@@ -68,7 +82,14 @@ const mention = (channel: string, extra: Record<string, unknown> = {}) => {
   return { type: "app_mention", user: "U1", team: "T1", text: "<@UBOT> [q1] how does soft navigation work", ts, event_ts: ts, channel, ...extra };
 };
 
-const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[]; posts: { channel: string; thread_ts?: string; text: string }[] };
+type Block = { type: string; elements?: { type: string; text?: { text: string }; action_id?: string; value?: string }[] };
+type Stats = {
+  slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[];
+  posts: { channel: string; thread_ts?: string; text: string; blocks?: Block[]; ts: string }[];
+  updates: { channel: string; ts: string; text: string }[];
+  github: { method: string; path: string; body?: unknown }[];
+};
+const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as Stats;
 const reset = () => fetch(`${MOCK}/reset`, { method: "POST" });
 
 // Ask the agent something in the allowed channel and read back what it cited.
@@ -125,6 +146,26 @@ async function mentionAndWait(question: string, { inHistory = false } = {}): Pro
   return ts;
 }
 
+// A button click, as Slack's interactivity delivers one: form-encoded `payload=<json>`,
+// signed like an event, to the same URL.
+async function sendInteraction(payload: Record<string, unknown>) {
+  const body = `payload=${encodeURIComponent(JSON.stringify(payload))}`;
+  const now = String(Math.floor(Date.now() / 1000));
+  const sig = "v0=" + createHmac("sha256", SECRET).update(`v0:${now}:${body}`).digest("hex");
+  return fetch(TARGET, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "x-slack-request-timestamp": now, "x-slack-signature": sig }, body });
+}
+
+// The first truthy value check() returns within ms, or undefined.
+async function until<T>(check: () => Promise<T | undefined>, ms = 15000): Promise<T | undefined> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    const v = await check();
+    if (v) return v;
+    await Bun.sleep(50);
+  }
+  return undefined;
+}
+
 // A reply in a thread, as Slack delivers one: a `message` event with thread_ts.
 async function threadReply(threadTs: string, text: string, extra: Record<string, unknown> = {}): Promise<void> {
   const ts = `${1995000000 + ++seq}.000100`;
@@ -161,7 +202,7 @@ async function inMode(env: Record<string, string>, run: () => Promise<string | n
 // Run a usage scenario from zero: the app restarted on a database of its own, deleted
 // after, and then restarted on the usual one.
 async function withFreshDb(run: () => Promise<string | null>, env: Record<string, string> = {}): Promise<string | null> {
-  const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+  const db = freshDb();
   try {
     return await inMode({ ...env, LOREHOUSE_DB: db }, run);
   } finally {
@@ -197,7 +238,9 @@ const WOMBAT_THREAD = "slack:C1:1790000001.000100";
 
 // ── scenarios ───────────────────────────────────────────────────────────────
 
-type Scenario = { name: string; run: () => Promise<string | null> }; // null = pass, string = why it failed
+// null = pass, string = why it failed. `needs` names earlier scenarios whose leftovers this
+// one checks; `--only` runs them first, so a scenario run alone is judged as in a full run.
+type Scenario = { name: string; needs?: string[]; run: () => Promise<string | null> };
 
 const scenarios: Scenario[] = [
   {
@@ -353,6 +396,23 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "loads a skill: read_skill hands the model each skill's own instructions",
+    run: async () => {
+      // Skills are prompts/skills/*.md, embedded like the other prompts; the model asks for
+      // one by name and must get its body, from source and from the compiled binary alike.
+      const want: [string, string][] = [
+        ["channel-digest", "Report what the company"],
+        ["write-a-skill", "Draft a skill a"],
+      ];
+      for (const [name, start] of want) {
+        const { text } = await ask(`[skill:${name}] help with this`);
+        const got = text.match(/\[skill:([^\]]*)\]/)?.[1];
+        if (got !== `${name}:${start}`) return `read_skill for ${name} gave ${JSON.stringify(got ?? text.slice(0, 120))}`;
+      }
+      return null;
+    },
+  },
+  {
     name: "answers an overview question from the most recently active thread",
     run: async () => {
       // "what's been discussed lately?" has no keywords to search for; the answer is the
@@ -408,6 +468,17 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "reads a thread only in a channel it reads: asked for a DM's thread, it reads nothing there",
+    run: async () => {
+      // The model takes channel ids from what it reads, so a planted id must not pull a
+      // DM or an unlisted channel into a public reply.
+      await reset();
+      const a = await ask("[thread:D1] what did they say");
+      if (!a.text.includes("[toolerror:not a channel I read: D1]")) return `the model was told ${JSON.stringify(a.text.slice(0, 120))}`;
+      return (await stats()).readChannels.includes("D1") ? "read the DM's thread" : null;
+    },
+  },
+  {
     name: "reflects an edit: the new text is cited, the old text no longer is",
     run: async () => {
       const doc = "slack:C1:1790000050.000100";
@@ -453,6 +524,7 @@ const scenarios: Scenario[] = [
   },
   {
     name: "the admin API forgets deleted messages too: not served, listed or found",
+    needs: ["forgets a deleted message: it is no longer cited or counted", "catches up after a restart on changes made while it was down"],
     run: async () => {
       // Deleted above: one live, and one (a pasted password) while the app was down.
       const ids = await allDocumentIds();
@@ -559,7 +631,7 @@ const scenarios: Scenario[] = [
   {
     name: "USAGE_RECORD_PEOPLE=1 records who asks and says so in the channel, once; turned off, it says so and erases them",
     run: async () => {
-      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      const db = freshDb();
       const notices = async () => (await stats()).posts.filter((p) => p.channel === ALLOWED && !p.thread_ts).map((p) => p.text);
       type People = Usage & { people?: number; askers?: { user: string; asks: number }[] };
       const restart = async (env: Record<string, string>) => { await stopApp(); await reset(); await startApp({ LOREHOUSE_DB: db, ...env }); };
@@ -589,7 +661,7 @@ const scenarios: Scenario[] = [
   {
     name: "forgets in usage a question deleted while it was down; one still in Slack stays",
     run: async () => {
-      const db = join(tmpdir(), `lorehouse-conformance-${process.pid}-${++seq}.db`);
+      const db = freshDb();
       try {
         await stopApp();
         await startApp({ LOREHOUSE_DB: db });
@@ -786,6 +858,50 @@ const scenarios: Scenario[] = [
     }),
   },
   {
+    // ADR 0002 §8: sessions persist by default, so a restart (a deploy, a crash) between
+    // the prompt and the click loses nothing.
+    name: "a turn parked on Approve survives a restart: approved after it, the pull request opens and the turn completes",
+    run: () => {
+      const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github` };
+      return inMode(env, async () => {
+        const runner = pollRunner(APP, RUNNER_TOKEN, "r-approve"); // keeps polling across the restart
+        try {
+          await Bun.sleep(200); // the first poll registers the runner
+          await reset();
+          const n = ++seq;
+          const thread = `${1970000000 + n}.000100`;
+          await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${n}] [pr] scout/conformance-approve`, ts: thread, event_ts: thread, channel: ALLOWED });
+          const prompt = await until(async () => (await stats()).posts.find((p) => p.channel === ALLOWED && p.thread_ts === thread && p.blocks?.length));
+          if (!prompt) return `no Approve/Deny prompt in the thread: ${JSON.stringify((await stats()).posts).slice(0, 300)}`;
+          const approve = prompt.blocks!.flatMap((b) => b.elements ?? []).find((e) => e.type === "button" && e.text?.text === "Approve");
+          if (!approve?.action_id) return `the prompt has no Approve button: ${JSON.stringify(prompt.blocks).slice(0, 300)}`;
+          if ((await stats()).github.some((c) => c.method === "POST")) return "a pull request was opened before anyone approved";
+
+          // A restart while the turn waits, as a deploy would do.
+          await stopApp();
+          await startApp(env);
+          await reset();
+          // The runner comes back on its next poll; a click before that finds its host
+          // offline, which is a different scenario from this one.
+          const back = await until(async () => ((await status()) as unknown as { runners?: { runner: string; online: boolean }[] }).runners?.some((r) => r.runner === "r-approve" && r.online));
+          if (!back) return `after the restart the runner never came back: ${JSON.stringify(((await status()) as unknown as { runners?: unknown }).runners)}`;
+
+          await sendInteraction({
+            type: "block_actions", user: { id: "U1" }, team: { id: "T1" }, channel: { id: ALLOWED },
+            message: { ts: prompt.ts, thread_ts: thread }, actions: [{ type: "button", action_id: approve.action_id, value: approve.value }],
+          });
+          const done = await until(async () => (await stats()).updates.find((u) => u.ts === prompt.ts && u.text.includes("[pr:")));
+          if (!done) return `approved after the restart, the turn never finished: updates ${JSON.stringify((await stats()).updates).slice(0, 300)}`;
+          if (!done.text.includes(`[q${n}] [pr:opened:https://github.com/acme/widgets/pull/7]`)) return `the turn ended with ${done.text.slice(0, 160)}, want the opened pull request`;
+          const opened = (await stats()).github.filter((c) => c.method === "POST" && c.path === "/repos/acme/widgets/pulls");
+          return opened.length === 1 ? null : `pull requests opened: ${opened.length}, want 1`;
+        } finally {
+          await runner.stop();
+        }
+      });
+    },
+  },
+  {
     name: "rejects a bad signature with 401",
     run: async () => {
       const r = await sendEvent(mention(ALLOWED), { badSig: true });
@@ -825,17 +941,31 @@ const scenarios: Scenario[] = [
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
+// Chosen before anything starts, so a pattern matching nothing fails at once.
+const { run: selected, prerequisites } = orExit2(() => selectScenarios(scenarios, ARGS.only));
+if (ARGS.only !== undefined) {
+  const extra = prerequisites.size ? `, ${prerequisites.size} of them only because the others need them` : "";
+  console.log(`--only ${JSON.stringify(ARGS.only)}: running ${selected.length} of ${scenarios.length} scenarios${extra}\n`);
+}
+
 const mock = Bun.spawn(["bun", join(HERE, "mock.ts")], {
   env: { ...process.env, PORT: String(MOCK_PORT), TTFT_MS: "50", TOKEN_DELAY_MS: "2", SLACK_FIXTURES: join(HERE, "fixtures/slack-history.json") },
   stdout: "ignore",
   stderr: "inherit",
 });
-// A file, not :memory:, so the restart scenario comes back to the same knowledge.
-const DB = join(tmpdir(), `lorehouse-conformance-${process.pid}.db`);
-const removeDb = (path = DB) => { for (const s of ["", "-wal", "-shm"]) rmSync(path + s, { force: true }); };
-removeDb();
+// A file, not :memory:, so the restart scenario comes back to the same knowledge. Each
+// database gets a directory of its own: SESSIONS_DB is left unset, so the app keeps its
+// sessions beside it, and no two runs (or two databases in one run) share them.
+const freshDb = () => join(mkdtempSync(join(tmpdir(), "lorehouse-conformance-")), "lorehouse.db");
+const DB = freshDb();
+const removeDb = (path = DB) => rmSync(dirname(path), { recursive: true, force: true });
 
 let app: ReturnType<typeof Bun.spawn> | undefined;
+// Never this shell's SESSIONS_DB: where sessions go by default is part of the contract.
+// Nor its settings files, which the app reads after the environment and could fill
+// SESSIONS_DB back in: LOREHOUSE_ENV_FILE points at a missing file beside the database
+// (startApp), and LOREHOUSE_SETTINGS is left to its default, also beside the database.
+const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, ...inherited } = process.env;
 
 // Start the app and wait until it listens, owns its port, and (unless waitReady is off,
 // for a start where /status is closed) has finished its Slack backfill/reconcile
@@ -844,9 +974,9 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
   const proc = Bun.spawn(APP_CMD, {
     // An external app runs from its own directory, so a binary that quietly reads files
     // from this repo (prompts, migrations) fails here instead of passing by accident.
-    cwd: appIdx >= 0 ? dirname(APP_CMD[0]!) : ROOT,
+    cwd: ARGS.app ? dirname(APP_CMD[0]!) : ROOT,
     env: {
-      ...process.env,
+      ...inherited,
       PORT: String(APP_PORT),
       SLACK_SIGNING_SECRET: SECRET,
       SLACK_BOT_TOKEN: "xoxb-conformance",
@@ -862,6 +992,7 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
       INGEST_DEBOUNCE_MS: "200",
       STATUS_TOKEN,
       ADMIN_TOKEN,
+      LOREHOUSE_ENV_FILE: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "lorehouse.env"),
       ...extraEnv,
     },
     stdout: "ignore",
@@ -894,11 +1025,11 @@ try {
   if (!(await waitHttp(`${MOCK}/stats`, 5000))) throw new Error("mock never came up");
   await startApp();
 
-  for (const s of scenarios) {
+  for (const s of selected) {
     const t0 = Date.now();
     const why = await s.run().catch((e) => String(e));
     if (why) failed++;
-    console.log(`${why ? "✗" : "✓"} ${s.name} (${Date.now() - t0} ms)${why ? `\n    ${why}` : ""}`);
+    console.log(`${why ? "✗" : "✓"} ${s.name} (${Date.now() - t0} ms)${prerequisites.has(s) ? " [needed]" : ""}${why ? `\n    ${why}` : ""}`);
   }
 } catch (e) {
   failed++;
@@ -908,5 +1039,7 @@ try {
   mock.kill();
   removeDb();
 }
-console.log(failed ? `\n${failed} failed` : `\nall ${scenarios.length} scenarios passed`);
+// A filtered run never reads as a full one.
+const skipped = scenarios.length - selected.length;
+console.log(failed ? `\n${failed} failed` : skipped ? `\n${selected.length} of ${scenarios.length} scenarios passed (${skipped} not run: --only)` : `\nall ${scenarios.length} scenarios passed`);
 process.exit(failed ? 1 : 0);

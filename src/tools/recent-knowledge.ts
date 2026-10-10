@@ -5,8 +5,9 @@ import { toolDescription } from "../prompts";
 type Recent = (opts: { limit: number; sinceSec?: number }) => (Chunk & { activeAt: string })[];
 
 // The most recently active threads, newest first, whenever they were, as a JSON string:
-// [{ id, title, source, activeAt, text (first 500 chars) }]. For overview questions
-// ("what's been discussed lately?") that keyword search can't answer.
+// { now, threads: [{ id, title, source, activeAt, text (first 500 chars) }] }. For overview
+// questions ("what's been discussed lately?") that keyword search can't answer. `now` is
+// there because the model has no clock: without it, "since August" is read against a guessed date.
 export function recentKnowledgeTool(recent: Recent, now: () => number = Date.now): Tool {
   return {
     spec: {
@@ -26,7 +27,10 @@ export function recentKnowledgeTool(recent: Recent, now: () => number = Date.now
       const limit = Math.min(Math.max(Math.floor(input?.limit ?? 15), 1), 30);
       const sinceSec = input?.days && input.days > 0 ? now() / 1000 - input.days * 86400 : undefined;
       const hits = recent({ limit, sinceSec });
-      return JSON.stringify(hits.map((c) => ({ id: c.id, title: c.title, source: c.source, activeAt: c.activeAt, text: c.text.slice(0, 500) })));
+      return JSON.stringify({
+        now: new Date(now()).toISOString(),
+        threads: hits.map((c) => ({ id: c.id, title: c.title, source: c.source, activeAt: c.activeAt, text: c.text.slice(0, 500) })),
+      });
     },
   };
 }

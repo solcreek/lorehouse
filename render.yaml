@@ -1,0 +1,29 @@
+# Lorehouse on Render: one web service from the published image, with a disk for its
+# SQLite files. New → Blueprint, point it at this repository (or your fork), and fill in
+# the secrets it asks for. A disk needs a paid instance type, and pins the service to one
+# instance; a deploy stops the old one before starting the new, which Lorehouse
+# tolerates (Slack redelivers, the start-up reconcile catches up).
+services:
+  - type: web
+    name: lorehouse
+    runtime: image
+    image:
+      # :latest is the newest release; :main follows every merge.
+      url: ghcr.io/solcreek/lorehouse:latest
+    plan: starter
+    healthCheckPath: /healthz
+    disk:
+      name: lorehouse-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: AGENT_CHANNELS
+        sync: false
+      - key: STATUS_TOKEN
+        generateValue: true

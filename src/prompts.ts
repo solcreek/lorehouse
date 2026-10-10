@@ -11,6 +11,8 @@ import workspaceReadFile from "../prompts/tools/workspace_read_file.md" with { t
 import workspaceWriteFile from "../prompts/tools/workspace_write_file.md" with { type: "text" };
 import openPullRequest from "../prompts/tools/open_pull_request.md" with { type: "text" };
 import workspaceClone from "../prompts/tools/workspace_clone.md" with { type: "text" };
+import channelDigest from "../prompts/skills/channel-digest.md" with { type: "text" };
+import writeASkill from "../prompts/skills/write-a-skill.md" with { type: "text" };
 import { branchPrefix, displayName, type AgentIdentity } from "./identity";
 
 const TOOLS: Record<string, string> = {
@@ -21,6 +23,12 @@ const TOOLS: Record<string, string> = {
   workspace_write_file: workspaceWriteFile,
   open_pull_request: openPullRequest,
   workspace_clone: workspaceClone,
+};
+
+// Parsed in app.ts, which keeps June out of this file.
+export const SKILLS: Record<string, string> = {
+  "channel-digest": channelDigest,
+  "write-a-skill": writeASkill,
 };
 
 export function render(template: string, vars: Record<string, string>): string {

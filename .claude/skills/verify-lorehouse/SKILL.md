@@ -9,19 +9,19 @@ Lorehouse's user surface is Slack. A teammate mentions `@scout` in an allowed pu
 
 The marketing site (`website/`, `bun run dev` on port 3000) and a developer's own `bun start` are not this instance. Never send events to them. Code tools stay off: this instance sets no sandbox or GitHub variables.
 
-Run every command from the repo root. The helper is `.cursor/skills/verify-lorehouse/control.ts`. Its stdout is one JSON object. Tokens, ports, and the debounce are the constants and the launch env in that file (`SIGNING_SECRET`, `STATUS_TOKEN`, `ADMIN_TOKEN`, `CHANNEL` = `C1`, `AGENT` = `scout`, `INGEST_DEBOUNCE_MS` = `200`).
+Run every command from the repo root. The helper is `.claude/skills/verify-lorehouse/control.ts`. Its stdout is one JSON object. Tokens, ports, and the debounce are the constants and the launch env in that file (`SIGNING_SECRET`, `STATUS_TOKEN`, `ADMIN_TOKEN`, `CHANNEL` = `C1`, `AGENT` = `scout`, `INGEST_DEBOUNCE_MS` = `200`).
 
 ## Launch
 
 `bun install` once, from the repo root, when `node_modules/` is missing. Then:
 
 ```bash
-bun .cursor/skills/verify-lorehouse/control.ts launch
+bun .claude/skills/verify-lorehouse/control.ts launch
 ```
 
 Launch starts a new process group for the mock and another for `src/server.ts`. It picks free ports, a sqlite file under `/tmp/lorehouse-verify/<runId>/`, and the fixture history in `conformance/fixtures/slack-history.json`. It does not set `KNOWLEDGE_SEED`. It returns when `GET /healthz` is `ok`, this run's pid owns the app port, `GET /status` reports `knowledge.state` `ready`, and the admin API serves `slack:C1:1790000001.000100` containing `quarterly wombat review`.
 
-The JSON includes `runId`, `app`, `mock`, `db`, and `evidence`. The evidence directory is `.cursor/skills/verify-lorehouse/artifacts/<runId>/`. Launch writes `/tmp/lorehouse-verify/current`. A second launch starts a second instance and moves `current`. Pass `--run <runId>` to talk to an older one.
+The JSON includes `runId`, `app`, `mock`, `db`, and `evidence`. The evidence directory is `.claude/skills/verify-lorehouse/artifacts/<runId>/`. Launch writes `/tmp/lorehouse-verify/current`. A second launch starts a second instance and moves `current`. Pass `--run <runId>` to talk to an older one.
 
 Ready does not mean a developer's `.env` was read. The child environment sets every Lorehouse variable itself so an existing `.env` cannot attach this process to a real workspace.
 
@@ -30,7 +30,7 @@ Ready does not mean a developer's `.env` was read. The child environment sets ev
 Run this before driving whenever a reply, status code, or port looks wrong:
 
 ```bash
-bun .cursor/skills/verify-lorehouse/control.ts doctor
+bun .claude/skills/verify-lorehouse/control.ts doctor
 ```
 
 Exit 0 means this run is worth driving. The report checks the recorded pids are alive, their command lines are this repo's `src/server.ts` and `conformance/mock.ts`, those pids own the recorded ports, `/healthz` is `ok`, unauthenticated `/status` is 401, `/status` with the helper's status token shows `@scout` and `knowledge.state` `ready`, the wombat document is indexed, the status token is rejected by the admin API, and the mock's `/stats` answers. Anything else: stop, and do not point the helper at another port.
@@ -63,8 +63,8 @@ The safe path is this isolated instance with the stand-ins. Confirm it did not e
 ## Cleanup
 
 ```bash
-bun .cursor/skills/verify-lorehouse/control.ts cleanup
-bun .cursor/skills/verify-lorehouse/control.ts cleanup --run <runId>
+bun .claude/skills/verify-lorehouse/control.ts cleanup
+bun .claude/skills/verify-lorehouse/control.ts cleanup --run <runId>
 ```
 
 Cleanup signals the process groups whose pids are stored for that run and whose command lines are still this repo's server and mock. It then deletes that run's directory, including its sqlite files. It does not delete the evidence directory. After cleanup, the `evidence` path from launch must still be a directory. `list` shows every run still on disk.
@@ -73,7 +73,7 @@ Run cleanup after a failed launch too. Launch already does this when it fails it
 
 ## Helpers
 
-All of these are `bun .cursor/skills/verify-lorehouse/control.ts <command>` from the repo root. Repeat `--run <runId>` when `current` is not the instance you intend.
+All of these are `bun .claude/skills/verify-lorehouse/control.ts <command>` from the repo root. Repeat `--run <runId>` when `current` is not the instance you intend.
 
 | command | what it does |
 |---|---|
