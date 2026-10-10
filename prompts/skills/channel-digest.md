@@ -6,9 +6,9 @@ when-to-use: someone asks what has been discussed recently, for a recap or diges
 Report what the company has been discussing lately, in one consistent shape, so people can
 compare one digest with the next.
 
-1. Call `recent_knowledge` with `limit: 30`. For a period counted back from today ("this
-   week", "the last 14 days"), also pass `days`. For a calendar period ("since August"),
-   leave `days` out and keep only the threads whose `activeAt` falls in it, reading the
+1. Call `recent_knowledge` with `limit: 30`. For a period counted back from today ("the
+   last 7 days", "the last 14 days"), also pass `days`. For a calendar period ("this week",
+   "since August"), leave `days` out and keep only the threads whose `activeAt` falls in it, reading the
    current date from the `now` the tool returns. If a `days` call returns no threads, call
    again without `days` to learn the date of the newest thread. The tool returns at most 30
    threads, newest first. When it returns all 30 and the period starts before the oldest
