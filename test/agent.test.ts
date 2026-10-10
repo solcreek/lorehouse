@@ -456,6 +456,12 @@ describe("remoteSandbox client", () => {
     expect(reqs[1]!.body).toEqual({ owner: "acme", name: "widgets", sha: "a".repeat(40), branch: "scout/x", token: "w" });
   });
 
+  test("a publish error that isn't JSON still surfaces with its status and text", async () => {
+    const f = (async () => new Response("unauthorized", { status: 401 })) as unknown as typeof fetch;
+    const sb = remoteSandbox("s1", { url: "https://fb.example", token: "bad", fetch: f });
+    await expect(sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main" })).rejects.toThrow("stage: 401 unauthorized");
+  });
+
   test("a daemon error surfaces with its status", async () => {
     const f = (async () => new Response("vm failed to boot", { status: 503 })) as unknown as typeof fetch;
     await expect(remoteSandbox("s", { url: "https://fb", token: "t", fetch: f }).exec("ls")).rejects.toThrow(/503 vm failed to boot/);

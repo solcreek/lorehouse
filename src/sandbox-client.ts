@@ -68,7 +68,14 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
-    if (!res.ok) throw new Error(`${op}: ${res.status} ${((JSON.parse(text || "{}") as { error?: string }).error ?? text).slice(0, 500)}`);
+    if (!res.ok) {
+      // The daemon's own errors are JSON; its 401, a rejected body, or a proxy's page aren't.
+      let reason = text;
+      try {
+        reason = (JSON.parse(text) as { error?: string }).error ?? text;
+      } catch {}
+      throw new Error(`${op}: ${res.status} ${reason.slice(0, 500)}`);
+    }
     return JSON.parse(text);
   }
 }
