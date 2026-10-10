@@ -126,7 +126,8 @@ with `main`, merge it in; never force-push. The PR description:
 "Stacked on #31. Retarget to `main` once it merges." When the base merges, retarget
 it: `gh pr edit <n> --base main`.
 
-**Checks by change.** CI runs all of them on every PR; run the ones you touched first.
+**Checks by change.** CI runs all of them on every PR except the verify-lorehouse drive,
+which is manual; run the ones you touched first.
 
 | change | run |
 |---|---|
