@@ -319,7 +319,7 @@ describe("open_pull_request — the approval gate", () => {
   });
 
   test("Deny pushes nothing", async () => {
-    const { sb, calls } = fakeRepo();
+    const { sb, calls, published } = fakeRepo();
     const gh = fakeGithub();
     const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
@@ -327,6 +327,7 @@ describe("open_pull_request — the approval gate", () => {
     s.resume(t1, parked.request.id, false);
     await s.result(t1);
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+    expect(published.some((p) => p.op === "push")).toBe(false); // staged for the card, never pushed by the host
     expect(gh.reqs).toHaveLength(0);
     expect(toolResult()?.result).toMatchObject({ status: "denied" });
   });
