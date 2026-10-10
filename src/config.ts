@@ -16,7 +16,7 @@ export type Config = {
   anthropic: { apiKey: string; baseUrl?: string; model: string };
   agent: { name?: string; coAuthor?: string; channels: Set<string>; dm: DmMode };
   // Lorehouse's own database (knowledge, migrations) — separate from the framework's
-  // session store on purpose.
+  // session store on purpose. The session store defaults to a file beside it (sessionsDbFor).
   db: { lorehouse: string; sessions: string; knowledgeSeed?: string };
   // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
   ingest: { backfillDays: number; refreshDays: number; debounceMs: number };
@@ -36,13 +36,66 @@ export type Config = {
   //   direct   one sandbox host Lorehouse calls (SANDBOX_URL + SANDBOX_TOKEN), e.g. on the
   //            same machine over loopback
   sandbox?: ({ mode: "runners"; runnerToken: string } | { mode: "direct"; url: string; token: string }) & { github: GithubCredentials };
+  // GitHub's REST API, for the code tools' credentials and pull requests (GITHUB_API_URL,
+  // default https://api.github.com). Like SLACK_API_URL, it points the app at a mock.
+  githubApiUrl?: string;
 };
 
 // A GitHub App (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY): short-lived tokens per repo, a bot
 // identity, owned by the org. Or a plain token (GITHUB_TOKEN), for development.
 export type GithubCredentials = { kind: "app"; appId: string; privateKey: string } | { kind: "token"; token: string };
 
+import { closeSync, openSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { normalizePem } from "./github-auth";
+
+// Where the framework's sessions live when SESSIONS_DB is unset: sessions.db beside
+// LOREHOUSE_DB, so a turn parked on an Approve, or a durable automation, survives a
+// restart (ADR 0002 §8). Lorehouse's own data in memory means a throwaway instance (a
+// test): its sessions stay in memory too.
+export function sessionsDbFor(lorehouseDb: string): string {
+  return lorehouseDb === ":memory:" ? ":memory:" : join(dirname(lorehouseDb), "sessions.db");
+}
+
+// Whether two paths name one file: equal once normalized, through a symlinked directory
+// above it (the file existing or not), through a symlink to the file once the file exists,
+// or as hard links to one inode. A link to a file not yet created isn't seen, nor a name
+// that differs only in case on a case-insensitive filesystem: assertDistinctDatabases
+// catches those at startup. This check is here to fail early with a clear message.
+function sameFile(a: string, b: string): boolean {
+  const canonical = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      try {
+        return join(realpathSync(dirname(resolve(p))), basename(p));
+      } catch {
+        return resolve(p);
+      }
+    }
+  };
+  if (canonical(a) === canonical(b)) return true;
+  try {
+    const x = statSync(a), y = statSync(b);
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch {
+    return false;
+  }
+}
+
+// Whether the two databases are one file, checked by identity once both exist. sameFile
+// above works on paths, before either file exists, and so can't see every way two paths
+// meet (a link to a file not yet created, a case-insensitive filesystem): this is the
+// check that holds. Creates an empty SESSIONS_DB file if needed, which the session store
+// would create a moment later anyway.
+export function assertDistinctDatabases(lorehouseDb: string, sessionsDb: string): void {
+  if (lorehouseDb === ":memory:" || sessionsDb === ":memory:") return;
+  closeSync(openSync(sessionsDb, "a"));
+  const a = statSync(lorehouseDb), b = statSync(sessionsDb);
+  if (a.dev === b.dev && a.ino === b.ino) {
+    throw new ConfigError([`SESSIONS_DB (must be a different file from LOREHOUSE_DB; "${sessionsDb}" and "${lorehouseDb}" are one file)`]);
+  }
+}
 
 // Every problem with the environment, one per entry; the message lists them all.
 export class ConfigError extends Error {
@@ -92,7 +145,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     },
     db: {
       lorehouse: env.LOREHOUSE_DB || "lorehouse.db",
-      sessions: env.SESSIONS_DB || ":memory:",
+      sessions: env.SESSIONS_DB || sessionsDbFor(env.LOREHOUSE_DB || "lorehouse.db"),
       knowledgeSeed: env.KNOWLEDGE_SEED || undefined,
     },
     ingest: {
@@ -104,7 +157,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     statusToken: env.STATUS_TOKEN || undefined,
     adminToken: env.ADMIN_TOKEN || undefined,
     usage: { recordPeople: env.USAGE_RECORD_PEOPLE === "1" },
+    githubApiUrl: env.GITHUB_API_URL || undefined,
   };
+  // One file for both would put June's session tables in Lorehouse's database: say so,
+  // rather than let a LOREHOUSE_DB named sessions.db, or a link to it, quietly share it.
+  if (config.db.sessions !== ":memory:" && sameFile(config.db.sessions, config.db.lorehouse)) missing.push(`SESSIONS_DB (must be a different file from LOREHOUSE_DB, got "${config.db.sessions}" for both)`);
   if (![undefined, "", "0", "1"].includes(env.USAGE_RECORD_PEOPLE)) missing.push(`USAGE_RECORD_PEOPLE (1 to record who asks, or unset; got "${env.USAGE_RECORD_PEOPLE}")`);
   // The admin token reads what people wrote: long, and never the status token, which is
   // the one handed to monitors.
