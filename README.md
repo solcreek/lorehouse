@@ -59,7 +59,7 @@ is enough; no zero-downtime setup is needed. A prototype of the same stack used 
 
 Every host needs the same few things:
 
-- a writable path for the SQLite file (`LOREHOUSE_DB`, `SESSIONS_DB`)
+- a writable directory for the SQLite files (`LOREHOUSE_DB`, and by default `SESSIONS_DB` beside it; a `SESSIONS_DB` set elsewhere needs its own directory writable too)
 - the Slack and Anthropic secrets as environment variables
 - outbound HTTPS to Slack and Anthropic
 
@@ -163,7 +163,7 @@ To set up Slack:
 | `ADMIN_TOKEN` | (none) | bearer token for the read-only [admin API](docs/admin-api.md) under `/api/v1`: the indexed threads and their text, search, the agent's threads, the sandboxes. 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |
 | `USAGE_RECORD_PEOPLE` | (off) | `1` makes [usage](docs/admin-api.md#usage) record who asks the agent things; each channel is told, and turning it off erases them. Off, usage never says who asked |
 | `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
-| `SESSIONS_DB` | `:memory:` | the agent framework's conversation state |
+| `SESSIONS_DB` | `sessions.db` beside `LOREHOUSE_DB` | the agent framework's conversation state, including a turn waiting on an Approve, so it survives a restart. `:memory:` keeps it in memory (lost on every restart), as it is when `LOREHOUSE_DB` is `:memory:` |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |
 | `INGEST_BACKFILL_DAYS` | `90` | how far back to read each allowed channel's history on first start (`0` = live only) |
 | `INGEST_REFRESH_DAYS` | `14` | on each start, re-check threads this recent for replies, edits and deletions made while the app was down |

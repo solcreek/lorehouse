@@ -7,7 +7,7 @@ import { slackChannel, type SlackNormalizedEvent } from "@junejs/core/channels";
 import { defineAgent, type Channel } from "@junejs/core/agent-config";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
-import type { Config } from "./config";
+import { assertDistinctDatabases, type Config } from "./config";
 import { agentIdentity } from "./identity";
 import { countDocuments, openKnowledge, recentDocuments, searcher, seedFromJsonl } from "./knowledge";
 import { recentKnowledgeTool } from "./tools/recent-knowledge";
@@ -53,6 +53,13 @@ export async function createApp(config: Config) {
   const identity = agentIdentity(config.agent.name, config.agent.coAuthor);
 
   const knowledge = openKnowledge(config.db.lorehouse);
+  // Both files exist from here on, so this compares the files themselves, not their names.
+  try {
+    assertDistinctDatabases(config.db.lorehouse, config.db.sessions);
+  } catch (err) {
+    knowledge.close();
+    throw err;
+  }
   const seeded = config.db.knowledgeSeed ? seedFromJsonl(knowledge, config.db.knowledgeSeed) : 0;
 
   // Slack history becomes knowledge — only for channels the agent is allowed in.
@@ -116,9 +123,10 @@ export async function createApp(config: Config) {
       ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx))
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
-    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey }) : staticToken(sb.github.token);
+    const apiUrl = config.githubApiUrl;
+    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
-    tools.push(...workspaceTools(sandboxFor, { commitAs: github.identity }), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName }));
+    tools.push(...workspaceTools(sandboxFor, { commitAs: github.identity }), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName, apiUrl }));
   }
 
   const dm = config.agent.dm;
