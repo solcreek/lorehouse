@@ -3,27 +3,28 @@
 // Everything else the agent does happens in a throwaway sandbox. Pushing a branch and opening
 // a PR is visible to the whole org, so this tool parks the turn on ctx.requestInput: the
 // Slack channel posts Approve / Deny, the Durable Object can hibernate meanwhile, and the
-// click resumes the turn with the clicker's verified id. Only then does anything leave
-// the sandbox.
+// click resumes the turn with the clicker's verified id. Only then does anything reach
+// GitHub. (Before it, the commits leave the sandbox only for the sandbox host, to be staged.)
 //
-// Credentials: a write token for this one repo is asked for only after the approval (from
-// a GitHub App, a short-lived installation token; see github-auth.ts). It enters the
-// sandbox for the single `git push` command only, run guarded (git-credential.ts: env
-// only, hooks off, no other credential helpers, answered only for github.com), to the
-// repo's github.com URL rather than `origin`, whose push URL the checkout could change.
-// The PR itself is opened from the worker side over the REST API.
+// Publishing goes through the sandbox host, not the sandbox (Sandbox.stage/push, see
+// sandbox/host/src/publish.rs). Before approval, the host stages the commits: it verifies
+// them into its own mirror and computes the diff, the patch and the authors the human
+// sees. After approval, the host pushes exactly that commit. The write token for this one
+// repo (a GitHub App installation token, see github-auth.ts) is asked for only then, and it
+// goes to the host, never into the sandbox. The PR itself is opened from the worker side
+// over the REST API.
 //
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
-// is read-only (it recomputes the same summary), requestInput then returns the stored
-// answer, and the post-approval part is idempotent — an already-open PR for the branch is
-// returned instead of creating a second one.
+// stages again (the same commits give the same sha and the same card), requestInput then
+// returns the stored answer, and the post-approval part is idempotent: an already-open PR
+// for the branch is returned instead of creating a second one.
 
+import { createHash } from "node:crypto";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
-import { WORKDIR, type SandboxFor } from "./workspace";
+import { WORKDIR, type SandboxFor, type Staged } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
-import type { GitIdentity, GithubAccess } from "../github-auth";
-import { gitWithToken, tokenEnv } from "./git-credential";
+import type { GitIdentity, GithubAccess, RepoRef } from "../github-auth";
 
 export type PullRequestOptions = {
   sandboxFor: SandboxFor;
@@ -71,36 +72,41 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         return r.stdout.trim();
       };
 
-      // ── before approval: read-only facts about what would be pushed ──────────
-      let repo: { owner: string; name: string };
-      let base: string, head: string, stat: string;
+      // ── before approval: what would be published, staged by the sandbox host ───
+      // The sandbox only says which repo and base. The commits are staged by the host
+      // (Sandbox.stage), which verifies them and computes what the approval shows: nothing
+      // shown or pushed comes from the sandbox's own git, which the model controls.
+      let repo: RepoRef;
+      let base: string;
       try {
         if (await sh("git status --porcelain")) return { error: "uncommitted changes — commit them first" };
         repo = parseGithubRemote(await sh("git remote get-url origin"));
         base = input.base ?? (await sh("git rev-parse --abbrev-ref origin/HEAD")).replace(/^origin\//, "");
-        head = await sh("git rev-parse HEAD");
-        // Both come from the sandbox (the model's), and go into shell commands below, one of
-        // them carrying the token: only a plain ref name and a full commit id get that far.
-        if (!isPlainRef(base)) return { error: "the repo's default branch isn't a plain branch name; give base explicitly" };
-        if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) return { error: "HEAD isn't a commit id" };
-        // A base this checkout hasn't fetched: say how to get it, rather than git's failure.
-        // git fetch in workspace_exec has no access to a private repo; workspace_clone does.
-        const known = await sb.exec(`git rev-parse --verify --quiet origin/${base}`, { cwd: WORKDIR, timeoutMs: 30_000 });
-        if (known.exitCode !== 0) {
-          return { error: `origin/${base} isn't in this checkout yet. Fetch with workspace_clone (${repo.owner}/${repo.name}); git fetch in workspace_exec has no access. Then call open_pull_request again.` };
-        }
-        stat = await sh(`git diff --stat origin/${base}...HEAD`);
       } catch (e) {
         return { error: (e as Error).message };
       }
-      if (!stat) return { error: `HEAD has no changes against origin/${base}` };
+      if (!isPlainRef(base)) return { error: "the repo's default branch isn't a plain branch name; give base explicitly" };
+      // A read token to stage with (the host mirrors the repo); write access waits for approval.
+      let readToken: string;
+      try {
+        readToken = await opts.github(repo, "read");
+      } catch (e) {
+        return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
+      }
+      let staged: Staged;
+      try {
+        staged = await sb.stage({ repo, base, token: readToken });
+      } catch (e) {
+        return { error: `couldn't stage the commits: ${(e as Error).message}` };
+      }
+      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(staged.sha)) return { error: "the staged commit id is malformed" };
 
       // Every commit must be by the account the PR comes from (the App's bot), before anyone
       // is asked to approve it: a commit made before that was enforced, or with an identity
-      // the model set, would otherwise go out under a made-up name. It fails closed: when
-      // the account can't be looked up (GitHub unreachable), nobody is asked to approve
-      // commits that can't be checked. Only a credential with no account to commit as
-      // (no identity provider) skips the check.
+      // the model set, would otherwise go out under a made-up name. The authors are the
+      // host's reading of the staged commits. It fails closed: when the account can't be
+      // looked up (GitHub unreachable), nobody is asked to approve commits that can't be
+      // checked. Only a credential with no account to commit as skips the check.
       let who: GitIdentity | undefined;
       try {
         who = await opts.github.identity?.();
@@ -109,31 +115,28 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       }
       if (who) {
         const want = `${who.name} <${who.email}>`;
-        let lines: string[];
-        try {
-          lines = (await sh(`git log --format='%an <%ae>|%cn <%ce>' origin/${base}..HEAD`)).split("\n").filter(Boolean);
-        } catch (e) {
-          return { error: (e as Error).message };
-        }
-        const off = lines.filter((l) => l !== `${want}|${want}`).length;
+        const off = staged.authors.filter((l) => l !== `${want}|${want}`).length;
         if (off) {
           return {
             error:
-              `${off} of ${lines.length} commit(s) on HEAD aren't by ${want}. Re-author them, then call open_pull_request again: ` +
-              `workspace_exec \`git rebase --exec 'git commit --amend --no-edit --reset-author' origin/${base}\` (commands already run as ${who.name}).`,
+              `${off} of ${staged.authors.length} commit(s) on HEAD aren't by ${want}. Re-author them, then call open_pull_request again: ` +
+              `workspace_exec \`git rebase --exec 'git commit --amend --no-edit --reset-author' origin/${base}\` (commands already run as ${who.name}; ` +
+              `if origin/${base} isn't in this checkout, fetch it with workspace_clone first).`,
           };
         }
       }
 
+      // An approval is for what its card shows: this commit, to this branch of this repo,
+      // against this base, under this title. A call that changes any of them is asked again,
+      // never answered by an earlier click.
+      const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, staged.sha])).digest("hex");
       const approved = await ctx.requestInput({
-        id: `pr:${input.branch}:${head.slice(0, 12)}`,
-        prompt:
-          `*Open a pull request?*\n${repo.owner}/${repo.name}: \`${input.branch}\` → \`${base}\` (${head.slice(0, 8)})\n` +
-          `*${input.title}*\n\`\`\`${clipStat(stat)}\`\`\``,
+        id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`,
+        prompt: approvalCard({ repo, branch: input.branch, base, title: input.title, staged }),
       });
       if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
 
-      // ── after approval: push, then open (or find) the PR ────────────────────
+      // ── after approval: the host pushes the staged commit, then open (or find) the PR ─
       let token: string;
       try {
         token = await opts.github(repo, "write");
@@ -141,14 +144,14 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
       }
       try {
-        await sh(gitWithToken(`push https://github.com/${repo.owner}/${repo.name}.git ${head}:refs/heads/${input.branch}`), tokenEnv(token));
+        await sb.push({ repo, sha: staged.sha, branch: input.branch, token });
       } catch (e) {
         return { error: `push failed: ${(e as Error).message}` };
       }
-      // A push to the URL (not to `origin`) doesn't update origin/<branch>: record it, so the
-      // checkout knows what it pushed and a later PR can be based on this branch. Local only;
-      // if it fails, a fetch (workspace_clone) brings it in anyway.
-      await sb.exec(`git update-ref refs/remotes/origin/${input.branch} ${head}`, { cwd: WORKDIR, timeoutMs: 30_000 }).catch(() => undefined);
+      // The checkout's origin/* is left as it is. Staging bundles what origin/* doesn't
+      // have, so recording the push there would make a replay (one cut off after this push,
+      // before its result was saved) stage nothing and never reach the PR below. A later PR
+      // based on this branch needs nothing from the checkout: the host diffs against GitHub.
 
       const gh = (path: string, init?: RequestInit) =>
         f(`https://api.github.com/repos/${repo.owner}/${repo.name}${path}`, {
@@ -197,8 +200,40 @@ export function parseGithubRemote(url: string): { owner: string; name: string } 
   return { owner: m[1]!, name: m[2]! };
 }
 
-// Slack section text caps at 3000 chars; the stat's summary line is the last one.
-function clipStat(stat: string): string {
-  const lines = stat.split("\n");
-  return lines.length <= 25 ? stat : [...lines.slice(0, 20), "…", lines.at(-1)!].join("\n");
+// Paths a reviewer should look at twice: what runs in CI, and who owns what (GitHub reads
+// CODEOWNERS from .github/, the root, or docs/). git quotes a path with unusual characters
+// (".github/\303\251.yml" with the quotes), so a leading quote is allowed.
+const SENSITIVE = /^"?(\.github\/|(docs\/)?CODEOWNERS$)/;
+
+// Text from the sandbox or the model, escaped for Slack mrkdwn: & < >, so it can hold no
+// mention, @channel or link. (Formatting such as *bold* in a title still renders.)
+const escapeSlack = (s: string) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+// …and for a code block, every run of backticks broken up so none can close the block.
+const inBlock = (s: string) => escapeSlack(s).replace(/`{3,}/g, (run) => run.split("").join("\u200b"));
+// …and for an inline code span, no backtick to close it.
+const inSpan = (s: string) => escapeSlack(s).replaceAll("`", "\u02cb");
+
+// At most n characters, never ending inside an escape.
+const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1).replace(/&[a-z]*$/, "")}…`);
+
+// What the approver sees, all from the host's staging: the stat, any sensitive paths, and as
+// much of the patch as fits. A Slack section caps at 3000 characters: the title, each stat
+// line and each path are clipped so the rest always fits, and the patch gets what is left.
+// Everything the sandbox or the model wrote (title, stat, paths, patch) is escaped: it can't
+// mention anyone, link anywhere, or break out of its code block or span.
+export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged }): string {
+  const { staged } = o;
+  const head =
+    `*Open a pull request?*\n${o.repo.owner}/${o.repo.name}: \`${o.branch}\` → \`${o.base}\` (${staged.sha.slice(0, 8)}, ` +
+    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${clip(escapeSlack(o.title.replace(/\s+/g, " ").trim()), 150)}*\n`;
+  const statLines = inBlock(staged.stat.trimEnd()).split("\n").map((l) => clip(l, 100));
+  const stat = statLines.length <= 15 ? statLines.join("\n") : [...statLines.slice(0, 12), "…", statLines.at(-1)!].join("\n");
+  const sensitive = staged.files.filter((f) => SENSITIVE.test(f));
+  const warn = sensitive.length ? `:warning: Changes ${sensitive.slice(0, 5).map((f) => `\`${clip(inSpan(f), 100)}\``).join(", ")}${sensitive.length > 5 ? " …" : ""}: check these closely.\n` : "";
+  const room = 2900 - head.length - stat.length - warn.length - 40;
+  let patch = inBlock(staged.patch);
+  const cut = patch.length > room || staged.patchTruncated;
+  if (patch.length > room) patch = patch.slice(0, Math.max(0, room)).replace(/&[a-z]*$/, "");
+  const excerpt = room > 200 ? `\`\`\`${patch.trimEnd()}${cut ? "\n… (truncated)" : ""}\`\`\`` : "";
+  return `${head}\`\`\`${stat}\`\`\`\n${warn}${excerpt}`;
 }

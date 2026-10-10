@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { AgentSession, replyStream, type EventSink, type ModelReply, type Model, type Runtime, type Tool, type TurnEvent } from "@junejs/core/agent-runtime";
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
-import { isPlainRef, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
+import { approvalCard, isPlainRef, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
 import type { GithubAccess } from "../src/github-auth";
 
 // A credential with no account to commit as (no identity provider), so no author check
@@ -30,9 +30,14 @@ const noRuntime: Runtime = { session() { throw new Error("no subagents"); } };
 const scripted = (script: ModelReply[]): Model => (msgs) =>
   replyStream(script[Math.min(msgs.filter((m) => m.role === "assistant").length, script.length - 1)]!);
 
-// A sandbox that answers the git commands open_pull_request issues and records every exec.
-function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; knownBases?: string[] } = {}) {
+const SHA = "0123456789abcdef0123456789abcdef01234567";
+
+// A sandbox whose checkout answers the few git commands open_pull_request still runs there
+// (status, origin, default branch), and whose host stages and pushes: every exec and every
+// publish call is recorded.
+function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; files?: string[]; patch?: string; stageError?: string; pushError?: string } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
+  const published: { op: "stage" | "push"; args: Record<string, unknown> }[] = [];
   const sb: Sandbox = {
     async exec(command, opts) {
       calls.push({ command, opts });
@@ -40,19 +45,32 @@ function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; kno
       if (command === "git status --porcelain") return ok(o.dirty ? " M src/a.ts\n" : "");
       if (command === "git remote get-url origin") return ok(`${o.origin ?? "https://github.com/acme/widgets.git"}\n`);
       if (command === "git rev-parse --abbrev-ref origin/HEAD") return ok("origin/main\n");
-      if (command === "git rev-parse HEAD") return ok("0123456789abcdef0123456789abcdef01234567\n");
-      if (command.startsWith("git diff --stat")) return ok(" src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
-      if (command.startsWith("git log --format=")) return ok((o.authors ?? []).map((a) => `${a}\n`).join(""));
-      if (command.includes(" push https://github.com/")) return ok("");
       if (command.startsWith("git update-ref refs/remotes/origin/")) return ok("");
-      if (command.startsWith("git rev-parse --verify --quiet origin/")) return o.knownBases === undefined || o.knownBases.includes(command.split("origin/")[1]!.trim()) ? ok("x\n") : { exitCode: 1, stdout: "", stderr: "" };
       return { exitCode: 1, stdout: "", stderr: `unexpected: ${command}` };
     },
     async readFile() { return ""; },
     async writeFile() {},
-    ...noPublish,
+    async stage(args) {
+      published.push({ op: "stage", args });
+      if (o.stageError) throw new Error(o.stageError);
+      // As the host does: it bundles only what the checkout's origin/* doesn't have.
+      if (calls.some((c) => c.command.startsWith("git update-ref refs/remotes/origin/"))) {
+        throw new Error("stage: 409 no commits to publish: HEAD has nothing that isn't on GitHub already");
+      }
+      return {
+        sha: SHA, baseSha: "f".repeat(40), commits: (o.authors ?? ["x"]).length,
+        stat: " src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
+        authors: o.authors ?? ["bot <b@x>|bot <b@x>"], files: o.files ?? ["src/a.ts"],
+        patch: o.patch ?? "--- a/src/a.ts\n+++ b/src/a.ts\n-old\n+new\n", patchTruncated: false,
+      };
+    },
+    async push(args) {
+      published.push({ op: "push", args });
+      if (o.pushError) throw new Error(o.pushError);
+      return { sha: args.sha, branch: args.branch };
+    },
   };
-  return { sb, calls };
+  return { sb, calls, published };
 }
 
 function fakeGithub(existing: unknown[] = []) {
@@ -79,31 +97,26 @@ function session(tool: Tool) {
 }
 
 describe("open_pull_request — the approval gate", () => {
-  test("parks before touching anything, then Approve pushes and opens a draft PR", async () => {
-    const { sb, calls } = fakeRepo();
+  test("parks with the host's staging on the card, then Approve has the host push the staged commit and opens a draft PR", async () => {
+    const { sb, calls, published } = fakeRepo();
     const gh = fakeGithub();
     const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("ghs_secret"), fetch: gh.f }));
 
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     const parked = await s.result(t1);
     expect(parked).toMatchObject({ status: "suspended" });
-    expect(JSON.stringify(parked)).toContain("src/a.ts | 2 +-"); // the human sees what would be pushed
-    expect(calls.some((c) => c.command.includes("push"))).toBe(false); // nothing left the sandbox
+    expect(JSON.stringify(parked)).toContain("src/a.ts | 2 +-"); // the human sees the host's stat…
+    expect(JSON.stringify(parked)).toContain("+new"); // …and the patch
+    expect(published).toEqual([{ op: "stage", args: { repo: { owner: "acme", name: "widgets" }, base: "main", token: "ghs_secret" } }]);
     expect(gh.reqs).toHaveLength(0);
 
     const inputId = (parked as { request: { id: string } }).request.id;
     s.resume(t1, inputId, true);
     expect(await s.result(t1)).toMatchObject({ status: "completed", text: "done" });
 
-    const push = calls.find((c) => c.command.includes(" push "))!;
-    // to the repo's github.com URL, not `origin` (whose push URL the checkout could change)
-    expect(push.command).toContain("push https://github.com/acme/widgets.git 0123456789abcdef0123456789abcdef01234567:refs/heads/scout/fix-a");
-    expect(push.command).toContain("-c core.hooksPath=/dev/null"); // no hook sees the token
-    expect(push.command).not.toContain("ghs_secret"); // token never in argv…
-    expect(push.opts?.env).toMatchObject({ LOREHOUSE_GH_TOKEN: "ghs_secret" }); // …only in this command's env
-    expect(calls.filter((c) => c.opts?.env).length).toBe(1); // and in no other command
-    // the checkout records what it pushed (a push to the URL doesn't), for a PR based on it
-    expect(calls.some((c) => c.command === "git update-ref refs/remotes/origin/scout/fix-a 0123456789abcdef0123456789abcdef01234567")).toBe(true);
+    // The host pushes exactly the staged commit; the token never enters the sandbox.
+    expect(published.filter((p) => p.op === "push")).toEqual([{ op: "push", args: { repo: { owner: "acme", name: "widgets" }, sha: SHA, branch: "scout/fix-a", token: "ghs_secret" } }]);
+    expect(calls.some((c) => c.command.includes("push") || JSON.stringify(c.opts ?? {}).includes("ghs_secret"))).toBe(false);
 
     const post = gh.reqs.find((r) => r.method === "POST")!;
     expect(post.url).toBe("https://api.github.com/repos/acme/widgets/pulls");
@@ -111,7 +124,7 @@ describe("open_pull_request — the approval gate", () => {
     expect(toolResult()?.result).toMatchObject({ status: "opened", number: 7 });
   });
 
-  test("a credential is asked for only after Approve, for write access to that one repo", async () => {
+  test("read access to stage before approval; write access only after Approve, for that one repo", async () => {
     const { sb } = fakeRepo();
     const asked: string[] = [];
     const github = async (repo: { owner: string; name: string }, access: "read" | "write") => {
@@ -121,28 +134,26 @@ describe("open_pull_request — the approval gate", () => {
     const { s } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     const parked = (await s.result(t1)) as { request: { id: string } };
-    expect(asked).toEqual([]); // nothing before a human says yes
+    expect(asked).toEqual(["acme/widgets:read"]); // no write access before a human says yes
     s.resume(t1, parked.request.id, true);
     await s.result(t1);
-    expect(asked).toEqual(["acme/widgets:write"]);
+    expect(asked.filter((a) => a.endsWith(":write"))).toEqual(["acme/widgets:write"]);
   });
 
-  test("no credential (e.g. the App isn't installed there): the model is told, nothing is pushed", async () => {
-    const { sb, calls } = fakeRepo();
+  test("no credential (e.g. the App isn't installed there): the model is told before anyone is asked, nothing is staged", async () => {
+    const { sb, published } = fakeRepo();
     const gh = fakeGithub();
     const github = async () => { throw new Error("the GitHub App isn't installed on acme/widgets"); };
     const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: gh.f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
-    const parked = (await s.result(t1)) as { request: { id: string } };
-    s.resume(t1, parked.request.id, true);
-    await s.result(t1);
-    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+    expect(await s.result(t1)).toMatchObject({ status: "completed" }); // never parked
+    expect(published).toEqual([]);
     expect(gh.reqs).toHaveLength(0);
     expect(String(toolResult()?.result.error)).toContain("isn't installed on acme/widgets");
   });
 
-  test("an origin not on github.com itself (the model can change it) gets no approval, no token, no push", async () => {
-    const { sb, calls } = fakeRepo({ origin: "https://evil.github.com/acme/widgets.git" });
+  test("an origin not on github.com itself (the model can change it) gets no approval, no token, nothing published", async () => {
+    const { sb, published } = fakeRepo({ origin: "https://evil.github.com/acme/widgets.git" });
     const asked: string[] = [];
     const github = async () => (asked.push("asked"), "ghs_secret");
     const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
@@ -150,23 +161,24 @@ describe("open_pull_request — the approval gate", () => {
     expect(await s.result(t1)).toMatchObject({ status: "completed" }); // never parked for approval
     expect(String(toolResult()?.result.error)).toContain("not a github.com remote");
     expect(asked).toEqual([]);
-    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+    expect(published).toEqual([]);
   });
 
-  test("a commit not by the App's bot is sent back to be re-authored, before anyone is asked to approve", async () => {
+  test("a commit not by the App's bot (by the host's reading) is sent back to be re-authored, before anyone is asked", async () => {
     const bot = "acme-agent[bot] <900+acme-agent[bot]@users.noreply.github.com>";
     const github = Object.assign(async () => "ghs_secret", { identity: async () => ({ name: "acme-agent[bot]", email: "900+acme-agent[bot]@users.noreply.github.com" }) });
     const outcome = async (authors: string[]) => {
-      const { sb, calls } = fakeRepo({ authors });
+      const { sb, published } = fakeRepo({ authors });
       const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
       const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
-      return { result: await s.result(t1), tool: toolResult()?.result, pushed: calls.some((c) => c.command.includes("push")) };
+      return { result: await s.result(t1), tool: toolResult()?.result, pushed: published.some((p) => p.op === "push") };
     };
     // One made-up author among two: no approval card, nothing pushed, and the model is told how to fix it.
     const wrong = await outcome([`${bot}|${bot}`, `Scout <scout@made-up.example>|${bot}`]);
     expect(wrong.result).toMatchObject({ status: "completed" });
     expect(String(wrong.tool?.error)).toContain("1 of 2 commit(s) on HEAD aren't by acme-agent[bot]");
     expect(String(wrong.tool?.error)).toContain("git rebase --exec 'git commit --amend --no-edit --reset-author' origin/main");
+    expect(String(wrong.tool?.error)).toContain("if origin/main isn't in this checkout, fetch it with workspace_clone first");
     expect(wrong.pushed).toBe(false);
     // A committer that isn't the bot counts too.
     expect(String((await outcome([`${bot}|Scout <scout@made-up.example>`])).tool?.error)).toContain("aren't by");
@@ -175,23 +187,114 @@ describe("open_pull_request — the approval gate", () => {
   });
 
   test("when who the commits should be by can't be looked up, nobody is asked to approve them", async () => {
-    const { sb, calls } = fakeRepo({ authors: ["Scout <scout@made-up.example>|Scout <scout@made-up.example>"] });
+    const { sb, published } = fakeRepo({ authors: ["Scout <scout@made-up.example>|Scout <scout@made-up.example>"] });
     const asked: string[] = [];
-    const github = Object.assign(async () => (asked.push("token"), "ghs_secret"), { identity: async () => { throw new Error("GitHub App: looking up the App: 502"); } });
+    const github = Object.assign(async (_r: unknown, access: string) => (asked.push(access), "ghs_secret"), { identity: async () => { throw new Error("GitHub App: looking up the App: 502"); } });
     const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github, fetch: fakeGithub().f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
     expect(await s.result(t1)).toMatchObject({ status: "completed" }); // never parked
     expect(String(toolResult()?.result.error)).toContain("can't check who the commits are by");
-    expect(asked).toEqual([]);
-    expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+    expect(asked).not.toContain("write");
+    expect(published.some((p) => p.op === "push")).toBe(false);
   });
 
-  test("a base the checkout hasn't fetched: the model is told to fetch with workspace_clone, nothing is asked", async () => {
-    const { sb, calls } = fakeRepo({ knownBases: ["main"] });
+  test("an approval is asked for again when the repo, base, branch or title differs, never reused", async () => {
+    const ids: string[] = [];
+    const ask = async (input: { branch: string; title: string; base?: string }, origin?: string) => {
+      const { sb } = fakeRepo({ origin });
+      const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+      await tool.run(input, { requestInput: async (r: { id: string }) => { ids.push(r.id); return false; } } as never);
+    };
+    await ask({ branch: "scout/x", title: "x" });
+    await ask({ branch: "scout/x", title: "x" }); // the same call: the same approval (a replay)
+    await ask({ branch: "scout/x", title: "a new title" });
+    await ask({ branch: "scout/x", title: "x", base: "develop" });
+    await ask({ branch: "scout/y", title: "x" });
+    await ask({ branch: "scout/x", title: "x" }, "https://github.com/acme/other.git");
+    expect(ids[0]).toBe(ids[1]!);
+    expect(new Set(ids).size).toBe(5);
+  });
+
+  test("a replay after the push (cut off before its result was saved) still reaches the PR", async () => {
+    const { sb, published } = fakeRepo();
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+    const ctx = { requestInput: async () => true } as never;
+    expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened" });
+    expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened" });
+    expect(published.map((p) => p.op)).toEqual(["stage", "push", "stage", "push"]);
+  });
+
+  test("a staging failure (nothing new, a base not on GitHub, refused commits) reaches the model; nobody is asked", async () => {
+    const { sb, published } = fakeRepo({ stageError: "stage: 404 the base branch scout/readme-license isn't on GitHub" });
     const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
     const r = (await tool.run({ branch: "scout/x", title: "x", base: "scout/readme-license" }, { requestInput: async () => { throw new Error("asked"); } } as never)) as { error: string };
-    expect(r.error).toContain("origin/scout/readme-license isn't in this checkout yet. Fetch with workspace_clone (acme/widgets)");
-    expect(calls.some((c) => c.command.startsWith("git diff"))).toBe(false);
+    expect(r.error).toBe("couldn't stage the commits: stage: 404 the base branch scout/readme-license isn't on GitHub");
+    expect(published.map((p) => p.op)).toEqual(["stage"]);
+  });
+
+  test("a push the host refuses after approval (the branch moved on) is reported, and no PR is opened", async () => {
+    const { sb } = fakeRepo({ pushError: "push: 409 push to scout/x: [rejected] (non-fast-forward)" });
+    const gh = fakeGithub();
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f });
+    const r = (await tool.run({ branch: "scout/x", title: "x" }, { requestInput: async () => true } as never)) as { error: string };
+    expect(r.error).toBe("push failed: push: 409 push to scout/x: [rejected] (non-fast-forward)");
+    expect(gh.reqs).toHaveLength(0);
+  });
+
+  test("the card flags changes under .github/ and keeps within Slack's 3000 characters, the patch cut to fit", () => {
+    const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 2, stat: " .github/workflows/ci.yml | 3 +\n src/a.ts | 1 +\n 2 files changed\n", authors: [], files: [".github/workflows/ci.yml", "src/a.ts"], patch: "+x\n".repeat(5000) + "```", patchTruncated: false };
+    const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
+    expect(card).toContain("2 commits");
+    expect(card).toContain(":warning: Changes `.github/workflows/ci.yml`");
+    expect(card).toContain("… (truncated)");
+    expect(card.length).toBeLessThanOrEqual(3000);
+    expect(card.match(/```/g)!.length % 2).toBe(0);
+    // A fence in the part of the patch that is shown can't break out of its block.
+    const fenced = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged: { ...staged, patch: "```\nevil\n" } });
+    expect(fenced).toContain("evil");
+    expect(fenced.match(/```/g)!.length % 2).toBe(0);
+  });
+
+  test("nothing the sandbox or the model wrote can add markup to the card", () => {
+    const staged = {
+      sha: SHA, baseSha: "f".repeat(40), commits: 1, authors: [],
+      stat: " .github/x`y | 1 +\n``````\n<!here> | 1 +\n",
+      files: [".github/a`<@U1>`b"],
+      patch: "+<https://evil.example|click> &lt; ``````\n",
+      patchTruncated: false,
+    };
+    const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix <!channel>\n*Approved by security*", staged });
+    expect(card).not.toMatch(/<[!@#]|<https?:/); // no mention, @channel or link
+    expect(card).toContain("&lt;!channel&gt;");
+    expect(card).toContain("&amp;lt;"); // an entity in the patch is shown as written
+    expect(card.match(/```/g)).toHaveLength(4); // only the two blocks' own fences
+    expect(card).toContain("`.github/aˋ&lt;@U1&gt;ˋb`"); // a path can't close its code span
+    expect(card).toContain("*Fix &lt;!channel&gt; *Approved by security**"); // the title stays on its line
+  });
+
+  test("the card fits Slack's 3000 characters whatever the title, branch, stat and paths", () => {
+    const long = (n: number) => "a".repeat(n);
+    const staged = {
+      sha: SHA, baseSha: "f".repeat(40), commits: 2, authors: [], patch: "+x\n".repeat(5000), patchTruncated: true,
+      stat: Array.from({ length: 30 }, (_, i) => ` ${long(500)}${i} | 1 +`).join("\n") + "\n",
+      files: Array.from({ length: 10 }, (_, i) => `.github/${long(500)}${i}`),
+    };
+    const card = approvalCard({ repo: { owner: long(39), name: long(100) }, branch: `scout/${long(194)}`, base: long(200), title: "<".repeat(5000), staged });
+    expect(card.length).toBeLessThanOrEqual(3000);
+    expect(card.match(/```/g)!.length % 2).toBe(0);
+    expect(card).toContain(":warning: Changes");
+  });
+
+  test("the card flags a .github/ path that git quoted", () => {
+    const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: ['".github/workflows/\\303\\251.yml"'], patch: "", patchTruncated: false };
+    const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
+    expect(card).toContain(":warning: Changes");
+  });
+
+  test("the card flags CODEOWNERS wherever GitHub reads it", () => {
+    const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false };
+    const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
+    expect(card).toContain(":warning: Changes `CODEOWNERS`, `docs/CODEOWNERS`:");
   });
 
   test("a base that isn't a plain branch name never reaches a shell command", async () => {
@@ -202,12 +305,12 @@ describe("open_pull_request — the approval gate", () => {
       expect(calls).toHaveLength(0);
     }
     // nor does a default branch the sandbox reports that isn't one
-    const { sb, calls } = fakeRepo();
+    const { sb, published } = fakeRepo();
     const exec = sb.exec.bind(sb);
     sb.exec = async (command, opts) => (command === "git rev-parse --abbrev-ref origin/HEAD" ? { exitCode: 0, stdout: "origin/main;id\n", stderr: "" } : exec(command, opts));
     const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
     expect(await tool.run({ branch: "scout/x", title: "x" }, {} as never)).toMatchObject({ error: expect.stringContaining("isn't a plain branch name") });
-    expect(calls.some((c) => c.command.startsWith("git diff") || c.command.startsWith("git log"))).toBe(false); // stopped before any command uses it
+    expect(published).toEqual([]); // stopped before the host is asked to stage against it
   });
 
   test("isPlainRef: ordinary branch names only", () => {
@@ -216,7 +319,7 @@ describe("open_pull_request — the approval gate", () => {
   });
 
   test("Deny pushes nothing", async () => {
-    const { sb, calls } = fakeRepo();
+    const { sb, calls, published } = fakeRepo();
     const gh = fakeGithub();
     const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f }));
     const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
@@ -224,6 +327,7 @@ describe("open_pull_request — the approval gate", () => {
     s.resume(t1, parked.request.id, false);
     await s.result(t1);
     expect(calls.some((c) => c.command.includes("push"))).toBe(false);
+    expect(published.some((p) => p.op === "push")).toBe(false); // staged for the card, never pushed by the host
     expect(gh.reqs).toHaveLength(0);
     expect(toolResult()?.result).toMatchObject({ status: "denied" });
   });
