@@ -53,6 +53,10 @@ function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; fil
     async stage(args) {
       published.push({ op: "stage", args });
       if (o.stageError) throw new Error(o.stageError);
+      // As the host does: it bundles only what the checkout's origin/* doesn't have.
+      if (calls.some((c) => c.command.startsWith("git update-ref refs/remotes/origin/"))) {
+        throw new Error("stage: 409 no commits to publish: HEAD has nothing that isn't on GitHub already");
+      }
       return {
         sha: SHA, baseSha: "f".repeat(40), commits: (o.authors ?? ["x"]).length,
         stat: " src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
@@ -113,8 +117,6 @@ describe("open_pull_request — the approval gate", () => {
     // The host pushes exactly the staged commit; the token never enters the sandbox.
     expect(published.filter((p) => p.op === "push")).toEqual([{ op: "push", args: { repo: { owner: "acme", name: "widgets" }, sha: SHA, branch: "scout/fix-a", token: "ghs_secret" } }]);
     expect(calls.some((c) => c.command.includes("push") || JSON.stringify(c.opts ?? {}).includes("ghs_secret"))).toBe(false);
-    // the checkout records what was pushed, for a PR based on it
-    expect(calls.some((c) => c.command === `git update-ref refs/remotes/origin/scout/fix-a ${SHA}`)).toBe(true);
 
     const post = gh.reqs.find((r) => r.method === "POST")!;
     expect(post.url).toBe("https://api.github.com/repos/acme/widgets/pulls");
@@ -193,6 +195,15 @@ describe("open_pull_request — the approval gate", () => {
     expect(String(toolResult()?.result.error)).toContain("can't check who the commits are by");
     expect(asked).not.toContain("write");
     expect(published.some((p) => p.op === "push")).toBe(false);
+  });
+
+  test("a replay after the push (cut off before its result was saved) still reaches the PR", async () => {
+    const { sb, published } = fakeRepo();
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+    const ctx = { requestInput: async () => true } as never;
+    expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened" });
+    expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened" });
+    expect(published.map((p) => p.op)).toEqual(["stage", "push", "stage", "push"]);
   });
 
   test("a staging failure (nothing new, a base not on GitHub, refused commits) reaches the model; nobody is asked", async () => {

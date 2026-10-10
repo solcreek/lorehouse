@@ -142,9 +142,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       } catch (e) {
         return { error: `push failed: ${(e as Error).message}` };
       }
-      // The checkout doesn't know about a push it didn't make: record it as origin/<branch>,
-      // so a later PR can be based on this branch. Local only; a fetch brings it in anyway.
-      await sb.exec(`git update-ref refs/remotes/origin/${input.branch} ${staged.sha}`, { cwd: WORKDIR, timeoutMs: 30_000 }).catch(() => undefined);
+      // The checkout's origin/* is left as it is. Staging bundles what origin/* doesn't
+      // have, so recording the push there would make a replay (one cut off after this push,
+      // before its result was saved) stage nothing and never reach the PR below. A later PR
+      // based on this branch needs nothing from the checkout: the host diffs against GitHub.
 
       const gh = (path: string, init?: RequestInit) =>
         f(`https://api.github.com/repos/${repo.owner}/${repo.name}${path}`, {
