@@ -121,7 +121,9 @@ now: `accept` is synchronous, so it can't look up whether a channel is private
 
 These are Lorehouse's position, not settings:
 
-- It works only in public channels. A DM is never knowledge.
+- It works only in public channels; private channels and group DMs stay shut. A DM is
+  never knowledge, and is answered at all only where the install's `DM_MODE` allows it,
+  from public knowledge and without code tools. A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread.
 - People are named as plain text, never @-mentioned.
 - A write token never enters a sandbox (the direction of #31).
