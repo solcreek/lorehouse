@@ -219,7 +219,11 @@ describe("open_pull_request — the approval gate", () => {
     expect(card).toContain(":warning: Changes `.github/workflows/ci.yml`");
     expect(card).toContain("… (truncated)");
     expect(card.length).toBeLessThanOrEqual(3000);
-    expect(card.match(/```/g)!.length % 2).toBe(0); // a fence in the patch can't break out of its block
+    expect(card.match(/```/g)!.length % 2).toBe(0);
+    // A fence in the part of the patch that is shown can't break out of its block.
+    const fenced = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged: { ...staged, patch: "```\nevil\n" } });
+    expect(fenced).toContain("evil");
+    expect(fenced.match(/```/g)!.length % 2).toBe(0);
   });
 
   test("a base that isn't a plain branch name never reaches a shell command", async () => {
