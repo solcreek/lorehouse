@@ -193,8 +193,9 @@ export function parseGithubRemote(url: string): { owner: string; name: string } 
   return { owner: m[1]!, name: m[2]! };
 }
 
-// Paths a reviewer should look at twice: what runs in CI, and who owns what.
-const SENSITIVE = /^\.github\//;
+// Paths a reviewer should look at twice: what runs in CI, and who owns what (GitHub reads
+// CODEOWNERS from .github/, the root, or docs/).
+const SENSITIVE = /^(\.github\/|(docs\/)?CODEOWNERS$)/;
 
 // What the approver sees, all from the host's staging: the stat, any sensitive paths, and as
 // much of the patch as fits. A Slack section caps at 3000 characters.
