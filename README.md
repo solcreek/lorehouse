@@ -59,7 +59,8 @@ is enough; no zero-downtime setup is needed. A prototype of the same stack used 
 |---|---|---|
 | **Linux you run**: a server at home, a Hetzner box, any VPS | works today | the compiled binary under systemd; HTTPS from Caddy or a Cloudflare Tunnel. CI builds the Linux binary and runs the full conformance suite against it on every change |
 | **Fly.io** | works today | one always-on machine with a volume for the SQLite files ([`fly.toml`](fly.toml), [below](#on-flyio)) |
-| **Render** | planned | a web service with a persistent disk |
+| **Render** | ready, not yet tried | the [`render.yaml`](render.yaml) Blueprint: the published image and a disk ([Nix](docs/nix.md#hosts)) |
+| **Railway** | ready, not yet tried | the published image and a volume, with the CLI ([steps](docs/nix.md#railway)) |
 | **Cloudflare Workers** | exploring | needs June's edge host and Durable Object storage instead of a SQLite file |
 | **Your laptop** | works today | `bun start` behind a quick tunnel, for trying it out ([runbook](docs/live-slack.md)) |
 
@@ -78,8 +79,10 @@ behind NAT. The host running Lorehouse itself needs no KVM. See
 
 ### On Fly.io
 
-The [`Dockerfile`](Dockerfile) packs the binary into a 178 MB image. The SQLite files go
-under `/data`. Set `app` in `fly.toml` to your own name, then:
+[`fly.toml`](fly.toml) runs the published image, `ghcr.io/solcreek/lorehouse:main` (about
+50 MB to pull; [Nix](docs/nix.md#hosts)), so nothing is built. For your own install,
+`:latest`, the newest release, is the steadier choice. The SQLite files go under
+`/data`. Set `app` in `fly.toml` to your own name, then:
 
 ```bash
 fly apps create <app>
@@ -107,7 +110,11 @@ CI deploys every merge to `main` that passes the conformance suite. To do the sa
 
 1. Create a token that can deploy only this app: `fly tokens create deploy -a <app>`.
 2. Store it as the `FLY_API_TOKEN` repository secret.
-3. Change the repository check in [`ci.yml`](.github/workflows/ci.yml).
+3. In [`ci.yml`](.github/workflows/ci.yml), change the repository check on both the
+   `image` and the `deploy` job: deploy runs the image that the `image` job publishes
+   to your repository's `ghcr.io/<owner>/<repo>`.
+4. After the first publish, make that package public
+   ([how](docs/nix.md#hosts)), so Fly can pull it.
 
 The deploy job pins its actions to commit SHAs, because it holds that token.
 
@@ -199,8 +206,12 @@ Go or Rust version would have to pass
 | `slack/` | the Slack app manifest |
 | `sandbox/` | the sandbox: the host daemon ([`host/`](sandbox/host/README.md), Rust), the in-VM agent (`guest/`, Go) and the feasibility spike |
 | `docs/` | the live-Slack runbook and its results, decisions (`adr/`) and experiments |
+| `flake.nix`, `nix/` | the pinned toolchain (`nix develop`), the binary and the container image ([Nix](docs/nix.md)) |
 
 ## Check it
+
+With [Nix](docs/nix.md), `nix develop` gives the toolchain, and `nix flake check` runs
+the contract against the binary Nix builds.
 
 ```bash
 bun run typecheck && bun run test
