@@ -58,7 +58,7 @@ turns each profile into a `defineAgent`.
 | `prompt` | `prompts/profiles/<id>.md`, embedded like every prompt |
 | `tools` | picked from Lorehouse's tool catalog by name |
 | `skills` | picked from the skill catalog by name (§4) |
-| `triggers` | what starts a turn: Slack mentions and follow-ups, a webhook, a schedule |
+| `triggers` | what starts a turn: Slack mentions and follow-ups, a webhook, a schedule. A webhook trigger verifies the provider's signature before any session exists, and derives the turn id from the verified delivery id (GitHub's `X-GitHub-Delivery`), so a redelivered event resumes or is dropped, never runs twice |
 | `delivery` | where an automation or job turn posts its result: a rule that resolves each trigger to a June `DeliveryTarget` (channel, optional thread), e.g. "the thread that asked for this PR, else this channel". Every target must be an allowlisted public channel (§6); an unresolvable one fails the turn, it never falls back to a DM |
 | `sandbox` | `none`, `read` or `write`. Only `write` may open a pull request |
 | `credentials` | which grants it may ask for, e.g. GitHub read or write, per repo |
