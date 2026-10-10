@@ -201,6 +201,15 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
     }
 }
 
+/// A file removed when this is dropped.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -244,13 +253,14 @@ impl Publisher {
         let _held = lock.lock().await;
         self.refresh(&dir, &req.owner, &req.name, req.token.as_deref()).await.map_err(|e| (502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)))?;
         let id = format!("{}-{:x}", unix_secs(), SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()));
-        let bundle = dir.join(format!("stage-{id}.bundle"));
-        let read = bundle_from(vms, sandbox, &bundle).await;
+        // Removed however this ends, a deadline that drops this future included.
+        let bundle = TempFile(dir.join(format!("stage-{id}.bundle")));
+        let read = bundle_from(vms, sandbox, &bundle.0).await;
         let staged = match read {
-            Ok(()) => self.stage_bundle(&dir, &bundle, &req.base, &id).await,
+            Ok(()) => self.stage_bundle(&dir, &bundle.0, &req.base, &id).await,
             Err(e) => Err(e),
         };
-        let _ = tokio::fs::remove_file(&bundle).await;
+        drop(bundle);
         self.prune_stale(&dir).await;
         staged
     }
@@ -626,6 +636,14 @@ mod tests {
         let err = s.publisher.stage_bundle(&dir, &blob, "main", &fresh("j")).await.unwrap_err();
         assert_eq!(err.0, 422, "{}", err.1);
         assert!(s.refs().iter().all(|r| !r.starts_with("refs/stage/")), "{:?}", s.refs());
+    }
+
+    #[test]
+    fn a_temp_file_is_removed_when_dropped() {
+        let path = std::env::temp_dir().join(format!("publish-tempfile-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        drop(TempFile(path.clone()));
+        assert!(!path.exists());
     }
 
     #[test]
