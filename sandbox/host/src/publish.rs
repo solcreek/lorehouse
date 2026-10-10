@@ -86,6 +86,8 @@ pub struct Publisher {
     mirrors: PathBuf,
     /// https://github.com in production; a file:// directory in tests.
     remote_base: String,
+    /// REVIEW_CAP; smaller in tests.
+    review_cap: usize,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -116,8 +118,28 @@ fn tail(s: &[u8]) -> String {
     s[start..].to_string()
 }
 
-/// One git command, in `dir`, in the guarded environment; its stdout.
+/// The most of a git command's stdout that is read; past it the command is stopped. The
+/// sandbox controls what is diffed, and a small bundle can expand into a huge diff.
+const OUTPUT_CAP: usize = 16 << 20;
+/// The most of each fact the approval shows (stat, files, authors) that a stage reads.
+const REVIEW_CAP: usize = 1 << 20;
+/// The most of a git command's stderr that is kept.
+const STDERR_CAP: u64 = 64 << 10;
+
+/// One git command, in `dir`, in the guarded environment; its stdout, which must fit
+/// OUTPUT_CAP.
 async fn git(dir: &Path, args: &[&str], token: Option<&str>, limit: Duration) -> Result<String, String> {
+    match git_capped(dir, args, token, limit, OUTPUT_CAP).await? {
+        (out, false) => Ok(out),
+        (_, true) => Err(format!("git {}: more than {OUTPUT_CAP} bytes of output", args[0])),
+    }
+}
+
+/// One git command, in `dir`, in the guarded environment; at most `cap` bytes of its stdout,
+/// and whether there was more (the command is stopped there, never read to the end).
+async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Duration, cap: usize) -> Result<(String, bool), String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
     cmd.env_clear()
@@ -141,16 +163,42 @@ async fn git(dir: &Path, args: &[&str], token: Option<&str>, limit: Duration) ->
     for (i, (k, v)) in config.iter().enumerate() {
         cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
     }
-    cmd.kill_on_drop(true);
-    let out = match tokio::time::timeout(limit, cmd.output()).await {
-        Err(_) => return Err(format!("git {} took over {} s", args[0], limit.as_secs())),
-        Ok(Err(e)) => return Err(format!("git: {e}")),
-        Ok(Ok(o)) => o,
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let work = async {
+        let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            return Err("git: no pipes".to_string());
+        };
+        // stderr on its own task, so a command stopped for too much stdout isn't left
+        // blocked on it; past STDERR_CAP the pipe closes.
+        let errors = tokio::spawn(async move {
+            let mut err = Vec::new();
+            let _ = stderr.take(STDERR_CAP).read_to_end(&mut err).await;
+            err
+        });
+        let mut out = Vec::new();
+        stdout.take(cap as u64 + 1).read_to_end(&mut out).await.map_err(|e| format!("git {}: {e}", args[0]))?;
+        if out.len() > cap {
+            let _ = child.kill().await;
+            errors.abort();
+            let mut cut = cap;
+            while cut > 0 && (out[cut] & 0xC0) == 0x80 {
+                cut -= 1;
+            }
+            out.truncate(cut);
+            return Ok((String::from_utf8_lossy(&out).into_owned(), true));
+        }
+        let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+        let err = errors.await.unwrap_or_default();
+        if !status.success() {
+            return Err(format!("git {}: {}", args[0], tail(&err)));
+        }
+        Ok((String::from_utf8_lossy(&out).into_owned(), false))
     };
-    if !out.status.success() {
-        return Err(format!("git {}: {}", args[0], tail(&out.stderr)));
+    match tokio::time::timeout(limit, work).await {
+        Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
+        Ok(r) => r,
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn unix_secs() -> u64 {
@@ -159,7 +207,7 @@ fn unix_secs() -> u64 {
 
 impl Publisher {
     pub fn new(mirrors: PathBuf, remote_base: String) -> Publisher {
-        Publisher { mirrors, remote_base: remote_base.trim_end_matches('/').to_string(), locks: Mutex::default() }
+        Publisher { mirrors, remote_base: remote_base.trim_end_matches('/').to_string(), review_cap: REVIEW_CAP, locks: Mutex::default() }
     }
 
     fn mirror(&self, owner: &str, name: &str) -> PathBuf {
@@ -226,29 +274,39 @@ impl Publisher {
         let base_sha = base_sha.trim().to_string();
         let range = format!("{base_sha}..{sha}");
         let three_dot = format!("{base_sha}...{sha}");
-        let local = |args: Vec<&str>| {
+        // What the approval shows, each read only so far: all of it, or the stage is refused
+        // (a cut list of files or authors would hide what is past the cut).
+        let review_cap = self.review_cap;
+        let fact = |what: &'static str, args: Vec<&str>| {
             let dir = dir.to_path_buf();
             let args: Vec<String> = args.into_iter().map(String::from).collect();
             async move {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                git(&dir, &args, None, GIT_LOCAL).await.map_err(|e| (500, e))
+                match git_capped(&dir, &args, None, GIT_LOCAL, review_cap).await {
+                    Ok((out, false)) => Ok(out),
+                    Ok((_, true)) => Err((413, format!("too much to review: the {what} come to over {review_cap} bytes"))),
+                    Err(e) => Err((500, e)),
+                }
             }
         };
-        let authors: Vec<String> = local(vec!["log", "--format=%an <%ae>|%cn <%ce>", &range]).await?.lines().map(String::from).collect();
+        let described = async {
+            let authors: Vec<String> = fact("authors", vec!["log", "--format=%an <%ae>|%cn <%ce>", &range]).await?.lines().map(String::from).collect();
+            let stat = fact("stat", vec!["diff", "--no-ext-diff", "--no-textconv", "--stat", &three_dot]).await?;
+            let files: Vec<String> = fact("files", vec!["diff", "--no-ext-diff", "--no-textconv", "--name-only", &three_dot]).await?.lines().map(String::from).collect();
+            // The patch is only an excerpt: cut, not refused.
+            let (patch, patch_truncated) = git_capped(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], None, GIT_LOCAL, MAX_PATCH).await.map_err(|e| (500, e))?;
+            Ok::<_, Failure>((authors, stat, files, patch, patch_truncated))
+        };
+        let (authors, stat, files, patch, patch_truncated) = match described.await {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
+                return Err(e);
+            }
+        };
         if authors.is_empty() {
             let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
             return Err((409, format!("no commits to publish: HEAD has nothing that isn't on {base} already")));
-        }
-        let stat = local(vec!["diff", "--no-ext-diff", "--no-textconv", "--stat", &three_dot]).await?;
-        let files = local(vec!["diff", "--no-ext-diff", "--no-textconv", "--name-only", &three_dot]).await?.lines().map(String::from).collect();
-        let mut patch = local(vec!["diff", "--no-ext-diff", "--no-textconv", &three_dot]).await?;
-        let patch_truncated = patch.len() > MAX_PATCH;
-        if patch_truncated {
-            let mut cut = MAX_PATCH;
-            while !patch.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            patch.truncate(cut);
         }
         Ok(Staged { sha, base_sha, commits: authors.len(), stat, authors, files, patch, patch_truncated })
     }
@@ -504,6 +562,24 @@ mod tests {
         let err = s.publisher.push(s.push(&head, "scout/old")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
         assert!(s.refs().iter().all(|r| !r.starts_with("refs/stage/")), "the expired stage is dropped");
+    }
+
+    #[tokio::test]
+    async fn what_the_approval_shows_is_read_only_up_to_a_cap() {
+        let mut s = scratch("cap");
+        s.publisher.review_cap = 4096;
+        // 400 files: their names alone are over the cap. Refused, not cut: a cut list would
+        // hide files from the approver.
+        sh(&s.vm, "for i in $(seq 1 400); do echo $i > file-with-a-long-name-$i; done && git add . && git commit -qm many");
+        let err = s.stage(&fresh("g")).await.unwrap_err();
+        assert_eq!(err.0, 413, "{}", err.1);
+        assert!(err.1.contains("too much to review"), "{}", err.1);
+        assert!(s.refs().iter().all(|r| !r.starts_with("refs/stage/")), "nothing is left staged");
+        // The patch is an excerpt: cut at MAX_PATCH, and the stage goes on.
+        s.publisher.review_cap = REVIEW_CAP;
+        sh(&s.vm, "git reset -q --hard origin/main && seq 1 200000 > big && git add big && git commit -qm big");
+        let staged = s.stage(&fresh("h")).await.unwrap();
+        assert!(staged.patch_truncated && staged.patch.len() <= MAX_PATCH && staged.patch.contains("+1\n"));
     }
 
     #[test]

@@ -184,4 +184,5 @@ push → { "owner": "acme", "name": "widgets", "sha": "…", "branch": "scout/x"
   - 409: nothing new to publish, or a branch that has moved on.
   - 404: the base isn't on GitHub, or the commit wasn't staged.
   - 422: the bundle was refused.
-  - 413: the commits are too large.
+  - 413: the commits are too large, or what the approval shows (stat, files, authors) is
+    over 1 MiB each. The host reads only that much of any of it; the patch is cut at 64 KiB.
