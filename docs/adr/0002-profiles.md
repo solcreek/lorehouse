@@ -30,8 +30,11 @@ June (`@junejs/core` 0.2.0-dev.49) already has most of the parts:
   skill only when the model asks for it.
 - `createNativeRuntime({ [id]: def, … })` holds several agents. `runtime.session(agent,
   id)` keeps their sessions apart.
-- `ProactiveTrigger`, `runDetached` and `runDelivered` start a turn that no inbound
-  message started, and deliver it to a channel.
+- `ProactiveTrigger` marks a turn that no inbound message started. On the native
+  runtime Lorehouse uses, `runDetached` or `runStream` runs it, and the Slack channel's
+  `post` or `deliver` puts the result in a thread. `runDelivered` does both in one call,
+  but only the durable (Cloudflare) runtime implements it; on the native runtime it is
+  `undefined` (checked on 0.2.0-dev.49 and dev.65).
 - `ChannelPolicy.denyTools` narrows tools per channel.
 
 Two pull requests already build on this. #25 loads `prompts/skills/*.md` through
@@ -73,8 +76,8 @@ whom to ask, and what one teaches would not reach the others.
 
 So **at most one profile per install is started by Slack messages**: the interactive
 one. Automation and job profiles are started by something else (a webhook, a schedule)
-and post into Slack under the same identity, through the channel's `post` or
-`runDelivered`. This avoids routing Slack events between profiles for now. If two
+and post into Slack under the same identity, through the Slack channel's `post` or
+`deliver`. This avoids routing Slack events between profiles for now. If two
 profiles ever need to answer Slack messages, routing is decided then, in its own ADR.
 
 ### 3. Three modes
