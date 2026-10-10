@@ -48,17 +48,17 @@ describe("who commits", () => {
   });
 });
 
-describe("a pull request based on a branch the checkout pushed", () => {
-  test("a push to the URL leaves origin/<branch> unknown; recording it makes the stacked diff work", () => {
-    const dir = repo("stacked");
+describe("a branch the host pushed", () => {
+  test("stays unknown to the checkout's origin/*, so its commits still bundle for a re-stage", () => {
+    const dir = repo("pushed");
     sh(`git remote add origin ${dir}.git && git push -q origin HEAD:refs/heads/main && git fetch -q origin`, { cwd: dir });
     sh(`echo a > a && git add a && git commit -qm a`, { cwd: dir });
     const first = sh(`git rev-parse HEAD`, { cwd: dir }).out.trim();
-    sh(`git push -q ${dir}.git ${first}:refs/heads/scout/one`, { cwd: dir }); // a push to the URL, not to origin
+    sh(`git push -q ${dir}.git ${first}:refs/heads/scout/one`, { cwd: dir }); // as the host pushes: not through origin
     expect(sh(`git rev-parse --verify --quiet origin/scout/one`, { cwd: dir }).code).not.toBe(0);
-    sh(`git update-ref refs/remotes/origin/scout/one ${first}`, { cwd: dir }); // recorded by hand
-    sh(`echo b > b && git add b && git commit -qm b`, { cwd: dir });
-    expect(sh(`git diff --stat origin/scout/one...HEAD`, { cwd: dir }).out).toMatch(/^ b \| 1 \+\n 1 file changed/);
+    // What the host has the sandbox bundle on a replay: still the pushed commit, not "empty bundle".
+    const r = sh(`git bundle create -q ${join(root, "replay.bundle")} HEAD --not --remotes=origin`, { cwd: dir });
+    expect(r.code).toBe(0);
   });
 });
 
