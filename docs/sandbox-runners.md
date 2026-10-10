@@ -158,9 +158,9 @@ lost because a connection dropped while the job ran.
 
 The agent's commits reach GitHub without a write token ever entering the sandbox. The
 model controls everything inside it, the `git` binary included, so the host does the
-verifying and the pushing. Two job ops do it. In serve mode, they are
-`POST /v1/sandboxes/{id}/stage` and `/push`, which take the same JSON. Both carry the request
-as JSON in `bodyBase64` and answer with JSON:
+verifying and the pushing. Two job ops do it, `stage` and `push`. A job carries the request
+as base64 JSON in `bodyBase64`, and its result is JSON. In serve mode, the same requests
+are `POST /v1/sandboxes/{id}/stage` and `/push`, with the JSON as the plain request body:
 
 ```json
 stage → { "owner": "acme", "name": "widgets", "base": "main", "token": "<read token>" }
