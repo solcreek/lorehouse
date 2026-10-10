@@ -27,6 +27,9 @@ const MOCK = `http://localhost:${MOCK_PORT}`, APP = `http://localhost:${APP_PORT
 // runs may share them.
 const DIR = mkdtempSync(join(tmpdir(), "lorehouse-e2e-"));
 const DB = join(DIR, "lorehouse.db");
+// Nothing from this shell or an installed settings file may point the app elsewhere:
+// LOREHOUSE_ENV_FILE is a missing file in DIR, and settings.json defaults to DIR too.
+const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, ...inherited } = process.env;
 
 const mock = Bun.spawn(["bun", join(ROOT, "conformance/mock.ts")], {
   env: { ...process.env, PORT: String(MOCK_PORT), TTFT_MS: "20", TOKEN_DELAY_MS: "1", SLACK_FIXTURES: join(ROOT, "conformance/fixtures/slack-history.json") },
@@ -36,7 +39,8 @@ const mock = Bun.spawn(["bun", join(ROOT, "conformance/mock.ts")], {
 const app = Bun.spawn(["bun", join(ROOT, "src/server.ts")], {
   cwd: ROOT,
   env: {
-    ...process.env,
+    ...inherited,
+    LOREHOUSE_ENV_FILE: join(DIR, "lorehouse.env"),
     PORT: String(APP_PORT),
     SLACK_SIGNING_SECRET: SECRET,
     SLACK_BOT_TOKEN: "xoxb-e2e",
