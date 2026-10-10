@@ -240,6 +240,13 @@ describe("code tools", () => {
     expect(find(checks, "token")[0]).toMatchObject({ level: "warn" });
   });
 
+  test("asks GitHub where the app would (GITHUB_API_URL)", async () => {
+    const { f, seen } = world();
+    await doctor({ env: { ...ENV, SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1", GITHUB_API_URL: "http://github.test/api/" }, fetch: f });
+    expect(seen).toContain("GET github.test/api/user");
+    expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
+  });
+
   test("with runners, a running app with none connected fails", async () => {
     const checks = await run(app, { app: { status: { agent: "scout", knowledge: { state: "ready", documents: 1 }, runners: [] } } }, "https://app.test");
     expect(find(checks.filter((c) => c.section === "deployment"), "runners")[0]?.level).toBe("fail");

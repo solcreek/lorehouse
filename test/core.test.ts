@@ -188,6 +188,12 @@ describe("config", () => {
     expect(sessions({ LOREHOUSE_DB: ":memory:", SESSIONS_DB: "/state/june.db" })).toBe("/state/june.db");
   });
 
+  test("GITHUB_API_URL: unset, GitHub itself (the tools' default); set, kept", () => {
+    expect(loadConfig(base).githubApiUrl).toBeUndefined();
+    expect(loadConfig({ ...base, GITHUB_API_URL: "" }).githubApiUrl).toBeUndefined();
+    expect(loadConfig({ ...base, GITHUB_API_URL: "http://localhost:9000/github" }).githubApiUrl).toBe("http://localhost:9000/github");
+  });
+
   test("SESSIONS_DB never shares LOREHOUSE_DB's file, defaulted or explicit", () => {
     expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/sessions.db" })).toThrow(/SESSIONS_DB \(must be a different file from LOREHOUSE_DB/);
     expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/x.db", SESSIONS_DB: "/data/../data/x.db" })).toThrow(/SESSIONS_DB/);

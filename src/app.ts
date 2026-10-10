@@ -116,9 +116,10 @@ export async function createApp(config: Config) {
       ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx))
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
-    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey }) : staticToken(sb.github.token);
+    const apiUrl = config.githubApiUrl;
+    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
-    tools.push(...workspaceTools(sandboxFor, { commitAs: github.identity }), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName }));
+    tools.push(...workspaceTools(sandboxFor, { commitAs: github.identity }), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName, apiUrl }));
   }
 
   const dm = config.agent.dm;

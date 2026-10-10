@@ -168,7 +168,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   // ── github (code tools) ──
   const sandbox = config.sandbox;
   if (sandbox) {
-    const api = (opts.githubApiUrl ?? "https://api.github.com").replace(/\/$/, "");
+    const api = (opts.githubApiUrl ?? config.githubApiUrl ?? "https://api.github.com").replace(/\/$/, "");
     const headers = { accept: "application/vnd.github+json", "user-agent": "lorehouse" };
     const gh = sandbox.github;
     // loadConfig checks only the PEM header; signing is what proves the key is one.

@@ -34,12 +34,14 @@ export type PullRequestOptions = {
   // goes into the PR: it identifies the workspace, and a PR can be public.
   approverName?: (slackUserId: string) => Promise<string | undefined>;
   fetch?: typeof fetch; // injectable for tests
+  apiUrl?: string; // GitHub's REST API, default https://api.github.com
 };
 
 type Input = { branch: string; title: string; body?: string; base?: string };
 
 export function pullRequestTool(opts: PullRequestOptions): Tool {
   const f = opts.fetch ?? fetch;
+  const api = (opts.apiUrl ?? "https://api.github.com").replace(/\/$/, "");
   const id = opts.identity ?? agentIdentity();
   const BRANCH_PREFIX = branchPrefix(id);
   return {
@@ -151,7 +153,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       await sb.exec(`git update-ref refs/remotes/origin/${input.branch} ${head}`, { cwd: WORKDIR, timeoutMs: 30_000 }).catch(() => undefined);
 
       const gh = (path: string, init?: RequestInit) =>
-        f(`https://api.github.com/repos/${repo.owner}/${repo.name}${path}`, {
+        f(`${api}/repos/${repo.owner}/${repo.name}${path}`, {
           ...init,
           headers: {
             accept: "application/vnd.github+json",

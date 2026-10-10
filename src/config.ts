@@ -36,6 +36,9 @@ export type Config = {
   //   direct   one sandbox host Lorehouse calls (SANDBOX_URL + SANDBOX_TOKEN), e.g. on the
   //            same machine over loopback
   sandbox?: ({ mode: "runners"; runnerToken: string } | { mode: "direct"; url: string; token: string }) & { github: GithubCredentials };
+  // GitHub's REST API, for the code tools' credentials and pull requests (GITHUB_API_URL,
+  // default https://api.github.com). Like SLACK_API_URL, it points the app at a mock.
+  githubApiUrl?: string;
 };
 
 // A GitHub App (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY): short-lived tokens per repo, a bot
@@ -113,6 +116,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     statusToken: env.STATUS_TOKEN || undefined,
     adminToken: env.ADMIN_TOKEN || undefined,
     usage: { recordPeople: env.USAGE_RECORD_PEOPLE === "1" },
+    githubApiUrl: env.GITHUB_API_URL || undefined,
   };
   // One file for both would put June's session tables in Lorehouse's database: say so,
   // rather than let a LOREHOUSE_DB named sessions.db quietly share it.

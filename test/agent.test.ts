@@ -123,6 +123,20 @@ describe("open_pull_request — the approval gate", () => {
     expect(asked).toEqual(["acme/widgets:write"]);
   });
 
+  test("GitHub's API can be elsewhere (GITHUB_API_URL): the PR is looked up and opened there", async () => {
+    const { sb } = fakeRepo();
+    const gh = fakeGithub();
+    const { s } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("ghs_secret"), fetch: gh.f, apiUrl: "http://github.test/api/" }));
+    const t1 = s.start({ turnId: "t1", userText: "open a PR" }).turnId;
+    const parked = (await s.result(t1)) as { request: { id: string } };
+    s.resume(t1, parked.request.id, true);
+    await s.result(t1);
+    expect(gh.reqs.map((r) => `${r.method} ${r.url}`)).toEqual([
+      "GET http://github.test/api/repos/acme/widgets/pulls?state=open&head=acme:scout%2Ffix-a",
+      "POST http://github.test/api/repos/acme/widgets/pulls",
+    ]);
+  });
+
   test("no credential (e.g. the App isn't installed there): the model is told, nothing is pushed", async () => {
     const { sb, calls } = fakeRepo();
     const gh = fakeGithub();
