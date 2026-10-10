@@ -118,6 +118,9 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
     needs: [image]
     runs-on: ubuntu-latest
+    # FLY_API_TOKEN belongs to this environment, which only main may deploy from; until
+    # it moves there from the repository secrets, any job could reference it (#59).
+    environment: production
     concurrency:
       group: deploy
       cancel-in-progress: false
