@@ -57,8 +57,9 @@ export function sessionsDbFor(lorehouseDb: string): string {
   return lorehouseDb === ":memory:" ? ":memory:" : join(dirname(lorehouseDb), "sessions.db");
 }
 
-// Whether two paths name one file: equal once normalized, through a symlink (to the file
-// or a directory above it, the file existing or not), or as hard links to one inode.
+// Whether two paths name one file: equal once normalized, through a symlinked directory
+// above it (the file existing or not), through a symlink to the file once the file exists,
+// or as hard links to one inode. A link to a file not yet created isn't seen.
 function sameFile(a: string, b: string): boolean {
   const canonical = (p: string): string => {
     try {
