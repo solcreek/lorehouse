@@ -100,3 +100,51 @@ bun .claude/skills/verify-lorehouse/control.ts cleanup
 Never point it at a developer's `bun start` or the website dev server. A drive that only
 calls `admin`/`status` did not exercise the feature, and one feature drive does not
 replace `bun run conformance`.
+
+## How we work
+
+Given an issue number: `gh issue view <n>`, branch from `main`, do it, run the checks
+below for what you touched, open a PR that closes the issue.
+
+**Issues are the work queue.** Write one so an agent can start without a briefing:
+`## Goal`, `## Context` (what exists now, with numbers and dates if measured),
+`## Where` (files), `## Done when`, `## Verify`.
+
+**Branches, commits, PRs.** One topic per PR, on `<type>/<topic>` (`feat/`, `fix/`,
+`docs/`, `chore/`). Commits are atomic and titled like the log: `type(scope): what is
+true now`. PRs merge with a merge commit, so each commit should stand alone. To catch up
+with `main`, merge it in; never force-push. The PR description:
+
+- `## Why` — the problem, and anything found on the way.
+- `## Scope` — one line per commit, then what is out of scope.
+- `## Tradeoffs` — what was chosen over what, and the cost.
+- `## Blast Radius` — what else changes: the contract, deploys, data, other callers.
+- `## Verification` — the commands run and their counts; what isn't verified yet, and
+  how to check it after the deploy.
+
+**Stacked PRs.** Base the PR on the branch below it and say so in the first line:
+"Stacked on #31. Retarget to `main` once it merges." When the base merges, retarget
+it: `gh pr edit <n> --base main`.
+
+**Checks by change.** CI runs all of them on every PR except the verify-lorehouse drive,
+which is manual; run the ones you touched first.
+
+| change | run |
+|---|---|
+| TypeScript (`src/`, `test/`, `conformance/`) | `bun run typecheck`, `bun run test`, `bun run conformance` |
+| user-visible behavior | the above, with a conformance scenario changed or added; Slack-facing: also verify-lorehouse (see "Verifying Slack-facing changes" above) |
+| `prompts/`, `migrations/`, `slack/manifest.yaml` | the above, then `bun run build` and `bun run conformance --app ./dist/lorehouse` |
+| a migration | also `bun test test/core.test.ts -t "migrations apply"` |
+| `sandbox/guest` | `go vet ./...`, `go test ./...`, `CGO_ENABLED=0 go build ./...` in that directory. Linux only: on a Mac, vet and build with `GOOS=linux`; `go test` runs in CI |
+| `sandbox/host` | `cargo clippy --locked -- -D warnings`, `cargo test --locked` in that directory |
+| `website/` | `bun install`, `bun run typecheck`, `bun run build` in that directory |
+| `bun.lock`, `go.sum`, `flake.nix`, `nix/` | `nix flake check`; new hashes per `docs/nix.md`. Without Nix installed, or on an Intel Mac (the flake doesn't cover `x86_64-darwin`), CI's `nix` job runs it |
+
+The mock's scripted model answers from the question, not the prompts: conformance proves
+a prompt is embedded and loads, not that its wording works. Say in Verification what
+still needs a real model.
+
+**Decisions.** A decision that later work must follow (the contract, where data lives,
+a new language or service, a security rule) gets an ADR: `docs/adr/NNNN-<slug>.md`
+with Status, Context, Decision and Consequences, as in 0001. A decision made in chat or
+in review is written down before it counts: in an ADR, the PR's Tradeoffs, or the issue.
