@@ -56,6 +56,7 @@ turns each profile into a `defineAgent`.
 | `tools` | picked from Lorehouse's tool catalog by name |
 | `skills` | picked from the skill catalog by name (§4) |
 | `triggers` | what starts a turn: Slack mentions and follow-ups, a webhook, a schedule |
+| `delivery` | where an automation or job turn posts its result: a rule that resolves each trigger to a June `DeliveryTarget` (channel, optional thread), e.g. "the thread that asked for this PR, else this channel". Every target must be an allowlisted public channel (§6); an unresolvable one fails the turn, it never falls back to a DM |
 | `sandbox` | `none`, `read` or `write`. Only `write` may open a pull request |
 | `credentials` | which grants it may ask for, e.g. GitHub read or write, per repo |
 | `knowledge` | which sources it may search. Default: every allowlisted public channel |
@@ -86,7 +87,8 @@ profiles ever need to answer Slack messages, routing is decided then, in its own
 
 Automation and job turns start with a `ProactiveTrigger` whose `by` names the trigger
 (`github:pull_request`, `schedule:weekly-digest`). That keeps "who started this" in the
-session log.
+session log. Where the result goes is the profile's `delivery`, resolved
+when the trigger fires, not chosen by the model.
 
 ### 4. Skills: June loads them, Lorehouse decides which exist
 
