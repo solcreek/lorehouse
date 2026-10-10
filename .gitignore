@@ -21,3 +21,6 @@ target/
 # nix build output
 /result
 /result-*
+
+# Claude Code agent worktrees
+.claude/worktrees/
