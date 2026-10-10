@@ -50,7 +50,7 @@ turns each profile into a `defineAgent`.
 
 | field | meaning |
 |---|---|
-| `id` | durable agent id: names its sessions and sandboxes. Never the display name |
+| `id` | durable agent id: names its sessions and sandboxes. Never the display name. A lowercase handle, `[a-z][a-z0-9-]{0,31}`, like the agent name, so it is valid in a sandbox id as is |
 | `mode` | `interactive`, `automation` or `job` (§3) |
 | `prompt` | `prompts/profiles/<id>.md`, embedded like every prompt |
 | `tools` | picked from Lorehouse's tool catalog by name |
@@ -146,11 +146,13 @@ character outside `[\w.-]` with `_`, because `sandboxd` accepts only
 sandbox.
 
 From now on the sandbox id includes the profile. The `lorehouse` profile keeps today's
-sanitized session id, so existing sandboxes still resolve. Every other profile's id must
-fit `sandboxd`'s character set and must never equal an id another profile can produce.
+sanitized session id, so existing sandboxes still resolve. Every other profile's sandbox id must
+fit `sandboxd`'s rules, including the 128-character limit, and must never equal an id
+another profile can produce.
 Joining profile and session with a separator does not guarantee that, since sanitizing
 already maps `:` to `_`. One form that does: `<profile>-<hash of the session id>`, where
-the hash is fixed-length hex and `<profile>` is never `lorehouse`; the exact form is
+the hash is fixed-length hex and `<profile>` is never `lorehouse`. With the §1 grammar it
+is at most 32 + 1 + 64 characters, whatever the session id's length. The exact form is
 settled in its implementation, with a test for the collision. Two profiles may work in
 the same thread; each keeps its own session and sandbox.
 
