@@ -138,7 +138,7 @@ which is manual; run the ones you touched first.
 | `sandbox/guest` | `go vet ./...`, `go test ./...`, `CGO_ENABLED=0 go build ./...` in that directory. Linux only: on a Mac, vet and build with `GOOS=linux`; `go test` runs in CI |
 | `sandbox/host` | `cargo clippy --locked -- -D warnings`, `cargo test --locked` in that directory |
 | `website/` | `bun install`, `bun run typecheck`, `bun run build` in that directory |
-| `bun.lock`, `go.sum`, `flake.nix`, `nix/` | `nix flake check`; new hashes per `docs/nix.md`. Without Nix (Intel Macs have none), CI's `nix` job runs it |
+| `bun.lock`, `go.sum`, `flake.nix`, `nix/` | `nix flake check`; new hashes per `docs/nix.md`. Without Nix installed, or on an Intel Mac (the flake doesn't cover `x86_64-darwin`), CI's `nix` job runs it |
 
 The mock's scripted model answers from the question, not the prompts: conformance proves
 a prompt is embedded and loads, not that its wording works. Say in Verification what
