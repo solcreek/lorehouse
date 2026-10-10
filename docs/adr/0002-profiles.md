@@ -134,8 +134,8 @@ A profile can narrow its tools, knowledge and credentials. It cannot widen past 
 One more rule is decided here but **not enforced yet**: a write token never enters a
 sandbox. Today `open_pull_request` still pushes from inside the sandbox with the write
 token in the command's environment (`src/tools/pull-request.ts`). #31 and #32 move the
-push to the sandbox host; the rule holds once they land, and no profile with
-`sandbox: write` ships before then.
+push to the sandbox host; the rule holds once they land. Until then the `lorehouse`
+profile keeps today's in-sandbox push, and no new profile with `sandbox: write` ships.
 
 ### 7. Sessions and sandboxes are keyed by profile
 
