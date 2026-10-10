@@ -204,8 +204,8 @@ export function parseGithubRemote(url: string): { owner: string; name: string } 
 // CODEOWNERS from .github/, the root, or docs/).
 const SENSITIVE = /^(\.github\/|(docs\/)?CODEOWNERS$)/;
 
-// Text from the sandbox or the model, made inert in Slack mrkdwn: & < > escaped, so it can
-// hold no mention, @channel or link.
+// Text from the sandbox or the model, escaped for Slack mrkdwn: & < >, so it can hold no
+// mention, @channel or link. (Formatting such as *bold* in a title still renders.)
 const escapeSlack = (s: string) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 // …and for a code block, every run of backticks broken up so none can close the block.
 const inBlock = (s: string) => escapeSlack(s).replace(/`{3,}/g, (run) => run.split("").join("\u200b"));
@@ -219,7 +219,7 @@ const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1)
 // much of the patch as fits. A Slack section caps at 3000 characters: the title, each stat
 // line and each path are clipped so the rest always fits, and the patch gets what is left.
 // Everything the sandbox or the model wrote (title, stat, paths, patch) is escaped: it can't
-// add markup to the card.
+// mention anyone, link anywhere, or break out of its code block or span.
 export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged }): string {
   const { staged } = o;
   const head =
