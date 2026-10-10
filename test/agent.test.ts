@@ -197,6 +197,23 @@ describe("open_pull_request — the approval gate", () => {
     expect(published.some((p) => p.op === "push")).toBe(false);
   });
 
+  test("an approval is asked for again when the repo, base, branch or title differs, never reused", async () => {
+    const ids: string[] = [];
+    const ask = async (input: { branch: string; title: string; base?: string }, origin?: string) => {
+      const { sb } = fakeRepo({ origin });
+      const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+      await tool.run(input, { requestInput: async (r: { id: string }) => { ids.push(r.id); return false; } } as never);
+    };
+    await ask({ branch: "scout/x", title: "x" });
+    await ask({ branch: "scout/x", title: "x" }); // the same call: the same approval (a replay)
+    await ask({ branch: "scout/x", title: "a new title" });
+    await ask({ branch: "scout/x", title: "x", base: "develop" });
+    await ask({ branch: "scout/y", title: "x" });
+    await ask({ branch: "scout/x", title: "x" }, "https://github.com/acme/other.git");
+    expect(ids[0]).toBe(ids[1]!);
+    expect(new Set(ids).size).toBe(5);
+  });
+
   test("a replay after the push (cut off before its result was saved) still reaches the PR", async () => {
     const { sb, published } = fakeRepo();
     const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });

@@ -19,6 +19,7 @@
 // returns the stored answer, and the post-approval part is idempotent: an already-open PR
 // for the branch is returned instead of creating a second one.
 
+import { createHash } from "node:crypto";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { WORKDIR, type SandboxFor, type Staged } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
@@ -124,8 +125,12 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         }
       }
 
+      // An approval is for what its card shows: this commit, to this branch of this repo,
+      // against this base, under this title. A call that changes any of them is asked again,
+      // never answered by an earlier click.
+      const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, staged.sha])).digest("hex");
       const approved = await ctx.requestInput({
-        id: `pr:${input.branch}:${staged.sha.slice(0, 12)}`,
+        id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`,
         prompt: approvalCard({ repo, branch: input.branch, base, title: input.title, staged }),
       });
       if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
