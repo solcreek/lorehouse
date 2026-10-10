@@ -167,13 +167,30 @@ describe("config", () => {
     expect(() => loadConfig({ ...base, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: pem })).toThrow(/GitHub credentials are set, but no sandbox/);
   });
 
-  test("defaults: port 3000, claude-opus-5, sessions in memory, empty channel allowlist", () => {
+  test("defaults: port 3000, claude-opus-5, sessions beside the database, empty channel allowlist", () => {
     const c = loadConfig(base);
     expect(c.port).toBe(3000);
     expect(c.anthropic.model).toBe("claude-opus-5");
-    expect(c.db.sessions).toBe(":memory:");
+    expect(c.db).toMatchObject({ lorehouse: "lorehouse.db", sessions: "sessions.db" });
     expect(c.agent.channels.size).toBe(0);
     expect(c.agent.dm).toBe("redirect");
+  });
+
+  // ADR 0002 §8: a turn parked on an Approve must survive a restart.
+  test("SESSIONS_DB: unset, a file beside LOREHOUSE_DB; an explicit one kept; in memory only with LOREHOUSE_DB in memory", () => {
+    const sessions = (env: Record<string, string>) => loadConfig({ ...base, ...env }).db.sessions;
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db" })).toBe("/data/sessions.db");
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db", SESSIONS_DB: "" })).toBe("/data/sessions.db");
+    expect(sessions({ LOREHOUSE_DB: "var/knowledge.sqlite" })).toBe("var/sessions.db");
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db", SESSIONS_DB: ":memory:" })).toBe(":memory:");
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db", SESSIONS_DB: "/state/june.db" })).toBe("/state/june.db");
+    expect(sessions({ LOREHOUSE_DB: ":memory:" })).toBe(":memory:");
+    expect(sessions({ LOREHOUSE_DB: ":memory:", SESSIONS_DB: "/state/june.db" })).toBe("/state/june.db");
+  });
+
+  test("SESSIONS_DB never shares LOREHOUSE_DB's file, defaulted or explicit", () => {
+    expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/sessions.db" })).toThrow(/SESSIONS_DB \(must be a different file from LOREHOUSE_DB/);
+    expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/x.db", SESSIONS_DB: "/data/../data/x.db" })).toThrow(/SESSIONS_DB/);
   });
 
   test("DM_MODE is redirect, ignore or answer; anything else is reported", () => {

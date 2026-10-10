@@ -228,7 +228,14 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   // ── storage ──
   for (const [key, path] of [["LOREHOUSE_DB", config.db.lorehouse], ["SESSIONS_DB", config.db.sessions]] as const) {
     if (path === ":memory:") {
-      add("storage", key, "warn", key === "SESSIONS_DB" ? "in memory: conversation state is lost on every restart; set a file path" : "in memory: the index is rebuilt from Slack on every start; set a file path");
+      // Unset, SESSIONS_DB is a file beside LOREHOUSE_DB: sessions in memory are either
+      // asked for, or follow a LOREHOUSE_DB in memory.
+      const lost = "in memory: a turn waiting on an Approve, and every conversation, is lost on every restart";
+      add("storage", key, "warn", key === "LOREHOUSE_DB"
+        ? "in memory: the index is rebuilt from Slack on every start; set a file path"
+        : env.SESSIONS_DB === ":memory:"
+          ? `${lost}; unset SESSIONS_DB to keep sessions beside LOREHOUSE_DB`
+          : `${lost}, as LOREHOUSE_DB is; set LOREHOUSE_DB to a file path, and sessions go beside it`);
       continue;
     }
     // SQLite reads and writes the database, and in WAL mode (knowledge.ts) creates -wal

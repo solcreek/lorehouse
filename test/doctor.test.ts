@@ -291,6 +291,24 @@ describe("storage", () => {
     expect(find(checks, "LOREHOUSE_DB")[0]?.level).toBe("fail");
     expect(find(checks, "SESSIONS_DB")[0]?.level).toBe("warn");
   });
+
+  // Sessions are a file beside LOREHOUSE_DB unless asked otherwise (ADR 0002 §8): the
+  // warning is about an explicit :memory:, and says how to get the default back.
+  test("SESSIONS_DB unset is a file beside LOREHOUSE_DB; an explicit :memory: warns, naming the fix", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-sessions-`);
+    try {
+      const unset = find(await run({ LOREHOUSE_DB: `${dir}/lorehouse.db`, SESSIONS_DB: undefined }), "SESSIONS_DB")[0];
+      expect(unset).toMatchObject({ level: "ok", detail: `${dir}/sessions.db (created on first start)` });
+      const explicit = find(await run({ LOREHOUSE_DB: `${dir}/lorehouse.db`, SESSIONS_DB: ":memory:" }), "SESSIONS_DB")[0];
+      expect(explicit?.level).toBe("warn");
+      expect(explicit?.detail).toBe("in memory: a turn waiting on an Approve, and every conversation, is lost on every restart; unset SESSIONS_DB to keep sessions beside LOREHOUSE_DB");
+      const follows = find(await run({ LOREHOUSE_DB: ":memory:", SESSIONS_DB: undefined }), "SESSIONS_DB")[0];
+      expect(follows?.level).toBe("warn");
+      expect(follows?.detail).toContain("as LOREHOUSE_DB is; set LOREHOUSE_DB to a file path, and sessions go beside it");
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
 });
 
 describe("the running deployment (--url)", () => {

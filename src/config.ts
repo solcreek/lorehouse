@@ -16,7 +16,7 @@ export type Config = {
   anthropic: { apiKey: string; baseUrl?: string; model: string };
   agent: { name?: string; coAuthor?: string; channels: Set<string>; dm: DmMode };
   // Lorehouse's own database (knowledge, migrations) — separate from the framework's
-  // session store on purpose.
+  // session store on purpose. The session store defaults to a file beside it (sessionsDbFor).
   db: { lorehouse: string; sessions: string; knowledgeSeed?: string };
   // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
   ingest: { backfillDays: number; refreshDays: number; debounceMs: number };
@@ -42,7 +42,16 @@ export type Config = {
 // identity, owned by the org. Or a plain token (GITHUB_TOKEN), for development.
 export type GithubCredentials = { kind: "app"; appId: string; privateKey: string } | { kind: "token"; token: string };
 
+import { dirname, join, resolve } from "node:path";
 import { normalizePem } from "./github-auth";
+
+// Where the framework's sessions live when SESSIONS_DB is unset: sessions.db beside
+// LOREHOUSE_DB, so a turn parked on an Approve, or a durable automation, survives a
+// restart (ADR 0002 §8). Lorehouse's own data in memory means a throwaway instance (a
+// test): its sessions stay in memory too.
+export function sessionsDbFor(lorehouseDb: string): string {
+  return lorehouseDb === ":memory:" ? ":memory:" : join(dirname(lorehouseDb), "sessions.db");
+}
 
 // Every problem with the environment, one per entry; the message lists them all.
 export class ConfigError extends Error {
@@ -92,7 +101,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     },
     db: {
       lorehouse: env.LOREHOUSE_DB || "lorehouse.db",
-      sessions: env.SESSIONS_DB || ":memory:",
+      sessions: env.SESSIONS_DB || sessionsDbFor(env.LOREHOUSE_DB || "lorehouse.db"),
       knowledgeSeed: env.KNOWLEDGE_SEED || undefined,
     },
     ingest: {
@@ -105,6 +114,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     adminToken: env.ADMIN_TOKEN || undefined,
     usage: { recordPeople: env.USAGE_RECORD_PEOPLE === "1" },
   };
+  // One file for both would put June's session tables in Lorehouse's database: say so,
+  // rather than let a LOREHOUSE_DB named sessions.db quietly share it.
+  if (config.db.sessions !== ":memory:" && resolve(config.db.sessions) === resolve(config.db.lorehouse)) missing.push(`SESSIONS_DB (must be a different file from LOREHOUSE_DB, got "${config.db.sessions}" for both)`);
   if (![undefined, "", "0", "1"].includes(env.USAGE_RECORD_PEOPLE)) missing.push(`USAGE_RECORD_PEOPLE (1 to record who asks, or unset; got "${env.USAGE_RECORD_PEOPLE}")`);
   // The admin token reads what people wrote: long, and never the status token, which is
   // the one handed to monitors.
