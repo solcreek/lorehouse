@@ -59,7 +59,7 @@ is enough; no zero-downtime setup is needed. A prototype of the same stack used 
 
 Every host needs the same few things:
 
-- a writable directory for the SQLite files (`LOREHOUSE_DB`, and `SESSIONS_DB` beside it)
+- a writable directory for the SQLite files (`LOREHOUSE_DB`, and by default `SESSIONS_DB` beside it; a `SESSIONS_DB` set elsewhere needs its own directory writable too)
 - the Slack and Anthropic secrets as environment variables
 - outbound HTTPS to Slack and Anthropic
 
