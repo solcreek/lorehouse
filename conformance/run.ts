@@ -839,6 +839,10 @@ const scenarios: Scenario[] = [
           await stopApp();
           await startApp(env);
           await reset();
+          // The runner comes back on its next poll; a click before that finds its host
+          // offline, which is a different scenario from this one.
+          const back = await until(async () => ((await status()) as unknown as { runners?: { runner: string; online: boolean }[] }).runners?.some((r) => r.runner === "r-approve" && r.online));
+          if (!back) return `after the restart the runner never came back: ${JSON.stringify(((await status()) as unknown as { runners?: unknown }).runners)}`;
 
           await sendInteraction({
             type: "block_actions", user: { id: "U1" }, team: { id: "T1" }, channel: { id: ALLOWED },
