@@ -131,7 +131,7 @@ it: `gh pr edit <n> --base main`.
 | change | run |
 |---|---|
 | TypeScript (`src/`, `test/`, `conformance/`) | `bun run typecheck`, `bun run test`, `bun run conformance` |
-| user-visible behavior | the above, with a conformance scenario changed or added; Slack-facing: also verify-lorehouse (below) |
+| user-visible behavior | the above, with a conformance scenario changed or added; Slack-facing: also verify-lorehouse (see "Verifying Slack-facing changes" above) |
 | `prompts/`, `migrations/`, `slack/manifest.yaml` | the above, then `bun run build` and `bun run conformance --app ./dist/lorehouse` |
 | a migration | also `bun test test/core.test.ts -t "migrations apply"` |
 | `sandbox/guest` | `go vet ./...`, `go test ./...`, `CGO_ENABLED=0 go build ./...` in that directory. Linux only: on a Mac, vet and build with `GOOS=linux`; `go test` runs in CI |
