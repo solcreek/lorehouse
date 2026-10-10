@@ -8,7 +8,8 @@
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
-// STATUS_TOKEN, ADMIN_TOKEN, and per scenario DM_MODE. SESSIONS_DB is never set: the app
+// STATUS_TOKEN, ADMIN_TOKEN, and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
+// and GITHUB_API_URL (GitHub's REST API, mocked). SESSIONS_DB is never set: the app
 // keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
@@ -69,7 +70,14 @@ const mention = (channel: string, extra: Record<string, unknown> = {}) => {
   return { type: "app_mention", user: "U1", team: "T1", text: "<@UBOT> [q1] how does soft navigation work", ts, event_ts: ts, channel, ...extra };
 };
 
-const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as { slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[]; posts: { channel: string; thread_ts?: string; text: string }[] };
+type Block = { type: string; elements?: { type: string; text?: { text: string }; action_id?: string; value?: string }[] };
+type Stats = {
+  slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[];
+  posts: { channel: string; thread_ts?: string; text: string; blocks?: Block[]; ts: string }[];
+  updates: { channel: string; ts: string; text: string }[];
+  github: { method: string; path: string; body?: unknown }[];
+};
+const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as Stats;
 const reset = () => fetch(`${MOCK}/reset`, { method: "POST" });
 
 // Ask the agent something in the allowed channel and read back what it cited.
@@ -124,6 +132,26 @@ async function mentionAndWait(question: string, { inHistory = false } = {}): Pro
   await sendEvent({ type: "app_mention", user: "U1", team: "T1", text, ts, event_ts: ts, channel: ALLOWED });
   await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`);
   return ts;
+}
+
+// A button click, as Slack's interactivity delivers one: form-encoded `payload=<json>`,
+// signed like an event, to the same URL.
+async function sendInteraction(payload: Record<string, unknown>) {
+  const body = `payload=${encodeURIComponent(JSON.stringify(payload))}`;
+  const now = String(Math.floor(Date.now() / 1000));
+  const sig = "v0=" + createHmac("sha256", SECRET).update(`v0:${now}:${body}`).digest("hex");
+  return fetch(TARGET, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "x-slack-request-timestamp": now, "x-slack-signature": sig }, body });
+}
+
+// The first truthy value check() returns within ms, or undefined.
+async function until<T>(check: () => Promise<T | undefined>, ms = 15000): Promise<T | undefined> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    const v = await check();
+    if (v) return v;
+    await Bun.sleep(50);
+  }
+  return undefined;
 }
 
 // A reply in a thread, as Slack delivers one: a `message` event with thread_ts.
@@ -785,6 +813,46 @@ const scenarios: Scenario[] = [
         await runner.stop();
       }
     }),
+  },
+  {
+    // ADR 0002 §8: sessions persist by default, so a restart (a deploy, a crash) between
+    // the prompt and the click loses nothing.
+    name: "a turn parked on Approve survives a restart: approved after it, the pull request opens and the turn completes",
+    run: () => {
+      const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github` };
+      return inMode(env, async () => {
+        const runner = pollRunner(APP, RUNNER_TOKEN, "r-approve"); // keeps polling across the restart
+        try {
+          await Bun.sleep(200); // the first poll registers the runner
+          await reset();
+          const n = ++seq;
+          const thread = `${1970000000 + n}.000100`;
+          await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${n}] [pr] scout/conformance-approve`, ts: thread, event_ts: thread, channel: ALLOWED });
+          const prompt = await until(async () => (await stats()).posts.find((p) => p.channel === ALLOWED && p.thread_ts === thread && p.blocks?.length));
+          if (!prompt) return `no Approve/Deny prompt in the thread: ${JSON.stringify((await stats()).posts).slice(0, 300)}`;
+          const approve = prompt.blocks!.flatMap((b) => b.elements ?? []).find((e) => e.type === "button" && e.text?.text === "Approve");
+          if (!approve?.action_id) return `the prompt has no Approve button: ${JSON.stringify(prompt.blocks).slice(0, 300)}`;
+          if ((await stats()).github.some((c) => c.method === "POST")) return "a pull request was opened before anyone approved";
+
+          // A restart while the turn waits, as a deploy would do.
+          await stopApp();
+          await startApp(env);
+          await reset();
+
+          await sendInteraction({
+            type: "block_actions", user: { id: "U1" }, team: { id: "T1" }, channel: { id: ALLOWED },
+            message: { ts: prompt.ts, thread_ts: thread }, actions: [{ type: "button", action_id: approve.action_id, value: approve.value }],
+          });
+          const done = await until(async () => (await stats()).updates.find((u) => u.ts === prompt.ts && u.text.includes("[pr:")));
+          if (!done) return `approved after the restart, the turn never finished: updates ${JSON.stringify((await stats()).updates).slice(0, 300)}`;
+          if (!done.text.includes(`[q${n}] [pr:opened:https://github.com/acme/widgets/pull/7]`)) return `the turn ended with ${done.text.slice(0, 160)}, want the opened pull request`;
+          const opened = (await stats()).github.filter((c) => c.method === "POST" && c.path === "/repos/acme/widgets/pulls");
+          return opened.length === 1 ? null : `pull requests opened: ${opened.length}, want 1`;
+        } finally {
+          await runner.stop();
+        }
+      });
+    },
   },
   {
     name: "rejects a bad signature with 401",
