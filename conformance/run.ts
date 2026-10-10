@@ -396,13 +396,20 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "loads a skill: read_skill hands the model the skill's own instructions",
+    name: "loads a skill: read_skill hands the model each skill's own instructions",
     run: async () => {
       // Skills are prompts/skills/*.md, embedded like the other prompts; the model asks for
       // one by name and must get its body, from source and from the compiled binary alike.
-      const { text } = await ask("[skill:channel-digest] what has been discussed lately");
-      const got = text.match(/\[skill:([^\]]*)\]/)?.[1];
-      return got === "channel-digest:Report what the company" ? null : `read_skill gave ${JSON.stringify(got ?? text.slice(0, 120))}`;
+      const want: [string, string][] = [
+        ["channel-digest", "Report what the company"],
+        ["write-a-skill", "Draft a skill a"],
+      ];
+      for (const [name, start] of want) {
+        const { text } = await ask(`[skill:${name}] help with this`);
+        const got = text.match(/\[skill:([^\]]*)\]/)?.[1];
+        if (got !== `${name}:${start}`) return `read_skill for ${name} gave ${JSON.stringify(got ?? text.slice(0, 120))}`;
+      }
+      return null;
     },
   },
   {
