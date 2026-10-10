@@ -54,4 +54,13 @@ describe("skills", () => {
     expect(rolling).not.toMatch(/this week/i);
     expect(calendar).toMatch(/this week/i);
   });
+
+  test("write-a-skill matches an existing skill against the thread's task, not against itself", () => {
+    // The request that loads write-a-skill is itself "turn this into a skill", so comparing
+    // the skills against "this request" would pick write-a-skill as the one to edit.
+    const text = SKILLS["write-a-skill"]!.replace(/\s+/g, " ");
+    expect(text).not.toMatch(/already covers this request/i);
+    expect(text).toContain("covers the task the thread is about");
+    expect(text).toContain("not this request to write a skill");
+  });
 });

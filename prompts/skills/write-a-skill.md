@@ -13,7 +13,8 @@ request.
    Find the request, what you did, and what people corrected or asked for afterwards. The
    corrections are the point of the skill. If the tool refuses or returns nothing, say so
    and ask them to paste the part that matters.
-2. Look at the skills listed in your instructions. If one already covers this request, load
+2. Look at the skills listed in your instructions. If one already covers the task the thread
+   is about (the request people corrected, not this request to write a skill), load
    it with `read_skill` and draft the whole changed file instead of a new one. `read_skill`
    returns only the steps: take its name, description and when-to-use from the list, and
    keep them unless the thread asks to change them.
