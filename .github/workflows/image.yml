@@ -31,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write
+      packages: write # push the per-arch build-<sha>-<arch> tags
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -53,7 +53,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      packages: write
+      packages: write # tag the multi-arch manifest
     steps:
       - name: tag both architectures
         env:

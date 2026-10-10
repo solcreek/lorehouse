@@ -9,11 +9,14 @@ on:
   push:
     tags: ["v*"]
 
+# Nothing by default; each job asks for what it writes.
+permissions: {}
+
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # gh release create
     # This job can write releases, so every action in it is pinned to a full commit SHA,
     # as in ci.yml's deploy job.
     steps:
@@ -51,7 +54,7 @@ jobs:
     needs: release
     permissions:
       contents: read
-      packages: write
+      packages: write # push ghcr.io/<repo> tags
     uses: ./.github/workflows/image.yml
     with:
       tags: ${{ github.ref_name }} latest

@@ -7,6 +7,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only unless a job says otherwise; only the image job writes (packages).
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -102,7 +106,7 @@ jobs:
     needs: [check, nix, sandbox-guest, sandbox-host]
     permissions:
       contents: read
-      packages: write
+      packages: write # push ghcr.io/<repo> tags
     uses: ./.github/workflows/image.yml
     with:
       tags: main sha-${{ github.sha }}
