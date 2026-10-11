@@ -12,6 +12,12 @@
 // dropped, and isClosed() tells the policy to refuse events there. What was indexed from
 // it stays until the next start, which refuses while the channel is listed; unlisting it
 // purges it (purge.ts). An outage (5xx, rate limit, no answer) closes nothing.
+// Closing is best effort for work already under way (maintainer decision on #90): new
+// reads and events are refused from the close on, and other turns can't name it in a tool,
+// but a turn admitted before
+// it, or a reconcile already reading, may finish. Cancelling those would need a token per
+// channel threaded through ingest, usage and the tool guard; a channel turning private
+// while listed is rare, and the next start refuses it anyway.
 //
 // Bot and system messages (joins, topic changes, deletion tombstones) are left out: the agent's own
 // answers must not become its sources. So are messages that mention the agent: they
