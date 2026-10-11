@@ -197,6 +197,9 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
 - **Every git command** on the host runs with no user or system config, no prompts, no
   replace objects and no hooks. A token travels as an HTTP header in the command's
   environment, never in argv. Tokens are in jobs only, never logged or recorded.
+- **A mirror is written by one job at a time**, under its lock. Git's automatic maintenance
+  is off (`maintenance.auto=false`, `gc.auto=0`): it runs detached, after the lock is
+  released, and a gc from outside the lock was seen to wedge a mirror (#76).
 - **Failures** come back as statuses with a reason:
   - 409: nothing new to publish, or a branch that has moved on.
   - 404: the base isn't on GitHub, or the stage isn't there (never completed, already

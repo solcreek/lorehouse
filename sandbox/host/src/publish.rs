@@ -14,9 +14,15 @@
 //! The mirror's refs/stage/<id> refs exist for git's sake (they keep a stage's objects from
 //! being collected); they authorize nothing.
 //!
-//! Every git command here runs with no user or system config, no prompts, no replace objects
-//! and no hooks. A token travels as an HTTP header in the command's environment, never in
-//! argv or a file.
+//! Every git command here runs with no user or system config, no prompts, no replace objects,
+//! no hooks and no maintenance of git's own. A token travels as an HTTP header in the
+//! command's environment, never in argv or a file.
+//!
+//! A mirror is only ever written by one job at a time, under its lock: a stage, a push, and
+//! the housekeeping after either (prune). Git's automatic maintenance is off, because it runs
+//! detached, after the lock is released: a `gc --prune=now` from outside the lock was seen to
+//! leave a `refs/stage/<id>` pointing at a pack it had removed, after which every fetch into
+//! the mirror failed (#76).
 
 use crate::vm::{self, Manager};
 use crate::vsock;
@@ -45,6 +51,10 @@ const STAGE_TTL: Duration = Duration::from_secs(24 * 3600);
 const CLOCK_SLACK: u64 = 300;
 const GIT_LOCAL: Duration = Duration::from_secs(120);
 const GIT_NETWORK: Duration = Duration::from_secs(600);
+/// `gc --auto` as push runs it: git's own thresholds (6700 loose objects, 50 packs), which
+/// the guarded environment turns off for every other command (gc.auto=0). In the foreground
+/// (gc.autoDetach=false, also from the environment), so it finishes under the lock.
+const GC_AUTO: &[&str] = &["-c", "gc.auto=6700", "gc", "--auto", "-q"];
 /// Where the checkout lives in every VM (Lorehouse's WORKDIR).
 const WORKDIR: &str = "/workspace/repo";
 
@@ -247,7 +257,8 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
 }
 
 /// git, in `dir`, with no user or system config, no prompts, no replace objects, no hooks,
-/// fsck on fetch, and the token (if any) as an HTTP header; stdout and stderr piped.
+/// fsck on fetch, no automatic maintenance, and the token (if any) as an HTTP header; stdout
+/// and stderr piped.
 fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
     use std::process::Stdio;
     let mut cmd = Command::new("git");
@@ -265,6 +276,14 @@ fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
         ("fetch.fsckObjects", "true".into()),
         ("transfer.fsckObjects", "true".into()),
         ("credential.helper", String::new()),
+        // No maintenance git starts on its own: a fetch ends with a detached `git
+        // maintenance run --auto` (traced on git 2.55 in #76), which would write to the
+        // mirror after the lock is released. A gc sandboxd asks for runs in the foreground,
+        // so under the lock.
+        ("maintenance.auto", "false".into()),
+        ("gc.auto", "0".into()),
+        ("gc.autoDetach", "false".into()),
+        ("maintenance.autoDetach", "false".into()),
     ];
     if let Some(t) = token {
         config.push(("http.extraHeader", format!("Authorization: Basic {}", B64.encode(format!("x-access-token:{t}")))));
@@ -613,7 +632,7 @@ impl Publisher {
             let status = if e.contains("non-fast-forward") || e.contains("[rejected]") || e.contains("fetch first") { 409 } else { 502 };
             return Err((status, format!("push to {}: {e}", record.branch)));
         }
-        let _ = git(&dir, &["gc", "--auto", "-q"], None, GIT_LOCAL).await;
+        let _ = git(&dir, GC_AUTO, None, GIT_LOCAL).await;
         Ok(Pushed { sha: record.sha, branch: record.branch })
     }
 
@@ -1243,6 +1262,35 @@ mod tests {
         let mut files = staged.files.clone();
         files.sort();
         assert_eq!(files, vec![".github/workflows/ci.yml", "docs/CODEOWNERS", "old/CODEOWNERS", "old/ci.yml", "we\tird\n\"é"]);
+    }
+
+    fn packs(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("objects/pack")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".pack")).count()
+    }
+
+    #[tokio::test]
+    async fn no_git_command_starts_maintenance_of_its_own() {
+        // A fetch ends with a detached `git maintenance run --auto` (gc --auto on older
+        // gits) unless the config says not to; detached, it outlives the mirror's lock.
+        let s = scratch("maintenance");
+        s.publisher.refresh(&s.dir(), "acme", "widgets", None).await.unwrap();
+        for (key, want) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false"), ("maintenance.autoDetach", "false")] {
+            let got = git(&s.dir(), &["config", "--get", key], None, GIT_LOCAL).await;
+            assert_eq!(got.as_deref().map(str::trim), Ok(want), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_still_collects_a_mirror_with_many_packs_before_it_answers() {
+        // gc.auto=0 everywhere else; push's own `gc --auto` keeps git's thresholds, and runs
+        // in the foreground, under the lock.
+        let s = scratch("gcauto");
+        sh(&s.vm, "echo g > g && git add g && git commit -qm g");
+        let staged = s.stage("scout/g").await.unwrap();
+        sh(&s.dir(), "for i in $(seq 1 55); do echo $i | git hash-object --stdin -w | git pack-objects -q objects/pack/pack >/dev/null; done");
+        assert!(packs(&s.dir()) > 50, "{}", packs(&s.dir()));
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/g")).await.unwrap();
+        assert!(packs(&s.dir()) <= 2, "{}", packs(&s.dir()));
     }
 
     #[test]
