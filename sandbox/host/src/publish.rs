@@ -1168,6 +1168,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_digest_is_sha256_in_lowercase_hex() {
+        // Known answers, independent of the hashing crate: what the app checks the digest
+        // against (/^[0-9a-f]{64}$/ in src/tools/pull-request.ts) and what a reviewer can
+        // recompute with sha256sum. The million-byte one spans many reads of the pipe.
+        let s = scratch("known-digest");
+        let blob = |content: &str| sh(&s.vm, &format!("{content} | git hash-object -w --stdin"));
+        for (content, want) in [
+            ("printf abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            ("printf ''", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("head -c 1000000 /dev/zero | tr '\\000' a", "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"),
+        ] {
+            let oid = blob(content);
+            assert_eq!(git_sha256(&s.vm, &["cat-file", "blob", &oid], GIT_LOCAL).await.unwrap(), want, "{content}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_head_that_is_a_tag_stages_its_commit_and_a_non_commit_leaves_nothing() {
         let s = scratch("tag");
         let dir = s.dir();
