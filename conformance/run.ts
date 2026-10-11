@@ -10,7 +10,7 @@
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
 // STATUS_TOKEN, ADMIN_TOKEN, LOREHOUSE_ENV_FILE (a missing file, so no installed settings
-// leak in), and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
+// leak in), LOREHOUSE_SETTINGS (settings.json beside LOREHOUSE_DB), and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
 // and GITHUB_API_URL (GitHub's REST API, mocked). SESSIONS_DB is never set: the app
 // keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
@@ -964,7 +964,7 @@ let app: ReturnType<typeof Bun.spawn> | undefined;
 // Never this shell's SESSIONS_DB: where sessions go by default is part of the contract.
 // Nor its settings files, which the app reads after the environment and could fill
 // SESSIONS_DB back in: LOREHOUSE_ENV_FILE points at a missing file beside the database
-// (startApp), and LOREHOUSE_SETTINGS is left to its default, also beside the database.
+// (startApp), and LOREHOUSE_SETTINGS at settings.json, also beside the database.
 const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, ...inherited } = process.env;
 
 // Start the app and wait until it listens, owns its port, and (unless waitReady is off,
@@ -993,6 +993,9 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
       STATUS_TOKEN,
       ADMIN_TOKEN,
       LOREHOUSE_ENV_FILE: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "lorehouse.env"),
+      // Set, not left to its default: the app's Bun loads the checkout's .env for every
+      // variable not set here, and one naming a settings file would fill in the rest.
+      LOREHOUSE_SETTINGS: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "settings.json"),
       ...extraEnv,
     },
     stdout: "ignore",
