@@ -83,7 +83,9 @@ quotable. DMs are never indexed.
 **Policy.** `src/policy.ts` restricts every channel event to channels in
 `AGENT_CHANNELS` (empty means nowhere) and refuses private channels and group DMs where the
 payload says so; mentions and reactions carry no channel type, and ingest reads every listed
-channel, so the list must hold only public channel ids. On start, `src/purge.ts` removes what was kept for
+channel, so the list must hold only public channel ids. June's Slack tools that take a
+channel id (read a thread, list or add reactions) are refused any channel but the one
+being answered in and the listed ones (`src/tools/slack-channels.ts`). On start, `src/purge.ts` removes what was kept for
 a channel no longer listed from `LOREHOUSE_DB` (its documents, joined threads, cursor, asks
 and searches; not June's sessions); `src/threads.ts`
 decides follow-ups (reply in a joined thread without a new mention, but not when it
