@@ -13,11 +13,10 @@ export function directMessage(raw: unknown): { channel: string; user: string } |
   return { channel: ev.channel, user: ev.user };
 }
 
-// Slack renders <#C…> as a link to the channel. With no allowlist the agent works in
-// any public channel it has been added to.
+// Slack renders <#C…> as a link to the channel. With no allowlist the agent works
+// nowhere (policy.ts), so there is no channel to point to: it says so.
 export function redirectText(channels: ReadonlySet<string>): string {
-  const where = channels.size === 0
-    ? "any public channel I'm in"
-    : [...channels].map((c) => `<#${c}>`).join(" or ");
-  return `I only answer in public, so everyone can learn from the question and the answer. Ask me in ${where}.`;
+  const why = "I only answer in public, so everyone can learn from the question and the answer.";
+  if (channels.size === 0) return `${why} I'm not set up in any channel yet.`;
+  return `${why} Ask me in ${[...channels].map((c) => `<#${c}>`).join(" or ")}.`;
 }

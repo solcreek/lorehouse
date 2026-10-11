@@ -210,6 +210,30 @@ async function withFreshDb(run: () => Promise<string | null>, env: Record<string
   }
 }
 
+// A scenario across a restart on a database of its own: `setup` runs with the `before`
+// settings and hands back the check, which runs after a restart with the `after` ones.
+// Then the usual app again. With no channels there is no ingest, so /status never says
+// ready: that start waits on /healthz (the start-up purge is done before the app listens).
+async function withRestart(
+  before: Record<string, string>,
+  after: Record<string, string>,
+  setup: () => Promise<() => Promise<string | null>>,
+): Promise<string | null> {
+  const db = freshDb();
+  try {
+    await stopApp();
+    await startApp({ ...before, LOREHOUSE_DB: db });
+    const check = await setup();
+    await stopApp();
+    await startApp({ ...after, LOREHOUSE_DB: db }, { waitReady: after.AGENT_CHANNELS !== "" });
+    return await check();
+  } finally {
+    await stopApp();
+    removeDb(db);
+    await startApp();
+  }
+}
+
 // Post a message into Slack's history, then deliver the Events API event for it.
 async function liveMessage(channel: string, channelType: string, text: string): Promise<string> {
   const ts = `${1980000000 + ++seq}.000100`;
@@ -809,6 +833,31 @@ const scenarios: Scenario[] = [
       const s = await stats();
       return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
     },
+  },
+  // An empty AGENT_CHANNELS means nowhere, for every event kind; a channel taken off the
+  // list leaves the knowledge index on the next start (#82).
+  {
+    name: "an empty AGENT_CHANNELS means nowhere: after a restart, a follow-up in a thread it joined gets no reply and no model call",
+    run: () => withRestart({ AGENT_CHANNELS: ALLOWED }, { AGENT_CHANNELS: "" }, async () => {
+      const thread = await mentionAndWait("where is the wombat review");
+      return async () => {
+        await reset();
+        await threadReply(thread, "and which floor is that on?");
+        await Bun.sleep(2500);
+        const s = await stats();
+        return s.modelCalls || s.slackCalls ? `answered anyway: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}` : null;
+      };
+    }),
+  },
+  {
+    name: "an empty AGENT_CHANNELS means nowhere: a mention is still refused",
+    run: () => withRestart({ AGENT_CHANNELS: ALLOWED }, { AGENT_CHANNELS: "" }, async () => async () => {
+      await reset();
+      await sendEvent(mention(ALLOWED));
+      await Bun.sleep(1500);
+      const s = await stats();
+      return s.modelCalls || s.slackCalls ? `ran anyway: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}` : null;
+    }),
   },
   {
     name: "answers a Slack redelivery only once",
