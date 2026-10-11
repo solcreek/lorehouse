@@ -2,9 +2,10 @@
 //
 // The card (src/tools/pull-request.ts) names a policy, APPROVER_POLICY, with the requester
 // and the turn it was posted in. June asks authorizeAnswer (approverGate) as each click
-// arrives; a click the rule lets through is recorded here, in Lorehouse's own database, as
-// the card's approver for that turn. June doesn't hand the tool who answered when it
-// resumes (the stored answer is the input alone), so this record is how the tool knows.
+// arrives; when June applies a click the rule let through, who it says answered is recorded
+// here, in Lorehouse's own database, as the card's approver for that turn. June doesn't hand
+// the tool who answered when it resumes (the stored answer is the input alone), so this
+// record is how the tool knows.
 //
 // At the moment of use, before it pushes, the tool checks the rule against the recorded
 // approver (approvalStore.decide). A card with no record was answered without asking

@@ -122,10 +122,10 @@ export async function createApp(config: Config) {
   ];
   // Who may click Approve on a pull request card is the install's rule (PR_APPROVER, ADR
   // 0002 §6). The card names APPROVER_POLICY, so June asks authorizeAnswer as each click
-  // arrives; a refused click changes nothing, and the clicker alone is told so. A click let
-  // through is recorded (src/approvals.ts) until the turn ends, so the tool can check the
-  // rule against who answered when it pushes, and name them. What a restart left behind is
-  // pruned on start, then daily.
+  // arrives; a refused click changes nothing, and the clicker alone is told so. Who June
+  // says answered a click let through is recorded (src/approvals.ts) until the turn ends, so
+  // the tool can check the rule against who answered when it pushes, and name them. What a
+  // restart left behind is pruned on start, then daily.
   const approvals = approvalStore(knowledge);
   tally(() => approvals.prune());
   setInterval(() => tally(() => approvals.prune()), 86_400_000).unref();
