@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { checkpointRuns, closeKnowledge, deleteDocument, openKnowledge, searcher, upsertDocument } from "../src/knowledge";
+import { checkpointRuns, checkpointSoon, closeKnowledge, deleteDocument, openKnowledge, searcher, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 import { purgeUnlistedChannels } from "../src/purge";
 import { eraseAskers, forgetAsk, pruneUsage, recordAsk, recordSearch } from "../src/usage";
@@ -40,7 +40,7 @@ describe("removed text leaves the WAL", () => {
     await Bun.sleep(150);
     expect(copies(`${path}-wal`, WORD)).toBe(0);
     expect(copies(path, WORD)).toBe(0);
-    db.close();
+    closeKnowledge(db);
   }));
 
   test("an edit's old text (a deleted reply re-renders its thread the same way)", withDb("edited", async (path) => {
@@ -51,15 +51,48 @@ describe("removed text leaves the WAL", () => {
     expect(searcher(db)("removed")[0]?.id).toBe(secret.docId);
     expect(copies(`${path}-wal`, WORD)).toBe(0);
     expect(copies(path, WORD)).toBe(0);
-    db.close();
+    closeKnowledge(db);
   }));
 
-  test("a new document asks for no checkpoint: only a replace or a delete can remove text", withDb("insert", async (path) => {
+  test("a new document, or a refresh that changed nothing, asks for no checkpoint", withDb("insert", async (path) => {
     const db = openKnowledge(path, MIGRATIONS, fast);
+    await Bun.sleep(50);
+    const opened = checkpointRuns(db); // the one every open runs
+    upsertDocument(db, secret);
     upsertDocument(db, secret);
     await Bun.sleep(100);
-    expect(checkpointRuns(db)).toBe(0);
+    expect(checkpointRuns(db)).toBe(opened);
+    closeKnowledge(db);
+  }));
+
+  test("an open empties a WAL an earlier process left behind (a stop that couldn't checkpoint)", withDb("left", async (path) => {
+    const first = openKnowledge(path, MIGRATIONS, { ...fast, delayMs: 60_000 });
+    upsertDocument(first, secret);
+    deleteDocument(first, secret.docId);
+    // A second connection keeps SQLite from removing the WAL when the first one closes.
+    const other = new Database(path);
+    other.query("SELECT count(*) FROM knowledge_documents").get();
+    first.close(); // no checkpoint: as if killed
+    expect(copies(`${path}-wal`, WORD)).toBeGreaterThan(0);
+    const db = openKnowledge(path, MIGRATIONS, fast);
+    await Bun.sleep(100);
+    expect(copies(`${path}-wal`, WORD)).toBe(0);
+    expect(copies(path, WORD)).toBe(0);
+    other.close();
+    closeKnowledge(db);
+  }));
+
+  test("a store closed with a plain close() stops its pending checkpoint quietly", withDb("plain", async (path) => {
+    const logs: string[] = [];
+    const db = openKnowledge(path, MIGRATIONS, { ...fast, log: (m) => logs.push(m) });
+    upsertDocument(db, secret);
+    checkpointSoon(db);
     db.close();
+    await Bun.sleep(150);
+    const runs = checkpointRuns(db);
+    await Bun.sleep(150);
+    expect(checkpointRuns(db)).toBe(runs); // not retried forever
+    expect(logs).toEqual([]);
   }));
 
   test("a purged channel's documents and searches (#85)", withDb("purge", async (path) => {
@@ -72,7 +105,7 @@ describe("removed text leaves the WAL", () => {
       expect(copies(`${path}-wal`, word)).toBe(0);
       expect(copies(path, word)).toBe(0);
     }
-    db.close();
+    closeKnowledge(db);
   }));
 
   test("usage forgotten or erased: a deleted question's search, an asker, rows past retention", withDb("usage", async (path) => {
@@ -91,23 +124,27 @@ describe("removed text leaves the WAL", () => {
       expect(copies(`${path}-wal`, word)).toBe(0);
       expect(copies(path, word)).toBe(0);
     }
-    db.close();
+    closeKnowledge(db);
   }));
 
   test("a burst of deletes shares one checkpoint", withDb("burst", async (path) => {
     const db = openKnowledge(path, MIGRATIONS, { ...fast, delayMs: 100 });
+    await Bun.sleep(50);
+    const opened = checkpointRuns(db);
     for (let i = 0; i < 20; i++) upsertDocument(db, { ...secret, docId: `slack:C2:${i}.1` });
     for (let i = 0; i < 20; i++) deleteDocument(db, `slack:C2:${i}.1`);
     await Bun.sleep(300);
-    expect(checkpointRuns(db)).toBe(1);
+    expect(checkpointRuns(db)).toBe(opened + 1);
     expect(copies(`${path}-wal`, WORD)).toBe(0);
-    db.close();
+    closeKnowledge(db);
   }));
 
   test("a busy checkpoint is logged, never thrown, and tried again until it completes", withDb("busy", async (path) => {
     const logs: string[] = [];
     const db = openKnowledge(path, MIGRATIONS, { ...fast, log: (m) => logs.push(m) });
     upsertDocument(db, secret);
+    await Bun.sleep(50);
+    const opened = checkpointRuns(db);
     // Another connection holds a read: the checkpoint can't reset the WAL under it.
     const reader = new Database(path);
     reader.exec("BEGIN");
@@ -115,12 +152,12 @@ describe("removed text leaves the WAL", () => {
     expect(deleteDocument(db, secret.docId)).toBe(true);
     await Bun.sleep(200);
     expect(logs.some((m) => m.includes("in use"))).toBe(true);
-    expect(checkpointRuns(db)).toBeGreaterThan(1); // retried
+    expect(checkpointRuns(db)).toBeGreaterThan(opened + 1); // retried
     reader.exec("COMMIT");
     reader.close();
     await Bun.sleep(200);
     expect(copies(`${path}-wal`, WORD)).toBe(0);
-    db.close();
+    closeKnowledge(db);
   }));
 
   test("closing the store checkpoints first: a delete just before leaves 0 copies, with nothing pending", withDb("close", (path) => {

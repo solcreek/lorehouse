@@ -716,8 +716,8 @@ const scenarios: Scenario[] = [
         await sendEvent({ type: "message", channel: ALLOWED, channel_type: "channel", user: "U7", text: replyText, ts: replyTs, thread_ts: root, event_ts: replyTs });
         const found = async (word: string) => (await admin<{ results: { id: string }[] }>(`/api/v1/search?q=${word}`)).results.length > 0;
         if (!(await until(async () => (await found(alone)) && (await found(reply))))) return "the messages were never indexed";
-        // What this checks is there to begin with: the WAL holds both words.
-        if (!copies(wal, alone) || !copies(wal, reply)) return `before deleting, the -wal holds ${copies(wal, alone)}/${copies(wal, reply)} copies; want some of each (the check below would prove nothing)`;
+        // What this checks is there to begin with: the files hold both words.
+        if (!inFiles(alone) || !inFiles(reply)) return `before deleting, LOREHOUSE_DB's files hold ${inFiles(alone)}/${inFiles(reply)} copies; want some of each (the check below would prove nothing)`;
         await deleteMessage(ALLOWED, aloneTs);
         // A reply's deletion names its thread, as Slack's does.
         await post("/fixtures/delete", { channel: ALLOWED, ts: replyTs });
@@ -740,7 +740,12 @@ const scenarios: Scenario[] = [
         const t0 = Date.now();
         proc.kill("SIGTERM");
         const code = await Promise.race([proc.exited, Bun.sleep(5000).then(() => "timeout" as const)]);
-        if (code === "timeout") return "still running 5 s after SIGTERM (Fly's default kill_timeout)";
+        if (code === "timeout") {
+          proc.kill("SIGKILL");
+          await proc.exited;
+          app = undefined;
+          return "still running 5 s after SIGTERM (Fly's default kill_timeout)";
+        }
         app = undefined;
         const t0Free = Date.now();
         while ((await listenerPids(APP_PORT)).length && Date.now() - t0Free < 5000) await Bun.sleep(20);
@@ -1523,7 +1528,12 @@ async function refusedStart(extraEnv: Record<string, string>): Promise<{ code: n
 async function stopApp(): Promise<void> {
   if (!app) return;
   app.kill();
-  await app.exited;
+  // A shutdown that wedges fails the run instead of hanging it.
+  if ((await Promise.race([app.exited, Bun.sleep(8000).then(() => "timeout" as const)])) === "timeout") {
+    console.log(`  (the app was still running 8 s after SIGTERM: killed)`);
+    app.kill("SIGKILL");
+    await app.exited;
+  }
   app = undefined;
   // wait until the port is free, so the next start can't be answered by a dying process
   const t0 = Date.now();

@@ -53,7 +53,13 @@ export function openKnowledge(path: string, migrations = MIGRATIONS, wal: WalOpt
     ensureIndex(db);
     if (path !== ":memory:") compactOnce(db);
   }
-  if (path !== ":memory:" && path !== "") checkpoints.set(db, new WalCheckpoint(db, wal));
+  if (path !== ":memory:" && path !== "") {
+    const c = new WalCheckpoint(db, wal);
+    checkpoints.set(db, c);
+    // A WAL left by a stop that couldn't checkpoint (busy, or killed) may hold removed text:
+    // empty it once on every open, as soon as the event loop is free.
+    c.request(0);
+  }
   return db;
 }
 
@@ -70,7 +76,8 @@ export function openKnowledge(path: string, migrations = MIGRATIONS, wal: WalOpt
 // A request arms one timer: a burst of deletes within `delayMs` shares a checkpoint, and a
 // steady stream of them can't put it off (the first request sets when it runs). A busy
 // checkpoint (another connection reading) is logged and tried again `retryMs` later; it
-// never throws into the write that asked for it.
+// never throws into the write that asked for it. Every open asks for one too, for a WAL
+// an earlier process left behind.
 
 export type WalOptions = { delayMs?: number; retryMs?: number; log?: (msg: string) => void };
 
@@ -92,21 +99,28 @@ class WalCheckpoint {
     if (this.stopped || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      if (!this.now()) this.request(this.retryMs);
+      if (!this.now(true)) this.request(this.retryMs);
     }, delayMs);
     // Never what keeps a process alive: closeKnowledge checkpoints on the way out.
     (this.timer as { unref?: () => void }).unref?.();
   }
 
-  // Checkpoint and truncate now. True when the WAL is empty afterwards.
-  now(): boolean {
+  // Checkpoint and truncate now. True when the WAL is empty afterwards. `retrying` says
+  // whether a failure will be tried again (the timer) or not (closing).
+  now(retrying: boolean): boolean {
     this.runs++;
+    const then = retrying ? "trying again" : "the next open tries again";
     try {
       const { busy } = this.db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
       if (!busy) return true;
-      this.log("knowledge: couldn't empty the WAL of removed text (the database is in use); trying again");
+      this.log(`knowledge: couldn't empty the WAL of removed text (the database is in use); ${then}`);
     } catch (err) {
-      this.log(`knowledge: couldn't empty the WAL of removed text; trying again: ${err}`);
+      // Closed under it (a plain db.close()): nothing left to checkpoint, and never will be.
+      if (/closed/i.test(String(err))) {
+        this.stop();
+        return true;
+      }
+      this.log(`knowledge: couldn't empty the WAL of removed text; ${then}: ${err}`);
     }
     return false;
   }
@@ -132,12 +146,12 @@ export function checkpointRuns(db: Database): number {
 
 // Close the knowledge store for good: no checkpoint pending, the WAL checkpointed and
 // truncated, then the connection closed. False when the checkpoint was busy (logged): the
-// WAL then keeps its frames until the next open checkpoints it.
+// WAL then keeps its frames until the next openKnowledge checkpoints it.
 export function closeKnowledge(db: Database): boolean {
   const c = checkpoints.get(db);
   c?.stop();
   checkpoints.delete(db);
-  const done = c ? c.now() : true;
+  const done = c ? c.now(false) : true;
   db.close();
   return done;
 }
@@ -188,11 +202,11 @@ function ensureIndex(db: Database): void {
 }
 
 // Insert, or replace in place (a Slack thread grows; its id doesn't change). The document
-// and its index row change together. A replaced document may have lost text (a deleted
-// reply, an edit), so replacing one asks for a checkpoint, as a delete does.
+// and its index row change together. A replaced document whose text changed may have lost
+// some (a deleted reply, an edit), so it asks for a checkpoint, as a delete does.
 export function upsertDocument(db: Database, doc: Document): void {
   const replaced = db.transaction(() => {
-    const existed = !!db.query("SELECT 1 FROM knowledge_documents WHERE doc_id = ?").get(doc.docId);
+    const old = db.query("SELECT title, text FROM knowledge_documents WHERE doc_id = ?").get(doc.docId) as { title: string; text: string } | null;
     const { id } = db.query(
       `INSERT INTO knowledge_documents (doc_id, kind, source, title, text, updated_at, source_version) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(doc_id) DO UPDATE SET kind = excluded.kind, source = excluded.source, title = excluded.title,
@@ -201,7 +215,7 @@ export function upsertDocument(db: Database, doc: Document): void {
     ).get(doc.docId, doc.kind, doc.source, doc.title, doc.text, new Date().toISOString(), doc.sourceVersion ?? null) as { id: number };
     db.query("DELETE FROM knowledge_fts WHERE rowid = ?").run(id);
     db.query("INSERT INTO knowledge_fts (rowid, title, text) VALUES (?, ?, ?)").run(id, indexText(doc.title), indexText(doc.text));
-    return existed;
+    return !!old && (old.title !== doc.title || old.text !== doc.text);
   })();
   if (replaced) checkpointSoon(db);
 }

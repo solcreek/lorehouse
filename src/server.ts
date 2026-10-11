@@ -62,7 +62,9 @@ if (config) {
   const STOP_REQUESTS_MS = 1000;
   let stopping = false;
   const shutdown = async (signal: string) => {
-    if (stopping) return; // a second signal changes nothing: the first is already bounded
+    // A second signal while shutting down means now: exit without waiting (the WAL keeps
+    // what it holds until the next start checkpoints it).
+    if (stopping) process.exit(1);
     stopping = true;
     console.log(`lorehouse: ${signal}: shutting down`);
     try {

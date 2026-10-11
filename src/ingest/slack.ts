@@ -413,7 +413,8 @@ export class SlackIngester {
   }
 
   // Shutting down: no thread waiting out its debounce is read, and no new event arms one.
-  // A read already in flight may still finish and write (before the store is closed).
+  // A read already in flight, or a start-up backfill or reconcile, may still try to write;
+  // once the store is closed that write fails and is logged.
   stop(): void {
     this.stopped = true;
     for (const timer of this.pending.values()) clearTimeout(timer);

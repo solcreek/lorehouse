@@ -69,7 +69,7 @@ export async function createApp(config: Config) {
   try {
     assertDistinctDatabases(config.db.lorehouse, config.db.sessions);
   } catch (err) {
-    knowledge.close();
+    closeKnowledge(knowledge);
     throw err;
   }
   // A channel taken off AGENT_CHANNELS leaves the index, with its joined threads, before
@@ -346,13 +346,16 @@ export async function createApp(config: Config) {
       ingester?.stop();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), waitMs); });
-      const runtimeClosed = runtime!.close().then(
-        () => "closed" as const,
-        (err) => { console.error("lorehouse: closing the agent runtime:", err); return "closed" as const; },
-      );
-      if ((await Promise.race([runtimeClosed, timeout])) === "timeout") console.error(`lorehouse: turns still running after ${waitMs} ms; closing without them`);
-      clearTimeout(timer);
-      closeKnowledge(knowledge);
+      try {
+        const runtimeClosed = Promise.resolve().then(() => runtime!.close()).then(
+          () => "closed" as const,
+          (err) => { console.error("lorehouse: closing the agent runtime:", err); return "closed" as const; },
+        );
+        if ((await Promise.race([runtimeClosed, timeout])) === "timeout") console.error(`lorehouse: turns still running after ${waitMs} ms; closing without them`);
+      } finally {
+        clearTimeout(timer);
+        closeKnowledge(knowledge);
+      }
     },
   };
 }
