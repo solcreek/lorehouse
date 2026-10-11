@@ -500,11 +500,43 @@ describe("publicChannelsOnly", () => {
   const open = publicChannelsOnly(new Set());
   const listed = publicChannelsOnly(parseAllowlist("C1, C2"));
 
-  test("public-channel messages pass; DMs and private channels never do", () => {
-    expect(open(ev({ type: "message", channel: "C9", channel_type: "channel" }))).toBe(true);
-    expect(open(ev({ type: "message", channel: "D1", channel_type: "im" }))).toBe(false);
-    expect(open(ev({ type: "message", channel: "G1", channel_type: "group" }))).toBe(false);
-    expect(open(ev({ type: "message", channel: "G2", channel_type: "mpim" }))).toBe(false);
+  test("public-channel messages on the allowlist pass; DMs and private channels never do", () => {
+    expect(listed(ev({ type: "message", channel: "C1", channel_type: "channel" }))).toBe(true);
+    for (const allow of [open, listed]) {
+      expect(allow(ev({ type: "message", channel: "D1", channel_type: "im" }))).toBe(false);
+      expect(allow(ev({ type: "message", channel: "G1", channel_type: "group" }))).toBe(false);
+      expect(allow(ev({ type: "message", channel: "G2", channel_type: "mpim" }))).toBe(false);
+    }
+  });
+
+  // An empty AGENT_CHANNELS means nowhere (#82), for every event kind the gate sees: in a
+  // channel on the list, one off it, and with no list at all. A follow-up in a thread the
+  // agent joined is a plain `message` reply, so it is the "thread reply" row.
+  describe("every event kind × empty / listed / unlisted", () => {
+    const kinds: [string, (channel: string) => Record<string, unknown>][] = [
+      ["app_mention", (channel) => ({ type: "app_mention", channel, user: "U1", text: "<@UBOT> hi", ts: "2.2" })],
+      ["top-level message", (channel) => ({ type: "message", channel, channel_type: "channel", user: "U1", text: "hi", ts: "2.2" })],
+      ["thread reply (a follow-up)", (channel) => ({ type: "message", channel, channel_type: "channel", user: "U1", text: "and?", ts: "2.3", thread_ts: "2.2" })],
+      ["message edit", (channel) => ({ type: "message", subtype: "message_changed", channel, channel_type: "channel", message: { ts: "2.2" } })],
+      ["message deletion", (channel) => ({ type: "message", subtype: "message_deleted", channel, channel_type: "channel", deleted_ts: "2.2" })],
+      ["reaction_added", (channel) => ({ type: "reaction_added", user: "U2", reaction: "+1", item: { type: "message", channel, ts: "2.2" } })],
+      ["reaction_removed", (channel) => ({ type: "reaction_removed", user: "U2", reaction: "+1", item: { type: "message", channel, ts: "2.2" } })],
+      ["another event naming a channel", (channel) => ({ type: "channel_rename", channel })],
+    ];
+    for (const [kind, event] of kinds) {
+      test(kind, () => {
+        expect(listed(ev(event("C1")))).toBe(true);
+        expect(listed(ev(event("C3")))).toBe(false);
+        expect(open(ev(event("C1")))).toBe(false);
+        expect(open(ev(event("C9")))).toBe(false);
+        // DM_MODE lets DMs in, never a channel, with or without a list.
+        expect(publicChannelsOnly(new Set(), { dms: true })(ev(event("C1")))).toBe(false);
+      });
+    }
+  });
+
+  test("what isn't an event callback is not the gate's to judge", () => {
+    expect(open({ type: "url_verification", challenge: "x" })).toBe(true);
   });
 
   test("a mention carries no channel_type, so only an allowlisted channel admits it", () => {
@@ -525,12 +557,14 @@ describe("publicChannelsOnly", () => {
     expect(listed(ev({ type: "message", channel: "C3", channel_type: "channel" }))).toBe(false);
   });
 
-  test("with dms on, a DM passes, whatever the allowlist; private channels and group DMs still don't", () => {
-    const withDms = publicChannelsOnly(parseAllowlist("C1"), { dms: true });
-    expect(withDms(ev({ type: "message", channel: "D1", channel_type: "im" }))).toBe(true);
-    expect(withDms(ev({ type: "message", channel: "G1", channel_type: "group" }))).toBe(false);
-    expect(withDms(ev({ type: "message", channel: "G2", channel_type: "mpim" }))).toBe(false);
-    expect(withDms(ev({ type: "message", channel: "C3", channel_type: "channel" }))).toBe(false);
+  test("with dms on, a DM passes, whatever the allowlist, even an empty one; private channels and group DMs still don't", () => {
+    for (const list of [parseAllowlist("C1"), new Set<string>()]) {
+      const withDms = publicChannelsOnly(list, { dms: true });
+      expect(withDms(ev({ type: "message", channel: "D1", channel_type: "im" }))).toBe(true);
+      expect(withDms(ev({ type: "message", channel: "G1", channel_type: "group" }))).toBe(false);
+      expect(withDms(ev({ type: "message", channel: "G2", channel_type: "mpim" }))).toBe(false);
+      expect(withDms(ev({ type: "message", channel: "C3", channel_type: "channel" }))).toBe(false);
+    }
   });
 });
 
@@ -546,10 +580,14 @@ describe("DM redirect", () => {
     expect(dm({ type: "app_mention", channel_type: undefined })).toBeUndefined();
   });
 
-  test("the reply links the allowlisted channels, or says any public channel", () => {
+  test("the reply links the allowlisted channels; with none, it says it isn't set up in any yet", () => {
     expect(redirectText(parseAllowlist("C1"))).toContain("Ask me in <#C1>.");
     expect(redirectText(parseAllowlist("C1,C2"))).toContain("Ask me in <#C1> or <#C2>.");
-    expect(redirectText(new Set())).toContain("Ask me in any public channel I'm in.");
+    // An empty list means nowhere (#82), never "any public channel".
+    const none = redirectText(new Set());
+    expect(none).toContain("I'm not set up in any channel yet");
+    expect(none).not.toContain("any public channel");
+    expect(none).not.toContain("Ask me in");
   });
 });
 

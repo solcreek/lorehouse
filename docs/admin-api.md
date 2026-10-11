@@ -76,7 +76,8 @@ keep serving the closed 404 after `ADMIN_TOKEN` is set.
 `GET /api/v1/documents/{id}` returns the same fields plus `text`, without `chars`. It
 takes the id as it is (`slack:C0123:1790000001.000100`) or percent-encoded, and gives a
 404 for an id that isn't indexed. A deleted message is gone from the index, so it gives a
-404 here too.
+404 here too, as does every thread of a channel taken off `AGENT_CHANNELS` once the app
+has restarted (the start purges them).
 
 ### Search
 
@@ -121,7 +122,8 @@ A thread joins when someone mentions the agent in it. `document` and `source` ar
 when the thread isn't indexed: a thread that holds only a question to the agent isn't
 knowledge. `asks`, `searches` and `emptySearches` come from [usage](#usage): the messages
 that asked the agent something there, its `search_knowledge` calls, and how many of those
-found nothing.
+found nothing. A channel taken off `AGENT_CHANNELS` takes its threads, and their asks
+and searches, off this list on the next start.
 
 ### Usage
 

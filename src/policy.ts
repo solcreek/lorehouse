@@ -9,15 +9,17 @@
 // A DM is never knowledge: ingest only reads the allowlisted channels. Private channels
 // and group DMs stay shut.
 //
+// Every channel event, of every kind, must be in a channel on the allowlist, and an empty
+// allowlist means nowhere (#82): mentions, follow-ups in threads the agent joined,
+// reactions, edits and deletions alike. (It once meant "any public channel" for message
+// events only, so emptying the list stopped new mentions but not follow-ups.)
+//
 // `accept` is synchronous, so it can't ask Slack (conversations.info) whether a channel
 // is private. What the payload itself says:
 //   • message events carry channel_type: "channel" (public) | "group" | "im" | "mpim"
-//   • app_mention events carry NO channel_type — so a mention is admitted only in a
-//     channel on the explicit allowlist.
+//   • app_mention events carry NO channel_type, so the allowlist alone vouches for them.
 //   • reaction events carry neither channel_type nor `channel`: the reacted-to message's
-//     channel is `item.channel`, and like a mention it must be on the allowlist.
-// An async accept (or a cached conversations.info lookup) in @junejs/core would let this
-// drop the allowlist for mentions. June has neither yet.
+//     channel is `item.channel`.
 
 type SlackEnvelope = {
   type?: string;
@@ -34,7 +36,7 @@ export function publicChannelsOnly(allowlist: ReadonlySet<string>, opts: { dms?:
     if (type === "reaction_added" || type === "reaction_removed") return !!item?.channel && allowlist.has(item.channel);
     if (!channel) return false;
     if (channel_type === "im") return opts.dms === true;
-    if (channel_type) return channel_type === "channel" && (allowlist.size === 0 || allowlist.has(channel));
+    if (channel_type) return channel_type === "channel" && allowlist.has(channel);
     return allowlist.has(channel);
   };
 }
