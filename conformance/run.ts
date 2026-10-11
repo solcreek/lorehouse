@@ -159,10 +159,10 @@ async function sendInteraction(payload: Record<string, unknown>) {
 // U1 asks for a pull request from `branch` in a new thread; resolves to the Approve/Deny
 // card posted there, or why there is none. Needs code tools (RUNNER_ENV) and a runner.
 type Card = { nonce: string; thread: string; prompt: Stats["posts"][number] };
-async function prCard(branch: string): Promise<Card | string> {
+async function prCard(branch: string, requester = "U1"): Promise<Card | string> {
   const n = ++seq;
   const thread = `${1970000000 + n}.000100`;
-  await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${n}] [pr] ${branch}`, ts: thread, event_ts: thread, channel: ALLOWED });
+  await sendEvent({ type: "app_mention", user: requester, team: "T1", text: `<@UBOT> [q${n}] [pr] ${branch}`, ts: thread, event_ts: thread, channel: ALLOWED });
   const prompt = await until(async () => (await stats()).posts.find((p) => p.channel === ALLOWED && p.thread_ts === thread && p.blocks?.length));
   if (!prompt) return `no Approve/Deny prompt in the thread: ${JSON.stringify((await stats()).posts).slice(0, 300)}`;
   return { nonce: `[q${n}]`, thread, prompt };
@@ -991,16 +991,16 @@ const scenarios: Scenario[] = [
           await reset();
           const rule = ((await status()) as unknown as { pullRequestApprover?: string }).pullRequestApprover;
           if (rule !== "requester") return `/status pullRequestApprover ${JSON.stringify(rule)}, want "requester"`;
-          const card = await prCard("scout/conformance-requester");
+          const card = await prCard("scout/conformance-requester", "U4"); // Kai, named in the fixtures
           if (typeof card === "string") return card;
           if (JSON.stringify(card.prompt).includes("someone other than")) return "under requester, the card says someone else must approve";
           const refused = await refusedFor("U2", "someone else", card, runner);
           if (refused) return refused;
-          await click("U1", card, "Approve");
+          await click("U4", card, "Approve");
           const done = await until(async () => (await stats()).updates.find((u) => u.ts === card.prompt.ts && u.text.includes("[pr:")));
           if (!done) return `approved by the requester, the turn never finished: responses ${JSON.stringify((await stats()).responses)}`;
           if (!done.text.includes(`${card.nonce} [pr:opened:https://github.com/acme/widgets/pull/7]`)) return `the turn ended with ${done.text.slice(0, 160)}, want the opened pull request`;
-          return openedBy(runner, null); // U1 has no name in the fixtures: "approved there."
+          return openedBy(runner, "Kai");
         } finally {
           await runner.stop();
         }

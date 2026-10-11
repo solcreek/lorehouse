@@ -453,13 +453,14 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
 
   // The rule as the app wires it (approverGate's authorize is src/app.ts's authorizeAnswer),
   // through the real engine and June's own grantAnswer.
-  const slackTurn = (rule: PrApprover) => {
+  const slackTurn = (rule: PrApprover, speaker: { id: string; attested?: boolean } | null = { id: "U1", attested: true }) => {
+    const user = speaker ?? undefined;
     const { sb, published } = fakeRepo();
     const gh = fakeGithub();
     const gate = approverGate(rule);
     const names = async (id: string) => ({ U1: "Rex Quinn", U2: "Ada Park", U3: "Bo Chen" } as Record<string, string>)[id];
     const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, approver: rule, approvedBy: gate.approvedBy, approverName: names }));
-    const event = { source: "slack", kind: "app_mention" as const, channelId: "C1", ts: "1.1", user: { id: "U1", attested: true } };
+    const event = { source: "slack", kind: "app_mention" as const, channelId: "C1", ts: "1.1", user };
     const t1 = s.start({ turnId: "t1", userText: "open a PR", event }).turnId;
     const prBody = () => (gh.reqs.find((r) => r.method === "POST")?.body as { body?: string } | undefined)?.body ?? "";
     return { s, t1, published, gh, gate, toolResult, prBody };
@@ -470,6 +471,20 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     const granted = await grantAnswer(t.s, { turnId: t.t1, inputId: parked.request.id, by }, t.gate.authorize);
     return () => t.s.resume(t.t1, parked.request.id, answer, { by, granted });
   };
+
+  test("with no verified requester, a rule that needs one posts no card: nothing is staged, and the model is told", async () => {
+    for (const rule of ["requester", "not-requester"] as const) {
+      for (const user of [null, { id: "U1" }]) {
+        const t = slackTurn(rule, user);
+        expect(await t.s.result(t.t1)).toMatchObject({ status: "completed" }); // never parked
+        expect(String(t.toolResult()?.result.error)).toContain("can't tell who asked for this pull request");
+        expect(t.published).toHaveLength(0);
+      }
+    }
+    // Under anyone there is nobody to check against, so the card goes up as usual.
+    const open = slackTurn("anyone", { id: "U1" });
+    expect(await open.s.result(open.t1)).toMatchObject({ status: "suspended" });
+  });
 
   test("the card names the approver policy with the requester, the turn's attested speaker", async () => {
     const { s, t1 } = slackTurn("anyone");

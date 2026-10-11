@@ -81,6 +81,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       if (input.base !== undefined && !isPlainRef(input.base)) {
         return { error: `base must be a plain branch name ([A-Za-z0-9_./-], no "..")` };
       }
+      const answerers = approvers(ctx, opts.approver ?? "requester");
+      if (answerers === "no-requester") {
+        return { error: "can't tell who asked for this pull request (the message has no verified sender), so nobody could approve it. Nothing was staged or pushed." };
+      }
       const sb = opts.sandboxFor(ctx);
       const sh = async (command: string, env?: Record<string, string>) => {
         const r = await sb.exec(command, { cwd: WORKDIR, env, timeoutMs: 5 * 60_000 });
@@ -155,7 +159,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const facts = [staged.sha, staged.commits, staged.stat, staged.files, staged.authors, staged.patch, staged.patchTruncated, staged.diffSha256];
       const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
       const inputId = `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`;
-      const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers: approvers(ctx) });
+      const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers });
       if (approved !== true) {
         opts.approvedBy?.(ctx, inputId); // the Deny's grant is used up: a later card with this id is someone else's
         return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
@@ -212,13 +216,17 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
 export const APPROVER_POLICY = "pull-request-approver";
 
 // Who may answer this turn's card: the policy, with the requester, the turn's speaker as
-// its channel attests them (a signed Slack event; unattested, there is no requester). A
-// turn with no inbound event (a test, a programmatic call) names nobody, so whoever drives
-// it resumes it, as June does for such a turn.
-function approvers(ctx: ToolContext): Answerers | undefined {
+// its channel attests them (a signed Slack event). A turn with no inbound event (a test, a
+// programmatic call) names nobody, so whoever drives it resumes it, as June does for such
+// a turn. A turn whose speaker isn't attested has no requester: under a rule that needs one
+// nobody could answer, so no card is posted (June, left to its default, refuses to park
+// such a turn too).
+function approvers(ctx: ToolContext, rule: PrApprover): Answerers | undefined | "no-requester" {
   if (!ctx.event) return undefined;
   const user = ctx.event.user;
-  return { policy: APPROVER_POLICY, scope: { requester: user?.attested ? user.id : null } };
+  const requester = user?.attested ? user.id : null;
+  if (!requester && rule !== "anyone") return "no-requester";
+  return { policy: APPROVER_POLICY, scope: { requester } };
 }
 
 // Whether the person who clicked (`by`, verified by the channel) may answer a card that

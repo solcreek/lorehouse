@@ -85,7 +85,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   if (config.sandbox) {
     const says: Record<typeof config.prApprover, string> = {
       requester: "only the person who asked for a pull request may approve (or deny) opening it; PR_APPROVER=anyone widens that to the thread, PR_APPROVER=not-requester asks for a second person",
-      anyone: "anyone in the thread may approve opening a pull request, the person who asked for it included",
+      anyone: "anyone in the thread may approve opening a pull request, the person who asked for it included; PR_APPROVER=not-requester asks for a second person",
       "not-requester": "someone other than the person who asked for a pull request approves (or denies) opening it",
     };
     add("configuration", "PR_APPROVER", "info", `${config.prApprover}: ${says[config.prApprover]}`);
