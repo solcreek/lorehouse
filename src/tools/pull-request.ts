@@ -25,7 +25,7 @@
 // for the branch is returned instead of creating a second one.
 
 import { createHash } from "node:crypto";
-import type { Answerers, Tool, ToolContext } from "@junejs/core/agent-runtime";
+import type { Answerers, AuthorizeAnswer, Tool, ToolContext } from "@junejs/core/agent-runtime";
 import type { PrApprover } from "../config";
 import { WORKDIR, type SandboxFor, type Staged } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
@@ -43,8 +43,9 @@ export type PullRequestOptions = {
   // Who may approve (PR_APPROVER, default anyone): the card says so when it isn't anyone.
   // The rule itself is applied to each click by the app, with mayApprove.
   approver?: PrApprover;
-  // The Slack user id whose click approved this card, when the app saw it (the turn's own
-  // event is the requester's, not the approver's). Unknown: the PR body names nobody.
+  // The Slack user id whose click answered this card, when the app saw it (the turn's own
+  // event is the requester's, not the approver's), taken once. Unknown: the PR body names
+  // nobody. See approverGate.
   approvedBy?: (ctx: ToolContext, inputId: string) => string | undefined;
   fetch?: typeof fetch; // injectable for tests
   apiUrl?: string; // GitHub's REST API, default https://api.github.com
@@ -154,7 +155,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
       const inputId = `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`;
       const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers: approvers(ctx) });
-      if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
+      if (approved !== true) {
+        opts.approvedBy?.(ctx, inputId); // the Deny's grant is used up: a later card with this id is someone else's
+        return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
+      }
 
       // ── after approval: the host pushes the staged commit, then open (or find) the PR ─
       let token: string;
@@ -224,6 +228,32 @@ export function mayApprove(rule: PrApprover, by: string | undefined, scope: unkn
   if (rule === "anyone") return true;
   const requester = (scope as { requester?: unknown } | null | undefined)?.requester;
   return typeof requester === "string" && requester !== "" && by !== requester;
+}
+
+// The install's rule as June's authorizeAnswer hook (src/app.ts wires it), and who it last
+// let answer each card, so the pull request can name its approver. In memory: after a
+// restart between the click and the PR, the name is left out, never guessed. A grant is
+// taken once (approvedBy), on Approve or Deny, so a later card with the same id (the same
+// change asked for again in the thread) never inherits an earlier clicker. The latest grant
+// wins: a grant whose resume then failed is replaced by the click that does answer.
+export function approverGate(rule: PrApprover, max = 1000) {
+  const grants = new Map<string, string>();
+  const key = (session: string, inputId: string) => `${session}\n${inputId}`;
+  const authorize: AuthorizeAnswer = ({ policy, scope, by, session, request }) => {
+    if (policy !== APPROVER_POLICY || !mayApprove(rule, by, scope)) return false;
+    const k = key(session, request.id);
+    grants.delete(k);
+    grants.set(k, by!);
+    if (grants.size > max) grants.delete(grants.keys().next().value!);
+    return true;
+  };
+  const approvedBy = (ctx: ToolContext, inputId: string): string | undefined => {
+    const k = key(ctx.sessionId, inputId);
+    const by = grants.get(k);
+    grants.delete(k);
+    return by;
+  };
+  return { authorize, approvedBy };
 }
 
 // A branch name safe to put in a shell command and a git refspec: letters, digits and

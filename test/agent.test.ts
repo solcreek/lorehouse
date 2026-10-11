@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { AgentSession, grantAnswer, replyStream, ResumeAuthorizationError, type EventSink, type ModelReply, type Model, type Runtime, type Tool, type TurnEvent } from "@junejs/core/agent-runtime";
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
-import { APPROVER_POLICY, approvalCard, isPlainRef, mayApprove, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
+import { APPROVER_POLICY, approvalCard, approverGate, isPlainRef, mayApprove, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
 import type { GithubAccess } from "../src/github-auth";
 
 // A credential with no account to commit as (no identity provider), so no author check
@@ -446,20 +446,24 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     for (const s of [{ requester: null }, {}, undefined, { requester: "" }]) expect(mayApprove("not-requester", "U2", s)).toBe(false);
   });
 
-  // The rule as the app applies it (src/app.ts's authorizeAnswer), through the real engine.
-  const authorize = (rule: "anyone" | "not-requester") => (a: { policy: string; scope?: unknown; by?: string }) => a.policy === APPROVER_POLICY && mayApprove(rule, a.by, a.scope);
+  // The rule as the app wires it (approverGate's authorize is src/app.ts's authorizeAnswer),
+  // through the real engine and June's own grantAnswer.
   const slackTurn = (rule: "anyone" | "not-requester") => {
     const { sb, published } = fakeRepo();
     const gh = fakeGithub();
-    const { s } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, approver: rule }));
+    const gate = approverGate(rule);
+    const names = async (id: string) => ({ U1: "Rex Quinn", U2: "Ada Park", U3: "Bo Chen" } as Record<string, string>)[id];
+    const { s, toolResult } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, approver: rule, approvedBy: gate.approvedBy, approverName: names }));
     const event = { source: "slack", kind: "app_mention" as const, channelId: "C1", ts: "1.1", user: { id: "U1", attested: true } };
     const t1 = s.start({ turnId: "t1", userText: "open a PR", event }).turnId;
-    return { s, t1, published, gh };
+    const prBody = () => (gh.reqs.find((r) => r.method === "POST")?.body as { body?: string } | undefined)?.body ?? "";
+    return { s, t1, published, gh, gate, toolResult, prBody };
   };
-  const click = async (s: AgentSession, t1: string, by: string, rule: "anyone" | "not-requester") => {
-    const parked = (await s.result(t1)) as { request: { id: string; prompt: string; answerers?: unknown } };
-    const granted = await grantAnswer(s, { turnId: t1, inputId: parked.request.id, by }, authorize(rule));
-    return () => s.resume(t1, parked.request.id, true, { by, granted });
+  type Turn = ReturnType<typeof slackTurn>;
+  const click = async (t: Turn, by: string, answer = true) => {
+    const parked = (await t.s.result(t.t1)) as { request: { id: string } };
+    const granted = await grantAnswer(t.s, { turnId: t.t1, inputId: parked.request.id, by }, t.gate.authorize);
+    return () => t.s.resume(t.t1, parked.request.id, answer, { by, granted });
   };
 
   test("the card names the approver policy with the requester, the turn's attested speaker", async () => {
@@ -471,26 +475,54 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(((await strict.s.result(strict.t1)) as { request: { prompt: string } }).request.prompt).toContain("Approved or denied by someone other than the person who asked for it.");
   });
 
-  test("anyone (the default): the requester's Approve opens it, and so does someone else's", async () => {
-    for (const by of ["U1", "U2"]) {
-      const { s, t1, published, gh } = slackTurn("anyone");
-      (await click(s, t1, by, "anyone"))();
-      expect(await s.result(t1)).toMatchObject({ status: "completed" });
-      expect(published.filter((p) => p.op === "push")).toHaveLength(1);
-      expect(gh.reqs.filter((r) => r.method === "POST")).toHaveLength(1);
+  test("anyone (the default): the requester's Approve opens it, and so does someone else's, who is named", async () => {
+    for (const [by, name] of [["U1", "Rex Quinn"], ["U2", "Ada Park"]] as const) {
+      const t = slackTurn("anyone");
+      (await click(t, by))();
+      expect(await t.s.result(t.t1)).toMatchObject({ status: "completed" });
+      expect(t.published.filter((p) => p.op === "push")).toHaveLength(1);
+      expect(t.gh.reqs.filter((r) => r.method === "POST")).toHaveLength(1);
+      expect(t.prBody()).toContain(`approved there by ${name}.`);
     }
   });
 
   test("not-requester: the requester's click is refused and nothing is pushed; someone else's then opens it", async () => {
-    const { s, t1, published, gh } = slackTurn("not-requester");
-    expect(await click(s, t1, "U1", "not-requester")).toThrow(ResumeAuthorizationError);
-    expect(await s.result(t1)).toMatchObject({ status: "suspended" }); // still waiting for someone else
-    expect(published.filter((p) => p.op === "push")).toHaveLength(0);
-    expect(gh.reqs).toHaveLength(0);
-    (await click(s, t1, "U2", "not-requester"))();
-    expect(await s.result(t1)).toMatchObject({ status: "completed" });
-    expect(published.filter((p) => p.op === "push")).toHaveLength(1);
-    expect(gh.reqs.filter((r) => r.method === "POST")).toHaveLength(1);
+    const t = slackTurn("not-requester");
+    expect(await click(t, "U1")).toThrow(ResumeAuthorizationError);
+    expect(await click(t, "U1", false)).toThrow(ResumeAuthorizationError); // Deny too
+    expect(await t.s.result(t.t1)).toMatchObject({ status: "suspended" }); // still waiting for someone else
+    expect(t.published.filter((p) => p.op === "push")).toHaveLength(0);
+    expect(t.gh.reqs).toHaveLength(0);
+    (await click(t, "U2"))();
+    expect(await t.s.result(t.t1)).toMatchObject({ status: "completed" });
+    expect(t.published.filter((p) => p.op === "push")).toHaveLength(1);
+    expect(t.gh.reqs.filter((r) => r.method === "POST")).toHaveLength(1);
+    expect(t.prBody()).toContain("approved there by Ada Park.");
+  });
+
+  test("a Deny uses up its grant: the same card asked for again never names the person who denied it", async () => {
+    const t = slackTurn("anyone");
+    const inputId = ((await t.s.result(t.t1)) as { request: { id: string } }).request.id;
+    (await click(t, "U3", false))();
+    expect(await t.s.result(t.t1)).toMatchObject({ status: "completed" });
+    expect(t.toolResult()?.result).toMatchObject({ status: "denied" });
+    expect(t.gate.approvedBy({ sessionId: "slack:C1:1.1" } as never, inputId)).toBeUndefined();
+  });
+
+  test("the gate: the latest grant for a card is its approver, taken once; other policies are refused", async () => {
+    const gate = approverGate("anyone", 2);
+    const ask = (by: string, session = "s", id = "pr:x") => gate.authorize({ policy: APPROVER_POLICY, scope: { requester: "U1" }, by, agent: "a", session, request: { id, prompt: "" } });
+    const ctx = (sessionId: string) => ({ sessionId }) as never;
+    expect(ask("U2")).toBe(true);
+    expect(ask("U3")).toBe(true); // U2's resume failed (say), and U3's click answered
+    expect(gate.approvedBy(ctx("s"), "pr:x")).toBe("U3");
+    expect(gate.approvedBy(ctx("s"), "pr:x")).toBeUndefined();
+    expect(gate.authorize({ policy: "something-else", by: "U2", agent: "a", session: "s", request: { id: "pr:x", prompt: "" } })).toBe(false);
+    expect(gate.approvedBy(ctx("s"), "pr:x")).toBeUndefined();
+    // Bounded: the oldest grant goes first.
+    ask("U2", "s1"), ask("U2", "s2"), ask("U2", "s3");
+    expect(gate.approvedBy(ctx("s1"), "pr:x")).toBeUndefined();
+    expect(gate.approvedBy(ctx("s3"), "pr:x")).toBe("U2");
   });
 });
 
