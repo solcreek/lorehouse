@@ -116,8 +116,14 @@ export function approverGate(rule: PrApprover, store: ApprovalStore, sessionOf: 
       if (e.type === "input.resolved" && e.inputId === request.id && !answered) {
         if (e.outcome !== "answered" || !e.by) return off(); // retired by a reset: nothing to record
         answered = true;
-        store.record(key, e.by);
-      } else if (answered && e.type === "input.requested") {
+        // June's sink swallows a subscriber's throw: say so. With no record the push decides
+        // as for a card with none (refused under not-requester, unnamed under anyone).
+        try {
+          store.record(key, e.by);
+        } catch (err) {
+          console.error("approvals: recording who answered", request.id, err);
+        }
+      } else if (answered && e.type === "input.requested" && e.request.id !== request.id) {
         // Parked again, on another card: this one is done with (a retry of it after this finds
         // no record, which under not-requester is refused), and nothing is left watching.
         off();
