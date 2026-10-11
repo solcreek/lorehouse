@@ -39,7 +39,9 @@ You name it per install; it defaults to `scout`.
 - **Directs agents, in a sandbox** *(experimental)*. With a sandbox attached, it can
   clone a repo, run the tests and open a pull request. The pull request waits for an
   Approve in the thread. The sandbox is designed as one Firecracker microVM per thread; so
-  far it has only been proven in a spike.
+  far it has only been proven in a spike. Reading needs no Approve: installing its GitHub
+  App on a repository, private or not, lets anyone in the agent's channels have it read that
+  repository and quote it in the thread ([what that allows](docs/github-app.md#what-installing-on-a-repository-allows)).
 
 ## Deploy it where you already run things
 

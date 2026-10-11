@@ -46,7 +46,9 @@ holds a long-lived token:
 3. **Private keys → Generate a private key**. A `.pem` file downloads. It is the App's
    password: keep it out of the repo and out of chat.
 4. **Install App** → your organization → **Only select repositories** → the repos the
-   agent may work on. Add more later from the same page.
+   agent may work on. Add more later from the same page. Choosing a repo here lets
+   anyone in the agent's channels read it, private or not: see
+   [What installing on a repository allows](#what-installing-on-a-repository-allows).
 5. Give Lorehouse both, e.g. on Fly.io:
 
    ```sh
@@ -60,6 +62,44 @@ holds a long-lived token:
 The App needs a sandbox to be useful: set it together with `SANDBOX_RUNNER_TOKEN` (or
 `SANDBOX_URL` + `SANDBOX_TOKEN`). Lorehouse refuses to start with GitHub credentials and
 no sandbox, and with both an App and `GITHUB_TOKEN`.
+
+## What installing on a repository allows
+
+Installing the App on a repository is the authorization to read it. There is no
+further approval step for reading:
+
+- **Who**: anyone who can ask the agent, which is anyone in a channel listed in
+  `AGENT_CHANNELS`. List only public channels there: a private one listed would be
+  answered too. With the code tools on, a DM never reaches the model (`DM_MODE=answer`
+  and a sandbox are refused together).
+- **What**: the whole contents of any repository the App is installed on, **private
+  repositories included**. `workspace_clone` asks for a read-only token (`contents:
+  read`, that one repo, expiring within the hour) and clones or fetches with it, without
+  asking anyone. A public repository the App isn't installed on is cloned anyway,
+  anonymously.
+- **Where it shows**: in the thread the agent answers in. Whatever the agent reads from
+  the checkout (a file, a diff, test output) it can quote there, and everyone in that
+  channel sees it: Slack guests, and in a shared channel people from other
+  organizations, included.
+- **What still needs a person**: writing. Pushing a branch and opening a pull request
+  waits for an Approve in the thread; only then is a write token asked for.
+
+To limit it:
+
+- Install the App on fewer repositories: only those whose contents everyone in every
+  channel in `AGENT_CHANNELS` may read. Remove one from the same page as in
+  step 4.
+- Keep the agent out of channels with guests (or anyone who shouldn't read those
+  repositories): don't list them in `AGENT_CHANNELS`. The code tools are on in every
+  listed channel or in none; there is no per-channel switch.
+
+Until profiles exist, the install's repository selection is the only limit on which
+private repositories can be read. A per-profile repository allowlist (the `credentials`
+field in [ADR 0002](adr/0002-profiles.md)) can narrow it later.
+
+With [`GITHUB_TOKEN`](#github_token) (development only), every repository that token can
+read is readable this way. The same token can write and enters the sandbox to clone with,
+so there the Approve is not a guarantee.
 
 ## Rotating the key
 

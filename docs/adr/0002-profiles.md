@@ -137,6 +137,11 @@ These are Lorehouse's position, not settings:
   (`sandbox/host/src/publish.rs`, #31; `src/tools/pull-request.ts`, #32). The
   development-only `GITHUB_TOKEN` is not covered: it is one token for reads and writes,
   and `workspace_clone` puts it in the sandbox to clone with.
+- Installing the GitHub App on a repository authorizes reading it: `workspace_clone`
+  reads it, private or not, with no approval, and only writing waits for an Approve (#68,
+  [docs/github-app.md](../github-app.md#what-installing-on-a-repository-allows)). A
+  profile's `credentials` (§1) can narrow which repositories; none can widen past the
+  install.
 - People are named as plain text, never @-mentioned.
 - Answers cite their sources.
 
