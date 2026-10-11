@@ -82,7 +82,9 @@ quotable. DMs are never indexed.
 **Policy.** `src/policy.ts` restricts to public channels in `AGENT_CHANNELS`; `src/threads.ts`
 decides follow-ups (reply in a joined thread without a new mention, but not when it
 mentions someone else/@channel); `src/dm.ts` handles `DM_MODE`. People are named as plain
-text, never @-mentioned (`src/tools/slack-names.ts`).
+text, never @-mentioned (`src/tools/slack-names.ts`), and that is enforced in code, not left
+to the prompt: everything posted to Slack goes through `src/slack-guard.ts`, which rewrites
+`<@U…>`, `<!channel>`, `<!here>`, `<!everyone>` and `<!subteam^…>` as plain names.
 
 **Configuration** (`src/settings.ts`, `src/config.ts`): per key, first non-empty of the
 process env, `LOREHOUSE_ENV_FILE` (default `/etc/lorehouse/lorehouse.env`, written by
