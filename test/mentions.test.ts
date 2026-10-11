@@ -94,7 +94,7 @@ describe("mentionStream", () => {
     expect(await run(["see @here", "dity"])).toBe("see @heredity");
   });
 
-  test("text goes out as it comes, holding back only an open <", async () => {
+  test("text goes out as it comes, holding back only an open < or a trailing @word", async () => {
     const s = mentionStream((t) => t);
     expect(await s.push("plain words ")).toBe("plain words ");
     expect(await s.push("then <!ch")).toBe("then ");
