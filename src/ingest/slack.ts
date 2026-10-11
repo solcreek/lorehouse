@@ -280,14 +280,15 @@ export class SlackIngester {
     let n = 0;
     for (const channel of channels) {
       for (const docId of docIdsWithPrefix(this.db, `slack:${channel}:`)) {
+        if (this.closed.has(channel)) break; // closed by a recheck meanwhile: not read again
         await this.refreshThread(channel, docId.slice(`slack:${channel}:`.length));
         n++;
       }
     }
     // Without users:read the re-render fell back to ids: leave the version unset so the
     // next start (after the scope is added and the app reinstalled) tries again. So too
-    // when a channel was skipped: its threads still have the old shape.
-    if (channels.length < this.opts.channels.size) return;
+    // when a channel was skipped or closed meanwhile: its threads still have the old shape.
+    if (channels.length < this.opts.channels.size || channels.some((c) => this.closed.has(c))) return;
     if (!this.users.available) {
       this.opts.log?.(`ingest: re-rendered ${n} threads without names; will retry once users:read is granted`);
       return;
@@ -335,6 +336,7 @@ export class SlackIngester {
     // Stored threads in the window that history no longer lists were deleted outright.
     for (const docId of docIdsWithPrefix(this.db, `slack:${channel}:`)) {
       const rootTs = docId.slice(`slack:${channel}:`.length);
+      if (this.closed.has(channel)) return;
       if (Number(rootTs) >= oldest && !seen.has(docId)) await this.refreshThread(channel, rootTs, "reconcile");
     }
     if (this.closed.has(channel)) return;
@@ -384,6 +386,7 @@ export class SlackIngester {
       if (why === "reconcile") this.reconciled.refreshed++;
       return "updated";
     }
+    if (this.closed.has(channel)) return "absent"; // closed while store() looked up names
     const removed = deleteDocument(this.db, docId);
     if (removed && why === "reconcile") this.reconciled.removed++;
     return removed ? "removed" : "absent";

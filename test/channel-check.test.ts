@@ -1,10 +1,11 @@
 // Every channel in AGENT_CHANNELS must be public, as conversations.info says (#86).
 
+import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { assertPublicChannels, classifyChannel, describeVerdict, isDefiniteFailure, lookUpChannel, lookUpChannels, type ChannelInfo } from "../src/channel-check";
 import { ConfigError } from "../src/config";
-import { docIdsWithPrefix, getCursor, openKnowledge } from "../src/knowledge";
-import { SlackIngester } from "../src/ingest/slack";
+import { docIdsWithPrefix, getCursor, openKnowledge, upsertDocument } from "../src/knowledge";
+import { SLACK_DOC_VERSION, SlackIngester } from "../src/ingest/slack";
 import { SlackApiError, type SlackApi } from "../src/slack-api";
 
 const PUBLIC: ChannelInfo = { name: "general", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false };
@@ -273,6 +274,62 @@ describe("ingest looks channels up", () => {
     expect(await ing.refreshThread("C1", "1790000003.000100")).toBe("absent");
     expect(ing.isClosed("C1")).toBe(true);
     expect(docIdsWithPrefix(db, "slack:C1:")).toEqual([]);
+  });
+
+  // Two stored threads that history doesn't list; the channel closes while the first one's
+  // writer is being named (store() waits on users.info).
+  function closesWhileNaming(db: Database) {
+    const read: string[] = [];
+    const base = infoApi({ C1: PUBLIC });
+    const info: Record<string, ChannelInfo | string> = { C1: PUBLIC };
+    let ing!: SlackIngester;
+    const api: SlackApi = {
+      async call<T>(method: string, params?: Record<string, string | number | undefined>) {
+        if (method === "conversations.info") {
+          const v = info[String(params?.channel)];
+          if (typeof v === "string") throw new SlackApiError("conversations.info", v);
+          return { channel: v } as T;
+        }
+        if (method === "users.info") {
+          info.C1 = { ...PUBLIC, is_private: true };
+          await ing.recheckChannels();
+          return { user: { id: "U1", name: "ana", profile: { display_name: "Ana" } } } as T;
+        }
+        return base.api.call<T>(method, params);
+      },
+      async *paginate<T>(method: string, params: Record<string, unknown>) {
+        if (method === "conversations.replies") {
+          read.push(String(params.ts));
+          yield { type: "message", user: "U1", text: "x", ts: String(params.ts) } as T;
+        }
+      },
+    };
+    ing = new SlackIngester(api, db, { channels: new Set(["C1"]), backfillDays: 0, refreshDays: 30, debounceMs: 0, now: () => 1790100000 * 1000, lookUp: (c) => lookUpChannel(api, c) });
+    for (const ts of ["1790000001.000100", "1790000002.000100"]) {
+      upsertDocument(db, { docId: `slack:C1:${ts}`, kind: "slack_thread", source: "https://acme.slack.com/x", title: "t", text: "b", sourceVersion: ts });
+    }
+    return { ing, read };
+  }
+  const docVersion = (db: Database) => (db.query("SELECT value FROM knowledge_index_meta WHERE key = 'slack_doc_version'").get() as { value: string } | null)?.value;
+
+  test("closed while reconcile names a thread's writer: that thread stays as stored, and the rest aren't read", async () => {
+    const db = openKnowledge(":memory:");
+    db.query("INSERT INTO knowledge_index_meta (key, value) VALUES ('slack_doc_version', ?)").run(SLACK_DOC_VERSION);
+    const { ing, read } = closesWhileNaming(db);
+    await ing.start();
+    expect(ing.isClosed("C1")).toBe(true);
+    expect(read).toEqual(["1790000001.000100"]);
+    expect(docIdsWithPrefix(db, "slack:C1:")).toEqual(["slack:C1:1790000001.000100", "slack:C1:1790000002.000100"]);
+  });
+
+  test("closed while a re-render names a thread's writer: the rest aren't read, and the re-render is left to the next start", async () => {
+    const db = openKnowledge(":memory:");
+    const { ing, read } = closesWhileNaming(db);
+    await ing.start();
+    expect(ing.isClosed("C1")).toBe(true);
+    expect(read).toEqual(["1790000001.000100"]);
+    expect(docIdsWithPrefix(db, "slack:C1:")).toEqual(["slack:C1:1790000001.000100", "slack:C1:1790000002.000100"]);
+    expect(docVersion(db)).toBeUndefined();
   });
 
   test("a recheck called while one is still waiting on Slack shares it: one lookup per channel in flight", async () => {
