@@ -204,8 +204,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return config;
 }
 
-// A URL whose host is this machine: localhost, 127.0.0.0/8 or ::1. The URL parser
-// normalizes the host first (2130706433 and 0x7f.1 are 127.0.0.1; [::0:1] is [::1]).
+// A URL whose host is this machine: localhost, 127.0.0.0/8 or ::1. Only a literal loopback
+// address: a name like 127.0.0.1.example.com is not one, and neither is something that
+// isn't a URL. The URL parser normalizes the host first (2130706433 and 0x7f.1 are
+// 127.0.0.1; [::0:1] is [::1]).
 export function isLoopbackUrl(url: string): boolean {
   if (!URL.canParse(url)) return false;
   const host = new URL(url).hostname;

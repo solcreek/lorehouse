@@ -335,8 +335,6 @@ type RunningStatus = {
   runners?: { runner: string; transport: string; online: boolean; capacity: number; running: number }[];
 };
 
-// Only a literal loopback address: a name like 127.0.0.1.example.com is not one, and
-// neither is something that isn't a URL.
 const MARK: Record<Level, string> = { ok: "✓", warn: "!", fail: "✗", info: "·" };
 
 export function report(checks: Check[]): string {
