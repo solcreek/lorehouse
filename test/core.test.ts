@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertDistinctDatabases, loadConfig } from "../src/config";
-import { countDocuments, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
+import { countDocuments, deleteDocument, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 import { render, systemPrompt, toolDescription } from "../src/prompts";
 import { agentIdentity } from "../src/identity";
@@ -57,6 +58,85 @@ describe("knowledge store", () => {
     expect(countDocuments(db)).toBe(1);
     expect(searcher(db)("thursday")[0]?.id).toBe("slack:C1:1.1");
     expect(searcher(db)("monday")).toEqual([]); // the old text left the index
+  });
+
+  // A message deleted or edited in Slack (a pasted secret) must leave the database file too,
+  // not only the search results: FTS5 otherwise keeps its words in the index's segments
+  // until a merge, and SQLite keeps freed pages' bytes, on disk and in every backup.
+  describe("removed text leaves the database file", () => {
+    const filler = (db: ReturnType<typeof openKnowledge>) => {
+      for (let i = 0; i < 50; i++) upsertDocument(db, { docId: `d${i}`, kind: "seed", source: "s", title: "t", text: `filler words here ${i} `.repeat(50) });
+    };
+    const secret = { docId: "slack:C1:9.9", kind: "slack_thread" as const, source: "https://x/p99", title: "t", text: "the launch password is zebrasecretword9 do not share" };
+    // The file's bytes once everything is written back (WAL checkpointed into it).
+    const fileHolds = (db: ReturnType<typeof openKnowledge>, path: string, word: string) => {
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      db.close();
+      return readFileSync(path).toString("latin1").includes(word);
+    };
+    const withFile = (name: string, body: (path: string) => void) => {
+      const path = join(import.meta.dir, `.tmp-${name}-${process.pid}.db`);
+      try {
+        body(path);
+      } finally {
+        for (const suffix of ["", "-wal", "-shm"]) rmSync(path + suffix, { force: true });
+      }
+    };
+
+    test("a deleted document", () => withFile("deleted", (path) => {
+      const db = openKnowledge(path);
+      filler(db);
+      upsertDocument(db, secret);
+      expect(deleteDocument(db, secret.docId)).toBe(true);
+      expect(fileHolds(db, path, "zebrasecretword9")).toBe(false);
+    }));
+
+    test("an edit's old text", () => withFile("edited", (path) => {
+      const db = openKnowledge(path);
+      filler(db);
+      upsertDocument(db, secret);
+      upsertDocument(db, { ...secret, text: "the launch password is (removed)" });
+      expect(searcher(db)("removed")[0]?.id).toBe(secret.docId);
+      expect(fileHolds(db, path, "zebrasecretword9")).toBe(false);
+    }));
+
+    test("a document deleted before this was enforced, once the database is opened", () => withFile("upgraded", (path) => {
+      const old = openKnowledge(path, MIGRATIONS.filter((m) => m.version <= 9));
+      old.exec("PRAGMA secure_delete = OFF"); // as a build before this one deleted: freed bytes stay
+      filler(old);
+      upsertDocument(old, secret);
+      deleteDocument(old, secret.docId);
+      expect(fileHolds(old, path, "zebrasecretword9")).toBe(true); // the residue this cleans up
+      const db = openKnowledge(path);
+      // Already out of the file while the app holds it open, not only after a later checkpoint.
+      expect(readFileSync(path).toString("latin1").includes("zebrasecretword9")).toBe(false);
+      expect(searcher(db)("filler")).toHaveLength(5); // the index still works after the clean-up
+      expect(fileHolds(db, path, "zebrasecretword9")).toBe(false);
+    }));
+
+    test("the one-time compaction never holds back the migrations, and is retried until it succeeds", () => withFile("busy", (path) => {
+      const old = openKnowledge(path, MIGRATIONS.filter((m) => m.version <= 9));
+      old.exec("PRAGMA secure_delete = OFF");
+      filler(old);
+      upsertDocument(old, secret);
+      deleteDocument(old, secret.docId);
+      old.close();
+      // Another process holds a read while the app starts: the compaction can't complete.
+      const reader = new Database(path);
+      reader.exec("BEGIN");
+      reader.query("SELECT count(*) FROM knowledge_documents").get();
+      const first = openKnowledge(path);
+      const versions = (first.query("SELECT version FROM lorehouse_migrations ORDER BY version").all() as { version: number }[]).map((r) => r.version);
+      expect(versions).toEqual(MIGRATIONS.map((m) => m.version)); // every migration recorded, in order
+      expect(first.query("SELECT value FROM knowledge_index_meta WHERE key = 'compacted'").get()).toBeNull();
+      first.close();
+      reader.exec("COMMIT");
+      reader.close();
+      // The next start completes it, and the residue leaves the file.
+      const db = openKnowledge(path);
+      expect(db.query("SELECT value FROM knowledge_index_meta WHERE key = 'compacted'").get()).not.toBeNull();
+      expect(fileHolds(db, path, "zebrasecretword9")).toBe(false);
+    }));
   });
 
   test("ingest cursors round-trip per source", () => {

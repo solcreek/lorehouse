@@ -3,9 +3,20 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
 *.log
+
+# Secrets. This repo is public. settings.json is what `lorehouse setup` and the Slack
+# install write beside the database, the working directory by default: the Slack app's
+# credentials, the bot token, the Anthropic key. (Its temp file too, if a write dies.)
 .env
+.env.*
 .dev.vars
+lorehouse.env
+settings.json
+settings.json.*.tmp
+!/.claude/settings.json
+*.pem
 
 # Research scratch space (benchmark builds, node_modules, raw result JSON).
 # Its conclusions live in docs/experiments/. (Root-anchored: a bare `experiments/`
