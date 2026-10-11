@@ -66,7 +66,10 @@ function answer(job: Job) {
 }
 
 const headers = (token: string, name: string) => ({ authorization: `Bearer ${token}`, "x-lorehouse-runner": name });
-const status = { type: "status", capacity: 2, running: 0, version: "fake" };
+// With a mirrors block as sandboxd reports it (sandbox/host/src/publish/upkeep.rs), which
+// /status passes through.
+export const MIRRORS = { count: 1, bytes: 1_048_576, maxBytes: 24 * 2 ** 30, perMirrorMaxBytes: 4 * 2 ** 30, fsFreeBytes: 100 * 2 ** 30, garbageBytes: 0, stageRefs: 0, records: 0, largest: { repo: "acme/widgets", bytes: 1_048_576 }, oldestIdleSecs: 60, lastGc: null, evicted: 0, refusedForSpace: 0, refreshTimeouts: 0 };
+const status = { type: "status", capacity: 2, running: 0, version: "fake", mirrors: MIRRORS };
 
 export async function wsRunner(base: string, token: string, name: string): Promise<FakeRunner> {
   const jobs: Job[] = [];

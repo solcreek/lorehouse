@@ -23,7 +23,7 @@ import { bearerMatches } from "./status-auth";
 import { listThreads } from "./threads";
 import type { UsageSummary } from "./usage";
 
-type RunnerSummary = { runner: string; transport: string; online: boolean; capacity: number; running: number; version?: string; lastSeenSecs: number };
+type RunnerSummary = { runner: string; transport: string; online: boolean; capacity: number; running: number; version?: string; lastSeenSecs: number; mirrors?: Record<string, unknown> };
 
 export type AdminOptions = {
   db: Database;
