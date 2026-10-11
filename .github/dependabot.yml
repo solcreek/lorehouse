@@ -1,0 +1,59 @@
+version: 2
+
+# Weekly version updates, one grouped PR per ecosystem and directory, for releases at
+# least a week old (a compromised release is usually yanked within days). Security
+# updates ignore the cooldown, the schedule and the PR limit.
+#
+# bun: Dependabot does version updates only, no security updates or alerts; security.yml
+# runs `bun audit` for those. A PR that changes the root bun.lock fails ci's nix job until
+# nix/packages.nix gets the new node_modules hashes (docs/nix.md); the job prints them.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: bun
+    directories: [/, /website]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      bun:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /sandbox/host
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /sandbox/guest
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      gomod:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]

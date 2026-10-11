@@ -10,7 +10,7 @@
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
 // STATUS_TOKEN, ADMIN_TOKEN, LOREHOUSE_ENV_FILE (a missing file, so no installed settings
-// leak in), and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
+// leak in), LOREHOUSE_SETTINGS (settings.json beside LOREHOUSE_DB), and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN
 // and GITHUB_API_URL (GitHub's REST API, mocked). SESSIONS_DB is never set: the app
 // keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
@@ -443,6 +443,24 @@ const scenarios: Scenario[] = [
       await Bun.sleep(1000); // > INGEST_DEBOUNCE_MS
       const a = await ask("when does the kangaroo deploy freeze start");
       return a.cite === `slack:${ALLOWED}:${ts}` ? null : `cited ${a.cite}, want slack:${ALLOWED}:${ts}`;
+    },
+  },
+  {
+    // Someone typed Slack's mention syntax as text (Slack delivers it escaped), so the
+    // knowledge holds it; a model quoting the source must still ping nobody.
+    name: "never @-mentions anyone: a quoted source's <!channel>, <!here>, <@U…> and <!subteam^…> reach Slack as plain names",
+    run: async () => {
+      const ts = await liveMessage(ALLOWED, "channel", "The quokka launch moved to May &lt;!channel&gt; &lt;!here|here&gt;, ask &lt;@U2&gt; or &lt;!subteam^S1|@launch-crew&gt;");
+      await Bun.sleep(1000); // > INGEST_DEBOUNCE_MS
+      const a = await ask("[quote] when is the quokka launch");
+      if (a.cite !== `slack:${ALLOWED}:${ts}`) return `cited ${a.cite}, want slack:${ALLOWED}:${ts}`;
+      if (!a.text.includes("[quote:")) return "the reply didn't quote its source";
+      const live = a.text.match(/<[@!][^>]*>/g);
+      if (live) return `the reply carries live mention markup: ${live.join(" ")}`;
+      // Each name keeps its "@", with an invisible word joiner (U+2060) after it so no
+      // Slack format can read it as a mention again.
+      for (const name of ["channel", "here", "Wendy", "launch-crew"]) if (!a.text.includes(`@\u2060${name}`)) return `the reply lost the name @${name}: ${a.text.slice(0, 300)}`;
+      return null;
     },
   },
   {
@@ -964,7 +982,7 @@ let app: ReturnType<typeof Bun.spawn> | undefined;
 // Never this shell's SESSIONS_DB: where sessions go by default is part of the contract.
 // Nor its settings files, which the app reads after the environment and could fill
 // SESSIONS_DB back in: LOREHOUSE_ENV_FILE points at a missing file beside the database
-// (startApp), and LOREHOUSE_SETTINGS is left to its default, also beside the database.
+// (startApp), and LOREHOUSE_SETTINGS at settings.json, also beside the database.
 const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, ...inherited } = process.env;
 
 // Start the app and wait until it listens, owns its port, and (unless waitReady is off,
@@ -993,6 +1011,9 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
       STATUS_TOKEN,
       ADMIN_TOKEN,
       LOREHOUSE_ENV_FILE: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "lorehouse.env"),
+      // Set, not left to its default: the app's Bun loads the checkout's .env for every
+      // variable not set here, and one naming a settings file would fill in the rest.
+      LOREHOUSE_SETTINGS: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "settings.json"),
       ...extraEnv,
     },
     stdout: "ignore",
