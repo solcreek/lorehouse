@@ -581,7 +581,7 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
 
   // The tool itself, without the end of the turn to clean up after it: a Deny or a refusal
   // deletes the card's record as it returns; every other outcome keeps it for the rest of the
-  // turn (a retry, or a crash-replay after the PR opened, needs it). The engine tests below
+  // turn (a retry, or a second run of the tool after the PR opened, needs it). The engine tests below
   // show the turn's end then deletes it.
   test("the tool deletes the card's record at once on a Deny or a refusal, and keeps it otherwise", async () => {
     const run = async (o: { existing?: unknown[]; postStatus?: number; writeError?: boolean; pushError?: string; answer?: boolean; rule?: PrApprover; record?: boolean }) => {
@@ -619,10 +619,10 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(await run({ pushError: "push: 409" })).toMatchObject({ result: { error: expect.stringContaining("push failed") }, left: 1 });
   });
 
-  test("not-requester: a crash-replay after the PR opened finds its record and reports the PR as existing; no second PR", async () => {
-    // The process dies after the PR is opened, before June saves the tool's result. On
-    // restart June replays the turn: the tool runs again from the top, requestInput returns the
-    // stored answer (no new click, no new record), and the PR is already open on GitHub.
+  test("not-requester: the tool run again in its turn after the PR opened finds its record and reports the PR as existing; no second PR", async () => {
+    // June runs a remote tool at least once: a run cut off after the PR opened, before June
+    // saved its result, is run again in the same turn. It runs from the top, requestInput
+    // returns the stored answer (no new click, no new record), and the PR is already open.
     const approvals = approvalStore(openKnowledge(":memory:"));
     const { sb } = fakeRepo();
     const open: unknown[] = [];
@@ -646,7 +646,7 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
       },
     } as never;
     expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened", number: 7 });
-    // …crash, restart, replay:
+    // …the same turn runs the tool again:
     expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "exists", number: 7 });
     expect(posts).toHaveLength(1);
   });

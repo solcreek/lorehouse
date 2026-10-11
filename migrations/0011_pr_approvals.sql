@@ -3,9 +3,9 @@
 -- against that person at the moment it pushes, and name them in the pull request
 -- (src/approvals.ts). One row per card in one turn: `turn` is the ts of the Slack message
 -- that started the turn, `card` the card's input id. The tool deletes the row at once on a
--- Deny or a refusal; every other outcome keeps it until the turn ends (a retry, or a
--- crash-replay after the PR opened, uses it again), and anything older than a day goes on
--- start and daily.
+-- Deny or a refusal; every other outcome keeps it until the turn ends (a retry of the tool in
+-- the same turn, or a replay of it after the PR opened, uses it again), and anything older
+-- than a day goes on start and daily.
 CREATE TABLE pr_approvals (
   session     TEXT NOT NULL,
   turn        TEXT NOT NULL,

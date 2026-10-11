@@ -24,9 +24,11 @@
 // stages again (the same commits give the same sha and, unless the base was rewritten, the
 // same card), requestInput then returns the stored answer, and the post-approval part is
 // idempotent: an already-open PR for the branch is returned instead of creating a second one.
-// That holds under every PR_APPROVER, a crash between opening the PR and June saving the
-// tool's result included: the approval record outlives the PR's opening until the turn ends
-// (src/approvals.ts), so the replay finds it and reports the PR as existing.
+// That holds under every PR_APPROVER: the approval record outlives the PR's opening until the
+// turn ends (src/approvals.ts), so a second run of this tool in the turn (a retry, or June
+// running a remote tool again, at least once) finds it and reports the PR as existing. The
+// same record lets such a run open a new PR for the same commit if the first was closed in
+// between: same card, same approver, same turn.
 
 import { createHash } from "node:crypto";
 import type { Answerers, Tool, ToolContext } from "@junejs/core/agent-runtime";
@@ -169,7 +171,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers });
       // This card in this turn. A Deny or a refusal deletes its approval record at once (done):
       // nothing was pushed, and nothing in this turn may use it. Every other outcome keeps it
-      // until the turn ends (src/approvals.ts): a retry after a failure, or a crash-replay after
+      // until the turn ends (src/approvals.ts): a second run in the turn, after a failure or after
       // the PR opened, gets the same stored answer from June and needs the same record.
       const key: CardKey | undefined = ctx.event?.ts ? { session: ctx.sessionId, turn: ctx.event.ts, card: inputId } : undefined;
       const done = <T>(result: T): T => {
@@ -183,7 +185,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       // A turn with no Slack event has no turn to key a record by: under not-requester, which
       // can't be met without knowing who answered, it is refused too.
       const rule = opts.approver ?? "requester";
-      const refused = () => done({ status: "refused", note: `This approval can't be shown to meet PR_APPROVER=${rule} (the card predates the rule, the rule changed since the click, or this approval was already used up), so nothing was pushed. Ask for the pull request again.` });
+      const refused = () => done({ status: "refused", note: `This approval can't be shown to meet PR_APPROVER=${rule} (the card predates the rule, the rule changed since the click, or the turn moved on to another card), so nothing was pushed. Ask for the pull request again.` });
       let approverId: string | undefined;
       if (opts.approvals) {
         if (!key) {

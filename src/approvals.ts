@@ -16,10 +16,13 @@
 // A record belongs to one card in one turn (the ts of the Slack message that started it), so
 // a later card, even with the same id, never finds an earlier approver. The tool deletes it
 // at once on a Deny or a refusal. Every other outcome keeps it until the turn ends: a retry
-// after a failure, or a crash-replay after the PR opened (which then reports the PR as
-// existing), gets the same stored answer from June and finds the same record. The end of the
-// turn (completed, failed or cancelled; approverGate watches it) deletes it, and prune()
-// clears anything a process that died left behind.
+// of the tool in the same turn, after a failure or after the PR opened, gets the same stored
+// answer from June and finds the same record (after the PR opened, it reports the PR as
+// existing). June runs remote tools at least once, so a host that re-runs a turn cut off by a
+// crash gets the same; Lorehouse's native host doesn't re-run such a turn today, and its
+// record waits for prune(). The end of the turn (completed, failed or cancelled;
+// approverGate watches it) deletes it, and prune() clears anything a process that died left
+// behind.
 
 import type { Database } from "bun:sqlite";
 import type { AuthorizeAnswer, TurnEvent } from "@junejs/core/agent-runtime";
