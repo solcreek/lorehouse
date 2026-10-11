@@ -44,7 +44,8 @@ export interface Sandbox {
 
 // What a stage found, all computed on the host from the verified commits. `stage`: the
 // stage's id, what push takes. `authors`: "author <email>|committer <email>", one per commit.
-export type Staged = { stage: string; sha: string; baseSha: string; commits: number; stat: string; authors: string[]; files: string[]; patch: string; patchTruncated: boolean };
+// `patch` is an excerpt; `diffSha256` is the SHA-256 of the complete diff against the base.
+export type Staged = { stage: string; sha: string; baseSha: string; commits: number; stat: string; authors: string[]; files: string[]; patch: string; patchTruncated: boolean; diffSha256: string };
 
 // How long publishing may take: a first mirror of a big repo is a full clone.
 export const STAGE_TIMEOUT_MS = 10 * 60_000;

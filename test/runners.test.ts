@@ -53,7 +53,7 @@ describe("over WebSocket", () => {
     expect(sent[0]).toMatchObject({ op: "stage", sandbox: "s1", timeoutMs: STAGE_TIMEOUT_MS });
     expect(JSON.parse(Buffer.from(sent[0]!.op === "stage" ? sent[0]!.bodyBase64 : "", "base64").toString())).toEqual({ owner: "acme", name: "widgets", base: "main", branch: "scout/x", token: "ghs_read" });
     const stage = `1790000000-${"c".repeat(32)}`;
-    const facts = { stage, sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: " x | 1 +", authors: ["bot <b@x>|bot <b@x>"], files: ["x"], patch: "+x", patchTruncated: false };
+    const facts = { stage, sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: " x | 1 +", authors: ["bot <b@x>|bot <b@x>"], files: ["x"], patch: "+x", patchTruncated: false, diffSha256: "d".repeat(64) };
     link.result(ok(sent[0]!, facts));
     expect(await staged).toEqual(facts);
 
