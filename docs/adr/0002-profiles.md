@@ -134,7 +134,8 @@ These are Lorehouse's position, not settings:
 - A pull request opens only after a person approves it in the thread. The Approve in
   Slack authorizes opening the pull request, not merging it: it opens as a draft, and the
   merge is gated on GitHub, by its review and branch protection (#60). By default anyone
-  in the thread may approve, the person who asked for the pull request included. An
+  in the thread may approve, the requester included: the person whose message got the
+  agent to post the card. (Before #67, June's default let only the requester answer.) An
   install can require someone else (`PR_APPROVER=not-requester`, #67); the requester's
   clicks are then refused, Deny included, because June's `authorizeAnswer` decides who
   may answer, not which answer. The rule is the install's, read as each click arrives; a
