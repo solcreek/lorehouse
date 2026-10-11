@@ -118,8 +118,9 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
     needs: [image]
     runs-on: ubuntu-latest
-    # FLY_API_TOKEN belongs to this environment, which only main may deploy from; until
-    # it moves there from the repository secrets, any job could reference it (#59).
+    # FLY_API_TOKEN is to move into this environment, restricted to deploys from main.
+    # Until #59 does both, the environment has no rules and the token is a repository
+    # secret any job could reference; only the job's `if` keeps it to main.
     environment: production
     concurrency:
       group: deploy
