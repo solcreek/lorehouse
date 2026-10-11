@@ -40,7 +40,8 @@ export type PullRequestOptions = {
   // The approver's name for the PR body, from their Slack user id. The id itself never
   // goes into the PR: it identifies the workspace, and a PR can be public.
   approverName?: (slackUserId: string) => Promise<string | undefined>;
-  // Who may approve (PR_APPROVER, default anyone): the card says so when it isn't anyone.
+  // Who may approve (PR_APPROVER, default requester): the card says so under not-requester,
+  // the one rule under which the person who asked can't answer it.
   // The rule itself is applied to each click by the app, with mayApprove.
   approver?: PrApprover;
   // The Slack user id whose click answered this card, when the app saw it (the turn's own
@@ -222,12 +223,14 @@ function approvers(ctx: ToolContext): Answerers | undefined {
 
 // Whether the person who clicked (`by`, verified by the channel) may answer a card that
 // named APPROVER_POLICY with `scope`, under the install's rule. Nobody unidentified may.
-// Under not-requester, a card with no known requester can't be checked, so nobody may.
+// Under requester or not-requester, a card with no known requester can't be checked, so
+// nobody may.
 export function mayApprove(rule: PrApprover, by: string | undefined, scope: unknown): boolean {
   if (!by) return false;
   if (rule === "anyone") return true;
   const requester = (scope as { requester?: unknown } | null | undefined)?.requester;
-  return typeof requester === "string" && requester !== "" && by !== requester;
+  if (typeof requester !== "string" || requester === "") return false;
+  return rule === "requester" ? by === requester : by !== requester;
 }
 
 // The install's rule as June's authorizeAnswer hook (src/app.ts wires it), and who it last

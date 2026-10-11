@@ -83,10 +83,13 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   if (config.usage.recordPeople) add("configuration", "USAGE_RECORD_PEOPLE", "info", "on: usage records who asks the agent things, and each channel is told so");
   // Who may click Approve on a pull request card (ADR 0002 §6); it matters with code tools.
   if (config.sandbox) {
-    add("configuration", "PR_APPROVER", "info", config.prApprover === "not-requester"
-      ? "not-requester: someone other than the person who asked for a pull request approves (or denies) opening it"
-      : "anyone: anyone in the thread may approve opening a pull request, the person who asked for it included; PR_APPROVER=not-requester asks for a second person");
-  } else if (config.prApprover !== "anyone") {
+    const says: Record<typeof config.prApprover, string> = {
+      requester: "only the person who asked for a pull request may approve (or deny) opening it; PR_APPROVER=anyone widens that to the thread, PR_APPROVER=not-requester asks for a second person",
+      anyone: "anyone in the thread may approve opening a pull request, the person who asked for it included",
+      "not-requester": "someone other than the person who asked for a pull request approves (or denies) opening it",
+    };
+    add("configuration", "PR_APPROVER", "info", `${config.prApprover}: ${says[config.prApprover]}`);
+  } else if (config.prApprover !== "requester") {
     add("configuration", "PR_APPROVER", "info", `${config.prApprover}: no effect while code tools are off`);
   }
 

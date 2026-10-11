@@ -8,6 +8,7 @@ import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
 import { APPROVER_POLICY, approvalCard, approverGate, isPlainRef, mayApprove, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
 import type { GithubAccess } from "../src/github-auth";
+import type { PrApprover } from "../src/config";
 
 // A credential with no account to commit as (no identity provider), so no author check
 // applies: these tests are about the approval gate, not who commits.
@@ -434,21 +435,25 @@ describe("open_pull_request — the approval gate", () => {
 });
 
 describe("open_pull_request — who may approve (PR_APPROVER)", () => {
-  test("anyone: any identified clicker, the requester included; not-requester: anyone identified but the requester", () => {
+  test("requester: only the requester; anyone: any identified clicker, the requester included; not-requester: anyone identified but the requester", () => {
     const scope = { requester: "U1" };
+    expect(mayApprove("requester", "U1", scope)).toBe(true);
+    expect(mayApprove("requester", "U2", scope)).toBe(false);
     expect(mayApprove("anyone", "U1", scope)).toBe(true);
     expect(mayApprove("anyone", "U2", scope)).toBe(true);
     expect(mayApprove("not-requester", "U1", scope)).toBe(false);
     expect(mayApprove("not-requester", "U2", scope)).toBe(true);
     // A click with no verified clicker is nobody's.
-    for (const rule of ["anyone", "not-requester"] as const) expect(mayApprove(rule, undefined, scope)).toBe(false);
-    // Under not-requester, a card whose requester isn't known can't be checked: nobody may.
-    for (const s of [{ requester: null }, {}, undefined, { requester: "" }]) expect(mayApprove("not-requester", "U2", s)).toBe(false);
+    for (const rule of ["requester", "anyone", "not-requester"] as const) expect(mayApprove(rule, undefined, scope)).toBe(false);
+    // A card whose requester isn't known can't be checked against them: nobody may.
+    for (const rule of ["requester", "not-requester"] as const) {
+      for (const s of [{ requester: null }, {}, undefined, { requester: "" }]) expect(mayApprove(rule, "U2", s)).toBe(false);
+    }
   });
 
   // The rule as the app wires it (approverGate's authorize is src/app.ts's authorizeAnswer),
   // through the real engine and June's own grantAnswer.
-  const slackTurn = (rule: "anyone" | "not-requester") => {
+  const slackTurn = (rule: PrApprover) => {
     const { sb, published } = fakeRepo();
     const gh = fakeGithub();
     const gate = approverGate(rule);
@@ -475,7 +480,20 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(((await strict.s.result(strict.t1)) as { request: { prompt: string } }).request.prompt).toContain("Approved or denied by someone other than the person who asked for it.");
   });
 
-  test("anyone (the default): the requester's Approve opens it, and so does someone else's, who is named", async () => {
+  test("requester (the default): someone else's Approve and Deny are refused and nothing is pushed; the requester's opens it", async () => {
+    const t = slackTurn("requester");
+    expect(await click(t, "U2")).toThrow(ResumeAuthorizationError);
+    expect(await click(t, "U2", false)).toThrow(ResumeAuthorizationError);
+    expect(await t.s.result(t.t1)).toMatchObject({ status: "suspended" });
+    expect(t.published.filter((p) => p.op === "push")).toHaveLength(0);
+    expect(t.gh.reqs).toHaveLength(0);
+    (await click(t, "U1"))();
+    expect(await t.s.result(t.t1)).toMatchObject({ status: "completed" });
+    expect(t.published.filter((p) => p.op === "push")).toHaveLength(1);
+    expect(t.prBody()).toContain("approved there by Rex Quinn.");
+  });
+
+  test("anyone: the requester's Approve opens it, and so does someone else's, who is named", async () => {
     for (const [by, name] of [["U1", "Rex Quinn"], ["U2", "Ada Park"]] as const) {
       const t = slackTurn("anyone");
       (await click(t, by))();

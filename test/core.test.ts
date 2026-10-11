@@ -339,12 +339,12 @@ describe("config", () => {
     expect(() => loadConfig({ ...base, DM_MODE: "reply" })).toThrow(/DM_MODE \(one of redirect, ignore, answer, got "reply"\)/);
   });
 
-  test("PR_APPROVER is anyone by default, or not-requester; anything else is reported", () => {
-    expect(loadConfig(base).prApprover).toBe("anyone");
-    expect(loadConfig({ ...base, PR_APPROVER: "" }).prApprover).toBe("anyone");
-    for (const rule of ["anyone", "not-requester"] as const) expect(loadConfig({ ...base, PR_APPROVER: rule }).prApprover).toBe(rule);
+  test("PR_APPROVER is requester by default, or anyone, or not-requester; anything else is reported", () => {
+    expect(loadConfig(base).prApprover).toBe("requester");
+    expect(loadConfig({ ...base, PR_APPROVER: "" }).prApprover).toBe("requester");
+    for (const rule of ["requester", "anyone", "not-requester"] as const) expect(loadConfig({ ...base, PR_APPROVER: rule }).prApprover).toBe(rule);
     expect(() => loadConfig({ ...base, PR_APPROVER: "someone-else" })).toThrow(ConfigError);
-    expect(() => loadConfig({ ...base, PR_APPROVER: "Not-Requester" })).toThrow(/PR_APPROVER \(one of anyone, not-requester, got "Not-Requester"\)/);
+    expect(() => loadConfig({ ...base, PR_APPROVER: "Not-Requester" })).toThrow(/PR_APPROVER \(one of requester, anyone, not-requester, got "Not-Requester"\)/);
   });
 
   test("PR_APPROVER can come from settings.json, under the environment", () => {

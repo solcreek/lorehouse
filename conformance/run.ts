@@ -180,15 +180,37 @@ async function click(user: string, card: Card, label: "Approve" | "Deny") {
   });
 }
 
+// `user` clicks Approve, then Deny, on the card, and each is refused: a reply to them alone
+// (ephemeral, beside the card), nothing pushed, no pull request, the card unchanged. Null
+// when so, else why not. `who` names them in the message.
+async function refusedFor(user: string, who: string, card: Card, runner: { jobs: { op: string }[] }): Promise<string | null> {
+  for (const [i, button] of (["Approve", "Deny"] as const).entries()) {
+    await click(user, card, button);
+    const refused = await until(async () => {
+      const r = (await stats()).responses.filter((x) => x.path.startsWith(`/slack/response/${user}-`));
+      return r.length > i ? r[i] : undefined;
+    });
+    if (!refused) return `${who}'s ${button} got no reply of its own: responses ${JSON.stringify((await stats()).responses)}`;
+    if (refused.response_type !== "ephemeral" || refused.replace_original !== false) return `the refusal of ${who}'s ${button} isn't ephemeral beside the card: ${JSON.stringify(refused)}`;
+  }
+  await Bun.sleep(300); // a click that was let through would have started pushing by now
+  const after = await stats();
+  if (runner.jobs.some((j) => j.op === "push")) return `${who}'s click pushed the branch`;
+  if (after.github.some((c) => c.method === "POST")) return `${who}'s click opened a pull request`;
+  if (after.updates.some((u) => u.ts === card.prompt.ts)) return `${who}'s click changed the card: ${JSON.stringify(after.updates).slice(0, 300)}`;
+  return null;
+}
+
 // Exactly one push and one pull request since the last reset, the PR naming its approver
-// by name (never by Slack id); null when so.
-async function openedBy(runner: { jobs: { op: string }[] }, approver: string): Promise<string | null> {
+// by name (never by Slack id), or (approver null) nobody; null when so.
+async function openedBy(runner: { jobs: { op: string }[] }, approver: string | null): Promise<string | null> {
   const pushes = runner.jobs.filter((j) => j.op === "push").length;
   if (pushes !== 1) return `pushes: ${pushes}, want 1`;
   const opened = (await stats()).github.filter((c) => c.method === "POST" && c.path === "/repos/acme/widgets/pulls");
   if (opened.length !== 1) return `pull requests opened: ${opened.length}, want 1`;
   const body = String((opened[0]!.body as { body?: string }).body);
-  return body.includes(`approved there by ${approver}.`) && !body.includes("U2") ? null : `the pull request's body ${JSON.stringify(body.slice(-160))}, want it to name ${approver}`;
+  const want = approver ? `approved there by ${approver}.` : "approved there.";
+  return body.includes(want) && !/U\d/.test(body) ? null : `the pull request's body ${JSON.stringify(body.slice(-160))}, want "${want}"`;
 }
 
 // The first truthy value check() returns within ms, or undefined.
@@ -956,11 +978,41 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    // ADR 0002 §6: by default anyone in the thread may approve, the requester included (the
-    // scenario above has the requester approve); here someone else does, and is named.
-    name: "PR_APPROVER unset (anyone): someone other than the requester approves, and the pull request names them",
+    // ADR 0002 §6: by default only the requester may approve (June's own default for a
+    // Slack turn). Someone else's clicks change nothing; the requester's opens it (the
+    // scenario above has the requester approve after a restart).
+    name: "PR_APPROVER unset (requester): someone else's Approve and Deny are refused and nothing is pushed; the requester's Approve opens it",
     run: () => {
       const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github` };
+      return inMode(env, async () => {
+        const runner = pollRunner(APP, RUNNER_TOKEN, "r-requester");
+        try {
+          await Bun.sleep(200); // the first poll registers the runner
+          await reset();
+          const rule = ((await status()) as unknown as { pullRequestApprover?: string }).pullRequestApprover;
+          if (rule !== "requester") return `/status pullRequestApprover ${JSON.stringify(rule)}, want "requester"`;
+          const card = await prCard("scout/conformance-requester");
+          if (typeof card === "string") return card;
+          if (JSON.stringify(card.prompt).includes("someone other than")) return "under requester, the card says someone else must approve";
+          const refused = await refusedFor("U2", "someone else", card, runner);
+          if (refused) return refused;
+          await click("U1", card, "Approve");
+          const done = await until(async () => (await stats()).updates.find((u) => u.ts === card.prompt.ts && u.text.includes("[pr:")));
+          if (!done) return `approved by the requester, the turn never finished: responses ${JSON.stringify((await stats()).responses)}`;
+          if (!done.text.includes(`${card.nonce} [pr:opened:https://github.com/acme/widgets/pull/7]`)) return `the turn ended with ${done.text.slice(0, 160)}, want the opened pull request`;
+          return openedBy(runner, null); // U1 has no name in the fixtures: "approved there."
+        } finally {
+          await runner.stop();
+        }
+      });
+    },
+  },
+  {
+    // ADR 0002 §6: an install may widen it to anyone in the thread; here someone other than
+    // the requester approves, and is named.
+    name: "PR_APPROVER=anyone: someone other than the requester approves, and the pull request names them",
+    run: () => {
+      const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github`, PR_APPROVER: "anyone" };
       return inMode(env, async () => {
         const runner = pollRunner(APP, RUNNER_TOKEN, "r-anyone");
         try {
@@ -1000,20 +1052,8 @@ const scenarios: Scenario[] = [
           if (typeof card === "string") return card;
           if (!JSON.stringify(card.prompt).includes("someone other than the person who asked for it")) return `the card doesn't say someone else approves: ${JSON.stringify(card.prompt).slice(0, 300)}`;
 
-          for (const [i, button] of (["Approve", "Deny"] as const).entries()) {
-            await click("U1", card, button);
-            const refused = await until(async () => {
-              const r = (await stats()).responses.filter((x) => x.path.startsWith("/slack/response/U1-"));
-              return r.length > i ? r[i] : undefined;
-            });
-            if (!refused) return `the requester's ${button} got no reply of its own: responses ${JSON.stringify((await stats()).responses)}`;
-            if (refused.response_type !== "ephemeral" || refused.replace_original !== false) return `the refusal of the requester's ${button} isn't ephemeral beside the card: ${JSON.stringify(refused)}`;
-          }
-          await Bun.sleep(300); // a click that was let through would have started pushing by now
-          const after = await stats();
-          if (runner.jobs.some((j) => j.op === "push")) return "the requester's own click pushed the branch";
-          if (after.github.some((c) => c.method === "POST")) return "the requester's own click opened a pull request";
-          if (after.updates.some((u) => u.ts === card.prompt.ts)) return `the requester's click changed the card: ${JSON.stringify(after.updates).slice(0, 300)}`;
+          const refused = await refusedFor("U1", "the requester", card, runner);
+          if (refused) return refused;
 
           await click("U2", card, "Approve");
           const done = await until(async () => (await stats()).updates.find((u) => u.ts === card.prompt.ts && u.text.includes("[pr:")));

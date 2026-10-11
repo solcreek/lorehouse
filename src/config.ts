@@ -12,11 +12,13 @@ export type DmMode = (typeof DM_MODES)[number];
 
 // Who may click Approve on a pull request card (ADR 0002 §6). The Approve opens the pull
 // request; merging it is gated on GitHub's own review.
-//   anyone         anyone in the thread, the person who asked for it included (default)
-//   not-requester  anyone but the person whose message started the turn that asked to open
-//                  it: a second person must look at it. Under this rule the requester can't
-//                  click Deny either (June's authorizeAnswer isn't told which button it was).
-export const PR_APPROVERS = ["anyone", "not-requester"] as const;
+// The requester is the person whose message started the turn that asked to open it.
+//   requester      the requester only (default; June's own default for a Slack turn)
+//   anyone         anyone in the thread, the requester included
+//   not-requester  anyone but the requester: a second person must look at it. Under this
+//                  rule the requester can't click Deny either (June's authorizeAnswer isn't
+//                  told which button it was).
+export const PR_APPROVERS = ["requester", "anyone", "not-requester"] as const;
 export type PrApprover = (typeof PR_APPROVERS)[number];
 
 export type Config = {
@@ -136,10 +138,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return "redirect";
   };
   const prApprover = (raw: string | undefined): PrApprover => {
-    if (raw === undefined || raw === "") return "anyone";
+    if (raw === undefined || raw === "") return "requester";
     if ((PR_APPROVERS as readonly string[]).includes(raw)) return raw as PrApprover;
     missing.push(`PR_APPROVER (one of ${PR_APPROVERS.join(", ")}, got "${raw}")`);
-    return "anyone";
+    return "requester";
   };
   const config: Config = {
     port: Number(env.PORT ?? 3000),

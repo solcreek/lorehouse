@@ -114,7 +114,8 @@ describe("configuration", () => {
 
   test("who may approve a pull request is said with code tools on, and an unknown value is a problem", async () => {
     const sandbox = { SANDBOX_URL: "http://127.0.0.1:9", SANDBOX_TOKEN: "x", GITHUB_TOKEN: "ghp_1" };
-    expect(find(await run(sandbox), "PR_APPROVER")).toMatchObject([{ section: "configuration", level: "info", detail: expect.stringMatching(/^anyone:/) }]);
+    expect(find(await run(sandbox), "PR_APPROVER")).toMatchObject([{ section: "configuration", level: "info", detail: expect.stringMatching(/^requester: only the person who asked/) }]);
+    expect(find(await run({ ...sandbox, PR_APPROVER: "anyone" }), "PR_APPROVER")).toMatchObject([{ level: "info", detail: expect.stringMatching(/^anyone:/) }]);
     expect(find(await run({ ...sandbox, PR_APPROVER: "not-requester" }), "PR_APPROVER")).toMatchObject([{ level: "info", detail: expect.stringMatching(/^not-requester:/) }]);
     // Without code tools it only matters once set.
     expect(find(await run({}), "PR_APPROVER")).toEqual([]);
