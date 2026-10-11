@@ -54,8 +54,9 @@ if (config) {
   keepAlive();
   setInterval(keepAlive, 5 * 60_000).unref();
 
-  // A stop (Fly sends SIGTERM, then SIGKILL after its kill_timeout, 5 s by default; Ctrl-C
-  // is SIGINT) shuts down in order, well inside that: the server stops taking requests
+  // A stop (Fly sends its kill_signal, SIGINT unless fly.toml says otherwise, then SIGKILL
+  // after its kill_timeout, 5 s by default; Ctrl-C is SIGINT too; most other supervisors
+  // send SIGTERM) shuts down in order, well inside that: the server stops taking requests
   // (those in flight get STOP_REQUESTS_MS), app.close() gives running turns the rest and
   // checkpoints and closes the databases, and the process exits 0. Without this the
   // process died with the knowledge DB's WAL as it was, deleted text included (#89).

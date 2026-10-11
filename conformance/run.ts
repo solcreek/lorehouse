@@ -744,7 +744,7 @@ const scenarios: Scenario[] = [
           proc.kill("SIGKILL");
           await proc.exited;
           app = undefined;
-          return "still running 5 s after SIGTERM (Fly's default kill_timeout)";
+          return "still running 5 s after SIGTERM (the length of Fly's default kill_timeout)";
         }
         app = undefined;
         const t0Free = Date.now();
