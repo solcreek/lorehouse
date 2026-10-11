@@ -37,6 +37,9 @@ export function indexText(s: string): string {
 export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL");
+  // Freed pages are zeroed, not left holding what was deleted (a pragma lasts one
+  // connection, so it is set on every open). See migrations/0010_fts_secure_delete.sql.
+  db.exec("PRAGMA secure_delete = ON");
   db.exec("CREATE TABLE IF NOT EXISTS lorehouse_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
   const applied = new Set((db.query("SELECT version FROM lorehouse_migrations").all() as { version: number }[]).map((r) => r.version));
   for (const m of [...migrations].sort((a, b) => a.version - b.version)) {
