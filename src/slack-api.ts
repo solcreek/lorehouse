@@ -17,7 +17,8 @@ export type SlackApiOptions = {
 };
 
 export type SlackApi = {
-  // signal: abort the request (and any wait out of a 429) when it fires.
+  // signal: aborts the request in flight when it fires; a 429 being waited out finishes its
+  // wait, then is not retried.
   call<T = Record<string, unknown>>(method: string, params?: Record<string, string | number | undefined>, opts?: { signal?: AbortSignal }): Promise<T>;
   // Every page of a cursor-paginated method, yielding the array under `key`.
   paginate<T>(method: string, params: Record<string, string | number | undefined>, key: string): AsyncGenerator<T>;
