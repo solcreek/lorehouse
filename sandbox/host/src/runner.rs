@@ -791,4 +791,95 @@ mod tests {
         // an app that sends no deadlineMs: timeout plus boot slack
         assert_eq!(job(None, Some(30_000)).app_deadline(), Duration::from_secs(90));
     }
+
+    /// A manager that never starts a VM here, and a publisher over file:// remotes in `dir`.
+    fn no_vms(dir: &std::path::Path) -> (std::sync::Arc<crate::vm::Manager>, std::sync::Arc<crate::publish::Publisher>) {
+        use crate::config::{Config, Mode};
+        let cfg = Config {
+            mode: Mode::Serve { listen: "127.0.0.1:0".into(), token: "t".into() },
+            state_dir: dir.join("state"),
+            golden: dir.join("golden.ext4"),
+            kernel: dir.join("vmlinux"),
+            uplink: "lo".into(),
+            max_vms: 1,
+            idle: Duration::from_secs(60),
+            vcpus: 1,
+            mem_mib: 128,
+            github_url: format!("file://{}", dir.display()),
+        };
+        (crate::vm::Manager::new(cfg), std::sync::Arc::new(crate::publish::Publisher::new(dir.join("mirrors"), format!("file://{}", dir.display()))))
+    }
+
+    #[tokio::test]
+    async fn a_refused_upgrade_says_why_and_a_wrong_token_does_not_fall_back() {
+        // What the WebSocket handshake sends, and how a refusal is told apart: 401 is a wrong
+        // token (no fallback to long poll), any other status means "no WebSocket here".
+        use super::{Runner, WsEnd};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, want) in [("401 Unauthorized", "Lost:401"), ("404 Not Found", "Refused:HTTP 404")] {
+            let dir = scratch_dir(&format!("ws-{}", &status[..3]));
+            let (vms, publisher) = no_vms(&dir);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = conn.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "the request ended early");
+                    req.extend_from_slice(&buf[..n]);
+                }
+                conn.write_all(format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                String::from_utf8(req).unwrap().to_ascii_lowercase()
+            });
+            let runner = Runner::new(vms, publisher, format!("http://{addr}"), "tok".into(), "box-1".into(), crate::config::Transport::Ws, dir.join("jobs"));
+            let end = match runner.ws_session().await {
+                WsEnd::Lost(m) => format!("Lost:{m}"),
+                WsEnd::Refused(m) => format!("Refused:{m}"),
+            };
+            assert!(end.starts_with(want), "{status}: {end}");
+            let req = server.await.unwrap();
+            assert!(req.starts_with("get /runners/connect http/1.1\r\n"), "{req}");
+            for header in ["authorization: bearer tok\r\n", "x-lorehouse-runner: box-1\r\n", "upgrade: websocket\r\n"] {
+                assert!(req.contains(header), "{header:?} missing from {req}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_publish_body_is_read_as_the_app_encodes_it() {
+        // src/runners/hub.ts sends a stage/push request as Buffer.from(JSON).toString("base64"):
+        // the standard alphabet, padded. Whatever its length (no, one or two "="), it must
+        // reach the publisher; anything else is refused before it does.
+        use super::{execute, B64};
+        use base64::Engine;
+        let dir = scratch_dir("publish-body");
+        let (vms, publisher) = no_vms(&dir);
+        let push = |body: Option<String>| Job { id: "j".into(), sandbox: "s".into(), op: "push".into(), method: None, path: None, body_base64: body, timeout_ms: None, deadline_ms: Some(60_000) };
+        let stage = format!("1700000000-{}", "0".repeat(32));
+        let mut pads = std::collections::HashSet::new();
+        for branch in ["scout/a", "scout/ab", "scout/abc"] {
+            let json = serde_json::json!({ "stage": stage, "owner": "acme", "name": "widgets", "sha": "a".repeat(40), "branch": branch, "token": "t" }).to_string();
+            let encoded = B64.encode(&json);
+            pads.insert(encoded.len() - encoded.trim_end_matches('=').len());
+            let r = execute(&vms, &publisher, push(Some(encoded)), Instant::now()).await;
+            // The publisher answered: there is no such stage here.
+            assert_eq!(r.status, 404, "{branch}: {:?}", r.error);
+            assert!(r.error.as_deref().unwrap_or("").contains("isn't here"), "{branch}: {:?}", r.error);
+        }
+        assert_eq!(pads, [0, 1, 2].into_iter().collect(), "every padding length was exercised");
+        // Not base64, URL-safe base64, or no body: refused as such, never parsed.
+        for body in [Some("not base64!".to_string()), Some("-_-_".to_string()), None] {
+            let r = execute(&vms, &publisher, push(body.clone()), Instant::now()).await;
+            assert_eq!(r.status, 400, "{body:?}");
+            assert!(r.error.as_deref().unwrap_or("").starts_with("bodyBase64"), "{body:?}: {:?}", r.error);
+        }
+        // base64 of something that isn't a push request: refused by the parser.
+        let r = execute(&vms, &publisher, push(Some(B64.encode("{\"stage\":1}"))), Instant::now()).await;
+        assert_eq!(r.status, 400);
+        assert!(r.error.as_deref().unwrap_or("").starts_with("push request:"), "{:?}", r.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
