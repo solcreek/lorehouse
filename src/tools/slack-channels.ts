@@ -19,7 +19,7 @@ export type Readable = (channelId: string) => boolean;
 // The refusal for a channel the agent doesn't read, or undefined when the call may go on.
 export function channelRefusal(input: unknown, ctx: ToolContext, readable: Readable): { error: string } | undefined {
   const channelId = (input as { channelId?: unknown } | undefined)?.channelId;
-  if (channelId === undefined || channelId === null || channelId === "") return undefined; // June uses the current channel, or has none
+  if (channelId === undefined || channelId === null || channelId === "") return undefined; // June uses the current channel ("" finds no target)
   if (typeof channelId === "string" && (channelId === current(ctx) || readable(channelId))) return undefined;
   return { error: `not a channel I read: ${String(channelId)}` };
 }

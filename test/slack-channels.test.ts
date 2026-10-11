@@ -102,6 +102,16 @@ describe("channelGuarded", () => {
     expect(await channelGuarded(raw, () => true).run({ channelId: 42 }, inC9)).toEqual({ error: "not a channel I read: 42" });
   });
 
+  test("only a Slack event's channel counts as the one being answered in", async () => {
+    const fromWeb = { event: { source: "web", channelId: "C9" } } as unknown as ToolContext;
+    expect(await channelGuarded(raw, () => false).run({ channelId: "C9" }, fromWeb)).toEqual({ error: "not a channel I read: C9" });
+  });
+
+  test("no channel id, null or empty: passed on for June to use the current channel or find no target", async () => {
+    const guarded = channelGuarded(raw, () => false);
+    for (const input of [{}, { channelId: null }, { channelId: "" }, undefined]) expect(await guarded.run(input, inC9)).toBe("ran");
+  });
+
   test("keeps the tool's spec", () => {
     expect(channelGuarded(raw, () => true).spec).toBe(raw.spec);
   });
