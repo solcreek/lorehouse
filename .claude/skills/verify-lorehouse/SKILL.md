@@ -23,7 +23,7 @@ Launch starts a new process group for the mock and another for `src/server.ts`. 
 
 The JSON includes `runId`, `app`, `mock`, `db`, and `evidence`. The evidence directory is `.claude/skills/verify-lorehouse/artifacts/<runId>/`. Launch writes `/tmp/lorehouse-verify/current`. A second launch starts a second instance and moves `current`. Pass `--run <runId>` to talk to an older one.
 
-Ready does not mean a developer's `.env` was read. The child environment sets every Lorehouse variable itself so an existing `.env` cannot attach this process to a real workspace.
+Ready does not mean a developer's `.env` was read. The child environment sets every Lorehouse variable itself so an existing `.env` cannot attach this process to a real workspace. It also points `LOREHOUSE_ENV_FILE` (a file that doesn't exist) and `LOREHOUSE_SETTINGS` into the run directory, so neither an installed `/etc/lorehouse/lorehouse.env` nor another `settings.json` fills in a key.
 
 ## Doctor
 
