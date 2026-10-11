@@ -109,7 +109,10 @@ fly ssh console -a <app> -C "lorehouse doctor --url https://<app>.fly.dev"
 CI deploys every merge to `main` that passes the conformance suite. To do the same:
 
 1. Create a token that can deploy only this app: `fly tokens create deploy -a <app>`.
-2. Store it as the `FLY_API_TOKEN` repository secret.
+2. In Settings → Environments, create `production`, set "Deployment branches and tags"
+   to `main` only, and store the token there as the `FLY_API_TOKEN` environment secret
+   (`gh secret set FLY_API_TOKEN --env production`), not as a repository secret: then
+   only the deploy job on `main` can read it.
 3. In [`ci.yml`](.github/workflows/ci.yml), change the repository check on both the
    `image` and the `deploy` job: deploy runs the image that the `image` job publishes
    to your repository's `ghcr.io/<owner>/<repo>`.
