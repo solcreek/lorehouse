@@ -8,7 +8,7 @@
 //!   PUT    /v1/sandboxes/{id}/file?path=…                         → 204
 //!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone)
 //!   GET    /v1/sandboxes                                          → what exists, running or not
-//!   POST   /v1/sandboxes/{id}/stage  {owner, name, base, token?} → the commits to publish, verified
+//!   POST   /v1/sandboxes/{id}/stage  {owner, name, base, branch, token?} → the commits to publish, verified, and a stage id
 //!   POST   /v1/sandboxes/{id}/push   {owner, name, sha, branch, token} → pushed (see publish.rs)
 //!   GET    /healthz                                               → ok (no auth)
 //!
