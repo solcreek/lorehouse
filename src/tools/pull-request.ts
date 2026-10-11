@@ -16,8 +16,8 @@
 // over the REST API.
 //
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
-// stages again (the same commits give the same sha and the same card), requestInput then
-// returns the stored answer, and the post-approval part is idempotent: an already-open PR
+// stages again (the same commits give the same sha and, unless the base was rewritten, the
+// same card), requestInput then returns the stored answer, and the post-approval part is idempotent: an already-open PR
 // for the branch is returned instead of creating a second one.
 
 import { createHash } from "node:crypto";
@@ -130,13 +130,13 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       }
 
       // An approval is for what its card shows: this commit, to this branch of this repo,
-      // against this base, under this title. A call that changes any of them is asked again,
-      // never answered by an earlier click.
-      const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, staged.sha])).digest("hex");
-      const approved = await ctx.requestInput({
-        id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`,
-        prompt: approvalCard({ repo, branch: input.branch, base, title: input.title, staged }),
-      });
+      // against this base, under this title, with this diff. A call that changes any of them
+      // (a replay after the base was rewritten can stage the same commit with another diff)
+      // is asked again, never answered by an earlier click. The stage id isn't in it: a
+      // replay stages again under a new id and shows the same card.
+      const card = approvalCard({ repo, branch: input.branch, base, title: input.title, staged });
+      const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, staged.sha, card])).digest("hex");
+      const approved = await ctx.requestInput({ id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`, prompt: card });
       if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
 
       // ── after approval: the host pushes the staged commit, then open (or find) the PR ─

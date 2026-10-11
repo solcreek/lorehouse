@@ -220,10 +220,10 @@ describe("open_pull_request — the approval gate", () => {
     expect(published.some((p) => p.op === "push")).toBe(false);
   });
 
-  test("an approval is asked for again when the repo, base, branch or title differs, never reused", async () => {
+  test("an approval is asked for again when the repo, base, branch, title or diff differs, never reused", async () => {
     const ids: string[] = [];
-    const ask = async (input: { branch: string; title: string; base?: string }, origin?: string) => {
-      const { sb } = fakeRepo({ origin });
+    const ask = async (input: { branch: string; title: string; base?: string }, origin?: string, patch?: string) => {
+      const { sb } = fakeRepo({ origin, patch });
       const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
       await tool.run(input, { requestInput: async (r: { id: string }) => { ids.push(r.id); return false; } } as never);
     };
@@ -233,8 +233,10 @@ describe("open_pull_request — the approval gate", () => {
     await ask({ branch: "scout/x", title: "x", base: "develop" });
     await ask({ branch: "scout/y", title: "x" });
     await ask({ branch: "scout/x", title: "x" }, "https://github.com/acme/other.git");
+    // The same commit with another diff (a replay after the base was rewritten).
+    await ask({ branch: "scout/x", title: "x" }, undefined, "--- a/src/a.ts\n+++ b/src/a.ts\n-older\n+new\n");
     expect(ids[0]).toBe(ids[1]!);
-    expect(new Set(ids).size).toBe(5);
+    expect(new Set(ids).size).toBe(6);
   });
 
   test("a replay after the push (cut off before its result was saved) still reaches the PR", async () => {
