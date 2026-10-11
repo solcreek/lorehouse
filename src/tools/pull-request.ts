@@ -15,9 +15,10 @@
 // goes to the host, never into the sandbox. The PR itself is opened from the worker side
 // over the REST API.
 //
-// Who may click Approve is the install's rule (PR_APPROVER, ADR 0002 §6), applied when the
-// click arrives: the card names a policy (APPROVER_POLICY) together with the requester, the
-// person whose message started this turn, and the app decides each click with mayApprove.
+// Who may click Approve is the install's rule (PR_APPROVER, ADR 0002 §6). The card names a
+// policy (APPROVER_POLICY) with the requester, the person whose message started this turn,
+// and the turn; the app decides each click and records who answered (src/approvals.ts). The
+// rule is checked again against that person here, at the moment of use, before the push.
 //
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
 // stages again (the same commits give the same sha and, unless the base was rewritten, the
@@ -25,8 +26,11 @@
 // for the branch is returned instead of creating a second one.
 
 import { createHash } from "node:crypto";
-import type { Answerers, AuthorizeAnswer, Tool, ToolContext } from "@junejs/core/agent-runtime";
+import type { Answerers, Tool, ToolContext } from "@junejs/core/agent-runtime";
 import type { PrApprover } from "../config";
+import { APPROVER_POLICY, type ApprovalStore, type CardKey, type CardScope } from "../approvals";
+
+export { APPROVER_POLICY, mayApprove } from "../approvals";
 import { WORKDIR, type SandboxFor, type Staged } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
@@ -42,12 +46,11 @@ export type PullRequestOptions = {
   approverName?: (slackUserId: string) => Promise<string | undefined>;
   // Who may approve (PR_APPROVER, default requester): the card says so under not-requester,
   // the one rule under which the person who asked can't answer it.
-  // The rule itself is applied to each click by the app, with mayApprove.
   approver?: PrApprover;
-  // The Slack user id whose click answered this card, when the app saw it (the turn's own
-  // event is the requester's, not the approver's), taken once; `peek` reads it without
-  // taking it. Unknown: the PR body names nobody. See approverGate.
-  approvedBy?: (ctx: ToolContext, inputId: string, o?: { peek?: boolean }) => string | undefined;
+  // Who answered each card (src/approvals.ts): checked against the rule before the push,
+  // named in the PR, and deleted at every outcome but a failed push. Without it (tests), no
+  // check is made here and nobody is named.
+  approvals?: ApprovalStore;
   fetch?: typeof fetch; // injectable for tests
   apiUrl?: string; // GitHub's REST API, default https://api.github.com
 };
@@ -160,18 +163,26 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
       const inputId = `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`;
       const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers });
-      if (approved !== true) {
-        opts.approvedBy?.(ctx, inputId); // the Deny's grant is used up: a later card with this id is someone else's
-        return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
-      }
-      // Under not-requester an Approve with no grant from this install's gate was never
-      // checked against the rule: a card parked before PR_APPROVER existed names the
-      // requester as its only answerer, and June resumes such a card without asking
-      // authorizeAnswer. A grant lost to a restart between the click and here is refused the
-      // same way: nothing is pushed, and it can be asked again. Only peeked here: a retry in
-      // the same turn (a push that failed once) gets the same stored answer and needs it too.
-      if (opts.approver === "not-requester" && ctx.event && !opts.approvedBy?.(ctx, inputId, { peek: true })) {
-        return { status: "refused", note: "This approval wasn't checked against PR_APPROVER=not-requester (the card predates the rule, or the app restarted), so nothing was pushed. Ask for the pull request again." };
+      // This card in this turn. Every outcome from here deletes its approval record (done),
+      // except a failed push: the model may retry in the same turn, and the retry gets the
+      // same stored answer and needs the same record. The turn's end deletes what is left.
+      const key: CardKey | undefined = ctx.event?.ts ? { session: ctx.sessionId, turn: ctx.event.ts, card: inputId } : undefined;
+      const done = <T>(result: T): T => {
+        if (key) opts.approvals?.forget(key);
+        return result;
+      };
+      if (approved !== true) return done({ status: "denied", note: "Nothing was pushed. Ask the requester what to change." });
+      // The rule, at the moment of use, against who actually answered. A card with no record
+      // was answered without authorizeAnswer: one parked before this deploy, whose only
+      // answerer June keeps as the requester. Under not-requester that fails closed.
+      let approverId: string | undefined;
+      if (key && opts.approvals) {
+        const verdict = opts.approvals.decide(key, opts.approver ?? "requester", requesterOf(ctx));
+        if (!verdict.ok) {
+          const rule = opts.approver ?? "requester";
+          return done({ status: "refused", note: `This approval can't be shown to meet PR_APPROVER=${rule} (the card predates the rule, or the rule changed since the click), so nothing was pushed. Ask for the pull request again.` });
+        }
+        approverId = verdict.approver;
       }
 
       // ── after approval: the host pushes the staged commit, then open (or find) the PR ─
@@ -179,12 +190,12 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       try {
         token = await opts.github(repo, "write");
       } catch (e) {
-        return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
+        return done({ error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` });
       }
       try {
         await sb.push({ stage: staged.stage, repo, sha: staged.sha, branch: input.branch, token });
       } catch (e) {
-        return { error: `push failed: ${(e as Error).message}` };
+        return { error: `push failed: ${(e as Error).message}` }; // the record stays for a retry in this turn
       }
       // The checkout's origin/* is left as it is. Staging bundles what origin/* doesn't
       // have, so recording the push there would make a replay (one cut off after this push,
@@ -205,24 +216,20 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const existing = await gh(`/pulls?state=open&head=${repo.owner}:${encodeURIComponent(input.branch)}`);
       if (existing.ok) {
         const [pr] = (await existing.json()) as { html_url: string; number: number }[];
-        if (pr) return { status: "exists", url: pr.html_url, number: pr.number };
+        if (pr) return done({ status: "exists", url: pr.html_url, number: pr.number });
       }
-      const approverId = opts.approvedBy?.(ctx, inputId);
       const approver = approverId ? await opts.approverName?.(approverId).catch(() => undefined) : undefined;
       const body = `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack, approved there${approver ? ` by ${approver}` : ""}.`;
       const res = await gh("/pulls", {
         method: "POST",
         body: JSON.stringify({ title: input.title, head: input.branch, base, body, draft: true }),
       });
-      if (!res.ok) return { error: `GitHub rejected the PR: ${res.status} ${(await res.text()).slice(0, 300)}` };
+      if (!res.ok) return done({ error: `GitHub rejected the PR: ${res.status} ${(await res.text()).slice(0, 300)}` });
       const pr = (await res.json()) as { html_url: string; number: number };
-      return { status: "opened", url: pr.html_url, number: pr.number };
+      return done({ status: "opened", url: pr.html_url, number: pr.number });
     },
   };
 }
-
-// The policy a pull request card names; the app decides each click on it (mayApprove).
-export const APPROVER_POLICY = "pull-request-approver";
 
 // Who may answer this turn's card: the policy, with the requester, the turn's speaker as
 // its channel attests them (a signed Slack event). A turn with no inbound event (a test, a
@@ -232,48 +239,16 @@ export const APPROVER_POLICY = "pull-request-approver";
 // such a turn too).
 function approvers(ctx: ToolContext, rule: PrApprover): Answerers | undefined | "no-requester" {
   if (!ctx.event) return undefined;
-  const user = ctx.event.user;
-  const requester = user?.attested ? user.id : null;
+  const requester = requesterOf(ctx);
   if (!requester && rule !== "anyone") return "no-requester";
-  return { policy: APPROVER_POLICY, scope: { requester } };
+  const scope: CardScope = { requester, turn: ctx.event.ts };
+  return { policy: APPROVER_POLICY, scope };
 }
 
-// Whether the person who clicked (`by`, verified by the channel) may answer a card that
-// named APPROVER_POLICY with `scope`, under the install's rule. Nobody unidentified may.
-// Under requester or not-requester, a card with no known requester can't be checked, so
-// nobody may.
-export function mayApprove(rule: PrApprover, by: string | undefined, scope: unknown): boolean {
-  if (!by) return false;
-  if (rule === "anyone") return true;
-  const requester = (scope as { requester?: unknown } | null | undefined)?.requester;
-  if (typeof requester !== "string" || requester === "") return false;
-  return rule === "requester" ? by === requester : by !== requester;
-}
-
-// The install's rule as June's authorizeAnswer hook (src/app.ts wires it), and who it last
-// let answer each card, so the pull request can name its approver. In memory: after a
-// restart between the click and the PR, the name is left out, never guessed. A grant is
-// taken once (approvedBy), on Approve or Deny, so a later card with the same id (the same
-// change asked for again in the thread) never inherits an earlier clicker. The latest grant
-// wins: a grant whose resume then failed is replaced by the click that does answer.
-export function approverGate(rule: PrApprover, max = 1000) {
-  const grants = new Map<string, string>();
-  const key = (session: string, inputId: string) => `${session}\n${inputId}`;
-  const authorize: AuthorizeAnswer = ({ policy, scope, by, session, request }) => {
-    if (policy !== APPROVER_POLICY || !mayApprove(rule, by, scope)) return false;
-    const k = key(session, request.id);
-    grants.delete(k);
-    grants.set(k, by!);
-    if (grants.size > max) grants.delete(grants.keys().next().value!);
-    return true;
-  };
-  const approvedBy = (ctx: ToolContext, inputId: string, o?: { peek?: boolean }): string | undefined => {
-    const k = key(ctx.sessionId, inputId);
-    const by = grants.get(k);
-    if (!o?.peek) grants.delete(k);
-    return by;
-  };
-  return { authorize, approvedBy };
+// The turn's speaker, when its channel attests them (a signed Slack event).
+function requesterOf(ctx: ToolContext): string | null {
+  const user = ctx.event?.user;
+  return user?.attested ? user.id : null;
 }
 
 // A branch name safe to put in a shell command and a git refspec: letters, digits and

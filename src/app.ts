@@ -30,7 +30,8 @@ import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
 import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, reconcileAsks, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
 import { cachedNames } from "./ingest/slack-users";
-import { approverGate, pullRequestTool } from "./tools/pull-request";
+import { pullRequestTool } from "./tools/pull-request";
+import { approvalStore, approverGate } from "./approvals";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
@@ -117,9 +118,15 @@ export async function createApp(config: Config) {
   ];
   // Who may click Approve on a pull request card is the install's rule (PR_APPROVER, ADR
   // 0002 §6). The card names APPROVER_POLICY, so June asks authorizeAnswer as each click
-  // arrives; a refused click changes nothing, and the clicker alone is told so. The gate
-  // also hands the tool who clicked, so the pull request names its approver.
-  const approver = approverGate(config.prApprover);
+  // arrives; a refused click changes nothing, and the clicker alone is told so. A click let
+  // through is recorded (src/approvals.ts) until the turn ends, so the tool can check the
+  // rule against who answered when it pushes, and name them. What a restart left behind is
+  // pruned on start, then daily.
+  const approvals = approvalStore(knowledge);
+  tally(() => approvals.prune());
+  setInterval(() => tally(() => approvals.prune()), 86_400_000).unref();
+  let runtime: Awaited<ReturnType<typeof createNativeRuntime>> | undefined;
+  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session));
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
   const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
@@ -134,11 +141,10 @@ export async function createApp(config: Config) {
     const apiUrl = config.githubApiUrl;
     const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
-    const approvedBy = approver.approvedBy;
     tools.push(
       ...workspaceTools(sandboxFor, { commitAs: github.identity }),
       cloneTool(sandboxFor, github),
-      pullRequestTool({ sandboxFor, github, identity, approverName, approver: config.prApprover, approvedBy, apiUrl }),
+      pullRequestTool({ sandboxFor, github, identity, approverName, approver: config.prApprover, approvals, apiUrl }),
     );
   }
 
@@ -225,7 +231,7 @@ export async function createApp(config: Config) {
     tools,
     skills: Object.entries(SKILLS).map(([name, text]) => parseSkill(name, text)),
     channels: [slack],
-    authorizeAnswer: approver.authorize,
+    authorizeAnswer,
   });
 
   const model = anthropic({
@@ -235,7 +241,7 @@ export async function createApp(config: Config) {
     // No cast: tsc checks the real SDK client against June's AnthropicClient here.
     client: new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl }),
   });
-  const runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions);
+  runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions);
   const mounted = mountAgent(agent, runtime);
   // Recording who asks is never silent: each channel is told when it starts, and again
   // when it stops (the record erased). Once per change, not on every start.
