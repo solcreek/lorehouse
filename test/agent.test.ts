@@ -432,7 +432,7 @@ describe("remoteSandbox client", () => {
     const reqs: { url: string; body: unknown }[] = [];
     const f = (async (url: string, init: RequestInit) => {
       reqs.push({ url, body: JSON.parse(init.body as string) });
-      if (url.endsWith("/stage")) return Response.json({ stage: STAGE, sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: "", authors: [], files: [], patch: "", patchTruncated: false });
+      if (url.endsWith("/stage")) return Response.json({ stage: STAGE, sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: "", authors: [], files: [], patch: "", patchTruncated: false, diffSha256: "d".repeat(64) });
       return Response.json({ error: `stage ${STAGE} isn't here: it never completed, was already used, or expired; stage again` }, { status: 404 });
     }) as typeof fetch;
     const sb = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f });

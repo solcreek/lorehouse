@@ -80,6 +80,10 @@ pub struct Staged {
     pub patch: String,
     #[serde(rename = "patchTruncated")]
     pub patch_truncated: bool,
+    /// SHA-256 (hex) of the complete diff against the base, as `patch` would be uncut: what
+    /// an approval binds, so two diffs that differ only past the excerpt differ here.
+    #[serde(rename = "diffSha256")]
+    pub diff_sha256: String,
 }
 
 /// A push names its stage, and restates what it pushes: each must match the stage's record.
@@ -163,32 +167,8 @@ async fn git(dir: &Path, args: &[&str], token: Option<&str>, limit: Duration) ->
 /// One git command, in `dir`, in the guarded environment; at most `cap` bytes of its stdout,
 /// and whether there was more (the command is stopped there, never read to the end).
 async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Duration, cap: usize) -> Result<(String, bool), String> {
-    use std::process::Stdio;
     use tokio::io::AsyncReadExt;
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
-        .env("HOME", dir)
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1");
-    let mut config: Vec<(&str, String)> = vec![
-        ("core.hooksPath", "/dev/null".into()),
-        ("fetch.fsckObjects", "true".into()),
-        ("transfer.fsckObjects", "true".into()),
-        ("credential.helper", String::new()),
-    ];
-    if let Some(t) = token {
-        config.push(("http.extraHeader", format!("Authorization: Basic {}", B64.encode(format!("x-access-token:{t}")))));
-    }
-    cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
-    for (i, (k, v)) in config.iter().enumerate() {
-        cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
-    }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut cmd = git_command(dir, args, token);
     let work = async {
         let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
@@ -225,6 +205,76 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
         Ok(r) => r,
     }
 }
+
+/// One git command, in `dir`, in the guarded environment: the SHA-256 (hex) of all of its
+/// stdout, however long, read as it comes and never kept.
+async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut cmd = git_command(dir, args, None);
+    let work = async {
+        let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+        let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            return Err("git: no pipes".to_string());
+        };
+        let errors = tokio::spawn(async move {
+            let mut err = Vec::new();
+            let _ = stderr.take(STDERR_CAP).read_to_end(&mut err).await;
+            err
+        });
+        let mut hash = Sha256::new();
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            let n = stdout.read(&mut buf).await.map_err(|e| format!("git {}: {e}", args[0]))?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buf[..n]);
+        }
+        let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+        let err = errors.await.unwrap_or_default();
+        if !status.success() {
+            return Err(format!("git {}: {}", args[0], tail(&err)));
+        }
+        Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    };
+    match tokio::time::timeout(limit, work).await {
+        Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
+        Ok(r) => r,
+    }
+}
+
+/// git, in `dir`, with no user or system config, no prompts, no replace objects, no hooks,
+/// fsck on fetch, and the token (if any) as an HTTP header; stdout and stderr piped.
+fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
+    use std::process::Stdio;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    cmd.env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+        .env("HOME", dir)
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    let mut config: Vec<(&str, String)> = vec![
+        ("core.hooksPath", "/dev/null".into()),
+        ("fetch.fsckObjects", "true".into()),
+        ("transfer.fsckObjects", "true".into()),
+        ("credential.helper", String::new()),
+    ];
+    if let Some(t) = token {
+        config.push(("http.extraHeader", format!("Authorization: Basic {}", B64.encode(format!("x-access-token:{t}")))));
+    }
+    cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
+    for (i, (k, v)) in config.iter().enumerate() {
+        cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd
+}
+
 
 /// A file removed when this is dropped.
 struct TempFile(PathBuf);
@@ -278,6 +328,9 @@ struct StageRecord {
     base_sha: String,
     branch: String,
     sha: String,
+    /// The staged diff's digest (Staged::diff_sha256), kept with what was approved.
+    #[serde(rename = "diffSha256")]
+    diff_sha256: String,
     /// Unix seconds.
     #[serde(rename = "createdAt")]
     created_at: u64,
@@ -401,6 +454,7 @@ impl Publisher {
             base_sha: staged.base_sha.clone(),
             branch: req.branch.clone(),
             sha: staged.sha.clone(),
+            diff_sha256: staged.diff_sha256.clone(),
             created_at: unix_secs(),
         };
         self.write_record(&record).map_err(|e| (500, format!("recording the stage: {e}")))?;
@@ -505,9 +559,12 @@ impl Publisher {
             let files: Vec<String> = fact("files", vec!["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", &three_dot]).await?.split('\0').filter(|f| !f.is_empty()).map(String::from).collect();
             // The patch is only an excerpt: cut, not refused.
             let (patch, patch_truncated) = git_capped(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], None, GIT_LOCAL, MAX_PATCH).await.map_err(|e| (500, e))?;
-            Ok::<_, Failure>((authors, stat, files, patch, patch_truncated))
+            // The same diff in full, hashed as it streams: what an approval binds, the
+            // part past the excerpt included.
+            let diff_sha256 = git_sha256(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], GIT_LOCAL).await.map_err(|e| (500, e))?;
+            Ok::<_, Failure>((authors, stat, files, patch, patch_truncated, diff_sha256))
         };
-        let (authors, stat, files, patch, patch_truncated) = match described.await {
+        let (authors, stat, files, patch, patch_truncated, diff_sha256) = match described.await {
             Ok(d) => d,
             Err(e) => {
                 let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
@@ -518,7 +575,7 @@ impl Publisher {
             let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
             return Err((409, format!("no commits to publish: HEAD has nothing that isn't on {base} already")));
         }
-        Ok(Staged { stage: String::new(), sha, base_sha, commits: authors.len(), stat, authors, files, patch, patch_truncated })
+        Ok(Staged { stage: String::new(), sha, base_sha, commits: authors.len(), stat, authors, files, patch, patch_truncated, diff_sha256 })
     }
 
     /// Push the commit a stage recorded to the branch it recorded: never forced, never
@@ -820,7 +877,7 @@ mod tests {
         }
         assert_eq!(sh(&dir, &format!("git rev-parse refs/stage/{id}")), head, "verification finished");
         assert!(s.records().is_empty(), "{:?}", s.records());
-        let staged = Staged { stage: id, sha: head.clone(), base_sha: String::new(), commits: 1, stat: String::new(), authors: vec![], files: vec![], patch: String::new(), patch_truncated: false };
+        let staged = Staged { stage: id, sha: head.clone(), base_sha: String::new(), commits: 1, stat: String::new(), authors: vec![], files: vec![], patch: String::new(), patch_truncated: false, diff_sha256: String::new() };
         let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/c")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
 
@@ -1061,6 +1118,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_digest_covers_the_whole_diff_and_is_recorded() {
+        // Two diffs past the patch cap that share the commit's place: each digest is the
+        // SHA-256 of its complete diff, the same diff gives the same digest, and the record
+        // keeps it.
+        use sha2::{Digest, Sha256};
+        let s = scratch("digest");
+        // The diff as a reviewer would get it from the mirror, untrimmed, with no user config.
+        let full = |s: &Scratch, sha: &str| -> String {
+            let out = std::process::Command::new("git")
+                .args(["-C", &s.dir().to_string_lossy(), "diff", "--no-ext-diff", "--no-textconv", &format!("main...{sha}")])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success() && out.stdout.len() > MAX_PATCH);
+            Sha256::digest(&out.stdout).iter().map(|b| format!("{b:02x}")).collect()
+        };
+        sh(&s.vm, "seq 1 200000 > big && git add big && git commit -qm big");
+        let one = s.stage("scout/d").await.unwrap();
+        assert!(one.patch_truncated);
+        assert_eq!(one.diff_sha256, full(&s, &one.sha));
+        let record: StageRecord = serde_json::from_slice(&std::fs::read(s.publisher.record_path(&one.stage)).unwrap()).unwrap();
+        assert_eq!(record.diff_sha256, one.diff_sha256);
+        assert_eq!(s.stage("scout/d").await.unwrap().diff_sha256, one.diff_sha256, "the same diff, the same digest");
+        // The same file, changed only at its end: far past what the patch shows.
+        sh(&s.vm, "git reset -q --hard origin/main && (seq 1 199999; echo last) > big && git add big && git commit -qm big");
+        let two = s.stage("scout/d").await.unwrap();
+        assert!(two.patch_truncated);
+        assert_ne!(two.diff_sha256, one.diff_sha256);
+        assert_eq!(two.diff_sha256, full(&s, &two.sha));
+    }
+
+    #[tokio::test]
     async fn a_head_that_is_a_tag_stages_its_commit_and_a_non_commit_leaves_nothing() {
         let s = scratch("tag");
         let dir = s.dir();
@@ -1103,7 +1193,7 @@ mod tests {
         assert!(err.1.contains("recording the stage"), "{}", err.1);
         assert_eq!(s.records(), vec![format!("{id}.json")], "no temporary file is left behind");
         std::fs::remove_dir_all(&path).unwrap();
-        let staged = Staged { stage: id, sha: head, base_sha: String::new(), commits: 1, stat: String::new(), authors: vec![], files: vec![], patch: String::new(), patch_truncated: false };
+        let staged = Staged { stage: id, sha: head, base_sha: String::new(), commits: 1, stat: String::new(), authors: vec![], files: vec![], patch: String::new(), patch_truncated: false, diff_sha256: String::new() };
         let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/w")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
         assert_eq!(s.remote("scout/w"), None);
