@@ -10,7 +10,7 @@
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
 //   GET  /stats                recorded Slack calls, model call count, channels read, posts
 //                              (with their blocks), message updates, response_url replies,
-//                              GitHub requests
+//                              GitHub requests, channels whose reactions were listed
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
@@ -21,13 +21,15 @@
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
 // question (or, when the question contains "[recent]", a recent_knowledge tool_use with
 // no input; "[thread]", a slack_read_thread tool_use with no input, or "[thread:<channel>]"
-// for a thread in that channel; "[whois]", a slack_resolve_user tool_use for the first
+// for a thread in that channel; "[reactions:<channel>]", a slack_list_reactions tool_use for
+// a message in that channel; "[whois]", a slack_resolve_user tool_use for the first
 // person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
 // an open_pull_request tool_use for that branch); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …", and with
 // "[quote]" in the question, the hit's text verbatim: "… [quote:<text>] w0 …"), or for
 // a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
+// or for reactions, their names ("[q7] [reactions:tada,eyes] …"),
 // or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for a
 // skill, its name and the first words of its body ("[q7] [skill:<name>:<words>] …"), or for
 // "[exec] <command>" (a workspace_exec tool_use), the exit code and output
@@ -158,6 +160,8 @@ function slack(method: string, body: Record<string, unknown>, token = ""): Respo
     if ((info.is_private || info.is_group || info.is_mpim) && token !== WITH_GROUPS_READ) return Response.json({ ok: false, error: "missing_scope", needed: "groups:read", provided: "channels:read" });
     return Response.json({ ok: true, channel: { id: body.channel, ...info } });
   }
+  // Every message has the same reactions; reactionChannels in /stats says where it was asked.
+  if (method === "reactions.get") return Response.json({ ok: true, type: "message", channel: body.channel, message: { ts: body.timestamp, reactions: [{ name: "tada", count: 2, users: ["U2", "U3"] }, { name: "eyes", count: 1, users: ["U2"] }] } });
   if (method === "users.info") {
     const user = users[String(body.user)];
     return user ? Response.json({ ok: true, user: { id: body.user, ...(user as object) } }) : Response.json({ ok: false, error: "user_not_found" });
@@ -217,6 +221,8 @@ function answerFor(messages: Msg[], result: Block): string {
   if (typeof failure === "string") return `${nonce} [toolerror:${failure.replace(/[\[\]\n]/g, " ").slice(0, 200)}] ${words.join(" ")}`;
   const skill = value as { name?: string; body?: string } | undefined;
   if (typeof skill?.body === "string") return `${nonce} [skill:${skill.name}:${skill.body.split(/\s+/).slice(0, 4).join(" ").replace(/[\[\]]/g, " ")}] ${words.join(" ")}`;
+  const reactions = (value as { reactions?: { name?: string }[] } | undefined)?.reactions;
+  if (reactions) return `${nonce} [reactions:${reactions.map((r) => r.name).join(",")}] ${words.join(" ")}`;
   const thread = value?.messages;
   if (thread) {
     const first = thread[0] ?? {};
@@ -260,6 +266,7 @@ async function anthropic(req: Request): Promise<Response> {
     const question = firstUserText(body.messages);
     // "[recent]" in the question → an overview question: list recent threads instead of searching
     // "[thread]" → read the thread the question was asked in; "[thread:<channel>]" → a thread there
+    // "[reactions:<channel>]" → list the reactions on a message in that channel
     // "[whois]" → look up the first person the question mentions (other than the bot)
     // "[exec] <command>" → run the command in the thread's sandbox (workspace_exec)
     // "[skill:<name>]" → load that skill (read_skill)
@@ -269,11 +276,12 @@ async function anthropic(req: Request): Promise<Response> {
     const recent = question.includes("[recent]");
     const threadIn = /\[thread:([A-Z0-9]+)\]/.exec(question)?.[1];
     const thread = question.includes("[thread]") || threadIn !== undefined;
+    const reactionsIn = /\[reactions:([A-Z0-9]+)\]/.exec(question)?.[1];
     const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
+    const input = skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));
@@ -389,7 +397,8 @@ Bun.serve({
       const posts = calls.filter((c) => c.method === "chat.postMessage").map((c) => ({ channel: c.body.channel, thread_ts: c.body.thread_ts, text: c.body.text, blocks: c.body.blocks, ts: c.body.__ts }));
       const updates = calls.filter((c) => c.method === "chat.update").map((c) => ({ channel: c.body.channel, ts: c.body.ts, text: c.body.text }));
       const responses = calls.filter((c) => c.method === "response_url").map((c) => ({ path: c.body.__path, text: c.body.text, response_type: c.body.response_type, replace_original: c.body.replace_original }));
-      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, posts, updates, responses, github: githubCalls });
+      const reactionChannels = [...new Set(calls.filter((c) => c.method === "reactions.get").map((c) => String(c.body.channel)))];
+      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, reactionChannels, posts, updates, responses, github: githubCalls });
     }
     if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });

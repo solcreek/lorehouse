@@ -24,6 +24,7 @@ import type { Server } from "bun";
 import type { RunnerSocketData } from "./runners/routes";
 import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { withNamedPeople } from "./tools/slack-names";
+import { withChannelGuard } from "./tools/slack-channels";
 import { neutralizeMentions } from "./mentions";
 import { withoutMentions } from "./slack-guard";
 import { directMessage, redirectText } from "./dm";
@@ -187,7 +188,9 @@ export async function createApp(config: Config) {
   const names = async (ids: string[]) => (await ingester?.names(ids)) ?? new Map();
   // Everything posted to Slack goes through withoutMentions: no reply, timeline note,
   // Approve card or notice can @-mention anyone, whatever the model writes (ADR 0002 §6).
-  const slack: Channel = withoutMentions(withNamedPeople(slackChannel({
+  // The channel's own tools (read a thread, list or add reactions) reach only the channel
+  // being answered in and those on AGENT_CHANNELS (slack-channels.ts).
+  const slack: Channel = withoutMentions(withChannelGuard(withNamedPeople(slackChannel({
     signingSecret: config.slack.signingSecret,
     botToken: config.slack.botToken,
     apiUrl: config.slack.apiUrl,
@@ -238,7 +241,7 @@ export async function createApp(config: Config) {
     // The name is the model's to choose: guarded like everything else it writes.
     tasks: (call) => neutralizeMentions(TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`),
     onError: (err) => console.error("slack:", err),
-  }), names, (c) => listed.has(c)), names);
+  }), names), (c) => listed.has(c)), names);
 
   const agent = defineAgent({
     name: AGENT_ID,

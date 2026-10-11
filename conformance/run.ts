@@ -84,7 +84,7 @@ const mention = (channel: string, extra: Record<string, unknown> = {}) => {
 
 type Block = { type: string; elements?: { type: string; text?: { text: string }; action_id?: string; value?: string }[] };
 type Stats = {
-  slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[];
+  slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[]; reactionChannels: string[];
   posts: { channel: string; thread_ts?: string; text: string; blocks?: Block[]; ts: string }[];
   updates: { channel: string; ts: string; text: string }[];
   responses: { path: string; text?: string; response_type?: string; replace_original?: boolean }[];
@@ -600,6 +600,28 @@ const scenarios: Scenario[] = [
       const a = await ask("[thread:D1] what did they say");
       if (!a.text.includes("[toolerror:not a channel I read: D1]")) return `the model was told ${JSON.stringify(a.text.slice(0, 120))}`;
       return (await stats()).readChannels.includes("D1") ? "read the DM's thread" : null;
+    },
+  },
+  {
+    name: "lists reactions only in a channel it reads: asked for an unlisted channel's, it is refused and Slack is never asked",
+    run: async () => {
+      // June's slack_list_reactions names who reacted how; outside the allowlist that's
+      // not the agent's to read (#83).
+      await reset();
+      const a = await ask("[reactions:C7] who reacted to the launch post");
+      if (!a.text.includes("[toolerror:not a channel I read: C7]")) return `the model was told ${JSON.stringify(a.text.slice(0, 120))}`;
+      const s = await stats();
+      return s.reactionChannels.length ? `Slack was asked for reactions in ${s.reactionChannels.join(",")}` : null;
+    },
+  },
+  {
+    name: "lists reactions in a channel it reads: the model gets them",
+    run: async () => {
+      await reset();
+      const a = await ask(`[reactions:${ALLOWED}] who reacted to the launch post`);
+      if (!a.text.includes("[reactions:tada,eyes]")) return `the model was told ${JSON.stringify(a.text.slice(0, 120))}`;
+      const s = await stats();
+      return s.reactionChannels.join(",") === ALLOWED ? null : `Slack was asked for reactions in ${JSON.stringify(s.reactionChannels)}`;
     },
   },
   {
