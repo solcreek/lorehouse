@@ -145,7 +145,7 @@ These are Lorehouse's position, not settings:
   someone else (`PR_APPROVER=not-requester`), #67. Under `not-requester` the requester's
   clicks are refused, Deny included, because June's `authorizeAnswer` decides who may
   answer, not which answer; and a refused click gets June's fixed reply, not a reason of
-  ours. The rule is the install's, read as each click arrives; a profile can't loosen it.
+  ours (both asked of June in junebuild/june#359). The rule is the install's, read as each click arrives; a profile can't loosen it.
 - With a GitHub App, a write token never enters a sandbox. The sandbox host stages the
   commits and, after the approval, pushes exactly the staged commit with the write token
   (`sandbox/host/src/publish.rs`, #31; `src/tools/pull-request.ts`, #32). The
