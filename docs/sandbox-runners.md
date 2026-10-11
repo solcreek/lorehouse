@@ -178,7 +178,9 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
      `files` is every path the commits change, complete: a rename is listed as both its
      old and its new path (no rename detection), and no path is quoted or escaped. What
      the approval card warns about is decided on this list. `patch` is an excerpt (64 KiB at
-     most); `diffSha256` is the SHA-256 of the complete diff, which an approval binds.
+     most); `diffSha256` is the SHA-256 of the complete diff, which an approval binds. It is
+     taken with whole blob ids (`--full-index`, which bind binary changes too) and pinned
+     diff options, so it depends on the two commits, not on the mirror or git's defaults.
   5. Only once all of that has succeeded, the host writes a stage record (sandbox, repo,
      base, branch, commit, time) under an unguessable id, synced to disk, and returns the
      id. A stage that fails, or is cut off by its deadline or cancelled, writes none.
