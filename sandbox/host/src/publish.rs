@@ -413,10 +413,10 @@ impl Publisher {
     /// on purpose (see stage_and_record).
     fn write_record(&self, record: &StageRecord) -> std::io::Result<()> {
         let dir = self.records();
-        if !dir.is_dir() {
-            std::fs::create_dir_all(&dir)?;
-            sync_dir(&self.mirrors)?;
-        }
+        // The directory's own entry is synced every time, not only by whoever created it: a
+        // stage of another repo may have created it and not synced it yet.
+        std::fs::create_dir_all(&dir)?;
+        sync_dir(&self.mirrors)?;
         let tmp = TempFile(dir.join(format!(".{}.tmp", record.id)));
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp.0)?;
         f.write_all(&serde_json::to_vec(record)?)?;
