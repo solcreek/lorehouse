@@ -184,6 +184,7 @@ export class SlackIngester {
   private pending = new Map<string, ReturnType<typeof setTimeout>>();
   // Channels found private or archived since the start, with why: never read again.
   private closed = new Map<string, string>();
+  private rechecking?: Promise<string[]>;
 
   constructor(
     private readonly api: SlackApi,
@@ -210,8 +211,15 @@ export class SlackIngester {
 
   // Look every open channel up again; close the ones Slack no longer shows as public. An
   // outage changes nothing (the channel was public when last asked): it is logged, and the
-  // next recheck asks again. Returns the channels left unverified by an outage.
-  async recheckChannels(when: "start" | "recheck" = "recheck"): Promise<string[]> {
+  // next recheck asks again. Returns the channels left unverified by an outage. A call made
+  // while one is still waiting on Slack shares it, so a timer that fires faster than Slack
+  // answers never has more than one round of lookups in flight.
+  recheckChannels(when: "start" | "recheck" = "recheck"): Promise<string[]> {
+    this.rechecking ??= this.lookUpOpenChannels(when).finally(() => { this.rechecking = undefined; });
+    return this.rechecking;
+  }
+
+  private async lookUpOpenChannels(when: "start" | "recheck"): Promise<string[]> {
     if (!this.opts.lookUp) return [];
     const unverified: string[] = [];
     for (const channel of this.opts.channels) {

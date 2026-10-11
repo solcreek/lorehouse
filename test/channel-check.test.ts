@@ -220,6 +220,29 @@ describe("ingest looks channels up", () => {
     expect(read).toEqual([]);
   });
 
+  test("a recheck called while one is still waiting on Slack shares it: one lookup per channel in flight", async () => {
+    const asked: string[] = [];
+    let answer!: () => void;
+    const gate = new Promise<void>((r) => { answer = r; });
+    const ing = new SlackIngester(infoApi({}).api, openKnowledge(":memory:"), {
+      channels: new Set(["C1", "C2"]),
+      backfillDays: 0,
+      refreshDays: 0,
+      debounceMs: 0,
+      lookUp: async (c) => { asked.push(c); await gate; return { channel: c, public: true }; },
+    });
+    const first = ing.recheckChannels();
+    const second = ing.recheckChannels();
+    await Bun.sleep(10);
+    expect(asked).toEqual(["C1"]);
+    answer();
+    expect(await Promise.all([first, second])).toEqual([[], []]);
+    expect(asked).toEqual(["C1", "C2"]);
+    // Once it settles, the next call asks again.
+    await ing.recheckChannels();
+    expect(asked).toEqual(["C1", "C2", "C1", "C2"]);
+  });
+
   test("an outage while running changes nothing (it was public when last asked)", async () => {
     const { api, info } = readingApi({ C1: PUBLIC });
     const ing = ingester(api, ["C1"]);
