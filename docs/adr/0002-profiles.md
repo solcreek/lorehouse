@@ -129,8 +129,14 @@ junebuild/june#195, already fixed in June; it goes with the upgrade (#38).
 These are Lorehouse's position, not settings:
 
 - It works only in public channels; private channels and group DMs stay shut. A DM is
-  never knowledge, and is answered at all only where the install's `DM_MODE` allows it,
-  from public knowledge and without code tools. A profile can't loosen that.
+  never knowledge. By default it is not answered either (`DM_MODE=redirect`): it gets a
+  one-line pointer to the public channels, with no model call and nothing read. An admin
+  may turn answering on with `DM_MODE=answer`, and that choice includes reading the DM
+  conversation itself (any thread in it), whose only reader is its author. Beyond it, the
+  answer reads what any public answer can: the whole knowledge index, whatever was
+  ingested or seeded into it, and nothing is filtered at read time. So only public
+  material may go into the index; what is indexed and when it leaves is the ingest's
+  rule, not the DM's (#82). It never has code tools (#58). A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread. The Approve in
   Slack authorizes opening the pull request, not merging it: it opens as a draft, and the
   merge is gated on GitHub, by its review and branch protection (#60). By default only the
@@ -145,6 +151,11 @@ These are Lorehouse's position, not settings:
   (`sandbox/host/src/publish.rs`, #31; `src/tools/pull-request.ts`, #32). The
   development-only `GITHUB_TOKEN` is not covered: it is one token for reads and writes,
   and `workspace_clone` puts it in the sandbox to clone with.
+- Installing the GitHub App on a repository authorizes reading it: `workspace_clone`
+  reads it, private or not, with no approval, and only writing waits for an Approve (#68,
+  [docs/github-app.md](../github-app.md#what-installing-on-a-repository-allows)). A
+  profile's `credentials` (§1) can narrow which repositories; none can widen past the
+  install.
 - People are named as plain text, never @-mentioned.
 - Answers cite their sources.
 
