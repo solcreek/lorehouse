@@ -18,6 +18,8 @@ You name it per install; it defaults to `scout`.
   - An edit is reflected, and a deleted message stops being quotable, including a secret
     someone pasted and then removed.
   - Changes made while it was down are caught up on the next start.
+  - A channel taken off `AGENT_CHANNELS` is forgotten on the next start: its threads
+    leave the index, and it stops answering follow-ups in threads it was asked into there.
 - **Works in your team's languages.** Chinese, Japanese and Korean are searchable word by
   word, not only in English. It replies in the language it was asked in.
 - **Knows people by name, and never pings them.**
@@ -168,7 +170,7 @@ To set up Slack:
 | env | default | |
 |---|---|---|
 | `AGENT_NAME` | `scout` | the agent's handle; must match the Slack app's display name |
-| `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never works in private channels |
+| `AGENT_CHANNELS` | (none) | the public channel ids it works in: answers mentions and follow-ups, counts reactions, and learns from. Empty means **nowhere**. It never works in private channels. ⚠️ On each start, everything learned from a channel no longer listed is purged: its threads leave the index (and the database file), with the threads it was asked into there, its ingest cursor, and usage's asks and searches there; seeded documents stay. **An empty list purges everything learned from Slack.** `lorehouse doctor` shows what the next start would purge |
 | `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call), `ignore`, or `answer` (from public knowledge; not with the code tools). A DM is never indexed |
 | `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). `/healthz` is always open and says only `ok` |
 | `ADMIN_TOKEN` | (none) | bearer token for the read-only [admin API](docs/admin-api.md) under `/api/v1`: the indexed threads and their text, search, the agent's threads, the sandboxes. 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |

@@ -80,7 +80,9 @@ to catch edits/deletes made while down, and re-indexes a thread live after it go
 `src/knowledge.ts` is SQLite FTS with CJK bigram indexing. Deleted messages must stop being
 quotable. DMs are never indexed.
 
-**Policy.** `src/policy.ts` restricts to public channels in `AGENT_CHANNELS`; `src/threads.ts`
+**Policy.** `src/policy.ts` restricts every channel event to public channels in
+`AGENT_CHANNELS` (empty means nowhere); on start, `src/purge.ts` removes what was kept for
+a channel no longer listed (its documents, joined threads, cursor, asks and searches); `src/threads.ts`
 decides follow-ups (reply in a joined thread without a new mention, but not when it
 mentions someone else/@channel); `src/dm.ts` handles `DM_MODE`. People are named as plain
 text, never @-mentioned (`src/tools/slack-names.ts`), and that is enforced in code, not left
