@@ -175,6 +175,9 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   2. It has the VM bundle what the checkout has that `origin` doesn't, and reads the bundle out in 12 MiB parts, at most 96 MiB in all.
   3. It fetches the bundle into `refs/stage/<id>`, with fsck on, no tags and only that one ref. A forged bundle, a `.git` tree entry, or a tag or replace ref riding along never reaches the mirror.
   4. The facts the approval shows (diff, files, authors) are computed in the mirror, never taken from the VM.
+     `files` is every path the commits change, complete: a rename is listed as both its
+     old and its new path (no rename detection), and no path is quoted or escaped. What
+     the approval card warns about is decided on this list.
   5. Only once all of that has succeeded, the host writes a stage record (sandbox, repo,
      base, branch, commit, time) under an unguessable id, and returns the id. A stage that
      fails, or is cut off by its deadline or cancelled, writes none.

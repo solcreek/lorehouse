@@ -73,6 +73,9 @@ pub struct Staged {
     pub stat: String,
     /// "author <email>|committer <email>", one per commit.
     pub authors: Vec<String>,
+    /// Every path the commits change, complete: a rename is listed as both of its paths (git
+    /// detects no renames here), and no path is quoted or escaped (bytes that aren't UTF-8
+    /// become U+FFFD). What the approval warns about is decided on this list.
     pub files: Vec<String>,
     pub patch: String,
     #[serde(rename = "patchTruncated")]
@@ -478,7 +481,9 @@ impl Publisher {
         let described = async {
             let authors: Vec<String> = fact("authors", vec!["log", "--format=%an <%ae>|%cn <%ce>", &range]).await?.lines().map(String::from).collect();
             let stat = fact("stat", vec!["diff", "--no-ext-diff", "--no-textconv", "--stat", &three_dot]).await?;
-            let files: Vec<String> = fact("files", vec!["diff", "--no-ext-diff", "--no-textconv", "--name-only", &three_dot]).await?.lines().map(String::from).collect();
+            // --no-renames: a rename is a delete and an add, so the path it moves away from is
+            // listed too. -z: one NUL after each path, none quoted (a newline in a name stays).
+            let files: Vec<String> = fact("files", vec!["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", &three_dot]).await?.split('\0').filter(|f| !f.is_empty()).map(String::from).collect();
             // The patch is only an excerpt: cut, not refused.
             let (patch, patch_truncated) = git_capped(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], None, GIT_LOCAL, MAX_PATCH).await.map_err(|e| (500, e))?;
             Ok::<_, Failure>((authors, stat, files, patch, patch_truncated))
@@ -1073,6 +1078,18 @@ mod tests {
         let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/w")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
         assert_eq!(s.remote("scout/w"), None);
+    }
+
+    #[tokio::test]
+    async fn files_lists_both_paths_of_a_rename_unquoted() {
+        // The approval warns on paths GitHub acts on; a rename away from one must show it.
+        let s = scratch("renames");
+        sh(&s.vm, "mkdir -p .github/workflows docs && echo ci > .github/workflows/ci.yml && echo '* @acme/owners' > docs/CODEOWNERS && git add . && git commit -qm sensitive && git push -q origin main && git fetch -q origin");
+        sh(&s.vm, "mkdir -p old && git mv .github/workflows/ci.yml old/ci.yml && git mv docs/CODEOWNERS old/CODEOWNERS && printf x > \"$(printf 'we\\tird\\n\"\\303\\251')\" && git add . && git commit -qm moved");
+        let staged = s.stage("scout/renames").await.unwrap();
+        let mut files = staged.files.clone();
+        files.sort();
+        assert_eq!(files, vec![".github/workflows/ci.yml", "docs/CODEOWNERS", "old/CODEOWNERS", "old/ci.yml", "we\tird\n\"é"]);
     }
 
     #[test]
