@@ -32,11 +32,12 @@ const scripted = (script: ModelReply[]): Model => (msgs) =>
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 const STAGE_ID = `1790000000-${"0".repeat(32)}`;
+const DIGEST = "d".repeat(64);
 
 // A sandbox whose checkout answers the few git commands open_pull_request still runs there
 // (status, origin, default branch), and whose host stages and pushes: every exec and every
 // publish call is recorded.
-function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; files?: string[]; patch?: string; stageError?: string; pushError?: string } = {}) {
+function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; files?: string[]; patch?: string; patchTruncated?: boolean; diffSha256?: string; stageError?: string; pushError?: string } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
   const published: { op: "stage" | "push"; args: Record<string, unknown> }[] = [];
   let stages = 0;
@@ -65,7 +66,7 @@ function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; fil
         sha: SHA, baseSha: "f".repeat(40), commits: (o.authors ?? ["x"]).length,
         stat: " src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
         authors: o.authors ?? ["bot <b@x>|bot <b@x>"], files: o.files ?? ["src/a.ts"],
-        patch: o.patch ?? "--- a/src/a.ts\n+++ b/src/a.ts\n-old\n+new\n", patchTruncated: false,
+        patch: o.patch ?? "--- a/src/a.ts\n+++ b/src/a.ts\n-old\n+new\n", patchTruncated: o.patchTruncated ?? false, diffSha256: o.diffSha256 ?? DIGEST,
       };
     },
     async push(args) {
@@ -222,8 +223,8 @@ describe("open_pull_request — the approval gate", () => {
 
   test("an approval is asked for again when the repo, base, branch, title or diff differs, never reused", async () => {
     const ids: string[] = [];
-    const ask = async (input: { branch: string; title: string; base?: string }, origin?: string, patch?: string) => {
-      const { sb } = fakeRepo({ origin, patch });
+    const ask = async (input: { branch: string; title: string; base?: string }, origin?: string, patch?: string, more: { patch?: string; patchTruncated?: boolean; diffSha256?: string } = {}) => {
+      const { sb } = fakeRepo({ origin, patch, ...more });
       const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
       await tool.run(input, { requestInput: async (r: { id: string }) => { ids.push(r.id); return false; } } as never);
     };
@@ -238,8 +239,23 @@ describe("open_pull_request — the approval gate", () => {
     await ask({ branch: "scout/x", title: "x" }, undefined, "--- a/src/a.ts\n+++ b/src/a.ts\n-older\n+new\n");
     await ask({ branch: "scout/x", title: "x" }, undefined, "+x\n".repeat(5000) + "+y\n");
     await ask({ branch: "scout/x", title: "x" }, undefined, "+x\n".repeat(5000) + "+z\n");
+    // The same commit, stat, files and patch excerpt, cut at the host's cap: only the
+    // digest of the complete diff tells them apart.
+    const cut = { patch: "+x\n".repeat(5000), patchTruncated: true };
+    await ask({ branch: "scout/x", title: "x" }, undefined, undefined, { ...cut, diffSha256: "1".repeat(64) });
+    await ask({ branch: "scout/x", title: "x" }, undefined, undefined, { ...cut, diffSha256: "2".repeat(64) });
     expect(ids[0]).toBe(ids[1]!);
-    expect(new Set(ids).size).toBe(8);
+    expect(new Set(ids).size).toBe(10);
+  });
+
+  test("a stage with no digest of its diff (an old host) is refused; nobody is asked", async () => {
+    const { sb, published } = fakeRepo({ diffSha256: "" });
+    let asked = false;
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f });
+    const result = await tool.run({ branch: "scout/x", title: "x" }, { requestInput: async () => ((asked = true), true) } as never);
+    expect(String((result as { error?: string }).error)).toContain("no digest of the staged diff");
+    expect(asked).toBe(false);
+    expect(published.map((p) => p.op)).toEqual(["stage"]);
   });
 
   test("a replay after the push (cut off before its result was saved) still reaches the PR", async () => {
@@ -272,7 +288,7 @@ describe("open_pull_request — the approval gate", () => {
   });
 
   test("the card flags changes under .github/ and keeps within Slack's 3000 characters, the patch cut to fit", () => {
-    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 2, stat: " .github/workflows/ci.yml | 3 +\n src/a.ts | 1 +\n 2 files changed\n", authors: [], files: [".github/workflows/ci.yml", "src/a.ts"], patch: "+x\n".repeat(5000) + "```", patchTruncated: false };
+    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 2, stat: " .github/workflows/ci.yml | 3 +\n src/a.ts | 1 +\n 2 files changed\n", authors: [], files: [".github/workflows/ci.yml", "src/a.ts"], patch: "+x\n".repeat(5000) + "```", patchTruncated: false, diffSha256: DIGEST };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
     expect(card).toContain("2 commits");
     expect(card).toContain(":warning: Changes `.github/workflows/ci.yml`");
@@ -291,7 +307,7 @@ describe("open_pull_request — the approval gate", () => {
       stat: " .github/x`y | 1 +\n``````\n<!here> | 1 +\n",
       files: [".github/a`<@U1>`b"],
       patch: "+<https://evil.example|click> &lt; ``````\n",
-      patchTruncated: false,
+      patchTruncated: false, diffSha256: DIGEST,
     };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix <!channel>\n*Approved by security*", staged });
     expect(card).not.toMatch(/<[!@#]|<https?:/); // no mention, @channel or link
@@ -305,7 +321,7 @@ describe("open_pull_request — the approval gate", () => {
   test("the card fits Slack's 3000 characters whatever the title, branch, stat and paths", () => {
     const long = (n: number) => "a".repeat(n);
     const staged = {
-      stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 2, authors: [], patch: "+x\n".repeat(5000), patchTruncated: true,
+      stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 2, authors: [], patch: "+x\n".repeat(5000), patchTruncated: true, diffSha256: DIGEST,
       stat: Array.from({ length: 30 }, (_, i) => ` ${long(500)}${i} | 1 +`).join("\n") + "\n",
       files: Array.from({ length: 10 }, (_, i) => `.github/${long(500)}${i}`),
     };
@@ -317,7 +333,7 @@ describe("open_pull_request — the approval gate", () => {
 
   test("the card flags a .github/ path with unusual characters, kept on one line", () => {
     // The host lists paths unquoted (-z), so one can hold anything but NUL.
-    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: [".github/workflows/\u00e9\n\t.yml"], patch: "", patchTruncated: false };
+    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: [".github/workflows/\u00e9\n\t.yml"], patch: "", patchTruncated: false, diffSha256: DIGEST };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
     expect(card).toContain(":warning: Changes `.github/workflows/\u00e9\ufffd\ufffd.yml`:");
   });
@@ -327,14 +343,14 @@ describe("open_pull_request — the approval gate", () => {
     // `git mv docs/CODEOWNERS old/CODEOWNERS`: each source and each destination.
     const staged = {
       stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed, 0 insertions(+), 0 deletions(-)\n", authors: [],
-      files: [".github/workflows/ci.yml", "docs/CODEOWNERS", "old/CODEOWNERS", "old/ci.yml"], patch: "", patchTruncated: false,
+      files: [".github/workflows/ci.yml", "docs/CODEOWNERS", "old/CODEOWNERS", "old/ci.yml"], patch: "", patchTruncated: false, diffSha256: DIGEST,
     };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Tidy", staged });
     expect(card).toContain(":warning: Changes `.github/workflows/ci.yml`, `docs/CODEOWNERS`:");
   });
 
   test("the card flags CODEOWNERS wherever GitHub reads it", () => {
-    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false };
+    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false, diffSha256: DIGEST };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
     expect(card).toContain(":warning: Changes `CODEOWNERS`, `docs/CODEOWNERS`:");
   });

@@ -45,6 +45,7 @@ function publish(job: Job) {
       stage, sha: SHA, baseSha: "f".repeat(40), commits: 1,
       stat: " src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
       authors: [], files: ["src/a.ts"], patch: "--- a/src/a.ts\n+++ b/src/a.ts\n-old\n+new\n", patchTruncated: false,
+      diffSha256: "d".repeat(64),
     });
   }
   const record = req.stage ? stages.get(req.stage) : undefined;

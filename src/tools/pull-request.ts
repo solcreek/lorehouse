@@ -103,6 +103,8 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         return { error: `couldn't stage the commits: ${(e as Error).message}` };
       }
       if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(staged.sha)) return { error: "the staged commit id is malformed" };
+      // The approval binds this digest; without one, nobody is asked.
+      if (!/^[0-9a-f]{64}$/.test(staged.diffSha256 ?? "")) return { error: "the host gave no digest of the staged diff; is sandboxd up to date?" };
 
       // Every commit must be by the account the PR comes from (the App's bot), before anyone
       // is asked to approve it: a commit made before that was enforced, or with an identity
@@ -131,13 +133,13 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
 
       // An approval is for what its card was made from: this commit, to this branch of this
       // repo, against this base, under this title, with these staged facts (the stat, the
-      // files, the authors, and the patch as the host read it, past what the card shows
-      // too). A call that changes any of them is asked again, never answered by an earlier
+      // files, the authors, the patch excerpt, and the host's SHA-256 of the complete diff,
+      // so a difference past the excerpt counts too). A call that changes any of them is asked again, never answered by an earlier
       // click: a replay after the base was rewritten can stage the same commit with another
       // diff. Neither the stage id nor the base's commit is in it: a replay stages again
       // under a new id, and a base that only moved on leaves the diff as it was.
       const card = approvalCard({ repo, branch: input.branch, base, title: input.title, staged });
-      const facts = [staged.sha, staged.commits, staged.stat, staged.files, staged.authors, staged.patch, staged.patchTruncated];
+      const facts = [staged.sha, staged.commits, staged.stat, staged.files, staged.authors, staged.patch, staged.patchTruncated, staged.diffSha256];
       const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
       const approved = await ctx.requestInput({ id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`, prompt: card });
       if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
