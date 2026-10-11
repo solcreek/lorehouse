@@ -132,16 +132,15 @@ These are Lorehouse's position, not settings:
   never knowledge, and is answered at all only where the install's `DM_MODE` allows it,
   from public knowledge and without code tools. A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread.
+- With a GitHub App, a write token never enters a sandbox. The sandbox host stages the
+  commits and, after the approval, pushes exactly the staged commit with the write token
+  (`sandbox/host/src/publish.rs`, #31; `src/tools/pull-request.ts`, #32). The
+  development-only `GITHUB_TOKEN` is not covered: it is one token for reads and writes,
+  and `workspace_clone` puts it in the sandbox to clone with.
 - People are named as plain text, never @-mentioned.
 - Answers cite their sources.
 
 A profile can narrow its tools, knowledge and credentials. It cannot widen past these.
-
-One more rule is decided here but **not enforced yet**: a write token never enters a
-sandbox. Today `open_pull_request` still pushes from inside the sandbox with the write
-token in the command's environment (`src/tools/pull-request.ts`). #31 and #32 move the
-push to the sandbox host; the rule holds once they land. Until then the `lorehouse`
-profile keeps today's in-sandbox push, and no new profile with `sandbox: write` ships.
 
 ### 7. Sessions and sandboxes are keyed by profile
 

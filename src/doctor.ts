@@ -21,7 +21,7 @@ import { accessSync, constants, existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createHmac } from "node:crypto";
 import manifest from "../slack/manifest.yaml";
-import { ConfigError, loadConfig, type Config } from "./config";
+import { ConfigError, isLoopbackUrl as isLoopback, loadConfig, type Config } from "./config";
 import { appJwt } from "./github-auth";
 import { agentIdentity, type AgentIdentity } from "./identity";
 import { loadEnv, readSettings } from "./settings";
@@ -206,20 +206,20 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       if (!res) add("github", "token", "fail", `${api}: ${error}`);
       else if (!res.ok) add("github", "token", "fail", `refused (${res.status}): check GITHUB_TOKEN`);
       else add("github", "token", "warn", `works, as ${(await json<{ login?: string }>(res))?.login ?? "?"}; a long-lived token is for development: use a GitHub App (docs/github-app.md)`);
+      // GitHub credentials need code tools (loadConfig), so this is always the case here.
+      add("github", "in the sandbox", "warn", "code tools are on with GITHUB_TOKEN: workspace_clone puts it in the sandbox to clone with, and it can write too, so code in the sandbox could push without an approval. A GitHub App's clone token is read-only (docs/github-app.md)");
     }
 
     // ── sandbox ──
-    // loadConfig checks only that SANDBOX_URL is set.
-    if (sandbox.mode === "direct" && !URL.canParse(sandbox.url)) {
-      add("sandbox", "host", "fail", `SANDBOX_URL "${sandbox.url}" isn't a URL`);
-    } else if (sandbox.mode === "direct") {
+    // loadConfig has refused a SANDBOX_URL that isn't https:// or plain http:// to this
+    // machine; doctor reports that under configuration.
+    if (sandbox.mode === "direct") {
       const url = sandbox.url.replace(/\/$/, "");
       const { res, error } = await get(`${url}/v1/sandboxes`, { headers: { authorization: `Bearer ${sandbox.token}` } });
       if (!res) add("sandbox", "host", "fail", `${url}: ${error}`);
       else if (res.status === 401) add("sandbox", "host", "fail", "refused: SANDBOX_TOKEN must be the host's SANDBOXD_TOKEN");
       else if (!res.ok) add("sandbox", "host", "fail", `${url}/v1/sandboxes answered ${res.status}`);
       else add("sandbox", "host", "ok", url);
-      if (/^http:/.test(url) && !isLoopback(url)) add("sandbox", "host", "warn", "plain HTTP off this machine: the token and every command cross the network in the clear");
     } else {
       add("sandbox", "runners", "info", opts.url && config.statusToken ? "runners connect in: see deployment below" : "runners connect in, so they can only be seen on the running app: pass --url, with STATUS_TOKEN set");
     }
@@ -336,14 +336,6 @@ type RunningStatus = {
   knowledge?: { state?: string; documents?: number; error?: string };
   runners?: { runner: string; transport: string; online: boolean; capacity: number; running: number }[];
 };
-
-// Only a literal loopback address: a name like 127.0.0.1.example.com is not one, and
-// neither is something that isn't a URL.
-function isLoopback(url: string): boolean {
-  if (!URL.canParse(url)) return false;
-  const host = new URL(url).hostname;
-  return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
-}
 
 const MARK: Record<Level, string> = { ok: "✓", warn: "!", fail: "✗", info: "·" };
 

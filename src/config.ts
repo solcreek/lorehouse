@@ -191,11 +191,32 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     const absent = (["SANDBOX_URL", "SANDBOX_TOKEN"] as const).filter((k) => !env[k]);
     if (absent.length) missing.push(...absent.map((k) => `${k} (the direct sandbox mode needs SANDBOX_URL and SANDBOX_TOKEN)`));
     if (!github) missing.push(needGithub);
-    if (!absent.length && github) config.sandbox = { mode: "direct", url: env.SANDBOX_URL!, token: env.SANDBOX_TOKEN!, github };
+    // Stage and push carry GitHub tokens to the host, and every call carries SANDBOX_TOKEN:
+    // plain HTTP only to this machine.
+    if (env.SANDBOX_URL && !sandboxUrlSafe(env.SANDBOX_URL)) {
+      missing.push(`SANDBOX_URL must be https://, or http:// to this machine (localhost, 127.0.0.0/8, [::1]); got ${JSON.stringify(env.SANDBOX_URL)}`);
+    } else if (!absent.length && github) config.sandbox = { mode: "direct", url: env.SANDBOX_URL!, token: env.SANDBOX_TOKEN!, github };
   } else if (github) {
     missing.push("SANDBOX_RUNNER_TOKEN or SANDBOX_URL + SANDBOX_TOKEN (GitHub credentials are set, but no sandbox)");
   }
   if (config.agent.dm === "answer" && config.sandbox) missing.push("DM_MODE=answer (not with code tools: code work stays in public channels)");
   if (missing.length) throw new ConfigError(missing);
   return config;
+}
+
+// A URL whose host is this machine: localhost, 127.0.0.0/8 or ::1. Only a literal loopback
+// address: a name like 127.0.0.1.example.com is not one, and neither is something that
+// isn't a URL. The URL parser normalizes the host first (2130706433 and 0x7f.1 are
+// 127.0.0.1; [::0:1] is [::1]).
+export function isLoopbackUrl(url: string): boolean {
+  if (!URL.canParse(url)) return false;
+  const host = new URL(url).hostname;
+  return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+}
+
+// Where a direct-mode sandbox host may be: https://, or plain http:// only to this machine.
+export function sandboxUrlSafe(url: string): boolean {
+  if (!URL.canParse(url)) return false;
+  const { protocol } = new URL(url);
+  return protocol === "https:" || (protocol === "http:" && isLoopbackUrl(url));
 }
