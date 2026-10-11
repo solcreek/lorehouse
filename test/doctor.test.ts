@@ -5,6 +5,8 @@ import { createHmac, generateKeyPairSync } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
+import { countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
+import { inThread, joinThread } from "../src/threads";
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 const DB = `${tmpdir()}/doctor-test-lorehouse.db`;
@@ -186,8 +188,41 @@ describe("channels", () => {
     expect(find(await run({}, { history: { C1: "channel_not_found" } }), "C1")[0]?.level).toBe("fail");
   });
 
-  test("no channels at all is a warning", async () => {
-    expect(find(await run({ AGENT_CHANNELS: "" }), "AGENT_CHANNELS")[0]?.level).toBe("warn");
+  test("no channels at all is a warning that says the agent works nowhere, and what a start purges", async () => {
+    const check = find(await run({ AGENT_CHANNELS: "" }), "AGENT_CHANNELS")[0];
+    expect(check?.level).toBe("warn");
+    expect(check?.detail).toContain("nowhere");
+    expect(check?.detail).toContain("purges everything it learned from Slack");
+  });
+
+  // Read-only: doctor counts what the next start would purge, and purges nothing (#82).
+  test("channels no longer listed: what the next start would purge, per channel, without touching the database", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-purge-`);
+    const path = `${dir}/lorehouse.db`;
+    try {
+      const db = openKnowledge(path);
+      for (const [channel, n] of [["C1", 1], ["C2", 3], ["C3", 1]] as const) {
+        for (let i = 0; i < n; i++) upsertDocument(db, { docId: `slack:${channel}:${i}.1`, kind: "slack_thread", source: "s", title: "t", text: "words" });
+      }
+      upsertDocument(db, { docId: "seed1", kind: "seed", source: "s", title: "t", text: "words" });
+      joinThread(db, "C2", "0.1");
+      db.close();
+      const checks = await run({ AGENT_CHANNELS: "C1", LOREHOUSE_DB: path, SESSIONS_DB: `${dir}/sessions.db` });
+      const purge = find(checks, "purge on start");
+      expect(purge).toHaveLength(1);
+      expect(purge[0]).toMatchObject({ section: "channels", level: "warn" });
+      expect(purge[0]!.detail).toContain("4 documents");
+      expect(purge[0]!.detail).toContain("C2 (3 documents)");
+      expect(purge[0]!.detail).toContain("C3 (1 document)");
+      const after = openKnowledge(path);
+      expect(countDocuments(after)).toBe(6);
+      expect(inThread(after, "C2", "0.1")).toBe(true);
+      after.close();
+      // Nothing to purge: no line at all.
+      expect(find(await run({ AGENT_CHANNELS: "C1,C2,C3", LOREHOUSE_DB: path, SESSIONS_DB: `${dir}/sessions.db` }), "purge on start")).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

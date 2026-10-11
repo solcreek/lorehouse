@@ -8,7 +8,8 @@
 //
 //   configuration  every setting loadConfig checks, all problems at once
 //   slack          the bot token, its scopes (against slack/manifest.yaml), the agent's name
-//   channels       each AGENT_CHANNELS id: public, and readable by the bot
+//   channels       each AGENT_CHANNELS id: public, and readable by the bot; what the next
+//                  start would purge for channels no longer listed (read from the database)
 //   anthropic      the API key, and that ANTHROPIC_MODEL exists
 //   github         the App's key and permissions, or the token (code tools only)
 //   sandbox        the direct sandbox host answers (code tools only)
@@ -17,6 +18,7 @@
 //
 // Exit code: 0 when nothing failed (warnings allowed), 1 when something did.
 
+import { Database } from "bun:sqlite";
 import { accessSync, constants, existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createHmac } from "node:crypto";
@@ -24,6 +26,7 @@ import manifest from "../slack/manifest.yaml";
 import { ConfigError, isLoopbackUrl as isLoopback, loadConfig, type Config } from "./config";
 import { appJwt } from "./github-auth";
 import { agentIdentity, type AgentIdentity } from "./identity";
+import { pendingPurge, type ChannelPurge } from "./purge";
 import { loadEnv, readSettings } from "./settings";
 import { configToken, slackCall, urlMismatch, type ManagedManifest } from "./setup";
 
@@ -130,7 +133,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
 
   // ── channels ──
   if (!config.agent.channels.size) {
-    add("channels", "AGENT_CHANNELS", "warn", "empty: the agent answers no mentions and learns nothing; set it to the public channel ids it may work in");
+    add("channels", "AGENT_CHANNELS", "warn", "empty: the agent works nowhere (no mentions, follow-ups or reactions) and learns nothing, and each start purges everything it learned from Slack; set it to the public channel ids it may work in");
   } else {
     for (const channel of config.agent.channels) {
       // Public channel ids start with C; G is a private channel or group DM, D a DM.
@@ -149,6 +152,17 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       else if (h.error === "channel_not_found") add("channels", channel, "fail", "no such public channel in this workspace (or it's private)");
       else add("channels", channel, "fail", `conversations.history: ${h.error}`);
     }
+  }
+  // What the next start would purge for channels no longer listed (purge.ts): counted
+  // from the database, read-only, so it can be put back on the list before it happens.
+  const purge = pendingPurgeIn(config.db.lorehouse, config.agent.channels);
+  if (typeof purge === "string") add("channels", "purge on start", "info", purge);
+  else if (purge.length) {
+    const docs = (k: number) => `${k} document${k === 1 ? "" : "s"}`;
+    const total = purge.reduce((sum, p) => sum + p.documents, 0);
+    add("channels", "purge on start", "warn",
+      `the next start removes ${docs(total)} learned from channels no longer in AGENT_CHANNELS, with the threads the agent joined there and their usage: ` +
+      purge.map((p) => `${p.channel} (${docs(p.documents)})`).join(", ") + ". Add a channel back to keep what it holds");
   }
 
   // ── anthropic ──
@@ -329,6 +343,21 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     else add("deployment", "runners", "ok", online.map((r) => `${r.runner} (${r.transport}, ${r.running}/${r.capacity})`).join(", "));
   }
   return checks;
+}
+
+// The purge a start would make on the database at `path`, opened read-only; nothing for
+// a database that doesn't exist yet or lives in memory, and why not, when it can't be read.
+function pendingPurgeIn(path: string, listed: ReadonlySet<string>): ChannelPurge[] | string {
+  if (path === ":memory:" || !existsSync(path)) return [];
+  let db: Database | undefined;
+  try {
+    db = new Database(path, { readonly: true });
+    return pendingPurge(db, listed);
+  } catch (e) {
+    return `not checked: couldn't read ${path} (${e instanceof Error ? e.message : e})`;
+  } finally {
+    db?.close();
+  }
 }
 
 type RunningStatus = {
