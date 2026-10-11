@@ -1,16 +1,24 @@
 name: ci
 
+# Every action is pinned to a full commit SHA, with its version in a comment: a moved
+# tag or a compromised branch upstream can't change what runs here.
 on:
   push:
     branches: [main]
   pull_request:
 
+# Read-only unless a job says otherwise; only the image job writes (packages).
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run test
@@ -23,8 +31,10 @@ jobs:
   sandbox-guest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: sandbox/guest/go.mod
       - run: go vet ./...
@@ -40,7 +50,9 @@ jobs:
       run:
         working-directory: sandbox/host
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release
@@ -55,8 +67,10 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix flake check -L
       - run: nix build .#image
       - name: the image answers /healthz
@@ -77,8 +91,10 @@ jobs:
       run:
         working-directory: website
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run build
@@ -90,7 +106,7 @@ jobs:
     needs: [check, nix, sandbox-guest, sandbox-host]
     permissions:
       contents: read
-      packages: write
+      packages: write # push ghcr.io/<repo> tags
     uses: ./.github/workflows/image.yml
     with:
       tags: main sha-${{ github.sha }}
@@ -102,13 +118,20 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'solcreek/lorehouse'
     needs: [image]
     runs-on: ubuntu-latest
+    # FLY_API_TOKEN is to move into this environment, restricted to deploys from main.
+    # Until #59 does both, the environment has no rules and the token is a repository
+    # secret any job could reference; only the job's `if` keeps it to main.
+    environment: production
     concurrency:
       group: deploy
       cancel-in-progress: false
-    # This job holds FLY_API_TOKEN, so every action in it is pinned to a full commit
-    # SHA: a moved tag or a compromised branch can't run here. Update deliberately.
+    # This job holds FLY_API_TOKEN. Like every action in this repository's workflows,
+    # its actions are pinned to a full commit SHA: a moved tag or a compromised branch
+    # can't run here. Update deliberately.
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
       # A run that finishes after a newer merge must not roll production back to it: deploy
       # only while this commit is still main's head, as image.yml does for :main. If that

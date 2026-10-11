@@ -9,19 +9,29 @@ on:
   push:
     tags: ["v*"]
 
+# Nothing by default; each job asks for what it writes.
+permissions: {}
+
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # gh release create
     # This job can write releases, so every action in it is pinned to a full commit SHA,
     # as in ci.yml's deploy job.
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         # Only the publish step writes, with GH_TOKEN; install and build never see the token.
         with:
           persist-credentials: false
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        # bun build --compile embeds this bun in the binaries we ship, so take it from
+        # the download, never from the Actions cache. No job writes that cache today
+        # (setup-bun caches only a pinned bun version, and none is pinned), but once one
+        # is, ci.yml's jobs would save it after bun install has run third-party lifecycle
+        # scripts.
+        with:
+          no-cache: true
       - run: bun install --frozen-lockfile
       # A tag push doesn't run ci.yml, so its gates run here before anything is published.
       - run: bun run typecheck
@@ -51,7 +61,7 @@ jobs:
     needs: release
     permissions:
       contents: read
-      packages: write
+      packages: write # push ghcr.io/<repo> tags
     uses: ./.github/workflows/image.yml
     with:
       tags: ${{ github.ref_name }} latest
