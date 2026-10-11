@@ -33,6 +33,9 @@ pub struct Config {
     pub idle: Duration,
     pub vcpus: u32,
     pub mem_mib: u32,
+    /// Where repos are published to and mirrored from: https://github.com. Another base (a
+    /// file:// directory) is for testing the publish path without GitHub.
+    pub github_url: String,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -122,6 +125,7 @@ impl Config {
             idle: Duration::from_secs(idle),
             vcpus: vcpus as u32,
             mem_mib: mem as u32,
+            github_url: var("SANDBOXD_GITHUB_URL").unwrap_or_else(|| "https://github.com".into()),
         })
     }
 }

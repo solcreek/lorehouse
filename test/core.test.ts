@@ -224,9 +224,19 @@ describe("config", () => {
 
   test("direct sandbox mode needs all three settings, or none", () => {
     expect(loadConfig(base).sandbox).toBeUndefined();
-    expect(() => loadConfig({ ...base, SANDBOX_URL: "http://x" })).toThrow(/SANDBOX_TOKEN.*GITHUB_TOKEN/);
+    expect(() => loadConfig({ ...base, SANDBOX_URL: "https://x" })).toThrow(/SANDBOX_TOKEN.*GITHUB_TOKEN/);
     expect(() => loadConfig({ ...base, GITHUB_TOKEN: "z" })).toThrow(/SANDBOX_URL/);
-    expect(loadConfig({ ...base, SANDBOX_URL: "http://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "direct", url: "http://x", token: "y", github: { kind: "token", token: "z" } });
+    expect(loadConfig({ ...base, SANDBOX_URL: "https://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "direct", url: "https://x", token: "y", github: { kind: "token", token: "z" } });
+  });
+
+  test("direct mode refuses a SANDBOX_URL that isn't https:// or plain http:// to this machine (it carries GitHub tokens)", () => {
+    const direct = (url: string) => loadConfig({ ...base, SANDBOX_URL: url, SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" });
+    for (const url of ["http://sandbox.internal:8080", "http://10.0.0.5", "http://127.0.0.1.example.test", "http://[::2]", "ftp://127.0.0.1", "not a url", "http://[bad"]) {
+      expect(() => direct(url), url).toThrow(/SANDBOX_URL must be https:\/\//);
+    }
+    for (const url of ["https://sandbox.internal", "http://localhost:8080", "http://127.0.0.1:8080", "http://127.9.8.7", "http://[::1]:8080", "http://2130706433/"]) {
+      expect(direct(url).sandbox, url).toMatchObject({ mode: "direct", url });
+    }
   });
 
   test("runner mode: a long SANDBOX_RUNNER_TOKEN plus GITHUB_TOKEN; never together with direct mode", () => {
@@ -234,7 +244,7 @@ describe("config", () => {
     expect(loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "runners", runnerToken: runner, github: { kind: "token", token: "z" } });
     expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner })).toThrow(/GITHUB_TOKEN/);
     expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: "short", GITHUB_TOKEN: "z" })).toThrow(/at least 32 characters/);
-    expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, SANDBOX_URL: "http://x", GITHUB_TOKEN: "z" })).toThrow(/one sandbox mode, not both/);
+    expect(() => loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, SANDBOX_URL: "https://x", GITHUB_TOKEN: "z" })).toThrow(/one sandbox mode, not both/);
   });
 
   test("GitHub App credentials: a numeric id and a PEM key (escaped newlines restored); never with GITHUB_TOKEN; never without a sandbox", () => {
@@ -329,7 +339,7 @@ describe("config", () => {
   });
 
   test("DM_MODE=answer can't be combined with code tools: code work stays public", () => {
-    const sandbox = { SANDBOX_URL: "http://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" };
+    const sandbox = { SANDBOX_URL: "https://x", SANDBOX_TOKEN: "y", GITHUB_TOKEN: "z" };
     expect(() => loadConfig({ ...base, ...sandbox, DM_MODE: "answer" })).toThrow(/DM_MODE=answer/);
     expect(loadConfig({ ...base, ...sandbox, DM_MODE: "redirect" }).sandbox).toBeDefined();
   });
