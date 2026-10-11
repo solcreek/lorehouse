@@ -112,7 +112,8 @@ function childEnv(overrides: Record<string, string>): Record<string, string> {
     "INGEST_BACKFILL_DAYS", "INGEST_REFRESH_DAYS", "INGEST_DEBOUNCE_MS",
     "STATUS_TOKEN", "ADMIN_TOKEN", "USAGE_RECORD_PEOPLE", "LOG_SLACK_EVENTS",
     "SANDBOX_RUNNER_TOKEN", "SANDBOX_URL", "SANDBOX_TOKEN",
-    "GITHUB_TOKEN", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_TOKEN", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_API_URL",
+    "LOREHOUSE_PUBLIC_URL", "LOREHOUSE_TUNNEL",
     "PORT",
   ]) env[key] = "";
   return { ...env, ...overrides };

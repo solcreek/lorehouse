@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,8 +15,12 @@ const { appEnv } = (await import(CONTROL)) as { appEnv: (dir: string, appPort: n
 // credentials) for every variable not already set. So a `.env` naming another env file or
 // settings file must not reach a real workspace's settings.
 describe("verify-lorehouse launches the app isolated from installed settings", () => {
-  test("a LOREHOUSE_ENV_FILE or LOREHOUSE_SETTINGS from the working directory's .env is never read", () => {
-    const root = mkdtempSync(join(tmpdir(), "lorehouse-verify-isolation-"));
+  const made: string[] = [];
+  const tmp = () => (made.push(mkdtempSync(join(tmpdir(), "lorehouse-verify-isolation-"))), made.at(-1)!);
+  afterAll(() => made.forEach((d) => rmSync(d, { recursive: true, force: true })));
+
+  test("nothing from the working directory's .env is read, nor an env file or settings.json it names", () => {
+    const root = tmp();
     const run = join(root, "run");
     const cwd = join(root, "checkout");
     mkdirSync(run);
@@ -25,7 +29,8 @@ describe("verify-lorehouse launches the app isolated from installed settings", (
     const fakeSettings = join(root, "installed-settings.json");
     writeFileSync(fakeEnv, "GITHUB_TOKEN=leaked-from-env-file\nUSAGE_RECORD_PEOPLE=leaked-from-env-file\n");
     writeFileSync(fakeSettings, JSON.stringify({ env: { SANDBOX_URL: "http://leaked-from-settings" } }));
-    writeFileSync(join(cwd, ".env"), `LOREHOUSE_ENV_FILE=${fakeEnv}\nLOREHOUSE_SETTINGS=${fakeSettings}\n`);
+    // Lorehouse keys the harness doesn't set itself would come from that .env too.
+    writeFileSync(join(cwd, ".env"), `LOREHOUSE_ENV_FILE=${fakeEnv}\nLOREHOUSE_SETTINGS=${fakeSettings}\nLOREHOUSE_PUBLIC_URL=https://leaked.example\nGITHUB_API_URL=https://leaked.example\n`);
 
     // What the app does first (src/server.ts: loadEnv()), in a fresh Bun with the env the
     // harness passes and a working directory holding that .env.
@@ -42,7 +47,7 @@ describe("verify-lorehouse launches the app isolated from installed settings", (
   test("the env file is a path in the run directory that doesn't exist, never the install's default", () => {
     // Left unset or blank, it falls back to /etc/lorehouse/lorehouse.env: a real install's
     // credentials on any machine that has one. (A test can't plant a file there.)
-    const run = mkdtempSync(join(tmpdir(), "lorehouse-verify-isolation-"));
+    const run = tmp();
     const env = appEnv(run, 1, 2);
     expect(env.LOREHOUSE_ENV_FILE).toBe(join(run, "lorehouse.env"));
     expect(existsSync(env.LOREHOUSE_ENV_FILE!)).toBe(false);
