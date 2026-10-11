@@ -83,11 +83,14 @@ quotable. DMs are never indexed.
 **Policy.** `src/policy.ts` restricts every channel event to channels in
 `AGENT_CHANNELS` (empty means nowhere) and refuses private channels and group DMs where the
 payload says so; mentions and reactions carry no channel type, and ingest reads every listed
-channel, so the list must hold only public channel ids. On start, `src/purge.ts` removes what was kept for
-a channel no longer listed from `LOREHOUSE_DB` (its documents, joined threads, cursor, asks
-and searches; not June's sessions); `src/threads.ts`
-decides follow-ups (reply in a joined thread without a new mention, but not when it
-mentions someone else/@channel); `src/dm.ts` handles `DM_MODE`. People are named as plain
+channel, so the list must hold only public channels, and that is enforced: on start,
+`src/channel-check.ts` looks each one up (`conversations.info`) and refuses to start while
+any is private, archived or can't be looked up (fail closed), and ingest looks again
+hourly, closing one that turned private (no reads, its events refused) until the next
+start. On start, `src/purge.ts` removes what was kept for a channel no longer listed from
+`LOREHOUSE_DB` (its documents, joined threads, cursor, asks and searches; not June's
+sessions); `src/threads.ts` decides follow-ups (reply in a joined thread without a new
+mention, but not when it mentions someone else/@channel); `src/dm.ts` handles `DM_MODE`. People are named as plain
 text, never @-mentioned (`src/tools/slack-names.ts`), and that is enforced in code, not left
 to the prompt: everything posted to Slack goes through `src/slack-guard.ts`, which rewrites
 `<@U…>`, `<!channel>`, `<!here>`, `<!everyone>` and `<!subteam^…>` as plain names, and

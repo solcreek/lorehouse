@@ -69,8 +69,8 @@ Installing the App on a repository is the authorization to read it. There is no
 further approval step for reading:
 
 - **Who**: anyone who can ask the agent, which is anyone in a channel listed in
-  `AGENT_CHANNELS`. List only public channels there: a private one listed would be
-  answered too. An empty list means nowhere: no mention or follow-up is answered in any
+  `AGENT_CHANNELS`, which holds only public channels: the app refuses to start with a
+  private one listed. An empty list means nowhere: no mention or follow-up is answered in any
   channel, and the next start forgets the threads it was asked into. With the code tools on,
   a DM never reaches the model (`DM_MODE=answer` and a sandbox are refused together).
 - **What**: the whole contents of any repository the App is installed on, **private
