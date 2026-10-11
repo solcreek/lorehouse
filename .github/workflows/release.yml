@@ -20,7 +20,7 @@ jobs:
     # This job can write releases, so every action in it is pinned to a full commit SHA,
     # as in ci.yml's deploy job.
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # Only the publish step writes, with GH_TOKEN; install and build never see the token.
         with:
           persist-credentials: false
