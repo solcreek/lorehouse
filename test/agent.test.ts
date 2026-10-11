@@ -310,10 +310,22 @@ describe("open_pull_request — the approval gate", () => {
     expect(card).toContain(":warning: Changes");
   });
 
-  test("the card flags a .github/ path that git quoted", () => {
-    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: ['".github/workflows/\\303\\251.yml"'], patch: "", patchTruncated: false };
+  test("the card flags a .github/ path with unusual characters, kept on one line", () => {
+    // The host lists paths unquoted (-z), so one can hold anything but NUL.
+    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: [".github/workflows/\u00e9\n\t.yml"], patch: "", patchTruncated: false };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
-    expect(card).toContain(":warning: Changes");
+    expect(card).toContain(":warning: Changes `.github/workflows/\u00e9\ufffd\ufffd.yml`:");
+  });
+
+  test("the card flags a rename away from .github/ or CODEOWNERS (the host lists both paths)", () => {
+    // What the host lists for `git mv .github/workflows/ci.yml old/ci.yml` and
+    // `git mv docs/CODEOWNERS old/CODEOWNERS`: each source and each destination.
+    const staged = {
+      stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed, 0 insertions(+), 0 deletions(-)\n", authors: [],
+      files: [".github/workflows/ci.yml", "docs/CODEOWNERS", "old/CODEOWNERS", "old/ci.yml"], patch: "", patchTruncated: false,
+    };
+    const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Tidy", staged });
+    expect(card).toContain(":warning: Changes `.github/workflows/ci.yml`, `docs/CODEOWNERS`:");
   });
 
   test("the card flags CODEOWNERS wherever GitHub reads it", () => {

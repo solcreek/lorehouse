@@ -203,9 +203,10 @@ export function parseGithubRemote(url: string): { owner: string; name: string } 
 }
 
 // Paths a reviewer should look at twice: what runs in CI, and who owns what (GitHub reads
-// CODEOWNERS from .github/, the root, or docs/). git quotes a path with unusual characters
-// (".github/\303\251.yml" with the quotes), so a leading quote is allowed.
-const SENSITIVE = /^"?(\.github\/|(docs\/)?CODEOWNERS$)/;
+// CODEOWNERS from .github/, the root, or docs/). Checked against the host's complete list
+// (Staged.files): every changed path, a rename as both its old and new path, none quoted.
+// So moving .github/workflows/ci.yml or docs/CODEOWNERS away is flagged too.
+const SENSITIVE = /^(\.github\/|(docs\/)?CODEOWNERS$)/;
 
 // Text from the sandbox or the model, escaped for Slack mrkdwn: & < >, so it can hold no
 // mention, @channel or link. (Formatting such as *bold* in a title still renders.)
@@ -213,7 +214,8 @@ const escapeSlack = (s: string) => s.replaceAll("&", "&amp;").replaceAll("<", "&
 // …and for a code block, every run of backticks broken up so none can close the block.
 const inBlock = (s: string) => escapeSlack(s).replace(/`{3,}/g, (run) => run.split("").join("\u200b"));
 // …and for an inline code span, no backtick to close it.
-const inSpan = (s: string) => escapeSlack(s).replaceAll("`", "\u02cb");
+// A path is unquoted, so it can hold a newline: control characters are shown as U+FFFD.
+const inSpan = (s: string) => escapeSlack(s).replaceAll("`", "\u02cb").replace(/[\u0000-\u001f\u007f]/g, "\ufffd");
 
 // At most n characters, never ending inside an escape.
 const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1).replace(/&[a-z]*$/, "")}…`);
