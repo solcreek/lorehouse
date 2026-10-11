@@ -63,6 +63,14 @@ describe("mentionStream", () => {
     expect(await run(["a <!subteam^S1|@cr", "ew> b <!he", "re>"])).toBe("a @crew b @here");
   });
 
+  test("a < sent just before a held mention can't join what the mention becomes", async () => {
+    for (const pieces of [["<<@U", "2>>"], ["<<<@U", "2>>"], ["<<!subteam^S1|@U", "2>>"], ["a <<!here", "> b"]]) {
+      const out = await run(pieces);
+      expect(out).not.toMatch(LIVE);
+      expect(neutralizeMentions(out)).toBe(out); // nothing left for Slack to read as a mention
+    }
+  });
+
   test("text goes out as it comes, holding back only an open <", async () => {
     const s = mentionStream((t) => t);
     expect(await s.push("plain words ")).toBe("plain words ");

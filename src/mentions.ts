@@ -57,8 +57,12 @@ export function mentionStream(guard: (text: string) => string | Promise<string>)
       const s = held + piece;
       const open = s.lastIndexOf("<");
       if (open >= 0 && !s.includes(">", open) && s.length - open <= MAX_HELD) {
-        held = s.slice(open);
-        return s.slice(0, open) ? guard(s.slice(0, open)) : "";
+        // The "<"s right before it are held too: sent alone, one would join whatever the
+        // held text becomes ("<" then "@U2>" from "<@U2>>" is "<@U2>" in Slack).
+        let start = open;
+        while (start > 0 && s[start - 1] === "<") start--;
+        held = s.slice(start);
+        return s.slice(0, start) ? guard(s.slice(0, start)) : "";
       }
       held = "";
       return s ? guard(s) : "";
