@@ -164,6 +164,15 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         opts.approvedBy?.(ctx, inputId); // the Deny's grant is used up: a later card with this id is someone else's
         return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
       }
+      // Who clicked, taken once, before anything is pushed. Under not-requester an Approve
+      // with no grant from this install's gate was never checked against the rule: a card
+      // parked before PR_APPROVER existed names the requester as its only answerer, and June
+      // resumes such a card without asking authorizeAnswer. A grant lost to a restart between
+      // the click and here is refused the same way: nothing is pushed, and it can be asked again.
+      const approverId = opts.approvedBy?.(ctx, inputId);
+      if (opts.approver === "not-requester" && ctx.event && !approverId) {
+        return { status: "refused", note: "This approval wasn't checked against PR_APPROVER=not-requester (the card predates the rule, or the app restarted), so nothing was pushed. Ask for the pull request again." };
+      }
 
       // ── after approval: the host pushes the staged commit, then open (or find) the PR ─
       let token: string;
@@ -198,7 +207,6 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         const [pr] = (await existing.json()) as { html_url: string; number: number }[];
         if (pr) return { status: "exists", url: pr.html_url, number: pr.number };
       }
-      const approverId = opts.approvedBy?.(ctx, inputId);
       const approver = approverId ? await opts.approverName?.(approverId).catch(() => undefined) : undefined;
       const body = `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack, approved there${approver ? ` by ${approver}` : ""}.`;
       const res = await gh("/pulls", {

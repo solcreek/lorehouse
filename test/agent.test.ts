@@ -533,6 +533,19 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(t.prBody()).toContain("approved there by Ada Park.");
   });
 
+  test("not-requester: an Approve the gate never granted (a card parked before the rule, or a grant lost to a restart) pushes nothing", async () => {
+    // June resumes a card parked with { user: requester } (the answerers before PR_APPROVER)
+    // without asking authorizeAnswer, so the requester's own click arrives with no grant.
+    const { sb, published } = fakeRepo();
+    const gh = fakeGithub();
+    const gate = approverGate("not-requester");
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, approver: "not-requester", approvedBy: gate.approvedBy });
+    const ctx = { sessionId: "slack:C1:1.1", requestInput: async () => true, event: { source: "slack", user: { id: "U1", attested: true } } } as never;
+    expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "refused" });
+    expect(published.filter((p) => p.op === "push")).toHaveLength(0);
+    expect(gh.reqs).toHaveLength(0);
+  });
+
   test("a Deny uses up its grant: the same card asked for again never names the person who denied it", async () => {
     const t = slackTurn("anyone");
     const inputId = ((await t.s.result(t.t1)) as { request: { id: string } }).request.id;
