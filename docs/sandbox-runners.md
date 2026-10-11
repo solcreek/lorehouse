@@ -179,15 +179,16 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
      old and its new path (no rename detection), and no path is quoted or escaped. What
      the approval card warns about is decided on this list.
   5. Only once all of that has succeeded, the host writes a stage record (sandbox, repo,
-     base, branch, commit, time) under an unguessable id, and returns the id. A stage that
-     fails, or is cut off by its deadline or cancelled, writes none.
+     base, branch, commit, time) under an unguessable id, synced to disk, and returns the
+     id. A stage that fails, or is cut off by its deadline or cancelled, writes none.
 - **push**, after approval: the host pushes the commit a stage record names to the branch
   it names, and nothing else, to `refs/heads/<branch>`. It never forces and never deletes.
   The record is the only authorization (a `refs/stage/` ref alone authorizes nothing):
   - The request must restate the record's sandbox, repo, commit and branch.
-  - A record is single-use: push removes it before checking or pushing anything, so it
-    covers one attempt whatever its outcome. A failed push needs a new stage; Lorehouse
-    stages on every run of `open_pull_request`, so a replay stages again.
+  - A record is single-use: push removes it (synced, so it can't come back after a crash)
+    before checking or pushing anything, so it covers one attempt whatever its outcome. A
+    failed push needs a new stage; Lorehouse stages on every run of `open_pull_request`,
+    so a replay stages again.
   - A record expires 24 h after it was made. Expired records and refs, and refs with no
     record, are dropped by the host's housekeeping.
 - **Every git command** on the host runs with no user or system config, no prompts, no

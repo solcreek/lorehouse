@@ -235,6 +235,11 @@ impl Drop for TempFile {
     }
 }
 
+/// Sync a directory, so the entries just created, renamed or removed in it survive a crash.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -403,17 +408,28 @@ impl Publisher {
         Ok(staged)
     }
 
-    /// Write a record atomically: a temporary file, synced, renamed into place. Synchronous
+    /// Write a record atomically and durably: a temporary file, synced, renamed into place,
+    /// and the directory synced, so a stage that was answered survives a crash. Synchronous
     /// on purpose (see stage_and_record).
     fn write_record(&self, record: &StageRecord) -> std::io::Result<()> {
         let dir = self.records();
-        std::fs::create_dir_all(&dir)?;
+        if !dir.is_dir() {
+            std::fs::create_dir_all(&dir)?;
+            sync_dir(&self.mirrors)?;
+        }
         let tmp = TempFile(dir.join(format!(".{}.tmp", record.id)));
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp.0)?;
         f.write_all(&serde_json::to_vec(record)?)?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp.0, self.record_path(&record.id))
+        let path = self.record_path(&record.id);
+        std::fs::rename(&tmp.0, &path)?;
+        if let Err(e) = sync_dir(&dir) {
+            // Not known to be durable: not answered, so not left behind either.
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Take a stage's record for one push: read it, then remove it, before anything else is
@@ -427,7 +443,8 @@ impl Publisher {
             }
             Err(e) => return Err((500, format!("stage {id} can't be read ({e}); nothing was pushed, stage again"))),
         };
-        if let Err(e) = std::fs::remove_file(&path) {
+        // Removed, and the removal synced: a consumed record can't come back after a crash.
+        if let Err(e) = std::fs::remove_file(&path).and_then(|()| sync_dir(&self.records())) {
             return Err((500, format!("stage {id} can't be consumed ({e}); nothing was pushed")));
         }
         match serde_json::from_slice::<StageRecord>(&bytes) {
