@@ -175,14 +175,19 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       // The rule, at the moment of use, against who actually answered. A card with no record
       // was answered without authorizeAnswer: one parked before this deploy, whose only
       // answerer June keeps as the requester. Under not-requester that fails closed.
+      // A turn with no Slack event has no turn to key a record by: under not-requester, which
+      // can't be met without knowing who answered, it is refused too.
+      const rule = opts.approver ?? "requester";
+      const refused = () => done({ status: "refused", note: `This approval can't be shown to meet PR_APPROVER=${rule} (the card predates the rule, the rule changed since the click, or this approval was already used up), so nothing was pushed. Ask for the pull request again.` });
       let approverId: string | undefined;
-      if (key && opts.approvals) {
-        const verdict = opts.approvals.decide(key, opts.approver ?? "requester", requesterOf(ctx));
-        if (!verdict.ok) {
-          const rule = opts.approver ?? "requester";
-          return done({ status: "refused", note: `This approval can't be shown to meet PR_APPROVER=${rule} (the card predates the rule, or the rule changed since the click), so nothing was pushed. Ask for the pull request again.` });
+      if (opts.approvals) {
+        if (!key) {
+          if (rule === "not-requester") return refused();
+        } else {
+          const verdict = opts.approvals.decide(key, rule, requesterOf(ctx));
+          if (!verdict.ok) return refused();
+          approverId = verdict.approver;
         }
-        approverId = verdict.approver;
       }
 
       // ── after approval: the host pushes the staged commit, then open (or find) the PR ─

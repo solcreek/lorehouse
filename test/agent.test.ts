@@ -618,6 +618,86 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(await run({ pushError: "push: 409" })).toMatchObject({ result: { error: expect.stringContaining("push failed") }, left: 1 });
   });
 
+  test("a record is for its own turn: the same card in a later turn finds none, and under not-requester is refused", async () => {
+    const approvals = approvalStore(openKnowledge(":memory:"));
+    const { sb, published } = fakeRepo();
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f, approver: "not-requester", approvals });
+    let card = "";
+    const inTurn = (ts: string, record: boolean) => ({
+      sessionId: "s",
+      event: { source: "slack", ts, user: { id: "U1", attested: true } },
+      requestInput: async (r: { id: string }) => {
+        card = r.id;
+        if (record) approvals.record({ session: "s", turn: ts, card: r.id }, "U2");
+        return true;
+      },
+    }) as never;
+    // An earlier turn's record for this very card, left behind (say, by a restart).
+    await tool.run({ branch: "scout/x", title: "x" }, { ...(inTurn("1.0", false) as object), requestInput: async (r: { id: string }) => ((card = r.id), false) } as never);
+    approvals.record({ session: "s", turn: "1.0", card }, "U2");
+    expect(await tool.run({ branch: "scout/x", title: "x" }, inTurn("1.1", false))).toMatchObject({ status: "refused" });
+    expect(published.filter((p) => p.op === "push")).toHaveLength(0);
+    // In its own turn the same record is what lets it through.
+    expect(await tool.run({ branch: "scout/x", title: "x" }, inTurn("1.2", true))).toMatchObject({ status: "opened" });
+  });
+
+  test("not-requester: a turn with no Slack event (nothing to key a record by) is refused", async () => {
+    const { sb, published } = fakeRepo();
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: fakeGithub().f, approver: "not-requester", approvals: approvalStore(openKnowledge(":memory:")) });
+    expect(await tool.run({ branch: "scout/x", title: "x" }, { sessionId: "s", requestInput: async () => true } as never)).toMatchObject({ status: "refused" });
+    expect(published.filter((p) => p.op === "push")).toHaveLength(0);
+  });
+
+  // The gate against a session it watches: what it records, and that it stops watching.
+  describe("the gate's watch on the turn", () => {
+    const watched = () => {
+      const listeners = new Set<(e: TurnEvent) => void>();
+      const session = {
+        pending: () => ({ turnId: "t1" }),
+        observe: (cb: (e: TurnEvent) => void) => (listeners.add(cb), () => void listeners.delete(cb)),
+      };
+      const store = approvalStore(openKnowledge(":memory:"));
+      const gate = approverGate("anyone", store, () => session);
+      const click = (by: string) => gate({ policy: APPROVER_POLICY, scope: { requester: "U1", turn: "1.1" }, by, agent: "a", session: "s", request: { id: "pr:x", prompt: "" } });
+      const emit = (e: object) => [...listeners].forEach((cb) => cb({ turnId: "t1", ...e } as TurnEvent));
+      const key = { session: "s", turn: "1.1", card: "pr:x" };
+      return { listeners, store, click, emit, key };
+    };
+    test("two clicks let through at once: the one June applied is recorded, not the last one asked", () => {
+      const w = watched();
+      expect(w.click("U2")).toBe(true);
+      expect(w.click("U3")).toBe(true); // asked too, but its resume loses
+      expect(w.store.count()).toBe(0); // nothing until June applies an answer
+      w.emit({ type: "input.resolved", inputId: "pr:x", outcome: "answered", by: "U2" });
+      expect(w.store.decide(w.key, "anyone", "U1").approver).toBe("U2");
+    });
+    for (const end of ["turn.completed", "turn.failed", "turn.cancelled"]) {
+      test(`${end}: the turn's records go, and nothing is left watching`, () => {
+        const w = watched();
+        w.click("U2");
+        w.emit({ type: "input.resolved", inputId: "pr:x", outcome: "answered", by: "U2" });
+        w.emit({ type: end, text: "", error: { message: "x" } });
+        expect(w.store.count()).toBe(0);
+        expect(w.listeners.size).toBe(0);
+      });
+    }
+    test("parked again on another card: this card's record goes, and nothing is left watching", () => {
+      const w = watched();
+      w.click("U2");
+      w.emit({ type: "input.resolved", inputId: "pr:x", outcome: "answered", by: "U2" });
+      w.emit({ type: "input.requested", request: { id: "pr:y", prompt: "" } });
+      expect(w.store.count()).toBe(0);
+      expect(w.listeners.size).toBe(0);
+    });
+    test("a park retired by a reset: nothing recorded, nothing left watching", () => {
+      const w = watched();
+      w.click("U2");
+      w.emit({ type: "input.resolved", inputId: "pr:x", outcome: "retired" });
+      expect(w.store.count()).toBe(0);
+      expect(w.listeners.size).toBe(0);
+    });
+  });
+
   describe("no approval outlives its card", () => {
     const outcome = async (o: Thread, by = "U2", answer = true) => {
       const t = thread({ rule: "anyone", ...o });

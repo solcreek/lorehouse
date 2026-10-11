@@ -94,23 +94,39 @@ export type ParkedSession = {
 };
 
 // The install's rule as June's authorizeAnswer hook (src/app.ts wires it). A click it lets
-// through is recorded as the card's approver in that turn, and the record is deleted when the
-// turn ends, however it ends.
+// through may still lose the race to another one (June asks this, then resumes), so what is
+// recorded is who June says answered: the `by` of the card's input.resolved, which June emits
+// when it applies the answer, before the turn runs on. The record then lasts until the turn
+// ends, however it ends, or the turn parks again on another card. Without a session to watch
+// (a test), the click itself is recorded.
 export function approverGate(rule: PrApprover, store: ApprovalStore, sessionOf: (session: string) => ParkedSession | undefined): AuthorizeAnswer {
   return ({ policy, scope, by, session, request }) => {
     if (policy !== APPROVER_POLICY || !mayApprove(rule, by, scope)) return false;
     const turn = (scope as Partial<CardScope> | undefined)?.turn;
     if (typeof turn !== "string" || turn === "") return false; // every card this version posts names its turn
-    store.record({ session, turn, card: request.id }, by!);
+    const key = { session, turn, card: request.id };
     const s = sessionOf(session);
     const turnId = s?.pending()?.turnId;
-    if (s && turnId) {
-      const off = s.observe((e) => {
-        if (e.type !== "turn.completed" && e.type !== "turn.failed" && e.type !== "turn.cancelled") return;
+    if (!s || !turnId) {
+      store.record(key, by!);
+      return true;
+    }
+    let answered = false;
+    const off = s.observe((e) => {
+      if (e.type === "input.resolved" && e.inputId === request.id && !answered) {
+        if (e.outcome !== "answered" || !e.by) return off(); // retired by a reset: nothing to record
+        answered = true;
+        store.record(key, e.by);
+      } else if (answered && e.type === "input.requested") {
+        // Parked again, on another card: this one is done with (a retry of it after this finds
+        // no record, which under not-requester is refused), and nothing is left watching.
+        off();
+        store.forget(key);
+      } else if (e.type === "turn.completed" || e.type === "turn.failed" || e.type === "turn.cancelled") {
         off();
         store.forgetTurn(session, turn);
-      }, { turnId });
-    }
+      }
+    }, { turnId });
     return true;
   };
 }
