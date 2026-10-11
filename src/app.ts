@@ -22,6 +22,8 @@ import type { Server } from "bun";
 import type { RunnerSocketData } from "./runners/routes";
 import { searchKnowledgeTool } from "./tools/search-knowledge";
 import { withNamedPeople } from "./tools/slack-names";
+import { neutralizeMentions } from "./mentions";
+import { withoutMentions } from "./slack-guard";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { adminRoutes } from "./admin";
@@ -150,7 +152,11 @@ export async function createApp(config: Config) {
     const f = feedbackOf(e, botUserId);
     if (f) tally(() => recordFeedback(knowledge, { channel: f.channel, messageTs: f.messageTs, rater: rater(f.user), rating: f.rating }, e.kind === "reaction_added"));
   };
-  const slack: Channel = withNamedPeople(slackChannel({
+  // People's names, as knowledge names them (from its cache; none before ingest is up).
+  const names = async (ids: string[]) => (await ingester?.names(ids)) ?? new Map();
+  // Everything posted to Slack goes through withoutMentions: no reply, timeline note,
+  // Approve card or notice can @-mention anyone, whatever the model writes (ADR 0002 §6).
+  const slack: Channel = withoutMentions(withNamedPeople(slackChannel({
     signingSecret: config.slack.signingSecret,
     botToken: config.slack.botToken,
     apiUrl: config.slack.apiUrl,
@@ -198,9 +204,10 @@ export async function createApp(config: Config) {
     // What the model says before a tool call ("Let me search…") goes to the task
     // timeline, not into the answer; only the final step's text is the reply.
     intermediateText: "status",
-    tasks: (call) => TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`,
+    // The name is the model's to choose: guarded like everything else it writes.
+    tasks: (call) => neutralizeMentions(TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`),
     onError: (err) => console.error("slack:", err),
-  }), async (ids) => (await ingester?.names(ids)) ?? new Map(), (c) => config.agent.channels.has(c));
+  }), names, (c) => config.agent.channels.has(c)), names);
 
   const agent = defineAgent({
     name: AGENT_ID,

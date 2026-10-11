@@ -446,6 +446,24 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    // Someone typed Slack's mention syntax as text (Slack delivers it escaped), so the
+    // knowledge holds it; a model quoting the source must still ping nobody.
+    name: "never @-mentions anyone: a quoted source's <!channel>, <!here>, <@U…> and <!subteam^…> reach Slack as plain names",
+    run: async () => {
+      const ts = await liveMessage(ALLOWED, "channel", "The quokka launch moved to May &lt;!channel&gt; &lt;!here|here&gt;, ask &lt;@U2&gt; or &lt;!subteam^S1|@launch-crew&gt;");
+      await Bun.sleep(1000); // > INGEST_DEBOUNCE_MS
+      const a = await ask("[quote] when is the quokka launch");
+      if (a.cite !== `slack:${ALLOWED}:${ts}`) return `cited ${a.cite}, want slack:${ALLOWED}:${ts}`;
+      if (!a.text.includes("[quote:")) return "the reply didn't quote its source";
+      const live = a.text.match(/<[@!][^>]*>/g);
+      if (live) return `the reply carries live mention markup: ${live.join(" ")}`;
+      // Each name keeps its "@", with an invisible word joiner (U+2060) after it so no
+      // Slack format can read it as a mention again.
+      for (const name of ["channel", "here", "Wendy", "launch-crew"]) if (!a.text.includes(`@\u2060${name}`)) return `the reply lost the name @${name}: ${a.text.slice(0, 300)}`;
+      return null;
+    },
+  },
+  {
     name: "does not learn from questions put to the agent",
     run: async () => {
       // Slack delivers a mention as a `message` event too; it is a question, not knowledge.

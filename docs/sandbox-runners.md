@@ -65,7 +65,8 @@ sandboxes on the runner with the most free room.
   still works. A list that is present must be an array of strings, or the whole status
   is refused.
 
-A **job** is one request to the sandbox's guest agent, or the removal of a sandbox:
+A **job** is one request to the sandbox's guest agent, the removal of a sandbox, or a
+publishing step (`stage`, `push`; see [Publishing](#publishing)):
 
 ```json
 { "id": "j_…", "sandbox": "slack_C1_1790000001.000100", "op": "guest",
@@ -152,3 +153,57 @@ lost because a connection dropped while the job ran.
   answered with a 500 that says it may have partly run, rather than left to its deadline
   or retried blindly. A job that can't be recorded first isn't run at all.
 - **A runner that disconnects** has 60 s to come back before its pending jobs fail.
+
+## Publishing
+
+The agent's commits reach GitHub without a write token ever entering the sandbox. The
+model controls everything inside it, the `git` binary included, so the host does the
+verifying and the pushing. Two job ops do it, `stage` and `push`. A job carries the request
+as base64 JSON in `bodyBase64`, and its result is JSON. In serve mode, the same requests
+are `POST /v1/sandboxes/{id}/stage` and `/push`, with the JSON as the plain request body:
+
+```json
+stage → { "owner": "acme", "name": "widgets", "base": "main", "branch": "scout/x", "token": "<read token>" }
+     ← { "stage": "<id>", "sha": "…", "baseSha": "…", "commits": 1, "stat": "…", "authors": ["bot <…>|bot <…>"],
+         "files": ["…"], "patch": "…", "patchTruncated": false, "diffSha256": "…" }
+push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "branch": "scout/x", "token": "<write token>" }
+     ← { "sha": "…", "branch": "scout/x" }
+```
+
+- **stage**, before a human approves:
+  1. The host refreshes its bare mirror of the repo from GitHub (`<SANDBOXD_STATE>/.mirrors/`).
+  2. It has the VM bundle what the checkout has that `origin` doesn't, and reads the bundle out in 12 MiB parts, at most 96 MiB in all.
+  3. It fetches the bundle into `refs/stage/<id>`, with fsck on, no tags and only that one ref. A forged bundle, a `.git` tree entry, or a tag or replace ref riding along never reaches the mirror.
+  4. The facts the approval shows (diff, files, authors) are computed in the mirror, never taken from the VM.
+     `files` is every path the commits change, complete: a rename is listed as both its
+     old and its new path (no rename detection), and no path is quoted or escaped. What
+     the approval card warns about is decided on this list. `patch` is an excerpt (64 KiB at
+     most); `diffSha256` is the SHA-256 of the complete diff, which an approval binds. It is
+     taken with whole blob ids (`--full-index`, which bind binary changes too) and pinned
+     diff options, so it depends on the two commits, not on the mirror or git's defaults.
+  5. Only once all of that has succeeded, the host writes a stage record (sandbox, repo,
+     base, branch, commit, time) under an unguessable id, synced to disk, and returns the
+     id. A stage that fails, or is cut off by its deadline or cancelled, writes none.
+- **push**, after approval: the host pushes the commit a stage record names to the branch
+  it names, and nothing else, to `refs/heads/<branch>`. It never forces and never deletes.
+  The record is the only authorization (a `refs/stage/` ref alone authorizes nothing):
+  - The request must restate the record's sandbox, repo, commit and branch.
+  - A record is single-use: push removes it (synced, so it can't come back after a crash)
+    before checking or pushing anything, so it covers one attempt whatever its outcome. A
+    failed push needs a new stage; Lorehouse stages on every run of `open_pull_request`,
+    so a replay stages again.
+  - A record expires 24 h after it was made. Expired records and refs, and refs with no
+    record, are dropped by the host's housekeeping.
+- **Every git command** on the host runs with no user or system config, no prompts, no
+  replace objects and no hooks. A token travels as an HTTP header in the command's
+  environment, never in argv. Tokens are in jobs only, never logged or recorded.
+- **Failures** come back as statuses with a reason:
+  - 409: nothing new to publish, or a branch that has moved on.
+  - 404: the base isn't on GitHub, or the stage isn't there (never completed, already
+    used, or dropped).
+  - 403: the push doesn't match its stage's record (nothing pushed, the stage is used up).
+  - 410: the stage has expired.
+  - 500: the record can't be read, is malformed, or can't be consumed (nothing pushed).
+  - 422: the bundle was refused.
+  - 413: the commits are too large, or what the approval shows (stat, files, authors) is
+    over 1 MiB each. The host reads only that much of any of it; the patch is cut at 64 KiB.
