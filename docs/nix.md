@@ -29,8 +29,8 @@ On an Intel Mac, work without Nix:
 - **Run everything through `bun`, not `node`/`npx`.** A Mac with both nvm and Homebrew
   Node can have two Node ABIs on the `PATH` (`node` from one, `#!/usr/bin/env node` from
   the other), and a test run under the wrong one fails with `NODE_MODULE_VERSION`
-  mismatches that look like regressions. The Bun-native scripts sidestep that; `tsc` is
-  plain JavaScript with no native modules, so either Node runs it the same.
+  mismatches that look like regressions. The Bun-native scripts sidestep that; `tsc` (TypeScript 7)
+  only launches TypeScript's own executable, not a Node addon, so either Node runs it the same.
 - **The sandbox** (`sandbox/guest`, `sandbox/host`) needs Linux (KVM, vsock) to run on
   any Mac; work on it on a Linux machine, where the flake applies.
 - **The container image**: the [`Dockerfile`](../Dockerfile), or `nix build .#image` on
