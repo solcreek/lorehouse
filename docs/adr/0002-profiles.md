@@ -133,13 +133,13 @@ These are Lorehouse's position, not settings:
   from public knowledge and without code tools. A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread. The Approve in
   Slack authorizes opening the pull request, not merging it: it opens as a draft, and the
-  merge is gated on GitHub, by its review and branch protection (#60). By default anyone
-  in the thread may approve, the requester included: the person whose message got the
-  agent to post the card. (Before #67, June's default let only the requester answer.) An
-  install can require someone else (`PR_APPROVER=not-requester`, #67); the requester's
-  clicks are then refused, Deny included, because June's `authorizeAnswer` decides who
-  may answer, not which answer. The rule is the install's, read as each click arrives; a
-  profile can't loosen it.
+  merge is gated on GitHub, by its review and branch protection (#60). By default only the
+  requester may approve: the person whose message got the agent to post the card. An
+  install may widen that to anyone in the thread (`PR_APPROVER=anyone`), or require
+  someone else (`PR_APPROVER=not-requester`), #67. Under `not-requester` the requester's
+  clicks are refused, Deny included, because June's `authorizeAnswer` decides who may
+  answer, not which answer; and a refused click gets June's fixed reply, not a reason of
+  ours. The rule is the install's, read as each click arrives; a profile can't loosen it.
 - With a GitHub App, a write token never enters a sandbox. The sandbox host stages the
   commits and, after the approval, pushes exactly the staged commit with the write token
   (`sandbox/host/src/publish.rs`, #31; `src/tools/pull-request.ts`, #32). The
