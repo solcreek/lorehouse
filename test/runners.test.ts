@@ -49,15 +49,17 @@ describe("over WebSocket", () => {
     const hub = hubWith();
     const { sent, link } = wsRunner(hub, "r1");
     const sb = hub.sandbox("s1");
-    const staged = sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", token: "ghs_read" });
+    const staged = sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", branch: "scout/x", token: "ghs_read" });
     expect(sent[0]).toMatchObject({ op: "stage", sandbox: "s1", timeoutMs: STAGE_TIMEOUT_MS });
-    expect(JSON.parse(Buffer.from(sent[0]!.op === "stage" ? sent[0]!.bodyBase64 : "", "base64").toString())).toEqual({ owner: "acme", name: "widgets", base: "main", token: "ghs_read" });
-    const facts = { sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: " x | 1 +", authors: ["bot <b@x>|bot <b@x>"], files: ["x"], patch: "+x", patchTruncated: false };
+    expect(JSON.parse(Buffer.from(sent[0]!.op === "stage" ? sent[0]!.bodyBase64 : "", "base64").toString())).toEqual({ owner: "acme", name: "widgets", base: "main", branch: "scout/x", token: "ghs_read" });
+    const stage = `1790000000-${"c".repeat(32)}`;
+    const facts = { stage, sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: " x | 1 +", authors: ["bot <b@x>|bot <b@x>"], files: ["x"], patch: "+x", patchTruncated: false };
     link.result(ok(sent[0]!, facts));
     expect(await staged).toEqual(facts);
 
-    const pushed = sb.push({ repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "ghs_write" });
-    expect(sent[1]).toMatchObject({ op: "push", timeoutMs: PUSH_TIMEOUT_MS });
+    const pushed = sb.push({ stage, repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "ghs_write" });
+    expect(sent[1]).toMatchObject({ op: "push", sandbox: "s1", timeoutMs: PUSH_TIMEOUT_MS });
+    expect(JSON.parse(Buffer.from(sent[1]!.op === "push" ? sent[1]!.bodyBase64 : "", "base64").toString())).toEqual({ stage, owner: "acme", name: "widgets", sha: "a".repeat(40), branch: "scout/x", token: "ghs_write" });
     link.result({ id: sent[1]!.id, status: 409, error: "push to scout/x: [rejected] (non-fast-forward)" });
     await expect(pushed).rejects.toThrow("push: 409 push to scout/x: [rejected] (non-fast-forward)");
   });

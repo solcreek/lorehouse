@@ -51,10 +51,10 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
       await call(`/file?path=${encodeURIComponent(path)}`, { method: "PUT", body: content });
     },
     async stage(o): Promise<Staged> {
-      return publish("stage", { owner: o.repo.owner, name: o.repo.name, base: o.base, token: o.token }, STAGE_TIMEOUT_MS) as Promise<Staged>;
+      return publish("stage", { owner: o.repo.owner, name: o.repo.name, base: o.base, branch: o.branch, token: o.token }, STAGE_TIMEOUT_MS) as Promise<Staged>;
     },
     async push(o) {
-      return publish("push", { owner: o.repo.owner, name: o.repo.name, sha: o.sha, branch: o.branch, token: o.token }, PUSH_TIMEOUT_MS) as Promise<{ sha: string; branch: string }>;
+      return publish("push", { stage: o.stage, owner: o.repo.owner, name: o.repo.name, sha: o.sha, branch: o.branch, token: o.token }, PUSH_TIMEOUT_MS) as Promise<{ sha: string; branch: string }>;
     },
   };
 

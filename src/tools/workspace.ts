@@ -34,15 +34,17 @@ export interface Sandbox {
   writeFile(path: string, content: string): Promise<void>;
   // Publishing, done by the sandbox host so a write token never enters the sandbox
   // (sandbox/host/src/publish.rs). stage: verify the commits the checkout has that GitHub
-  // doesn't, and describe them against `base`. push: push a staged commit to one branch.
+  // doesn't, describe them against `base`, and record a stage for `branch`. push: push the
+  // commit a stage recorded, to the branch it recorded; a stage authorizes one push
+  // attempt, whatever its outcome, and the host refuses a push that doesn't restate it.
   // Both throw with the host's reason (no commits, the base isn't on GitHub, refused…).
-  stage(o: { repo: RepoRef; base: string; token?: string }): Promise<Staged>;
-  push(o: { repo: RepoRef; sha: string; branch: string; token: string }): Promise<{ sha: string; branch: string }>;
+  stage(o: { repo: RepoRef; base: string; branch: string; token?: string }): Promise<Staged>;
+  push(o: { stage: string; repo: RepoRef; sha: string; branch: string; token: string }): Promise<{ sha: string; branch: string }>;
 }
 
-// What a stage found, all computed on the host from the verified commits. `authors`:
-// "author <email>|committer <email>", one per commit.
-export type Staged = { sha: string; baseSha: string; commits: number; stat: string; authors: string[]; files: string[]; patch: string; patchTruncated: boolean };
+// What a stage found, all computed on the host from the verified commits. `stage`: the
+// stage's id, what push takes. `authors`: "author <email>|committer <email>", one per commit.
+export type Staged = { stage: string; sha: string; baseSha: string; commits: number; stat: string; authors: string[]; files: string[]; patch: string; patchTruncated: boolean };
 
 // How long publishing may take: a first mirror of a big repo is a full clone.
 export const STAGE_TIMEOUT_MS = 10 * 60_000;

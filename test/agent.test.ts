@@ -428,24 +428,25 @@ describe("remoteSandbox client", () => {
   });
 
   test("stage and push are POSTs with the request as JSON; any non-2xx is the daemon's reason", async () => {
+    const STAGE = `1790000000-${"c".repeat(32)}`;
     const reqs: { url: string; body: unknown }[] = [];
     const f = (async (url: string, init: RequestInit) => {
       reqs.push({ url, body: JSON.parse(init.body as string) });
-      if (url.endsWith("/stage")) return Response.json({ sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: "", authors: [], files: [], patch: "", patchTruncated: false });
-      return Response.json({ error: "a".repeat(40) + " wasn't staged here; stage it first" }, { status: 404 });
+      if (url.endsWith("/stage")) return Response.json({ stage: STAGE, sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: "", authors: [], files: [], patch: "", patchTruncated: false });
+      return Response.json({ error: `stage ${STAGE} isn't here: it never completed, was already used, or expired; stage again` }, { status: 404 });
     }) as typeof fetch;
     const sb = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f });
-    expect((await sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", token: "r" })).commits).toBe(1);
-    await expect(sb.push({ repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "w" })).rejects.toThrow("push: 404 " + "a".repeat(40) + " wasn't staged here");
+    expect((await sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", branch: "scout/x", token: "r" })).stage).toBe(STAGE);
+    await expect(sb.push({ stage: STAGE, repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "w" })).rejects.toThrow(`push: 404 stage ${STAGE} isn't here`);
     expect(reqs.map((r) => r.url)).toEqual(["https://fb.example/v1/sandboxes/s1/stage", "https://fb.example/v1/sandboxes/s1/push"]);
-    expect(reqs[0]!.body).toEqual({ owner: "acme", name: "widgets", base: "main", token: "r" });
-    expect(reqs[1]!.body).toEqual({ owner: "acme", name: "widgets", sha: "a".repeat(40), branch: "scout/x", token: "w" });
+    expect(reqs[0]!.body).toEqual({ owner: "acme", name: "widgets", base: "main", branch: "scout/x", token: "r" });
+    expect(reqs[1]!.body).toEqual({ stage: STAGE, owner: "acme", name: "widgets", sha: "a".repeat(40), branch: "scout/x", token: "w" });
   });
 
   test("a publish error that isn't JSON still surfaces with its status and text", async () => {
     const f = (async () => new Response("unauthorized", { status: 401 })) as unknown as typeof fetch;
     const sb = remoteSandbox("s1", { url: "https://fb.example", token: "bad", fetch: f });
-    await expect(sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main" })).rejects.toThrow("stage: 401 unauthorized");
+    await expect(sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", branch: "scout/x" })).rejects.toThrow("stage: 401 unauthorized");
   });
 
   test("a daemon error surfaces with its status", async () => {
