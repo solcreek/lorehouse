@@ -336,22 +336,25 @@ export async function createApp(config: Config) {
       return (await mounted.fetch(req)) ?? new Response("not found", { status: 404 });
     },
     // Shut down (server.ts, on SIGTERM/SIGINT, once the server takes no more requests): no
-    // timer or debounced ingest read starts again; turns in flight get up to `waitMs` to
-    // finish while June's runtime closes (and with it SESSIONS_DB); then the knowledge store
-    // is checkpointed, its WAL truncated (#89: a deleted message's frames leave
-    // lorehouse.db-wal), and closed. A turn still running after `waitMs` is cut off: its
-    // later writes to the store fail, and are logged.
+    // timer starts again, and ingest arms no new read but reads now the threads still
+    // waiting out their debounce (an edit or deletion just before the stop isn't dropped);
+    // those reads, and turns in flight, get up to `waitMs` to finish while June's runtime
+    // closes (and with it SESSIONS_DB); then the knowledge store is checkpointed, its WAL
+    // truncated (#89: a deleted message's frames leave lorehouse.db-wal), and closed. A turn
+    // or read still running after `waitMs` is cut off: its later writes to the store fail,
+    // and are logged.
     async close({ waitMs = 2500 }: { waitMs?: number } = {}) {
       for (const t of timers) clearInterval(t);
-      ingester?.stop();
+      const ingestStopped = ingester?.stop();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), waitMs); });
       try {
         const runtimeClosed = Promise.resolve().then(() => runtime!.close()).then(
-          () => "closed" as const,
-          (err) => { console.error("lorehouse: closing the agent runtime:", err); return "closed" as const; },
+          () => {},
+          (err) => { console.error("lorehouse: closing the agent runtime:", err); },
         );
-        if ((await Promise.race([runtimeClosed, timeout])) === "timeout") console.error(`lorehouse: turns still running after ${waitMs} ms; closing without them`);
+        const settled = Promise.all([runtimeClosed, ingestStopped]).then(() => "closed" as const);
+        if ((await Promise.race([settled, timeout])) === "timeout") console.error(`lorehouse: turns or ingest reads still running after ${waitMs} ms; closing without them`);
       } finally {
         clearTimeout(timer);
         closeKnowledge(knowledge);
