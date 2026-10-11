@@ -133,10 +133,11 @@ These are Lorehouse's position, not settings:
   one-line pointer to the public channels, with no model call and nothing read. An admin
   may turn answering on with `DM_MODE=answer`, and that choice includes reading the DM
   conversation itself (any thread in it), whose only reader is its author. Beyond it, the
-  answer reads only the channels in `AGENT_CHANNELS` (the knowledge index and their
-  threads), which is why that list must hold public channels only: nothing checks it at
-  read time (only `lorehouse doctor` does). It never has code tools (#58). A profile
-  can't loosen that.
+  answer reads only the knowledge index, which holds every channel ever listed in
+  `AGENT_CHANNELS` (taking one off the list does not purge what was indexed), and threads
+  in the channels listed now. That is why the list must hold public channels only:
+  nothing checks it at read time (only `lorehouse doctor` does). It never has code
+  tools (#58). A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread.
 - With a GitHub App, a write token never enters a sandbox. The sandbox host stages the
   commits and, after the approval, pushes exactly the staged commit with the write token
