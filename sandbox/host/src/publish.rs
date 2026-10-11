@@ -635,6 +635,31 @@ mod tests {
         publisher: Publisher,
     }
 
+    /// The scratch area is removed when the test ends, passed or failed (a panic unwinds
+    /// through this too).
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if std::fs::remove_dir_all(&self.root).is_err() {
+                // A test that failed mid-way can leave a directory read-only: make every
+                // directory writable again, then retry.
+                #[cfg(unix)]
+                writable(&self.root);
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn writable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                writable(&entry.path());
+            }
+        }
+    }
+
     fn sh(dir: &Path, script: &str) -> String {
         let out = std::process::Command::new("sh")
             .arg("-c")
