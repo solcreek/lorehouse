@@ -351,7 +351,10 @@ function pendingPurgeIn(path: string, listed: ReadonlySet<string>): ChannelPurge
   if (path === ":memory:" || !existsSync(path)) return [];
   let db: Database | undefined;
   try {
-    db = new Database(path, { readonly: true });
+    // Not { readonly: true }: macOS's SQLite can't open a WAL database read-only without
+    // its -shm file. query_only refuses every write instead.
+    db = new Database(path, { readwrite: true, create: false });
+    db.exec("PRAGMA query_only = ON");
     return pendingPurge(db, listed);
   } catch (e) {
     return `not checked: couldn't read ${path} (${e instanceof Error ? e.message : e})`;

@@ -79,6 +79,12 @@ describe("purging channels no longer listed", () => {
     }
   });
 
+  test("a malformed Slack id names no channel, and is left alone", () => {
+    const db = openKnowledge(":memory:");
+    upsertDocument(db, { docId: "slack:noColon", kind: "slack_thread", source: "s", title: "t", text: "words" });
+    expect(purgeUnlistedChannels(db, new Set(["C1"]))).toEqual([]);
+  });
+
   test("a channel known only from its joined threads or usage rows is purged too", () => {
     const db = openKnowledge(":memory:");
     joinThread(db, "C5", "1.1"); // asked in, never indexed (a thread holding only the question)

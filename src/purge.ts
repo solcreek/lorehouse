@@ -10,6 +10,10 @@
 // A 👍/👎 (agent_feedback) stays until retention: it holds no text and no thread. An empty
 // list purges everything learned from Slack.
 //
+// Not here: June's saved conversations in SESSIONS_DB (the agent's turns in those
+// threads, with what it quoted). They are the framework's tables, which Lorehouse code
+// doesn't touch (AGENTS.md); they are no longer reachable once the channel is unlisted.
+//
 // pendingPurge counts the same rows without changing anything, for `lorehouse doctor`.
 
 import type { Database } from "bun:sqlite";
@@ -22,7 +26,7 @@ const SLACK_DOCS = "kind = 'slack_thread' AND doc_id >= 'slack:' AND doc_id < 's
 // Every Slack channel Lorehouse keeps something for, sorted.
 function knownChannels(db: Database): string[] {
   const rows = db.query(
-    `SELECT substr(doc_id, 7, instr(substr(doc_id, 7), ':') - 1) AS channel FROM knowledge_documents WHERE ${SLACK_DOCS}
+    `SELECT substr(doc_id, 7, instr(substr(doc_id, 7), ':') - 1) AS channel FROM knowledge_documents WHERE ${SLACK_DOCS} AND instr(substr(doc_id, 7), ':') > 1
      UNION SELECT substr(source, 7) FROM ingest_cursors WHERE source >= 'slack:' AND source < 'slack;'
      UNION SELECT channel FROM agent_threads
      UNION SELECT channel FROM agent_asks
