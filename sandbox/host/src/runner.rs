@@ -170,7 +170,7 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
                     }
                 } else {
                     match serde_json::from_slice::<publish::PushRequest>(&body) {
-                        Ok(req) => publisher.push(req).await.map(|p| serde_json::to_vec(&p)),
+                        Ok(req) => publisher.push(&job.sandbox, req).await.map(|p| serde_json::to_vec(&p)),
                         Err(e) => Err((400, format!("push request: {e}"))),
                     }
                 };

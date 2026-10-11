@@ -9,7 +9,7 @@
 //!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone)
 //!   GET    /v1/sandboxes                                          → what exists, running or not
 //!   POST   /v1/sandboxes/{id}/stage  {owner, name, base, branch, token?} → the commits to publish, verified, and a stage id
-//!   POST   /v1/sandboxes/{id}/push   {owner, name, sha, branch, token} → pushed (see publish.rs)
+//!   POST   /v1/sandboxes/{id}/push   {stage, owner, name, sha, branch, token} → pushed (see publish.rs)
 //!   GET    /healthz                                               → ok (no auth)
 //!
 //! Every /v1 request needs `Authorization: Bearer <SANDBOXD_TOKEN>`. Requests for a
@@ -131,8 +131,8 @@ async fn stage(State(app): State<App>, Path(id): Path<String>, Json(req): Json<p
     }
 }
 
-async fn push(State(app): State<App>, Json(req): Json<publish::PushRequest>) -> Response {
-    match app.publisher.push(req).await {
+async fn push(State(app): State<App>, Path(id): Path<String>, Json(req): Json<publish::PushRequest>) -> Response {
+    match app.publisher.push(&id, req).await {
         Ok(pushed) => Json(pushed).into_response(),
         Err((status, msg)) => error(status, msg),
     }

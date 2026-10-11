@@ -79,8 +79,10 @@ pub struct Staged {
     pub patch_truncated: bool,
 }
 
+/// A push names its stage, and restates what it pushes: each must match the stage's record.
 #[derive(Deserialize)]
 pub struct PushRequest {
+    pub stage: String,
     pub owner: String,
     pub name: String,
     pub sha: String,
@@ -280,6 +282,11 @@ fn new_stage_id() -> Result<String, String> {
     Ok(format!("{}-{hex}", unix_secs()))
 }
 
+/// A stage id as new_stage_id makes them; nothing else is ever a file or ref name.
+fn stage_id(s: &str) -> bool {
+    stage_secs(s).is_some()
+}
+
 /// The creation time a well-formed stage id starts with.
 fn stage_secs(s: &str) -> Option<u64> {
     let (secs, rand) = s.split_once('-')?;
@@ -312,7 +319,7 @@ impl Publisher {
         self.mirrors.join(".stages")
     }
 
-    /// Where a stage's record is; `id` must be a well-formed stage id.
+    /// Where a stage's record is; `id` must be a stage_id().
     fn record_path(&self, id: &str) -> PathBuf {
         self.records().join(format!("{id}.json"))
     }
@@ -404,6 +411,27 @@ impl Publisher {
         std::fs::rename(&tmp.0, self.record_path(&record.id))
     }
 
+    /// Take a stage's record for one push: read it, then remove it, before anything else is
+    /// checked. Any error is a refusal.
+    fn claim(&self, id: &str) -> Result<StageRecord, Failure> {
+        let path = self.record_path(id);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err((404, format!("stage {id} isn't here: it never completed, was already used, or expired; stage again")));
+            }
+            Err(e) => return Err((500, format!("stage {id} can't be read ({e}); nothing was pushed, stage again"))),
+        };
+        if let Err(e) = std::fs::remove_file(&path) {
+            return Err((500, format!("stage {id} can't be consumed ({e}); nothing was pushed")));
+        }
+        match serde_json::from_slice::<StageRecord>(&bytes) {
+            Ok(r) if r.id == id => Ok(r),
+            Ok(_) => Err((500, format!("stage {id}'s record names another stage; nothing was pushed, stage again"))),
+            Err(e) => Err((500, format!("stage {id}'s record is malformed ({e}); nothing was pushed, stage again"))),
+        }
+    }
+
     /// The host half of stage: fetch a bundle into refs/stage/<id> and describe it against
     /// the base branch. Separate so it can be tested without a VM.
     async fn stage_bundle(&self, dir: &Path, bundle: &Path, base: &str, id: &str) -> Result<Staged, Failure> {
@@ -469,36 +497,36 @@ impl Publisher {
         Ok(Staged { stage: String::new(), sha, base_sha, commits: authors.len(), stat, authors, files, patch, patch_truncated })
     }
 
-    /// Push a staged commit to one branch: never forced, never anything not staged.
-    pub async fn push(&self, req: PushRequest) -> Result<Pushed, Failure> {
-        if !plain_name(&req.owner) || !plain_name(&req.name) || !commit_id(&req.sha) || !plain_ref(&req.branch) {
-            return Err((400, "push: a plain owner, name, commit id and branch are needed".into()));
+    /// Push the commit a stage recorded to the branch it recorded: never forced, never
+    /// anything a completed stage didn't record, never twice for one stage.
+    pub async fn push(&self, sandbox: &str, req: PushRequest) -> Result<Pushed, Failure> {
+        if !vm::valid_id(sandbox) || !stage_id(&req.stage) || !plain_name(&req.owner) || !plain_name(&req.name) || !commit_id(&req.sha) || !plain_ref(&req.branch) {
+            return Err((400, "push: a plain sandbox id, stage id, owner, name, commit id and branch are needed".into()));
         }
         let dir = self.mirror(&req.owner, &req.name);
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
-        // Only what a stage produced (what an approval was about) goes out, and only while
-        // it is fresh: an expired stage is dropped here, not just at the next stage.
+        // Consumed first: from here on this stage authorizes nothing more, whatever happens.
+        let record = self.claim(&req.stage)?;
+        if expired(record.created_at, unix_secs()) {
+            return Err((410, format!("stage {} has expired (a stage can be pushed for {} h); stage again", req.stage, STAGE_TTL.as_secs() / 3600)));
+        }
+        let asked = (sandbox, req.owner.as_str(), req.name.as_str(), req.sha.as_str(), req.branch.as_str());
+        let recorded = (record.sandbox.as_str(), record.owner.as_str(), record.name.as_str(), record.sha.as_str(), record.branch.as_str());
+        if asked != recorded {
+            return Err((403, format!("the push doesn't match stage {}: it was {} of {}/{} to {} from sandbox {}; nothing was pushed", req.stage, record.sha, record.owner, record.name, record.branch, record.sandbox)));
+        }
+        let refspec = format!("{}:refs/heads/{}", record.sha, record.branch);
+        let pushed = git(&dir, &["push", "-q", &self.url(&record.owner, &record.name), &refspec], Some(&req.token), GIT_NETWORK).await;
+        // The stage's ref is done with either way (its record is gone).
+        let _ = git(&dir, &["update-ref", "-d", &format!("refs/stage/{}", record.id)], None, GIT_LOCAL).await;
         self.prune(&dir).await;
-        let staged = git(&dir, &["for-each-ref", "--format=%(objectname)", "refs/stage/"], None, GIT_LOCAL).await.unwrap_or_default();
-        if !staged.lines().any(|l| l == req.sha) {
-            return Err((404, format!("{} wasn't staged here; stage it first", req.sha)));
-        }
-        let refspec = format!("{}:refs/heads/{}", req.sha, req.branch);
-        if let Err(e) = git(&dir, &["push", "-q", &self.url(&req.owner, &req.name), &refspec], Some(&req.token), GIT_NETWORK).await {
+        if let Err(e) = pushed {
             let status = if e.contains("non-fast-forward") || e.contains("[rejected]") || e.contains("fetch first") { 409 } else { 502 };
-            return Err((status, format!("push to {}: {e}", req.branch)));
-        }
-        // Pushed: its stage refs are done with.
-        for line in git(&dir, &["for-each-ref", "--format=%(objectname) %(refname)", "refs/stage/"], None, GIT_LOCAL).await.unwrap_or_default().lines() {
-            if let Some((sha, name)) = line.split_once(' ') {
-                if sha == req.sha {
-                    let _ = git(&dir, &["update-ref", "-d", name], None, GIT_LOCAL).await;
-                }
-            }
+            return Err((status, format!("push to {}: {e}", record.branch)));
         }
         let _ = git(&dir, &["gc", "--auto", "-q"], None, GIT_LOCAL).await;
-        Ok(Pushed { sha: req.sha, branch: req.branch })
+        Ok(Pushed { sha: record.sha, branch: record.branch })
     }
 
     /// Housekeeping, never authorization: drop expired records (all repos'), and this
@@ -665,7 +693,7 @@ mod tests {
             std::fs::read_dir(self.publisher.records()).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
         }
         fn push(&self, staged: &Staged, branch: &str) -> PushRequest {
-            PushRequest { owner: "acme".into(), name: "widgets".into(), sha: staged.sha.clone(), branch: branch.into(), token: "unused-for-file-remotes".into() }
+            PushRequest { stage: staged.stage.clone(), owner: "acme".into(), name: "widgets".into(), sha: staged.sha.clone(), branch: branch.into(), token: "unused-for-file-remotes".into() }
         }
         /// The commit a branch is at on "GitHub", if it exists.
         fn remote(&self, branch: &str) -> Option<String> {
@@ -679,7 +707,7 @@ mod tests {
         let s = scratch("happy");
         let head = sh(&s.vm, "echo hello > POC.md && git add POC.md && git commit -qm poc && git rev-parse HEAD");
         let staged = s.stage("scout/poc").await.unwrap();
-        assert!(stage_secs(&staged.stage).is_some(), "{}", staged.stage);
+        assert!(stage_id(&staged.stage), "{}", staged.stage);
         assert_eq!(staged.sha, head);
         assert_eq!(staged.commits, 1);
         assert_eq!(staged.files, vec!["POC.md"]);
@@ -687,10 +715,32 @@ mod tests {
         assert_eq!(staged.authors, vec!["bot <1+bot@users.noreply.github.com>|bot <1+bot@users.noreply.github.com>"]);
         assert!(staged.patch.contains("+hello") && !staged.patch_truncated);
         assert_eq!(s.records(), vec![format!("{}.json", staged.stage)], "one record, no temporary file");
-        let pushed = s.publisher.push(s.push(&staged, "scout/poc")).await.unwrap();
+        let pushed = s.publisher.push(SANDBOX, s.push(&staged, "scout/poc")).await.unwrap();
         assert_eq!(pushed.sha, head);
         assert_eq!(s.remote("scout/poc").as_deref(), Some(head.as_str()));
         assert!(s.stage_refs().is_empty(), "a pushed stage's ref is dropped");
+        assert!(s.records().is_empty(), "and its record consumed");
+    }
+
+    #[tokio::test]
+    async fn a_ref_without_a_record_is_not_pushable() {
+        // Verified into refs/stage/<id>, with no record written: the state a stage cut off
+        // between the two is in. The ref names the commit, and still authorizes nothing.
+        let s = scratch("norecord");
+        let head = sh(&s.vm, "echo x > x && git add x && git commit -qm x && git rev-parse HEAD");
+        let bundle = s.bundle().await;
+        let id = new_stage_id().unwrap();
+        let mut staged = s.publisher.stage_bundle(&s.dir(), &bundle, "main", &id).await.unwrap();
+        staged.stage = id.clone();
+        assert_eq!(sh(&s.dir(), &format!("git rev-parse refs/stage/{id}")), head);
+        let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/x")).await.unwrap_err();
+        assert_eq!(err.0, 404, "{}", err.1);
+        assert_eq!(s.remote("scout/x"), None);
+        // Nor is a commit no stage produced, under a made-up stage id.
+        let main = sh(&s.vm, "git rev-parse origin/main");
+        let made_up = Staged { stage: new_stage_id().unwrap(), sha: main, ..staged };
+        assert_eq!(s.publisher.push(SANDBOX, s.push(&made_up, "scout/x")).await.unwrap_err().0, 404);
+        assert_eq!(s.remote("scout/x"), None);
     }
 
     #[tokio::test]
@@ -712,7 +762,7 @@ mod tests {
         assert_eq!(sh(&dir, &format!("git rev-parse refs/stage/{id}")), head, "verification finished");
         assert!(s.records().is_empty(), "{:?}", s.records());
         let staged = Staged { stage: id, sha: head.clone(), base_sha: String::new(), commits: 1, stat: String::new(), authors: vec![], files: vec![], patch: String::new(), patch_truncated: false };
-        let err = s.publisher.push(s.push(&staged, "scout/c")).await.unwrap_err();
+        let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/c")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
 
         // A cancel: the stage future is dropped once its ref exists.
@@ -724,12 +774,78 @@ mod tests {
         }
         assert!(s.records().is_empty(), "{:?}", s.records());
         let staged = Staged { stage: id, ..staged };
-        let err = s.publisher.push(s.push(&staged, "scout/c")).await.unwrap_err();
+        let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/c")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
         assert_eq!(s.remote("scout/c"), None);
         // The refs left behind are dropped by the next housekeeping.
         s.publisher.prune(&dir).await;
         assert!(s.stage_refs().is_empty(), "{:?}", s.stage_refs());
+    }
+
+    #[tokio::test]
+    async fn a_record_is_used_once_and_a_replay_stages_again() {
+        let s = scratch("once");
+        let head = sh(&s.vm, "echo r > r && git add r && git commit -qm r && git rev-parse HEAD");
+        let first = s.stage("scout/r").await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&first, "scout/r")).await.unwrap();
+        // The same stage again: consumed.
+        let err = s.publisher.push(SANDBOX, s.push(&first, "scout/r")).await.unwrap_err();
+        assert_eq!(err.0, 404, "{}", err.1);
+        // A replay (Lorehouse re-runs open_pull_request after a restart): the checkout's
+        // origin/* doesn't know about the push, so the same commits stage again, under a new
+        // id, and pushing them again is a no-op.
+        let replay = s.stage("scout/r").await.unwrap();
+        assert_eq!(replay.sha, head);
+        assert_ne!(replay.stage, first.stage);
+        s.publisher.push(SANDBOX, s.push(&replay, "scout/r")).await.unwrap();
+        assert_eq!(s.remote("scout/r").as_deref(), Some(head.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_push_that_does_not_match_its_stage_is_refused_and_uses_the_stage_up() {
+        let s = scratch("mismatch");
+        sh(&s.vm, "echo m > m && git add m && git commit -qm m");
+        let other_sha = sh(&s.vm, "git rev-parse origin/main");
+        type Alter = fn(&mut PushRequest, &mut String, &str);
+        let cases: [(&str, Alter); 5] = [
+            ("sha", |p, _, other| p.sha = other.to_string()),
+            ("branch", |p, _, _| p.branch = "scout/elsewhere".into()),
+            ("repo name", |p, _, _| p.name = "gadgets".into()),
+            ("repo owner", |p, _, _| p.owner = "acne".into()),
+            ("sandbox", |_, sandbox, _| *sandbox = "slack_C1_1790000002.000100".into()),
+        ];
+        for (what, alter) in cases {
+            let staged = s.stage("scout/m").await.unwrap();
+            let mut req = s.push(&staged, "scout/m");
+            let mut sandbox = SANDBOX.to_string();
+            alter(&mut req, &mut sandbox, &other_sha);
+            let err = s.publisher.push(&sandbox, req).await.unwrap_err();
+            assert_eq!(err.0, 403, "{what}: {}", err.1);
+            assert_eq!(s.remote("scout/m"), None, "{what}");
+            assert_eq!(s.remote("scout/elsewhere"), None, "{what}");
+            // The stage is used up: the right push now finds nothing.
+            let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/m")).await.unwrap_err();
+            assert_eq!(err.0, 404, "{what}: {}", err.1);
+        }
+        assert!(sh(&s.root, "git -C acme/gadgets.git for-each-ref --format='%(refname)'").lines().all(|r| r == "refs/heads/main"));
+    }
+
+    #[tokio::test]
+    async fn a_stage_past_its_ttl_is_not_pushed() {
+        let s = scratch("ttl");
+        sh(&s.vm, "echo old > old && git add old && git commit -qm old");
+        for (what, age) in [("expired", -(STAGE_TTL.as_secs() as i64) - 60), ("from the future", CLOCK_SLACK as i64 + 60)] {
+            let staged = s.stage("scout/old").await.unwrap();
+            // Its record says it was made long ago (or later than now), with nothing else changed.
+            let path = s.publisher.record_path(&staged.stage);
+            let mut record: StageRecord = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record.created_at = (unix_secs() as i64 + age) as u64;
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/old")).await.unwrap_err();
+            assert_eq!(err.0, 410, "{what}: {}", err.1);
+            assert_eq!(s.remote("scout/old"), None, "{what}");
+            assert!(!path.exists(), "{what}: the expired record is consumed too");
+        }
     }
 
     #[tokio::test]
@@ -745,6 +861,60 @@ mod tests {
         s.publisher.prune(&s.dir()).await;
         assert_eq!(s.records(), vec![format!("{}.json", live.stage)]);
         assert_eq!(s.stage_refs(), vec![format!("refs/stage/{}", live.stage)]);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_or_malformed_record_is_refused() {
+        let s = scratch("badrecord");
+        sh(&s.vm, "echo u > u && git add u && git commit -qm u");
+        type Corrupt = fn(&Path, &str);
+        let corrupt: [(&str, Corrupt); 4] = [
+            // A directory where the file was: the read fails, whoever runs the test.
+            ("unreadable", |p, _| {
+                std::fs::remove_file(p).unwrap();
+                std::fs::create_dir(p).unwrap();
+            }),
+            ("not JSON", |p, _| std::fs::write(p, b"{\"id\":").unwrap()),
+            ("a field missing", |p, _| {
+                let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+                v.as_object_mut().unwrap().remove("branch");
+                std::fs::write(p, v.to_string()).unwrap();
+            }),
+            ("another stage's record", |p, id| {
+                let other = std::fs::read_to_string(p).unwrap().replace(id, &new_stage_id().unwrap());
+                std::fs::write(p, other).unwrap();
+            }),
+        ];
+        for (what, corrupt) in corrupt {
+            let staged = s.stage("scout/u").await.unwrap();
+            corrupt(&s.publisher.record_path(&staged.stage), &staged.stage);
+            let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/u")).await.unwrap_err();
+            assert_eq!(err.0, 500, "{what}: {}", err.1);
+            assert_eq!(s.remote("scout/u"), None, "{what}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_record_that_cannot_be_consumed_is_not_pushed() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = scratch("noconsume");
+        sh(&s.vm, "echo n > n && git add n && git commit -qm n");
+        let staged = s.stage("scout/n").await.unwrap();
+        // The records directory read-only: the record reads, but can't be removed.
+        let records = s.publisher.records();
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(records.join("probe"), b"").is_ok() {
+            // Root ignores the mode; there is no way to make removal fail here.
+            std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: running as root");
+            return;
+        }
+        let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/n")).await.unwrap_err();
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(err.0, 500, "{}", err.1);
+        assert!(err.1.contains("can't be consumed"), "{}", err.1);
+        assert_eq!(s.remote("scout/n"), None);
     }
 
     #[tokio::test]
@@ -786,17 +956,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_push_never_goes_over_a_diverged_branch() {
+    async fn a_push_never_goes_over_a_diverged_branch_and_a_refused_one_needs_a_new_stage() {
         let s = scratch("push");
         // Stage and push one commit, then a diverged one to the same branch: refused, not forced.
         let first = sh(&s.vm, "echo 1 > one && git add one && git commit -qm one && git rev-parse HEAD");
         let staged = s.stage("scout/x").await.unwrap();
-        s.publisher.push(s.push(&staged, "scout/x")).await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/x")).await.unwrap();
         sh(&s.vm, "git reset -q --hard origin/main && echo 2 > two && git add two && git commit -qm two");
         let other = s.stage("scout/x").await.unwrap();
-        let err = s.publisher.push(s.push(&other, "scout/x")).await.unwrap_err();
+        let err = s.publisher.push(SANDBOX, s.push(&other, "scout/x")).await.unwrap_err();
         assert_eq!(err.0, 409, "{}", err.1);
         assert_eq!(s.remote("scout/x").as_deref(), Some(first.as_str()));
+        // The refused attempt used the stage up.
+        assert_eq!(s.publisher.push(SANDBOX, s.push(&other, "scout/x")).await.unwrap_err().0, 404);
     }
 
     #[tokio::test]
@@ -844,18 +1016,17 @@ mod tests {
         let staged = s.publisher.stage_and_record(&dir, &bundle, SANDBOX, &request("scout/tag"), &id).await.unwrap();
         assert_eq!(staged.sha, head);
         assert_eq!(sh(&dir, &format!("git rev-parse refs/stage/{id}")), head, "the stage ref is the commit, not the tag");
-        s.publisher.push(s.push(&staged, "scout/tag")).await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/tag")).await.unwrap();
         assert_eq!(s.remote("scout/tag").as_deref(), Some(head.as_str()));
         // A HEAD that peels to a blob: refused, and no stage ref or record left behind.
         let blob = s.root.join("blob.bundle");
         let b = blob.display();
         sh(&s.vm, &format!("x=$(echo x | git hash-object -w --stdin) && git tag -a tb -m tb $x && git bundle create -q {b} refs/tags/tb"));
         advertise_as_head(&blob, "refs/tags/tb");
-        let before = s.records();
         let err = s.publisher.stage_and_record(&dir, &blob, SANDBOX, &request("scout/tag"), &new_stage_id().unwrap()).await.unwrap_err();
         assert_eq!(err.0, 422, "{}", err.1);
         assert!(s.stage_refs().is_empty(), "{:?}", s.refs());
-        assert_eq!(s.records(), before);
+        assert!(s.records().is_empty());
     }
 
     #[tokio::test]
@@ -874,7 +1045,7 @@ mod tests {
         assert_eq!(s.records(), vec![format!("{id}.json")], "no temporary file is left behind");
         std::fs::remove_dir_all(&path).unwrap();
         let staged = Staged { stage: id, sha: head, base_sha: String::new(), commits: 1, stat: String::new(), authors: vec![], files: vec![], patch: String::new(), patch_truncated: false };
-        let err = s.publisher.push(s.push(&staged, "scout/w")).await.unwrap_err();
+        let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/w")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
         assert_eq!(s.remote("scout/w"), None);
     }
@@ -898,10 +1069,10 @@ mod tests {
         assert!(plain_name("lorehouse-playground") && !plain_name("..") && !plain_name(".git") && !plain_name("a/b"));
         assert!(commit_id(&"a".repeat(40)) && !commit_id(&"A".repeat(40)) && !commit_id("abc"));
         let id = new_stage_id().unwrap();
-        assert!(stage_secs(&id).is_some() && id != new_stage_id().unwrap());
+        assert!(stage_id(&id) && id != new_stage_id().unwrap());
         let hex = "0".repeat(32);
         for bad in ["", "123", &format!("x-{hex}"), &format!("123-{}", "A".repeat(32)), &format!("123-{hex}0"), &format!("../{hex}"), &format!("123-{hex}/..")] {
-            assert!(stage_secs(bad).is_none(), "{bad}");
+            assert!(!stage_id(bad), "{bad}");
         }
     }
 }
