@@ -1528,7 +1528,8 @@ async function refusedStart(extraEnv: Record<string, string>): Promise<{ code: n
 async function stopApp(): Promise<void> {
   if (!app) return;
   app.kill();
-  // A shutdown that wedges fails the run instead of hanging it.
+  // A shutdown that wedges is killed after 8 s instead of hanging the run (the SIGTERM
+  // scenario is what fails one that takes over 5 s).
   if ((await Promise.race([app.exited, Bun.sleep(8000).then(() => "timeout" as const)])) === "timeout") {
     console.log(`  (the app was still running 8 s after SIGTERM: killed)`);
     app.kill("SIGKILL");
