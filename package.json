@@ -22,12 +22,12 @@
     "doctor": "bun src/server.ts doctor"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.128.0",
+    "@anthropic-ai/sdk": "^0.131.0",
     "@junejs/core": "0.2.0-dev.65",
     "@junejs/server": "1.0.0-dev.45"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "typescript": "^5.9.0"
+    "typescript": "^7.0.2"
   }
 }
