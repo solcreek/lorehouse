@@ -80,8 +80,10 @@ pub struct Staged {
     pub patch: String,
     #[serde(rename = "patchTruncated")]
     pub patch_truncated: bool,
-    /// SHA-256 (hex) of the complete diff against the base, as `patch` would be uncut: what
-    /// an approval binds, so two diffs that differ only past the excerpt differ here.
+    /// SHA-256 (hex) of the complete diff against the base, with whole blob ids
+    /// (`--full-index`, which bind binary changes too) and pinned diff options, so it
+    /// depends on the two commits, not the mirror or the git release's defaults: what an
+    /// approval binds. Two diffs that differ only past the excerpt differ here.
     #[serde(rename = "diffSha256")]
     pub diff_sha256: String,
 }
@@ -560,8 +562,13 @@ impl Publisher {
             // The patch is only an excerpt: cut, not refused.
             let (patch, patch_truncated) = git_capped(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], None, GIT_LOCAL, MAX_PATCH).await.map_err(|e| (500, e))?;
             // The same diff in full, hashed as it streams: what an approval binds, the
-            // part past the excerpt included.
-            let diff_sha256 = git_sha256(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], GIT_LOCAL).await.map_err(|e| (500, e))?;
+            // part past the excerpt included. --full-index: whole blob ids, not abbreviations
+            // whose length depends on the mirror (its size, its core.abbrev); a binary change
+            // is bound by its blob ids too. No --binary: its deflated data depends on
+            // core.compression and the zlib build. Renames, the algorithm and the heuristic
+            // are pinned, not left to the git release's defaults (a rename limit's, say).
+            // What is left is how a git release prints a diff, which is stable.
+            let diff_sha256 = git_sha256(dir, &["diff", "--no-ext-diff", "--no-textconv", "--full-index", "--no-renames", "--diff-algorithm=myers", "--indent-heuristic", &three_dot], GIT_LOCAL).await.map_err(|e| (500, e))?;
             Ok::<_, Failure>((authors, stat, files, patch, patch_truncated, diff_sha256))
         };
         let (authors, stat, files, patch, patch_truncated, diff_sha256) = match described.await {
@@ -1121,18 +1128,19 @@ mod tests {
     async fn the_digest_covers_the_whole_diff_and_is_recorded() {
         // Two diffs past the patch cap that share the commit's place: each digest is the
         // SHA-256 of its complete diff, the same diff gives the same digest, and the record
-        // keeps it.
+        // keeps it. Then the same commits once the mirror abbreviates differently: the
+        // same digest.
         use sha2::{Digest, Sha256};
         let s = scratch("digest");
         // The diff as a reviewer would get it from the mirror, untrimmed, with no user config.
         let full = |s: &Scratch, sha: &str| -> String {
             let out = std::process::Command::new("git")
-                .args(["-C", &s.dir().to_string_lossy(), "diff", "--no-ext-diff", "--no-textconv", &format!("main...{sha}")])
+                .args(["-C", &s.dir().to_string_lossy(), "diff", "--no-ext-diff", "--no-textconv", "--full-index", "--no-renames", "--diff-algorithm=myers", "--indent-heuristic", &format!("main...{sha}")])
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
-            assert!(out.status.success() && out.stdout.len() > MAX_PATCH);
+            assert!(out.status.success());
             Sha256::digest(&out.stdout).iter().map(|b| format!("{b:02x}")).collect()
         };
         sh(&s.vm, "seq 1 200000 > big && git add big && git commit -qm big");
@@ -1148,6 +1156,15 @@ mod tests {
         assert!(two.patch_truncated);
         assert_ne!(two.diff_sha256, one.diff_sha256);
         assert_eq!(two.diff_sha256, full(&s, &two.sha));
+        // The same commits once the mirror abbreviates blob ids differently (as it does when
+        // it grows): the excerpt's index lines change, the digest doesn't.
+        sh(&s.vm, "git reset -q --hard origin/main && printf 'a\\000b' > blob.bin && git add blob.bin && git commit -qm bin");
+        let before = s.stage("scout/d").await.unwrap();
+        sh(&s.dir(), "git config core.abbrev 20");
+        let after = s.stage("scout/d").await.unwrap();
+        assert_ne!(before.patch, after.patch, "the excerpt's abbreviations changed");
+        assert_eq!(before.diff_sha256, after.diff_sha256);
+        assert_eq!(after.diff_sha256, full(&s, &after.sha));
     }
 
     #[tokio::test]
