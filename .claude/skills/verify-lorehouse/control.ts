@@ -108,7 +108,7 @@ function childEnv(overrides: Record<string, string>): Record<string, string> {
     "SLACK_SIGNING_SECRET", "SLACK_BOT_TOKEN", "SLACK_API_URL", "SLACK_BOT_USER_ID",
     "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
     "AGENT_NAME", "AGENT_CHANNELS", "AGENT_CO_AUTHOR", "DM_MODE",
-    "LOREHOUSE_DB", "SESSIONS_DB", "KNOWLEDGE_SEED",
+    "LOREHOUSE_DB", "SESSIONS_DB", "KNOWLEDGE_SEED", "LOREHOUSE_ENV_FILE", "LOREHOUSE_SETTINGS",
     "INGEST_BACKFILL_DAYS", "INGEST_REFRESH_DAYS", "INGEST_DEBOUNCE_MS",
     "STATUS_TOKEN", "ADMIN_TOKEN", "USAGE_RECORD_PEOPLE", "LOG_SLACK_EVENTS",
     "SANDBOX_RUNNER_TOKEN", "SANDBOX_URL", "SANDBOX_TOKEN",
@@ -116,6 +116,35 @@ function childEnv(overrides: Record<string, string>): Record<string, string> {
     "PORT",
   ]) env[key] = "";
   return { ...env, ...overrides };
+}
+
+// The app's whole environment for a run whose files live in `dir`.
+export function appEnv(dir: string, appPort: number, mockPort: number): Record<string, string> {
+  return childEnv({
+    PORT: String(appPort),
+    SLACK_SIGNING_SECRET: SIGNING_SECRET,
+    SLACK_BOT_TOKEN: "xoxb-verify",
+    SLACK_API_URL: `http://127.0.0.1:${mockPort}/slack/api`,
+    ANTHROPIC_API_KEY: "verify",
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${mockPort}/anthropic`,
+    AGENT_NAME: AGENT,
+    AGENT_CHANNELS: CHANNEL,
+    DM_MODE: "redirect",
+    LOREHOUSE_DB: join(dir, "lorehouse.db"),
+    SESSIONS_DB: join(dir, "sessions.db"),
+    INGEST_BACKFILL_DAYS: "36500",
+    INGEST_REFRESH_DAYS: "36500",
+    INGEST_DEBOUNCE_MS: DEBOUNCE_MS,
+    STATUS_TOKEN,
+    ADMIN_TOKEN,
+    // The app also reads an env file and settings.json, and fills any key blanked above
+    // from them. Point both into the run directory, where nothing writes an env file and
+    // settings.json is only what this run's app writes. Unset, the env file would default
+    // to an install's /etc/lorehouse/lorehouse.env, and either could come from the
+    // checkout's .env, which Bun loads for every variable not set here.
+    LOREHOUSE_ENV_FILE: join(dir, "lorehouse.env"),
+    LOREHOUSE_SETTINGS: join(dir, "settings.json"),
+  });
 }
 
 function spawnDetached(cmd: string[], env: Record<string, string>, log: string): number {
@@ -328,24 +357,7 @@ async function launch(): Promise<never> {
     fail("mock never answered /stats", { runId, log: clip(mockLog, true) });
   }
 
-  state.app.pid = spawnDetached([SERVER], childEnv({
-    PORT: String(appPort),
-    SLACK_SIGNING_SECRET: SIGNING_SECRET,
-    SLACK_BOT_TOKEN: "xoxb-verify",
-    SLACK_API_URL: `http://127.0.0.1:${mockPort}/slack/api`,
-    ANTHROPIC_API_KEY: "verify",
-    ANTHROPIC_BASE_URL: `http://127.0.0.1:${mockPort}/anthropic`,
-    AGENT_NAME: AGENT,
-    AGENT_CHANNELS: CHANNEL,
-    DM_MODE: "redirect",
-    LOREHOUSE_DB: db,
-    SESSIONS_DB: join(dir, "sessions.db"),
-    INGEST_BACKFILL_DAYS: "36500",
-    INGEST_REFRESH_DAYS: "36500",
-    INGEST_DEBOUNCE_MS: DEBOUNCE_MS,
-    STATUS_TOKEN,
-    ADMIN_TOKEN,
-  }), appLog);
+  state.app.pid = spawnDetached([SERVER], appEnv(dir, appPort, mockPort), appLog);
   saveState(state);
 
   const health = await waitHttp(`http://127.0.0.1:${appPort}/healthz`, 15000);
@@ -796,8 +808,11 @@ const commands: Record<string, () => Promise<never> | never> = {
   cleanup,
 };
 
-const run = command ? commands[command] : undefined;
-if (!run) {
-  fail(`unknown command ${command ?? "(none)"}`, { commands: Object.keys(commands) });
+// Imported (test/verify-isolation.test.ts reads appEnv), it runs nothing.
+if (import.meta.main) {
+  const run = command ? commands[command] : undefined;
+  if (!run) {
+    fail(`unknown command ${command ?? "(none)"}`, { commands: Object.keys(commands) });
+  }
+  await run();
 }
-await run();
