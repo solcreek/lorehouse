@@ -109,10 +109,11 @@ pub struct Publisher {
     /// REVIEW_CAP; smaller in tests.
     review_cap: usize,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
-    /// Tests only: a stage waits here after verifying, just before its record is written,
-    /// so a test can cut it off at the last moment.
+    /// Tests only: after verifying, just before its record is written, a stage signals the
+    /// first and waits on the second (never signalled), so a test can cut it off at exactly
+    /// that moment, however long verifying took.
     #[cfg(test)]
-    before_record: Option<Arc<tokio::sync::Notify>>,
+    before_record: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 fn plain_name(s: &str) -> bool {
@@ -379,7 +380,8 @@ impl Publisher {
     async fn stage_and_record(&self, dir: &Path, bundle: &Path, sandbox: &str, req: &StageRequest, id: &str) -> Result<Staged, Failure> {
         let mut staged = self.stage_bundle(dir, bundle, &req.base, id).await?;
         #[cfg(test)]
-        if let Some(gate) = &self.before_record {
+        if let Some((reached, gate)) = &self.before_record {
+            reached.notify_one();
             gate.notified().await;
         }
         // No await from here on: a stage cut off by its deadline or cancelled is cut off at
@@ -778,30 +780,38 @@ mod tests {
         let mut s = scratch("cutoff");
         let head = sh(&s.vm, "echo c > c && git add c && git commit -qm c && git rev-parse HEAD");
         // Every stage stops after verifying, right before its record: the last moment a
-        // deadline or a cancel can land.
-        let gate = Arc::new(tokio::sync::Notify::new());
-        s.publisher.before_record = Some(gate.clone());
+        // deadline or a cancel can land. `reached` says a stage is there.
+        let reached = Arc::new(tokio::sync::Notify::new());
+        s.publisher.before_record = Some((reached.clone(), Arc::new(tokio::sync::Notify::new())));
         let bundle = s.bundle().await;
         let dir = s.dir();
         let req = request("scout/c");
 
-        // The deadline: the runner's timeout drops the stage.
+        // The deadline: the runner's timeout drops the stage, once it is at the gate.
         let id = new_stage_id().unwrap();
-        let cut = tokio::time::timeout(Duration::from_secs(2), s.publisher.stage_and_record(&dir, &bundle, SANDBOX, &req, &id)).await;
-        assert!(cut.is_err(), "the stage was cut off");
+        {
+            let stage = s.publisher.stage_and_record(&dir, &bundle, SANDBOX, &req, &id);
+            tokio::pin!(stage);
+            tokio::select! {
+                _ = &mut stage => panic!("the gate holds the stage"),
+                _ = reached.notified() => {}
+            }
+            let cut = tokio::time::timeout(Duration::from_millis(50), &mut stage).await;
+            assert!(cut.is_err(), "the stage was cut off");
+        }
         assert_eq!(sh(&dir, &format!("git rev-parse refs/stage/{id}")), head, "verification finished");
         assert!(s.records().is_empty(), "{:?}", s.records());
         let staged = Staged { stage: id, sha: head.clone(), base_sha: String::new(), commits: 1, stat: String::new(), authors: vec![], files: vec![], patch: String::new(), patch_truncated: false };
         let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/c")).await.unwrap_err();
         assert_eq!(err.0, 404, "{}", err.1);
 
-        // A cancel: the stage future is dropped once its ref exists.
+        // A cancel: the stage future is dropped at the gate.
         let id = new_stage_id().unwrap();
-        let ref_file = dir.join("refs/stage").join(&id);
         tokio::select! {
             _ = s.publisher.stage_and_record(&dir, &bundle, SANDBOX, &req, &id) => panic!("the gate holds the stage"),
-            _ = async { while !ref_file.exists() { tokio::time::sleep(Duration::from_millis(5)).await } } => {}
+            _ = reached.notified() => {}
         }
+        assert_eq!(sh(&dir, &format!("git rev-parse refs/stage/{id}")), head, "verification finished");
         assert!(s.records().is_empty(), "{:?}", s.records());
         let staged = Staged { stage: id, ..staged };
         let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/c")).await.unwrap_err();
