@@ -122,6 +122,19 @@ describe("mentionGuard", () => {
     expect(deltas(out)).toBe("before @channel after");
   });
 
+  test("the step's message.completed, which June emits before its tool call, doesn't let held text go", async () => {
+    const out = await collect(g.events(from([
+      { type: "message.delta", turnId: "t", text: "before <!ch" },
+      { type: "message.completed", turnId: "t", text: "before <!ch" },
+      { type: "action.requested", turnId: "t", call: { id: "c1", name: "search_knowledge", input: {} } },
+      { type: "action.completed", turnId: "t", call: { id: "c1", name: "search_knowledge", input: {} }, result: "[]" },
+      { type: "message.delta", turnId: "t", text: "annel> after" },
+      { type: "turn.completed", turnId: "t", text: "annel> after" },
+    ])));
+    expect(deltas(out)).toBe("before @channel after");
+    expect(deltas(out)).not.toMatch(LIVE);
+  });
+
   test("text still held when the text ends goes out before what ends it", async () => {
     const out = await collect(g.events(from([
       { type: "message.delta", turnId: "t", text: "3 <" },

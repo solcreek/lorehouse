@@ -18,8 +18,10 @@ import { mentionedUserIds, mentionStream, neutralizeMentions } from "./mentions"
 
 type Names = (ids: string[]) => Promise<Map<string, { short: string }>>;
 
-// Events between which a turn's text carries on (and may close a held `<`).
-const CONTINUES = new Set<TurnEvent["type"]>(["turn.started", "action.requested", "action.completed", "reasoning.delta"]);
+// Events between which a turn's text carries on (and may close a held `<`). June emits
+// message.completed at the end of every model step, before that step's tool calls, so it
+// doesn't end the text either.
+const CONTINUES = new Set<TurnEvent["type"]>(["turn.started", "message.completed", "action.requested", "action.completed", "reasoning.delta"]);
 
 export function mentionGuard(names: Names = async () => new Map()) {
   const text = async (s: string): Promise<string> => {
@@ -41,12 +43,12 @@ export function mentionGuard(names: Names = async () => new Map()) {
       // A held "<!chan" stays held across a tool call: the text after it may land in the
       // same Slack message and close it. Only an event that ends the text lets it go.
       if (CONTINUES.has(e.type)) {
-        yield e.type === "reasoning.delta" ? { ...e, text: await text(e.text) } : e;
+        yield e.type === "reasoning.delta" || e.type === "message.completed" ? { ...e, text: await text(e.text) } : e;
         continue;
       }
       const held = await stream.flush();
       if (held && last?.type === "message.delta") yield { ...last, text: held };
-      if (e.type === "message.completed" || e.type === "turn.completed") yield { ...e, text: await text(e.text) };
+      if (e.type === "turn.completed") yield { ...e, text: await text(e.text) };
       else if (e.type === "input.requested") yield { ...e, request: { ...e.request, prompt: await text(e.request.prompt) } };
       else yield e;
     }
