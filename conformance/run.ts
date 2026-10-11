@@ -457,7 +457,9 @@ const scenarios: Scenario[] = [
       if (!a.text.includes("[quote:")) return "the reply didn't quote its source";
       const live = a.text.match(/<[@!][^>]*>/g);
       if (live) return `the reply carries live mention markup: ${live.join(" ")}`;
-      for (const want of ["@channel", "@here", "@Wendy", "@launch-crew"]) if (!a.text.includes(want)) return `the reply lost the name ${want}: ${a.text.slice(0, 300)}`;
+      // Each name keeps its "@", with an invisible word joiner (U+2060) after it so no
+      // Slack format can read it as a mention again.
+      for (const name of ["channel", "here", "Wendy", "launch-crew"]) if (!a.text.includes(`@\u2060${name}`)) return `the reply lost the name @${name}: ${a.text.slice(0, 300)}`;
       return null;
     },
   },

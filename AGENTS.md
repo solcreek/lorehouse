@@ -84,7 +84,8 @@ decides follow-ups (reply in a joined thread without a new mention, but not when
 mentions someone else/@channel); `src/dm.ts` handles `DM_MODE`. People are named as plain
 text, never @-mentioned (`src/tools/slack-names.ts`), and that is enforced in code, not left
 to the prompt: everything posted to Slack goes through `src/slack-guard.ts`, which rewrites
-`<@U…>`, `<!channel>`, `<!here>`, `<!everyone>` and `<!subteam^…>` as plain names.
+`<@U…>`, `<!channel>`, `<!here>`, `<!everyone>` and `<!subteam^…>` as plain names, and
+breaks bare `@here`/`@channel`/`@everyone` too, with an invisible U+2060 after the `@`.
 
 **Configuration** (`src/settings.ts`, `src/config.ts`): per key, first non-empty of the
 process env, `LOREHOUSE_ENV_FILE` (default `/etc/lorehouse/lorehouse.env`, written by
