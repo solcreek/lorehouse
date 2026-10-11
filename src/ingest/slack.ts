@@ -2,8 +2,18 @@
 // root message and its replies); a message nobody replied to is a thread of one.
 //
 // Only channels on the agent's allowlist are read, and the channel policy has already
-// dropped DMs and private channels before a live event gets here. Bot and system
-// messages (joins, topic changes, deletion tombstones) are left out: the agent's own
+// dropped DMs and private channels before a live event gets here.
+//
+// With `lookUp` (the app passes conversations.info, channel-check.ts), each channel is
+// looked up again before ingest first reads it, and again on every recheckChannels()
+// (hourly, from the app). One that Slack now says is private or archived, or that it
+// won't show this token (channel_not_found, missing_scope: what a channel turned private
+// likely answers), is closed, sticky until a restart: no longer read, its live events
+// dropped, and isClosed() tells the policy to refuse events there. What was indexed from
+// it stays until the next start, which refuses while the channel is listed; unlisting it
+// purges it (purge.ts). An outage (5xx, rate limit, no answer) closes nothing.
+//
+// Bot and system messages (joins, topic changes, deletion tombstones) are left out: the agent's own
 // answers must not become its sources. So are messages that mention the agent: they
 // are questions put to it, not knowledge.
 //
@@ -25,6 +35,7 @@
 import type { Database } from "bun:sqlite";
 import { countDocuments, deleteDocument, docIdsWithPrefix, documentVersion, getCursor, setCursor, upsertDocument, type Document } from "../knowledge";
 import { SlackApiError, type SlackApi } from "../slack-api";
+import { describeVerdict, isDefiniteFailure, type ChannelVerdict } from "../channel-check";
 import { SlackUsers, type PersonName } from "./slack-users";
 
 export type SlackMessage = {
@@ -138,7 +149,7 @@ export function threadOfEvent(ev: Record<string, unknown> | undefined): { channe
 export type IngestStatus = {
   state: "idle" | "backfilling" | "ready" | "error";
   documents: number;
-  channels: Record<string, { cursor?: string; threads: number }>;
+  channels: Record<string, { cursor?: string; threads: number; closed?: string }>;
   reconciled: { refreshed: number; removed: number };
   error?: string;
 };
@@ -154,6 +165,8 @@ export type IngestOptions = {
   // `oldestSec` (live roots, not tombstones), for others that must forget what was
   // deleted while the app was down (usage's asks).
   onReconciled?: (channel: string, oldestSec: number, roots: ReadonlySet<string>) => Promise<void>;
+  // Whether a channel is still public (conversations.info). Unset: channels aren't looked up.
+  lookUp?: (channel: string) => Promise<ChannelVerdict>;
 };
 
 // Bump whenever threadDocument renders differently (what it leaves out, how it names
@@ -169,6 +182,8 @@ export class SlackIngester {
   private error?: string;
   private reconciled = { refreshed: 0, removed: 0 };
   private pending = new Map<string, ReturnType<typeof setTimeout>>();
+  // Channels found private or archived since the start, with why: never read again.
+  private closed = new Map<string, string>();
 
   constructor(
     private readonly api: SlackApi,
@@ -188,17 +203,54 @@ export class SlackIngester {
     return this.users.names(ids);
   }
 
-  // Resolve the workspace URL (for permalinks) and the bot's own user id, re-render
-  // stored threads if the document shape changed, then for each allowed channel: read
-  // new history since the cursor, and reconcile what changed while the app was down.
+  // A channel found private or archived while the app runs: refused until a restart.
+  isClosed(channel: string): boolean {
+    return this.closed.has(channel);
+  }
+
+  // Look every open channel up again; close the ones Slack no longer shows as public. An
+  // outage changes nothing (the channel was public when last asked): it is logged, and the
+  // next recheck asks again. Returns the channels left unverified by an outage.
+  async recheckChannels(when: "start" | "recheck" = "recheck"): Promise<string[]> {
+    if (!this.opts.lookUp) return [];
+    const unverified: string[] = [];
+    for (const channel of this.opts.channels) {
+      if (this.closed.has(channel)) continue;
+      const v = await this.opts.lookUp(channel);
+      if (v.public) continue;
+      if (v.reason === "lookup_failed" && !isDefiniteFailure(v)) {
+        unverified.push(channel);
+        this.opts.log?.(when === "start"
+          ? `ingest: ${describeVerdict(v)}; its history isn't read on this start (live messages still are), and the next recheck asks again`
+          : `ingest: ${describeVerdict(v)}; nothing changes, and the next recheck asks again`);
+        continue;
+      }
+      this.closed.set(channel, v.reason === "lookup_failed" ? v.error : v.reason);
+      for (const [key, timer] of this.pending) {
+        if (!key.startsWith(`${channel}:`)) continue;
+        clearTimeout(timer);
+        this.pending.delete(key);
+      }
+      this.opts.log?.(`ingest: ${describeVerdict(v)}: no longer read, and mentions there are refused. What was learned there stays until the next start, which refuses while it is in AGENT_CHANNELS; take it off the list, and that start purges it`);
+    }
+    return unverified;
+  }
+
+  // Resolve the workspace URL (for permalinks) and the bot's own user id, look each
+  // channel up (lookUp), re-render stored threads if the document shape changed, then for
+  // each allowed channel still public: read new history since the cursor, and reconcile
+  // what changed while the app was down.
   async start(): Promise<void> {
     this.state = "backfilling";
     try {
       const auth = await this.api.call<{ url: string; user_id?: string }>("auth.test");
       this.workspaceUrl = auth.url;
       this.botUserId = auth.user_id;
-      await this.rerenderIfStale();
-      for (const channel of this.opts.channels) {
+      // A channel Slack wouldn't confirm (an outage) has its history skipped on this start.
+      const unverified = new Set(await this.recheckChannels("start"));
+      const readable = [...this.opts.channels].filter((c) => !this.closed.has(c) && !unverified.has(c));
+      await this.rerenderIfStale(readable);
+      for (const channel of readable) {
         if (this.opts.backfillDays > 0 || getCursor(this.db, `slack:${channel}`)) await this.backfill(channel);
         if (this.opts.refreshDays > 0) await this.reconcile(channel);
       }
@@ -214,18 +266,20 @@ export class SlackIngester {
     return (this.opts.now?.() ?? Date.now()) / 1000;
   }
 
-  private async rerenderIfStale(): Promise<void> {
+  private async rerenderIfStale(channels: string[]): Promise<void> {
     const row = this.db.query("SELECT value FROM knowledge_index_meta WHERE key = 'slack_doc_version'").get() as { value: string } | null;
     if (row?.value === SLACK_DOC_VERSION) return;
     let n = 0;
-    for (const channel of this.opts.channels) {
+    for (const channel of channels) {
       for (const docId of docIdsWithPrefix(this.db, `slack:${channel}:`)) {
         await this.refreshThread(channel, docId.slice(`slack:${channel}:`.length));
         n++;
       }
     }
     // Without users:read the re-render fell back to ids: leave the version unset so the
-    // next start (after the scope is added and the app reinstalled) tries again.
+    // next start (after the scope is added and the app reinstalled) tries again. So too
+    // when a channel was skipped: its threads still have the old shape.
+    if (channels.length < this.opts.channels.size) return;
     if (!this.users.available) {
       this.opts.log?.(`ingest: re-rendered ${n} threads without names; will retry once users:read is granted`);
       return;
@@ -323,11 +377,12 @@ export class SlackIngester {
   // Re-reads the thread once things settle.
   onRawEvent(ev: Record<string, unknown> | undefined): void {
     const t = threadOfEvent(ev);
-    if (!t || !this.opts.channels.has(t.channel)) return;
+    if (!t || !this.opts.channels.has(t.channel) || this.closed.has(t.channel)) return;
     const key = `${t.channel}:${t.threadTs}`;
     clearTimeout(this.pending.get(key));
     this.pending.set(key, setTimeout(() => {
       this.pending.delete(key);
+      if (this.closed.has(t.channel)) return;
       this.refreshThread(t.channel, t.threadTs).catch((err) => this.opts.log?.(`ingest: thread ${key}: ${err}`));
     }, this.opts.debounceMs));
   }
@@ -335,7 +390,10 @@ export class SlackIngester {
   status(): IngestStatus {
     const channels: IngestStatus["channels"] = {};
     // threads: what the index holds for the channel now, not what this run happened to read
-    for (const c of this.opts.channels) channels[c] = { cursor: getCursor(this.db, `slack:${c}`), threads: countDocuments(this.db, `slack:${c}:`) };
+    for (const c of this.opts.channels) {
+      const closed = this.closed.get(c);
+      channels[c] = { cursor: getCursor(this.db, `slack:${c}`), threads: countDocuments(this.db, `slack:${c}:`), ...(closed ? { closed } : {}) };
+    }
     return { state: this.state, documents: countDocuments(this.db), channels, reconciled: { ...this.reconciled }, ...(this.error ? { error: this.error } : {}) };
   }
 }

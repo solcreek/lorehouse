@@ -10,7 +10,7 @@
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
 // STATUS_TOKEN, ADMIN_TOKEN, LOREHOUSE_ENV_FILE (a missing file, so no installed settings
-// leak in), LOREHOUSE_SETTINGS (settings.json beside LOREHOUSE_DB), and per scenario DM_MODE, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN,
+// leak in), LOREHOUSE_SETTINGS (settings.json beside LOREHOUSE_DB), and per scenario DM_MODE, INGEST_CHANNEL_RECHECK_MS, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN,
 // PR_APPROVER and GITHUB_API_URL (GitHub's REST API, mocked). SESSIONS_DB is never set: the app
 // keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
@@ -108,7 +108,7 @@ type Usage = {
   emptySearches: { threads: number; of: number; queries: string[] };
   feedback: { up: number; down: number; raters: number; downMessages: { channel: string; ts: string }[] };
 };
-type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number }>; reconciled: { refreshed: number; removed: number } } };
+type Status = { agent: string; knowledge: { state: string; documents: number; channels: Record<string, { cursor?: string; threads: number; closed?: string }>; reconciled: { refreshed: number; removed: number } } };
 const STATUS_TOKEN = "conformance-status";
 const APP = `http://localhost:${APP_PORT}`;
 // Runner mode: sandbox hosts connect in (docs/sandbox-runners.md).
@@ -916,6 +916,125 @@ const scenarios: Scenario[] = [
       return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
     },
   },
+  // Every listed channel must be public, as Slack's conversations.info says: a start with
+  // one that is private, archived, or can't be looked up is refused, naming each (#86).
+  {
+    name: "refuses to start with a private channel in AGENT_CHANNELS, naming each, before reading Slack or purging anything",
+    run: async () => {
+      // A joined thread in the listed channel: a start that purged before refusing would drop it.
+      const thread = await mentionAndWait("where is the wombat review");
+      await stopApp();
+      try {
+        await reset();
+        // C7 is private with a C… id, as Slack's newer private channels are; G1 an older one.
+        // The app's token has no groups:read, so Slack answers missing_scope for them.
+        const r = await refusedStart({ AGENT_CHANNELS: "C7,G1" });
+        if (typeof r === "string") return r;
+        for (const want of ["C7 couldn't be looked up, so it counts as not public: conversations.info said missing_scope", "G1 couldn't be looked up, so it counts as not public: conversations.info said missing_scope"]) {
+          if (!r.stderr.includes(want)) return `stderr doesn't say "${want}": ${r.stderr.slice(0, 400)}`;
+        }
+        const s = await stats();
+        const others = Object.keys(s.byMethod).filter((m) => m !== "conversations.info");
+        if (others.length) return `called Slack beyond conversations.info before refusing: ${JSON.stringify(s.byMethod)}`;
+        // A token that may see private channels gets is_private: named as private.
+        const seen = await refusedStart({ AGENT_CHANNELS: "C7,G1", SLACK_BOT_TOKEN: "xoxb-with-groups-read" });
+        if (typeof seen === "string") return `with groups:read: ${seen}`;
+        for (const want of ["C7 (#board-only) is a private channel", "G1 (#secret-merger) is a private channel"]) {
+          if (!seen.stderr.includes(want)) return `with groups:read, stderr doesn't say "${want}": ${seen.stderr.slice(0, 400)}`;
+        }
+      } finally {
+        await startApp();
+      }
+      const { threads } = await admin<{ threads: { channel: string; threadTs: string }[] }>("/api/v1/threads?limit=200");
+      return threads.some((t) => t.channel === ALLOWED && t.threadTs === thread) ? null : `the refused start purged ${ALLOWED}'s joined thread ${thread}`;
+    },
+  },
+  {
+    name: "refuses to start with an archived channel in AGENT_CHANNELS, naming it and not the public one",
+    run: async () => {
+      const db = freshDb();
+      await stopApp();
+      try {
+        const r = await refusedStart({ AGENT_CHANNELS: `${ALLOWED},C8`, LOREHOUSE_DB: db });
+        if (typeof r === "string") return r;
+        if (!r.stderr.includes("C8 (#old-launch) is archived")) return `stderr doesn't name C8 as archived: ${r.stderr.slice(0, 400)}`;
+        return r.stderr.includes(`${ALLOWED} (#general)`) ? `stderr names the public ${ALLOWED} too: ${r.stderr.slice(0, 400)}` : null;
+      } finally {
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
+    name: "a channel lookup that fails refuses the start (fails closed): not found, a token without channels:read, Slack unreachable",
+    run: async () => {
+      const db = freshDb();
+      await stopApp();
+      try {
+        const cases: [Record<string, string>, string][] = [
+          [{ AGENT_CHANNELS: `${ALLOWED},C404` }, "C404 couldn't be looked up, so it counts as not public: conversations.info said channel_not_found"],
+          [{ SLACK_BOT_TOKEN: "xoxb-without-channels-read" }, `${ALLOWED} couldn't be looked up, so it counts as not public: conversations.info said missing_scope`],
+          [{ SLACK_API_URL: `http://127.0.0.1:${await closedPort()}/api` }, `${ALLOWED} couldn't be looked up, so it counts as not public: conversations.info said `],
+        ];
+        for (const [env, want] of cases) {
+          const r = await refusedStart({ ...env, LOREHOUSE_DB: db });
+          if (typeof r === "string") return `${JSON.stringify(env)}: ${r}`;
+          if (!r.stderr.includes(want)) return `${JSON.stringify(env)}: stderr doesn't say "${want}": ${r.stderr.slice(0, 400)}`;
+        }
+        return null;
+      } finally {
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
+    name: "starts when every listed channel is public, after looking each one up",
+    run: async () => {
+      const db = freshDb();
+      await stopApp();
+      try {
+        await reset();
+        await startApp({ AGENT_CHANNELS: `${ALLOWED},${REMOVED}`, LOREHOUSE_DB: db });
+        const s = await stats();
+        if ((s.byMethod["conversations.info"] ?? 0) < 2) return `conversations.info called ${s.byMethod["conversations.info"] ?? 0} time(s), want one per channel at least`;
+        const { knowledge } = await status();
+        // Read: its backfill left a cursor.
+        return knowledge.channels[REMOVED]?.cursor ? null : `${REMOVED} wasn't read: ${JSON.stringify(knowledge.channels)}`;
+      } finally {
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
+    name: "a listed channel turned private while running is closed at the next recheck: a mention there gets no reply and no model call; the other channel still answers",
+    run: async () => {
+      const db = freshDb();
+      const PUBLIC_C2 = { name: "random", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false };
+      await stopApp();
+      try {
+        await startApp({ AGENT_CHANNELS: `${ALLOWED},${REMOVED}`, LOREHOUSE_DB: db, INGEST_CHANNEL_RECHECK_MS: "300" });
+        await post("/fixtures/channel", { channel: REMOVED, info: { ...PUBLIC_C2, is_private: true } });
+        const closed = await until(async () => (await status()).knowledge.channels[REMOVED]?.closed, 5000);
+        if (!closed) return `${REMOVED} never closed: ${JSON.stringify((await status()).knowledge.channels)}`;
+        await reset();
+        await sendEvent(mention(REMOVED));
+        await Bun.sleep(1500);
+        const s = await stats();
+        const asked = s.modelCalls || s.byMethod["chat.startStream"] || s.byMethod["chat.postMessage"];
+        if (asked) return `answered in the closed channel: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}`;
+        const a = await ask("when is the quarterly wombat review");
+        return a.cite === WOMBAT_THREAD ? null : `${ALLOWED} answered ${JSON.stringify(a.text.slice(0, 120))}, want a cite of ${WOMBAT_THREAD}`;
+      } finally {
+        await post("/fixtures/channel", { channel: REMOVED, info: PUBLIC_C2 });
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
   // An empty AGENT_CHANNELS means nowhere, for every event kind; a channel taken off the
   // list leaves the knowledge index on the next start (#82).
   {
@@ -1240,34 +1359,38 @@ const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS
 // Start the app and wait until it listens, owns its port, and (unless waitReady is off,
 // for a start where /status is closed) has finished its Slack backfill/reconcile
 // (GET /status → ready).
+function appEnv(extraEnv: Record<string, string>): Record<string, string | undefined> {
+  return {
+    ...inherited,
+    PORT: String(APP_PORT),
+    SLACK_SIGNING_SECRET: SECRET,
+    SLACK_BOT_TOKEN: "xoxb-conformance",
+    SLACK_API_URL: `${MOCK}/slack/api`,
+    ANTHROPIC_API_KEY: "conformance",
+    ANTHROPIC_BASE_URL: `${MOCK}/anthropic`,
+    AGENT_CHANNELS: ALLOWED,
+    KNOWLEDGE_SEED: join(HERE, "fixtures/corpus.jsonl"),
+    LOREHOUSE_DB: DB,
+    // Fixture timestamps are fixed, so look back far enough that they never age out.
+    INGEST_BACKFILL_DAYS: "36500",
+    INGEST_REFRESH_DAYS: "36500",
+    INGEST_DEBOUNCE_MS: "200",
+    STATUS_TOKEN,
+    ADMIN_TOKEN,
+    LOREHOUSE_ENV_FILE: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "lorehouse.env"),
+    // Set, not left to its default: the app's Bun loads the checkout's .env for every
+    // variable not set here, and one naming a settings file would fill in the rest.
+    LOREHOUSE_SETTINGS: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "settings.json"),
+    ...extraEnv,
+  };
+}
+
 async function startApp(extraEnv: Record<string, string> = {}, { waitReady = true } = {}): Promise<void> {
   const proc = Bun.spawn(APP_CMD, {
     // An external app runs from its own directory, so a binary that quietly reads files
     // from this repo (prompts, migrations) fails here instead of passing by accident.
     cwd: ARGS.app ? dirname(APP_CMD[0]!) : ROOT,
-    env: {
-      ...inherited,
-      PORT: String(APP_PORT),
-      SLACK_SIGNING_SECRET: SECRET,
-      SLACK_BOT_TOKEN: "xoxb-conformance",
-      SLACK_API_URL: `${MOCK}/slack/api`,
-      ANTHROPIC_API_KEY: "conformance",
-      ANTHROPIC_BASE_URL: `${MOCK}/anthropic`,
-      AGENT_CHANNELS: ALLOWED,
-      KNOWLEDGE_SEED: join(HERE, "fixtures/corpus.jsonl"),
-      LOREHOUSE_DB: DB,
-      // Fixture timestamps are fixed, so look back far enough that they never age out.
-      INGEST_BACKFILL_DAYS: "36500",
-      INGEST_REFRESH_DAYS: "36500",
-      INGEST_DEBOUNCE_MS: "200",
-      STATUS_TOKEN,
-      ADMIN_TOKEN,
-      LOREHOUSE_ENV_FILE: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "lorehouse.env"),
-      // Set, not left to its default: the app's Bun loads the checkout's .env for every
-      // variable not set here, and one naming a settings file would fill in the rest.
-      LOREHOUSE_SETTINGS: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "settings.json"),
-      ...extraEnv,
-    },
+    env: appEnv(extraEnv),
     stdout: "ignore",
     stderr: "pipe",
   });
@@ -1281,6 +1404,32 @@ async function startApp(extraEnv: Record<string, string> = {}, { waitReady = tru
     if (Date.now() - t0 > 15000) throw new Error(`ingest never became ready: ${JSON.stringify(await status().catch((e) => String(e)))}`);
     await Bun.sleep(50);
   }
+}
+
+// A local port nothing listens on: bound, then let go.
+async function closedPort(): Promise<number> {
+  const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = server.port;
+  server.stop(true);
+  return port;
+}
+
+// Start the app with settings it must refuse: it must exit non-zero within 15 s without
+// ever listening. Resolves to its exit code and what it wrote to stderr, or why not.
+async function refusedStart(extraEnv: Record<string, string>): Promise<{ code: number; stderr: string } | string> {
+  const proc = Bun.spawn(APP_CMD, { cwd: ARGS.app ? dirname(APP_CMD[0]!) : ROOT, env: appEnv(extraEnv), stdout: "ignore", stderr: "pipe" });
+  const stderr = new Response(proc.stderr as ReadableStream).text(); // drained as it runs
+  const exited = await Promise.race([proc.exited, Bun.sleep(15000).then(() => undefined)]);
+  if (exited === undefined) {
+    const listening = await fetch(`${APP}/healthz`).then((r) => r.ok, () => false);
+    proc.kill();
+    await proc.exited;
+    const t0 = Date.now();
+    while ((await listenerPids(APP_PORT)).length && Date.now() - t0 < 5000) await Bun.sleep(20);
+    return listening ? "started and listened, want a refusal" : "neither started nor exited within 15 s";
+  }
+  const text = await stderr;
+  return exited === 0 ? `exited 0, want a failure: ${text.slice(0, 300)}` : { code: exited, stderr: text };
 }
 
 async function stopApp(): Promise<void> {

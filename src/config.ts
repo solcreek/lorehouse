@@ -30,7 +30,8 @@ export type Config = {
   // session store on purpose. The session store defaults to a file beside it (sessionsDbFor).
   db: { lorehouse: string; sessions: string; knowledgeSeed?: string };
   // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
-  ingest: { backfillDays: number; refreshDays: number; debounceMs: number };
+  // recheckMs: how often listed channels are looked up again for one turned private (0 = never).
+  ingest: { backfillDays: number; refreshDays: number; debounceMs: number; recheckMs: number };
   // Print every Slack event the policy lets through, raw, to stdout. For checking what
   // real Slack sends against what the conformance mock assumes. Off by default.
   logSlackEvents: boolean;
@@ -171,6 +172,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       backfillDays: nonNegative("INGEST_BACKFILL_DAYS", 90),
       refreshDays: nonNegative("INGEST_REFRESH_DAYS", 14),
       debounceMs: nonNegative("INGEST_DEBOUNCE_MS", 5000),
+      recheckMs: nonNegative("INGEST_CHANNEL_RECHECK_MS", 3_600_000),
     },
     logSlackEvents: env.LOG_SLACK_EVENTS === "1",
     statusToken: env.STATUS_TOKEN || undefined,

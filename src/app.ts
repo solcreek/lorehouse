@@ -14,6 +14,7 @@ import { recentKnowledgeTool } from "./tools/recent-knowledge";
 import { SlackIngester } from "./ingest/slack";
 import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
+import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
 import { SKILLS, systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
@@ -57,6 +58,11 @@ const AGENT_ID = "lorehouse";
 export async function createApp(config: Config) {
   const identity = agentIdentity(config.agent.name, config.agent.coAuthor);
 
+  // Every listed channel must be public, as Slack says (channel-check.ts): before the
+  // database is opened or purged, and before anything listens. A ConfigError names each.
+  const slackReads = slackApi({ token: config.slack.botToken, apiUrl: config.slack.apiUrl });
+  await assertPublicChannels(slackReads, config.agent.channels);
+
   const knowledge = openKnowledge(config.db.lorehouse);
   // Both files exist from here on, so this compares the files themselves, not their names.
   try {
@@ -72,8 +78,9 @@ export async function createApp(config: Config) {
 
   // Slack history becomes knowledge — only for channels the agent is allowed in.
   const ingester = config.agent.channels.size
-    ? new SlackIngester(slackApi({ token: config.slack.botToken, apiUrl: config.slack.apiUrl }), knowledge, {
+    ? new SlackIngester(slackReads, knowledge, {
         channels: config.agent.channels,
+        lookUp: (channel) => lookUpChannel(slackReads, channel),
         backfillDays: config.ingest.backfillDays,
         refreshDays: config.ingest.refreshDays,
         debounceMs: config.ingest.debounceMs,
@@ -152,6 +159,10 @@ export async function createApp(config: Config) {
     );
   }
 
+  // Where the agent works: the listed channels, less any ingest found private or archived
+  // since the start (refused from then on; see ingest/slack.ts).
+  const listed = { has: (channel: string) => config.agent.channels.has(channel) && !ingester?.isClosed(channel) };
+
   const dm = config.agent.dm;
   const shouldRespond = (e: SlackNormalizedEvent) =>
     e.kind === "app_mention" ||
@@ -219,7 +230,7 @@ export async function createApp(config: Config) {
           if (direct) return slack.post!({ channelId: direct.channel }, redirectText(config.agent.channels)).then(() => undefined);
         }
       : undefined,
-    accept: publicChannelsOnly(config.agent.channels, { dms: dm !== "ignore" }),
+    accept: publicChannelsOnly(listed, { dms: dm !== "ignore" }),
     stream: true,
     // What the model says before a tool call ("Let me search…") goes to the task
     // timeline, not into the answer; only the final step's text is the reply.
@@ -227,7 +238,7 @@ export async function createApp(config: Config) {
     // The name is the model's to choose: guarded like everything else it writes.
     tasks: (call) => neutralizeMentions(TASK_LABELS[call.name] ?? `Running ${call.name.replaceAll("_", " ")}`),
     onError: (err) => console.error("slack:", err),
-  }), names, (c) => config.agent.channels.has(c)), names);
+  }), names, (c) => listed.has(c)), names);
 
   const agent = defineAgent({
     name: AGENT_ID,
@@ -287,6 +298,11 @@ export async function createApp(config: Config) {
     // Kick off the Slack backfill; call after the server is listening (it runs in the
     // background and never blocks /healthz).
     startIngest: async () => {
+      // A channel can turn private (or be archived) while the app runs: look again
+      // (INGEST_CHANNEL_RECHECK_MS, hourly by default), armed before anything here can fail.
+      if (ingester && config.ingest.recheckMs > 0) {
+        setInterval(() => void ingester.recheckChannels().catch((err) => console.error("ingest:", err)), config.ingest.recheckMs).unref();
+      }
       await announceRecordPeople();
       await ingester?.start();
     },

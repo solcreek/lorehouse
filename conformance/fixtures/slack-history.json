@@ -1,4 +1,11 @@
 {
+  "_channels": {
+    "C1": { "name": "general", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false },
+    "C2": { "name": "random", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false },
+    "C7": { "name": "board-only", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": true, "is_archived": false },
+    "C8": { "name": "old-launch", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": true },
+    "G1": { "name": "secret-merger", "is_channel": false, "is_group": true, "is_im": false, "is_mpim": false, "is_private": true, "is_archived": false }
+  },
   "_users": {
     "U2": { "name": "wendy.w", "profile": { "display_name": "Wendy", "real_name": "Wendy Wu" } },
     "U3": { "name": "omar", "profile": { "display_name": "", "real_name": "Omar Ortiz" } },

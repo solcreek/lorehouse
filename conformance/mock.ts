@@ -2,7 +2,7 @@
 // implementations are measured against identical, deterministic upstreams.
 //
 //   /slack/api/<method>        Slack Web API (JSON, form or query params). Records every call.
-//                              Serves conversations.history/replies from its fixtures.
+//                              Serves conversations.history/replies/info from its fixtures.
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
 //   /github/…                  GitHub's REST API, as much as open_pull_request uses: the
 //                              token's user, and listing and opening pull requests.
@@ -14,6 +14,8 @@
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
+//   POST /fixtures/channel     {channel, info} — what conversations.info says of it now
+//                              (info null: no such channel)
 //   POST /reset                clear recorded calls (fixtures stay)
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
@@ -36,7 +38,15 @@
 //
 // Env: PORT (8900), TTFT_MS (300) delay before the first event, TOKENS (80),
 //      TOKEN_DELAY_MS (15) between text deltas, SLACK_FIXTURES (JSON file:
-//      { "<channel>": [message, …] }, roots and replies together).
+//      { "<channel>": [message, …] }, roots and replies together; "_users": users.info
+//      answers; "_channels": conversations.info answers, { "<channel>": {name, is_private,
+//      is_archived, …} }, and a channel not there is channel_not_found).
+//
+// conversations.info, as Slack likely answers the app's token (channels:read, no
+// groups:read): a public channel's info; for a private channel or group DM, missing_scope
+// (needed groups:read), as the app never asks for groups:read; with the bot token
+// "xoxb-with-groups-read", a private channel's info too (is_private: true); with the bot
+// token "xoxb-without-channels-read", missing_scope for every channel.
 
 import { readFileSync } from "node:fs";
 
@@ -57,10 +67,15 @@ type FixtureMessage = { ts: string; thread_ts?: string; user?: string; bot_id?: 
 const history = new Map<string, FixtureMessage[]>();
 // users.info answers, from the fixture's "_users" key: { "U2": { profile: {…} }, … }
 let users: Record<string, unknown> = {};
+// conversations.info answers, from the fixture's "_channels" key.
+let channelInfo: Record<string, Record<string, unknown>> = {};
+const NO_CHANNELS_READ = "xoxb-without-channels-read";
+const WITH_GROUPS_READ = "xoxb-with-groups-read";
 if (process.env.SLACK_FIXTURES) {
   const seed = JSON.parse(readFileSync(process.env.SLACK_FIXTURES, "utf8")) as Record<string, unknown>;
   users = (seed._users ?? {}) as Record<string, unknown>;
-  for (const [channel, messages] of Object.entries(seed)) if (channel !== "_users") history.set(channel, [...(messages as FixtureMessage[])]);
+  channelInfo = (seed._channels ?? {}) as Record<string, Record<string, unknown>>;
+  for (const [channel, messages] of Object.entries(seed)) if (!channel.startsWith("_")) history.set(channel, [...(messages as FixtureMessage[])]);
 }
 
 function conversations(method: string, body: Record<string, unknown>): Response {
@@ -113,7 +128,7 @@ function threadCalls(threadTs: string): SlackCall[] {
   return calls.filter((c) => (c.method === "chat.startStream" && c.body.thread_ts === threadTs) || streamTs.has(String(c.body.ts)));
 }
 
-function slack(method: string, body: Record<string, unknown>): Response {
+function slack(method: string, body: Record<string, unknown>, token = ""): Response {
   // epoch ms, not performance.now(): the driver (another process) compares against it
   const call: SlackCall = { t: Date.now(), method, body };
   if (method === "chat.startStream") {
@@ -136,6 +151,13 @@ function slack(method: string, body: Record<string, unknown>): Response {
   }
   if (method === "auth.test") return Response.json({ ok: true, url: "https://acme.slack.com/", user_id: "UBOT", team_id: "T1", bot_id: "B1" });
   if (method === "conversations.history" || method === "conversations.replies") return conversations(method, body);
+  if (method === "conversations.info") {
+    if (token === NO_CHANNELS_READ) return Response.json({ ok: false, error: "missing_scope", needed: "channels:read", provided: "chat:write" });
+    const info = channelInfo[String(body.channel)];
+    if (!info) return Response.json({ ok: false, error: "channel_not_found" });
+    if ((info.is_private || info.is_group || info.is_mpim) && token !== WITH_GROUPS_READ) return Response.json({ ok: false, error: "missing_scope", needed: "groups:read", provided: "channels:read" });
+    return Response.json({ ok: true, channel: { id: body.channel, ...info } });
+  }
   if (method === "users.info") {
     const user = users[String(body.user)];
     return user ? Response.json({ ok: true, user: { id: body.user, ...(user as object) } }) : Response.json({ ok: false, error: "user_not_found" });
@@ -311,7 +333,8 @@ Bun.serve({
     if (url.pathname.startsWith("/slack/api/")) {
       // reads come as GET query params, writes as JSON/form bodies; accept both
       const params = { ...Object.fromEntries(url.searchParams), ...(await parseBody(req)) };
-      return slack(url.pathname.slice("/slack/api/".length), params);
+      const token = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+      return slack(url.pathname.slice("/slack/api/".length), params, token);
     }
     // An interaction's response_url (a scenario puts this one in its click): what is posted
     // here (an ephemeral reply to the clicker) is recorded like a Slack call.
@@ -322,6 +345,12 @@ Bun.serve({
     if (url.pathname === "/fixtures/messages" && req.method === "POST") {
       const { channel, message } = (await req.json()) as { channel: string; message: FixtureMessage };
       history.set(channel, [...(history.get(channel) ?? []), message]);
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/fixtures/channel" && req.method === "POST") {
+      const { channel, info } = (await req.json()) as { channel: string; info: Record<string, unknown> | null };
+      if (info) channelInfo[channel] = info;
+      else delete channelInfo[channel];
       return Response.json({ ok: true });
     }
     if (url.pathname === "/fixtures/edit" && req.method === "POST") {

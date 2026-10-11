@@ -15,9 +15,14 @@
 // events only, so emptying the list stopped new mentions but not follow-ups.)
 //
 // `accept` is synchronous, so it can't ask Slack (conversations.info) whether a channel
-// is private. What the payload itself says:
+// is private. It doesn't need to: the start asks for every listed channel and refuses to
+// start while any is private, archived or can't be looked up (channel-check.ts, #86), and
+// ingest asks again hourly; a channel that turned private since is taken out of the
+// allowlist handed in here (app.ts), so its events are refused from then on. What the
+// payload itself says:
 //   • message events carry channel_type: "channel" (public) | "group" | "im" | "mpim"
-//   • app_mention events carry NO channel_type, so the allowlist alone vouches for them.
+//   • app_mention events carry NO channel_type, so the allowlist (checked as above) vouches
+//     for them.
 //   • reaction events carry neither channel_type nor `channel`: the reacted-to message's
 //     channel is `item.channel`.
 
@@ -26,7 +31,7 @@ type SlackEnvelope = {
   event?: { type?: string; channel?: string; channel_type?: string; item?: { channel?: string } };
 };
 
-export function publicChannelsOnly(allowlist: ReadonlySet<string>, opts: { dms?: boolean } = {}) {
+export function publicChannelsOnly(allowlist: { has(channel: string): boolean }, opts: { dms?: boolean } = {}) {
   return (raw: unknown): boolean => {
     const env = raw as SlackEnvelope | undefined;
     // slackChannel only consults accept for event_callback deliveries (Approve/Deny clicks
