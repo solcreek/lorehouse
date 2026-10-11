@@ -2,9 +2,10 @@
 -- applies a click the rule let through (input.resolved), so the tool can check PR_APPROVER
 -- against that person at the moment it pushes, and name them in the pull request
 -- (src/approvals.ts). One row per card in one turn: `turn` is the ts of the Slack message
--- that started the turn, `card` the card's input id. The tool deletes the row at every
--- outcome but a failed push (a retry in the same turn uses it again); the end of the turn
--- deletes what is left, and anything older than a day goes on start and daily.
+-- that started the turn, `card` the card's input id. The tool deletes the row at once on a
+-- Deny or a refusal; every other outcome keeps it until the turn ends (a retry, or a
+-- crash-replay after the PR opened, uses it again), and anything older than a day goes on
+-- start and daily.
 CREATE TABLE pr_approvals (
   session     TEXT NOT NULL,
   turn        TEXT NOT NULL,

@@ -579,10 +579,11 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(t.prBody()).toContain("approved there by Ada Park.");
   });
 
-  // Every way out of an approved (or denied) card leaves no approval behind.
-  // The tool itself, without the end of the turn to clean up after it: each outcome deletes
-  // the card's record as it returns, except a failed push (a retry in the turn needs it).
-  test("the tool deletes the card's record at every outcome but a failed push", async () => {
+  // The tool itself, without the end of the turn to clean up after it: a Deny or a refusal
+  // deletes the card's record as it returns; every other outcome keeps it for the rest of the
+  // turn (a retry, or a crash-replay after the PR opened, needs it). The engine tests below
+  // show the turn's end then deletes it.
+  test("the tool deletes the card's record at once on a Deny or a refusal, and keeps it otherwise", async () => {
     const run = async (o: { existing?: unknown[]; postStatus?: number; writeError?: boolean; pushError?: string; answer?: boolean; rule?: PrApprover; record?: boolean }) => {
       const approvals = approvalStore(openKnowledge(":memory:"));
       const { sb } = fakeRepo({ pushError: o.pushError });
@@ -609,13 +610,45 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
       expect(approvals.decide(other, "anyone", "U1").approver).toBe("U3");
       return { result, left: approvals.count() - 1 };
     };
-    expect(await run({})).toMatchObject({ result: { status: "opened" }, left: 0 });
-    expect(await run({ existing: [{ html_url: "u", number: 3 }] })).toMatchObject({ result: { status: "exists" }, left: 0 });
-    expect(await run({ writeError: true })).toMatchObject({ result: { error: expect.stringContaining("no GitHub credential") }, left: 0 });
-    expect(await run({ postStatus: 422 })).toMatchObject({ result: { error: expect.stringContaining("GitHub rejected") }, left: 0 });
     expect(await run({ answer: false })).toMatchObject({ result: { status: "denied" }, left: 0 });
     expect(await run({ rule: "requester" })).toMatchObject({ result: { status: "refused" }, left: 0 }); // U2's record, the rule now requester
+    expect(await run({})).toMatchObject({ result: { status: "opened" }, left: 1 });
+    expect(await run({ existing: [{ html_url: "u", number: 3 }] })).toMatchObject({ result: { status: "exists" }, left: 1 });
+    expect(await run({ writeError: true })).toMatchObject({ result: { error: expect.stringContaining("no GitHub credential") }, left: 1 });
+    expect(await run({ postStatus: 422 })).toMatchObject({ result: { error: expect.stringContaining("GitHub rejected") }, left: 1 });
     expect(await run({ pushError: "push: 409" })).toMatchObject({ result: { error: expect.stringContaining("push failed") }, left: 1 });
+  });
+
+  test("not-requester: a crash-replay after the PR opened finds its record and reports the PR as existing; no second PR", async () => {
+    // The process dies after the PR is opened, before June saves the tool's result. On
+    // restart June replays the turn: the tool runs again from the top, requestInput returns the
+    // stored answer (no new click, no new record), and the PR is already open on GitHub.
+    const approvals = approvalStore(openKnowledge(":memory:"));
+    const { sb } = fakeRepo();
+    const open: unknown[] = [];
+    const posts: unknown[] = [];
+    const f = (async (_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return Response.json(open);
+      posts.push(init?.body);
+      const pr = { html_url: "https://github.com/acme/widgets/pull/7", number: 7 };
+      open.push(pr);
+      return Response.json(pr, { status: 201 });
+    }) as typeof fetch;
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: f, approver: "not-requester", approvals });
+    let clicked = false;
+    const ctx = {
+      sessionId: "s",
+      event: { source: "slack", ts: "1.1", user: { id: "U1", attested: true } },
+      requestInput: async (r: { id: string }) => {
+        if (!clicked) approvals.record({ session: "s", turn: "1.1", card: r.id }, "U2"); // U2's click, recorded once
+        clicked = true;
+        return true;
+      },
+    } as never;
+    expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened", number: 7 });
+    // …crash, restart, replay:
+    expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "exists", number: 7 });
+    expect(posts).toHaveLength(1);
   });
 
   test("a record is for its own turn: the same card in a later turn finds none, and under not-requester is refused", async () => {
@@ -698,7 +731,8 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     });
   });
 
-  describe("no approval outlives its card", () => {
+  // Through the engine: whatever the outcome, no approval outlives its turn.
+  describe("no approval outlives its turn", () => {
     const outcome = async (o: Thread, by = "U2", answer = true) => {
       const t = thread({ rule: "anyone", ...o });
       const t1 = t.start("1.1");
@@ -707,11 +741,11 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
       expect(t.approvals.count()).toBe(0);
       return t;
     };
-    test("opened", async () => {
+    test("opened: kept until the turn ends, then gone", async () => {
       const t = await outcome({});
       expect(t.toolResults()[0]).toMatchObject({ status: "opened" });
     });
-    test("an open pull request for the branch already exists", async () => {
+    test("an open pull request for the branch already exists: kept until the turn ends, then gone", async () => {
       const t = await outcome({ existing: [{ html_url: "https://github.com/acme/widgets/pull/3", number: 3 }] });
       expect(t.toolResults()[0]).toMatchObject({ status: "exists" });
     });

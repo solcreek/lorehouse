@@ -24,9 +24,9 @@
 // stages again (the same commits give the same sha and, unless the base was rewritten, the
 // same card), requestInput then returns the stored answer, and the post-approval part is
 // idempotent: an already-open PR for the branch is returned instead of creating a second one.
-// Except under PR_APPROVER=not-requester after a crash between opening the PR and June saving
-// the tool's result: the approval record was already deleted, so the replay is refused (it
-// fails closed, though the PR is open).
+// That holds under every PR_APPROVER, a crash between opening the PR and June saving the
+// tool's result included: the approval record outlives the PR's opening until the turn ends
+// (src/approvals.ts), so the replay finds it and reports the PR as existing.
 
 import { createHash } from "node:crypto";
 import type { Answerers, Tool, ToolContext } from "@junejs/core/agent-runtime";
@@ -51,7 +51,8 @@ export type PullRequestOptions = {
   // the one rule under which the person who asked can't answer it.
   approver?: PrApprover;
   // Who answered each card (src/approvals.ts): checked against the rule before the push,
-  // named in the PR, and deleted at every outcome but a failed push. Without it (tests), no
+  // named in the PR, deleted at once on a Deny or a refusal and otherwise kept until the turn
+  // ends (src/approvals.ts). Without it (tests), no
   // check is made here and nobody is named.
   approvals?: ApprovalStore;
   fetch?: typeof fetch; // injectable for tests
@@ -166,9 +167,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
       const inputId = `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`;
       const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers });
-      // This card in this turn. Every outcome from here deletes its approval record (done),
-      // except a failed push: the model may retry in the same turn, and the retry gets the
-      // same stored answer and needs the same record. The turn's end deletes what is left.
+      // This card in this turn. A Deny or a refusal deletes its approval record at once (done):
+      // nothing was pushed, and nothing in this turn may use it. Every other outcome keeps it
+      // until the turn ends (src/approvals.ts): a retry after a failure, or a crash-replay after
+      // the PR opened, gets the same stored answer from June and needs the same record.
       const key: CardKey | undefined = ctx.event?.ts ? { session: ctx.sessionId, turn: ctx.event.ts, card: inputId } : undefined;
       const done = <T>(result: T): T => {
         if (key) opts.approvals?.forget(key);
@@ -198,12 +200,12 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       try {
         token = await opts.github(repo, "write");
       } catch (e) {
-        return done({ error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` });
+        return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
       }
       try {
         await sb.push({ stage: staged.stage, repo, sha: staged.sha, branch: input.branch, token });
       } catch (e) {
-        return { error: `push failed: ${(e as Error).message}` }; // the record stays for a retry in this turn
+        return { error: `push failed: ${(e as Error).message}` };
       }
       // The checkout's origin/* is left as it is. Staging bundles what origin/* doesn't
       // have, so recording the push there would make a replay (one cut off after this push,
@@ -224,7 +226,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const existing = await gh(`/pulls?state=open&head=${repo.owner}:${encodeURIComponent(input.branch)}`);
       if (existing.ok) {
         const [pr] = (await existing.json()) as { html_url: string; number: number }[];
-        if (pr) return done({ status: "exists", url: pr.html_url, number: pr.number });
+        if (pr) return { status: "exists", url: pr.html_url, number: pr.number };
       }
       const approver = approverId ? await opts.approverName?.(approverId).catch(() => undefined) : undefined;
       const body = `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack, approved there${approver ? ` by ${approver}` : ""}.`;
@@ -232,9 +234,9 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         method: "POST",
         body: JSON.stringify({ title: input.title, head: input.branch, base, body, draft: true }),
       });
-      if (!res.ok) return done({ error: `GitHub rejected the PR: ${res.status} ${(await res.text()).slice(0, 300)}` });
+      if (!res.ok) return { error: `GitHub rejected the PR: ${res.status} ${(await res.text()).slice(0, 300)}` };
       const pr = (await res.json()) as { html_url: string; number: number };
-      return done({ status: "opened", url: pr.html_url, number: pr.number });
+      return { status: "opened", url: pr.html_url, number: pr.number };
     },
   };
 }
