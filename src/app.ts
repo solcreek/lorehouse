@@ -14,6 +14,7 @@ import { recentKnowledgeTool } from "./tools/recent-knowledge";
 import { SlackIngester } from "./ingest/slack";
 import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
+import { describePurge, purgeUnlistedChannels } from "./purge";
 import { SKILLS, systemPrompt } from "./prompts";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
@@ -63,6 +64,9 @@ export async function createApp(config: Config) {
     knowledge.close();
     throw err;
   }
+  // A channel taken off AGENT_CHANNELS leaves the index, with its joined threads, before
+  // anything is answered (purge.ts); an empty list leaves nothing from Slack.
+  for (const p of purgeUnlistedChannels(knowledge, config.agent.channels)) console.log(describePurge(p));
   const seeded = config.db.knowledgeSeed ? seedFromJsonl(knowledge, config.db.knowledgeSeed) : 0;
 
   // Slack history becomes knowledge — only for channels the agent is allowed in.
