@@ -21,7 +21,8 @@
 // person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
 // an open_pull_request tool_use for that branch); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
-// id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …"), or for
+// id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …", and with
+// "[quote]" in the question, the hit's text verbatim: "… [quote:<text>] w0 …"), or for
 // a thread, its first reply's author and text ("[q7] [author:<author>] [text:<text>] …"),
 // or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for a
 // skill, its name and the first words of its body ("[q7] [skill:<name>:<words>] …"), or for
@@ -160,10 +161,10 @@ function firstUserText(messages: Msg[]): string {
 
 // The first search hit in a tool_result: search_knowledge returns the hits, recent_knowledge
 // returns them under `threads`.
-function firstHit(content: unknown): { id?: string; source?: string } {
+function firstHit(content: unknown): { id?: string; source?: string; text?: string } {
   const r = resultValue(content);
   const v = r && typeof r === "object" && "threads" in r ? (r as { threads: unknown }).threads : r;
-  if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string };
+  if (Array.isArray(v) && v[0] && typeof v[0] === "object") return v[0] as { id?: string; source?: string; text?: string };
   return {};
 }
 
@@ -198,7 +199,10 @@ function answerFor(messages: Msg[], result: Block): string {
     return `${nonce} [author:${first.author ?? `none (user ${first.user})`}] [text:${(first.text ?? "").replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
   }
   const hit = firstHit(result.content);
-  return `${nonce} [cite:${hit.id ?? "none"}] [src:${hit.source ?? "none"}] ${words.join(" ")}`;
+  // "[quote]" in the question: the hit's text too, verbatim (Slack markup and all), as a
+  // model quoting its source faithfully would.
+  const quote = question.includes("[quote]") ? ` [quote:${(hit.text ?? "").replace(/[\[\]\n]/g, " ")}]` : "";
+  return `${nonce} [cite:${hit.id ?? "none"}] [src:${hit.source ?? "none"}]${quote} ${words.join(" ")}`;
 }
 
 function sse(events: [string, unknown][], firstDelay: number, gap: (i: number) => number): Response {
