@@ -3,10 +3,10 @@
 // end: park → Approve/Deny → resume → push + PR (or nothing).
 
 import { describe, expect, test } from "bun:test";
-import { AgentSession, replyStream, type EventSink, type ModelReply, type Model, type Runtime, type Tool, type TurnEvent } from "@junejs/core/agent-runtime";
+import { AgentSession, grantAnswer, replyStream, ResumeAuthorizationError, type EventSink, type ModelReply, type Model, type Runtime, type Tool, type TurnEvent } from "@junejs/core/agent-runtime";
 import { memorySessionStore } from "@junejs/core/test";
 import { clip, workspaceTools, type ExecOptions, type Sandbox } from "../src/tools/workspace";
-import { approvalCard, isPlainRef, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
+import { APPROVER_POLICY, approvalCard, isPlainRef, mayApprove, pullRequestTool, parseGithubRemote } from "../src/tools/pull-request";
 import type { GithubAccess } from "../src/github-auth";
 
 // A credential with no account to commit as (no identity provider), so no author check
@@ -433,6 +433,67 @@ describe("open_pull_request — the approval gate", () => {
   });
 });
 
+describe("open_pull_request — who may approve (PR_APPROVER)", () => {
+  test("anyone: any identified clicker, the requester included; not-requester: anyone identified but the requester", () => {
+    const scope = { requester: "U1" };
+    expect(mayApprove("anyone", "U1", scope)).toBe(true);
+    expect(mayApprove("anyone", "U2", scope)).toBe(true);
+    expect(mayApprove("not-requester", "U1", scope)).toBe(false);
+    expect(mayApprove("not-requester", "U2", scope)).toBe(true);
+    // A click with no verified clicker is nobody's.
+    for (const rule of ["anyone", "not-requester"] as const) expect(mayApprove(rule, undefined, scope)).toBe(false);
+    // Under not-requester, a card whose requester isn't known can't be checked: nobody may.
+    for (const s of [{ requester: null }, {}, undefined, { requester: "" }]) expect(mayApprove("not-requester", "U2", s)).toBe(false);
+  });
+
+  // The rule as the app applies it (src/app.ts's authorizeAnswer), through the real engine.
+  const authorize = (rule: "anyone" | "not-requester") => (a: { policy: string; scope?: unknown; by?: string }) => a.policy === APPROVER_POLICY && mayApprove(rule, a.by, a.scope);
+  const slackTurn = (rule: "anyone" | "not-requester") => {
+    const { sb, published } = fakeRepo();
+    const gh = fakeGithub();
+    const { s } = session(pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, approver: rule }));
+    const event = { source: "slack", kind: "app_mention" as const, channelId: "C1", ts: "1.1", user: { id: "U1", attested: true } };
+    const t1 = s.start({ turnId: "t1", userText: "open a PR", event }).turnId;
+    return { s, t1, published, gh };
+  };
+  const click = async (s: AgentSession, t1: string, by: string, rule: "anyone" | "not-requester") => {
+    const parked = (await s.result(t1)) as { request: { id: string; prompt: string; answerers?: unknown } };
+    const granted = await grantAnswer(s, { turnId: t1, inputId: parked.request.id, by }, authorize(rule));
+    return () => s.resume(t1, parked.request.id, true, { by, granted });
+  };
+
+  test("the card names the approver policy with the requester, the turn's attested speaker", async () => {
+    const { s, t1 } = slackTurn("anyone");
+    const parked = (await s.result(t1)) as { request: { answerers?: unknown; prompt: string } };
+    expect(parked.request.answerers).toEqual({ policy: APPROVER_POLICY, scope: { requester: "U1" } });
+    expect(parked.request.prompt).not.toContain("someone other than");
+    const strict = slackTurn("not-requester");
+    expect(((await strict.s.result(strict.t1)) as { request: { prompt: string } }).request.prompt).toContain("Approved or denied by someone other than the person who asked for it.");
+  });
+
+  test("anyone (the default): the requester's Approve opens it, and so does someone else's", async () => {
+    for (const by of ["U1", "U2"]) {
+      const { s, t1, published, gh } = slackTurn("anyone");
+      (await click(s, t1, by, "anyone"))();
+      expect(await s.result(t1)).toMatchObject({ status: "completed" });
+      expect(published.filter((p) => p.op === "push")).toHaveLength(1);
+      expect(gh.reqs.filter((r) => r.method === "POST")).toHaveLength(1);
+    }
+  });
+
+  test("not-requester: the requester's click is refused and nothing is pushed; someone else's then opens it", async () => {
+    const { s, t1, published, gh } = slackTurn("not-requester");
+    expect(await click(s, t1, "U1", "not-requester")).toThrow(ResumeAuthorizationError);
+    expect(await s.result(t1)).toMatchObject({ status: "suspended" }); // still waiting for someone else
+    expect(published.filter((p) => p.op === "push")).toHaveLength(0);
+    expect(gh.reqs).toHaveLength(0);
+    (await click(s, t1, "U2", "not-requester"))();
+    expect(await s.result(t1)).toMatchObject({ status: "completed" });
+    expect(published.filter((p) => p.op === "push")).toHaveLength(1);
+    expect(gh.reqs.filter((r) => r.method === "POST")).toHaveLength(1);
+  });
+});
+
 describe("workspace tools", () => {
   test("every command runs as the account commits are by; without one (lookup failed), it runs as is", async () => {
     const seen: (Record<string, string> | undefined)[] = [];
@@ -628,15 +689,23 @@ describe("agent identity — the name is per-install config", () => {
   });
 
   test("the PR names who approved it, never by Slack user id; unknown, it says only that it was approved", async () => {
-    const approvedBy = (userId: string) => ({ requestInput: async () => true, event: { user: { id: userId } } }) as never;
-    const bodyWith = async (approverName?: (id: string) => Promise<string | undefined>) => {
+    // The turn's own speaker is the requester (U0REQUESTER); the approver is whoever the app
+    // saw click Approve on this card (approvedBy), and only they are named.
+    const requested = { requestInput: async () => true, event: { source: "slack", user: { id: "U0REQUESTER", attested: true } } } as never;
+    const bodyWith = async (approverName?: (id: string) => Promise<string | undefined>, clicked: string | null = "U0SECRETID") => {
       const gh = fakeGithub();
-      const tool = pullRequestTool({ sandboxFor: () => fakeRepo().sb, github: staticToken("t"), fetch: gh.f, approverName });
-      await tool.run({ branch: "scout/x", title: "x" }, approvedBy("U0SECRETID"));
+      const tool = pullRequestTool({ sandboxFor: () => fakeRepo().sb, github: staticToken("t"), fetch: gh.f, approverName, approvedBy: (_ctx, inputId) => (inputId.startsWith("pr:") ? (clicked ?? undefined) : undefined) });
+      await tool.run({ branch: "scout/x", title: "x" }, requested);
       return (gh.reqs.find((r) => r.method === "POST")!.body as { body: string }).body;
     };
-    const named = await bodyWith(async (id) => (id === "U0SECRETID" ? "Ada Park" : undefined));
+    const names = async (id: string) => ({ U0SECRETID: "Ada Park", U0REQUESTER: "Rex Quinn" } as Record<string, string>)[id];
+    // Who clicked isn't known (a restart mid-continuation): nobody is named, the requester least of all.
+    const unknown = await bodyWith(names, null);
+    expect(unknown).toContain("Opened by Scout from Slack, approved there.");
+    expect(unknown).not.toContain("Rex Quinn");
+    const named = await bodyWith(names);
     expect(named).toContain("Opened by Scout from Slack, approved there by Ada Park.");
+    expect(named).not.toContain("Rex Quinn");
     for (const body of [named, await bodyWith(), await bodyWith(async () => undefined), await bodyWith(async () => { throw new Error("users.info down"); })]) {
       expect(body).not.toContain("U0SECRETID");
     }

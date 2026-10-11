@@ -15,13 +15,18 @@
 // goes to the host, never into the sandbox. The PR itself is opened from the worker side
 // over the REST API.
 //
+// Who may click Approve is the install's rule (PR_APPROVER, ADR 0002 §6), applied when the
+// click arrives: the card names a policy (APPROVER_POLICY) together with the requester, the
+// person whose message started this turn, and the app decides each click with mayApprove.
+//
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
 // stages again (the same commits give the same sha and, unless the base was rewritten, the
 // same card), requestInput then returns the stored answer, and the post-approval part is idempotent: an already-open PR
 // for the branch is returned instead of creating a second one.
 
 import { createHash } from "node:crypto";
-import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
+import type { Answerers, Tool, ToolContext } from "@junejs/core/agent-runtime";
+import type { PrApprover } from "../config";
 import { WORKDIR, type SandboxFor, type Staged } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
@@ -35,6 +40,12 @@ export type PullRequestOptions = {
   // The approver's name for the PR body, from their Slack user id. The id itself never
   // goes into the PR: it identifies the workspace, and a PR can be public.
   approverName?: (slackUserId: string) => Promise<string | undefined>;
+  // Who may approve (PR_APPROVER, default anyone): the card says so when it isn't anyone.
+  // The rule itself is applied to each click by the app, with mayApprove.
+  approver?: PrApprover;
+  // The Slack user id whose click approved this card, when the app saw it (the turn's own
+  // event is the requester's, not the approver's). Unknown: the PR body names nobody.
+  approvedBy?: (ctx: ToolContext, inputId: string) => string | undefined;
   fetch?: typeof fetch; // injectable for tests
   apiUrl?: string; // GitHub's REST API, default https://api.github.com
 };
@@ -138,10 +149,11 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       // click: a replay after the base was rewritten can stage the same commit with another
       // diff. Neither the stage id nor the base's commit is in it: a replay stages again
       // under a new id, and a base that only moved on leaves the diff as it was.
-      const card = approvalCard({ repo, branch: input.branch, base, title: input.title, staged });
+      const card = approvalCard({ repo, branch: input.branch, base, title: input.title, staged, approver: opts.approver });
       const facts = [staged.sha, staged.commits, staged.stat, staged.files, staged.authors, staged.patch, staged.patchTruncated, staged.diffSha256];
       const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
-      const approved = await ctx.requestInput({ id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`, prompt: card });
+      const inputId = `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`;
+      const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers: approvers(ctx) });
       if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
 
       // ── after approval: the host pushes the staged commit, then open (or find) the PR ─
@@ -177,7 +189,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         const [pr] = (await existing.json()) as { html_url: string; number: number }[];
         if (pr) return { status: "exists", url: pr.html_url, number: pr.number };
       }
-      const approverId = ctx.event?.user?.id;
+      const approverId = opts.approvedBy?.(ctx, inputId);
       const approver = approverId ? await opts.approverName?.(approverId).catch(() => undefined) : undefined;
       const body = `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack, approved there${approver ? ` by ${approver}` : ""}.`;
       const res = await gh("/pulls", {
@@ -189,6 +201,29 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       return { status: "opened", url: pr.html_url, number: pr.number };
     },
   };
+}
+
+// The policy a pull request card names; the app decides each click on it (mayApprove).
+export const APPROVER_POLICY = "pull-request-approver";
+
+// Who may answer this turn's card: the policy, with the requester, the turn's speaker as
+// its channel attests them (a signed Slack event; unattested, there is no requester). A
+// turn with no inbound event (a test, a programmatic call) names nobody, so whoever drives
+// it resumes it, as June does for such a turn.
+function approvers(ctx: ToolContext): Answerers | undefined {
+  if (!ctx.event) return undefined;
+  const user = ctx.event.user;
+  return { policy: APPROVER_POLICY, scope: { requester: user?.attested ? user.id : null } };
+}
+
+// Whether the person who clicked (`by`, verified by the channel) may answer a card that
+// named APPROVER_POLICY with `scope`, under the install's rule. Nobody unidentified may.
+// Under not-requester, a card with no known requester can't be checked, so nobody may.
+export function mayApprove(rule: PrApprover, by: string | undefined, scope: unknown): boolean {
+  if (!by) return false;
+  if (rule === "anyone") return true;
+  const requester = (scope as { requester?: unknown } | null | undefined)?.requester;
+  return typeof requester === "string" && requester !== "" && by !== requester;
 }
 
 // A branch name safe to put in a shell command and a git refspec: letters, digits and
@@ -231,11 +266,12 @@ const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1)
 // line and each path are clipped so the rest always fits, and the patch gets what is left.
 // Everything the sandbox or the model wrote (title, stat, paths, patch) is escaped: it can't
 // mention anyone, link anywhere, or break out of its code block or span.
-export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged }): string {
+export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged; approver?: PrApprover }): string {
   const { staged } = o;
   const head =
     `*Open a pull request?*\n${o.repo.owner}/${o.repo.name}: \`${o.branch}\` → \`${o.base}\` (${staged.sha.slice(0, 8)}, ` +
-    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${clip(escapeSlack(o.title.replace(/\s+/g, " ").trim()), 150)}*\n`;
+    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${clip(escapeSlack(o.title.replace(/\s+/g, " ").trim()), 150)}*\n` +
+    (o.approver === "not-requester" ? "_Approved or denied by someone other than the person who asked for it._\n" : "");
   const statLines = inBlock(staged.stat.trimEnd()).split("\n").map((l) => clip(l, 100));
   const stat = statLines.length <= 15 ? statLines.join("\n") : [...statLines.slice(0, 12), "…", statLines.at(-1)!].join("\n");
   const sensitive = staged.files.filter((f) => SENSITIVE.test(f));

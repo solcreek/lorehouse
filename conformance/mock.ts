@@ -6,9 +6,11 @@
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
 //   /github/…                  GitHub's REST API, as much as open_pull_request uses: the
 //                              token's user, and listing and opening pull requests.
+//   POST /slack/response/…     an interaction's response_url: recorded (the ephemeral replies)
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
 //   GET  /stats                recorded Slack calls, model call count, channels read, posts
-//                              (with their blocks), message updates, GitHub requests
+//                              (with their blocks), message updates, response_url replies,
+//                              GitHub requests
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
@@ -311,6 +313,12 @@ Bun.serve({
       const params = { ...Object.fromEntries(url.searchParams), ...(await parseBody(req)) };
       return slack(url.pathname.slice("/slack/api/".length), params);
     }
+    // An interaction's response_url (a scenario puts this one in its click): what is posted
+    // here (an ephemeral reply to the clicker) is recorded like a Slack call.
+    if (url.pathname.startsWith("/slack/response/") && req.method === "POST") {
+      calls.push({ t: Date.now(), method: "response_url", body: { ...(await parseBody(req)), __path: url.pathname } });
+      return new Response("ok");
+    }
     if (url.pathname === "/fixtures/messages" && req.method === "POST") {
       const { channel, message } = (await req.json()) as { channel: string; message: FixtureMessage };
       history.set(channel, [...(history.get(channel) ?? []), message]);
@@ -351,7 +359,8 @@ Bun.serve({
       const readChannels = [...new Set(calls.filter((c) => c.method.startsWith("conversations.")).map((c) => String(c.body.channel)))];
       const posts = calls.filter((c) => c.method === "chat.postMessage").map((c) => ({ channel: c.body.channel, thread_ts: c.body.thread_ts, text: c.body.text, blocks: c.body.blocks, ts: c.body.__ts }));
       const updates = calls.filter((c) => c.method === "chat.update").map((c) => ({ channel: c.body.channel, ts: c.body.ts, text: c.body.text }));
-      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, posts, updates, github: githubCalls });
+      const responses = calls.filter((c) => c.method === "response_url").map((c) => ({ path: c.body.__path, text: c.body.text, response_type: c.body.response_type, replace_original: c.body.replace_original }));
+      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, posts, updates, responses, github: githubCalls });
     }
     if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });

@@ -10,6 +10,15 @@
 export const DM_MODES = ["redirect", "ignore", "answer"] as const;
 export type DmMode = (typeof DM_MODES)[number];
 
+// Who may click Approve on a pull request card (ADR 0002 §6). The Approve opens the pull
+// request; merging it is gated on GitHub's own review.
+//   anyone         anyone in the thread, the person who asked for it included (default)
+//   not-requester  anyone but the person whose message started the turn that asked to open
+//                  it: a second person must look at it. Under this rule the requester can't
+//                  click Deny either (June's authorizeAnswer isn't told which button it was).
+export const PR_APPROVERS = ["anyone", "not-requester"] as const;
+export type PrApprover = (typeof PR_APPROVERS)[number];
+
 export type Config = {
   port: number;
   slack: { signingSecret: string; botToken: string; apiUrl?: string; botUserId?: string };
@@ -39,6 +48,8 @@ export type Config = {
   // GitHub's REST API, for the code tools' credentials and pull requests (GITHUB_API_URL,
   // default https://api.github.com). Like SLACK_API_URL, it points the app at a mock.
   githubApiUrl?: string;
+  // Who may approve opening a pull request (PR_APPROVER, see PR_APPROVERS).
+  prApprover: PrApprover;
 };
 
 // A GitHub App (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY): short-lived tokens per repo, a bot
@@ -124,6 +135,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     missing.push(`DM_MODE (one of ${DM_MODES.join(", ")}, got "${raw}")`);
     return "redirect";
   };
+  const prApprover = (raw: string | undefined): PrApprover => {
+    if (raw === undefined || raw === "") return "anyone";
+    if ((PR_APPROVERS as readonly string[]).includes(raw)) return raw as PrApprover;
+    missing.push(`PR_APPROVER (one of ${PR_APPROVERS.join(", ")}, got "${raw}")`);
+    return "anyone";
+  };
   const config: Config = {
     port: Number(env.PORT ?? 3000),
     slack: {
@@ -158,6 +175,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     adminToken: env.ADMIN_TOKEN || undefined,
     usage: { recordPeople: env.USAGE_RECORD_PEOPLE === "1" },
     githubApiUrl: env.GITHUB_API_URL || undefined,
+    prApprover: prApprover(env.PR_APPROVER),
   };
   // One file for both would put June's session tables in Lorehouse's database: say so,
   // rather than let a LOREHOUSE_DB named sessions.db, or a link to it, quietly share it.

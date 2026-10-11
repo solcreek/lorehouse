@@ -112,6 +112,18 @@ describe("configuration", () => {
     expect(bad[0]!.detail).toStartWith("USAGE_RECORD_PEOPLE");
   });
 
+  test("who may approve a pull request is said with code tools on, and an unknown value is a problem", async () => {
+    const sandbox = { SANDBOX_URL: "http://127.0.0.1:9", SANDBOX_TOKEN: "x", GITHUB_TOKEN: "ghp_1" };
+    expect(find(await run(sandbox), "PR_APPROVER")).toMatchObject([{ section: "configuration", level: "info", detail: expect.stringMatching(/^anyone:/) }]);
+    expect(find(await run({ ...sandbox, PR_APPROVER: "not-requester" }), "PR_APPROVER")).toMatchObject([{ level: "info", detail: expect.stringMatching(/^not-requester:/) }]);
+    // Without code tools it only matters once set.
+    expect(find(await run({}), "PR_APPROVER")).toEqual([]);
+    expect(find(await run({ PR_APPROVER: "not-requester" }), "PR_APPROVER")).toMatchObject([{ level: "info", detail: expect.stringContaining("no effect while code tools are off") }]);
+    const bad = await run({ PR_APPROVER: "nobody" });
+    expect(bad[0]).toMatchObject({ section: "configuration", level: "fail" });
+    expect(bad[0]!.detail).toStartWith("PR_APPROVER");
+  });
+
   test("a bad agent name is a configuration problem", async () => {
     const checks = await run({ AGENT_NAME: "Not A Handle!" });
     expect(checks[0]).toMatchObject({ section: "configuration", level: "fail" });

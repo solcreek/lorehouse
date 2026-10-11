@@ -5,7 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { anthropic } from "@junejs/core/agent-models";
 import { slackChannel, type SlackNormalizedEvent } from "@junejs/core/channels";
 import { defineAgent, parseSkill, type Channel } from "@junejs/core/agent-config";
-import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
+import type { AuthorizeAnswer, Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import { assertDistinctDatabases, type Config } from "./config";
 import { agentIdentity } from "./identity";
@@ -30,7 +30,7 @@ import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
 import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, reconcileAsks, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
 import { cachedNames } from "./ingest/slack-users";
-import { pullRequestTool } from "./tools/pull-request";
+import { APPROVER_POLICY, mayApprove, pullRequestTool } from "./tools/pull-request";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
@@ -115,6 +115,21 @@ export async function createApp(config: Config) {
     }),
     recentKnowledgeTool((o) => recentDocuments(knowledge, o)),
   ];
+  // Who may click Approve on a pull request card is the install's rule (PR_APPROVER, ADR
+  // 0002 §6). The card names APPROVER_POLICY, so June asks authorizeAnswer as each click
+  // arrives; a refused click changes nothing, and the clicker alone is told so. A click it
+  // grants is remembered here, in memory, so the pull request can name its approver (the
+  // turn's own event is the requester's). The first grant for a card is the click that
+  // answers it; after a restart mid-continuation the name is simply left out.
+  const approvals = new Map<string, string>();
+  const approvalKey = (session: string, inputId: string) => `${session}\n${inputId}`;
+  const authorizeAnswer: AuthorizeAnswer = ({ policy, scope, by, session, request }) => {
+    if (policy !== APPROVER_POLICY || !mayApprove(config.prApprover, by, scope)) return false;
+    const key = approvalKey(session, request.id);
+    if (!approvals.has(key)) approvals.set(key, by!);
+    if (approvals.size > 1000) approvals.delete(approvals.keys().next().value!);
+    return true;
+  };
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
   const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
@@ -129,7 +144,12 @@ export async function createApp(config: Config) {
     const apiUrl = config.githubApiUrl;
     const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
-    tools.push(...workspaceTools(sandboxFor, { commitAs: github.identity }), cloneTool(sandboxFor, github), pullRequestTool({ sandboxFor, github, identity, approverName, apiUrl }));
+    const approvedBy = (ctx: ToolContext, inputId: string) => approvals.get(approvalKey(ctx.sessionId, inputId));
+    tools.push(
+      ...workspaceTools(sandboxFor, { commitAs: github.identity }),
+      cloneTool(sandboxFor, github),
+      pullRequestTool({ sandboxFor, github, identity, approverName, approver: config.prApprover, approvedBy, apiUrl }),
+    );
   }
 
   const dm = config.agent.dm;
@@ -215,6 +235,7 @@ export async function createApp(config: Config) {
     tools,
     skills: Object.entries(SKILLS).map(([name, text]) => parseSkill(name, text)),
     channels: [slack],
+    authorizeAnswer,
   });
 
   const model = anthropic({
@@ -282,6 +303,8 @@ export async function createApp(config: Config) {
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
           // Whether usage records who asks: a setting, not anyone's data.
           recordsWhoAsks: recordPeople,
+          // Who may approve opening a pull request (PR_APPROVER): a setting, like the above.
+          pullRequestApprover: config.prApprover,
           ...(hub ? { runners: hub.status() } : {}),
         });
       }
