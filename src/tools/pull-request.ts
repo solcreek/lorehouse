@@ -15,13 +15,27 @@
 // goes to the host, never into the sandbox. The PR itself is opened from the worker side
 // over the REST API.
 //
+// Who may click Approve is the install's rule (PR_APPROVER, ADR 0002 §6). The card names a
+// policy (APPROVER_POLICY) with the requester, the person whose message started this turn,
+// and the turn; the app decides each click and records who answered (src/approvals.ts). The
+// rule is checked again against that person here, at the moment of use, before the push.
+//
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
 // stages again (the same commits give the same sha and, unless the base was rewritten, the
-// same card), requestInput then returns the stored answer, and the post-approval part is idempotent: an already-open PR
-// for the branch is returned instead of creating a second one.
+// same card), requestInput then returns the stored answer, and the post-approval part is
+// idempotent: an already-open PR for the branch is returned instead of creating a second one.
+// That holds under every PR_APPROVER: the approval record outlives the PR's opening until the
+// turn ends or parks on another card (src/approvals.ts), so a second run of this tool in the
+// turn before it moves on (a retry, or June running a remote tool again, at least once) finds it and reports the PR as existing. The
+// same record lets such a run open a new PR for the same commit if the first was closed in
+// between: same card, same approver, same turn.
 
 import { createHash } from "node:crypto";
-import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
+import type { Answerers, Tool, ToolContext } from "@junejs/core/agent-runtime";
+import type { PrApprover } from "../config";
+import { APPROVER_POLICY, type ApprovalStore, type CardKey, type CardScope } from "../approvals";
+
+export { APPROVER_POLICY, mayApprove } from "../approvals";
 import { WORKDIR, type SandboxFor, type Staged } from "./workspace";
 import { agentIdentity, branchPrefix, displayName, type AgentIdentity } from "../identity";
 import { toolDescription } from "../prompts";
@@ -35,6 +49,14 @@ export type PullRequestOptions = {
   // The approver's name for the PR body, from their Slack user id. The id itself never
   // goes into the PR: it identifies the workspace, and a PR can be public.
   approverName?: (slackUserId: string) => Promise<string | undefined>;
+  // Who may approve (PR_APPROVER, default requester): the card says so under not-requester,
+  // the one rule under which the person who asked can't answer it.
+  approver?: PrApprover;
+  // Who answered each card (src/approvals.ts): checked against the rule before the push,
+  // named in the PR, deleted at once on a Deny or a refusal and otherwise kept until the turn
+  // ends (src/approvals.ts). Without it (tests), no
+  // check is made here and nobody is named.
+  approvals?: ApprovalStore;
   fetch?: typeof fetch; // injectable for tests
   apiUrl?: string; // GitHub's REST API, default https://api.github.com
 };
@@ -67,6 +89,10 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       }
       if (input.base !== undefined && !isPlainRef(input.base)) {
         return { error: `base must be a plain branch name ([A-Za-z0-9_./-], no "..")` };
+      }
+      const answerers = approvers(ctx, opts.approver ?? "requester");
+      if (answerers === "no-requester") {
+        return { error: "can't tell who asked for this pull request (the message has no verified sender), so nobody could approve it. Nothing was staged or pushed." };
       }
       const sb = opts.sandboxFor(ctx);
       const sh = async (command: string, env?: Record<string, string>) => {
@@ -138,11 +164,38 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       // click: a replay after the base was rewritten can stage the same commit with another
       // diff. Neither the stage id nor the base's commit is in it: a replay stages again
       // under a new id, and a base that only moved on leaves the diff as it was.
-      const card = approvalCard({ repo, branch: input.branch, base, title: input.title, staged });
+      const card = approvalCard({ repo, branch: input.branch, base, title: input.title, staged, approver: opts.approver });
       const facts = [staged.sha, staged.commits, staged.stat, staged.files, staged.authors, staged.patch, staged.patchTruncated, staged.diffSha256];
       const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
-      const approved = await ctx.requestInput({ id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`, prompt: card });
-      if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
+      const inputId = `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`;
+      const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers });
+      // This card in this turn. A Deny or a refusal deletes its approval record at once (done):
+      // nothing was pushed, and nothing in this turn may use it. Every other outcome keeps it
+      // until the turn ends or parks on another card (src/approvals.ts): a second run before
+      // then, after a failure or after the PR opened, gets the same stored answer from June and needs the same record.
+      const key: CardKey | undefined = ctx.event?.ts ? { session: ctx.sessionId, turn: ctx.event.ts, card: inputId } : undefined;
+      const done = <T>(result: T): T => {
+        if (key) opts.approvals?.forget(key);
+        return result;
+      };
+      if (approved !== true) return done({ status: "denied", note: "Nothing was pushed. Ask the requester what to change." });
+      // The rule, at the moment of use, against who actually answered. A card with no record
+      // was answered without authorizeAnswer: one parked before this deploy, whose only
+      // answerer June keeps as the requester. Under not-requester that fails closed.
+      // A turn with no Slack event has no turn to key a record by: under not-requester, which
+      // can't be met without knowing who answered, it is refused too.
+      const rule = opts.approver ?? "requester";
+      const refused = () => done({ status: "refused", note: `This approval can't be shown to meet PR_APPROVER=${rule} (the card predates the rule, the rule changed since the click, or the turn moved on to another card), so nothing was pushed. Ask for the pull request again.` });
+      let approverId: string | undefined;
+      if (opts.approvals) {
+        if (!key) {
+          if (rule === "not-requester") return refused();
+        } else {
+          const verdict = opts.approvals.decide(key, rule, requesterOf(ctx));
+          if (!verdict.ok) return refused();
+          approverId = verdict.approver;
+        }
+      }
 
       // ── after approval: the host pushes the staged commit, then open (or find) the PR ─
       let token: string;
@@ -177,7 +230,6 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         const [pr] = (await existing.json()) as { html_url: string; number: number }[];
         if (pr) return { status: "exists", url: pr.html_url, number: pr.number };
       }
-      const approverId = ctx.event?.user?.id;
       const approver = approverId ? await opts.approverName?.(approverId).catch(() => undefined) : undefined;
       const body = `${input.body ?? ""}\n\n---\nOpened by ${displayName(id)} from Slack, approved there${approver ? ` by ${approver}` : ""}.`;
       const res = await gh("/pulls", {
@@ -189,6 +241,26 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       return { status: "opened", url: pr.html_url, number: pr.number };
     },
   };
+}
+
+// Who may answer this turn's card: the policy, with the requester, the turn's speaker as
+// its channel attests them (a signed Slack event). A turn with no inbound event (a test, a
+// programmatic call) names nobody, so whoever drives it resumes it, as June does for such
+// a turn. A turn whose speaker isn't attested has no requester: under a rule that needs one
+// nobody could answer, so no card is posted (June, left to its default, refuses to park
+// such a turn too).
+function approvers(ctx: ToolContext, rule: PrApprover): Answerers | undefined | "no-requester" {
+  if (!ctx.event) return undefined;
+  const requester = requesterOf(ctx);
+  if (!requester && rule !== "anyone") return "no-requester";
+  const scope: CardScope = { requester, turn: ctx.event.ts };
+  return { policy: APPROVER_POLICY, scope };
+}
+
+// The turn's speaker, when its channel attests them (a signed Slack event).
+function requesterOf(ctx: ToolContext): string | null {
+  const user = ctx.event?.user;
+  return user?.attested ? user.id : null;
 }
 
 // A branch name safe to put in a shell command and a git refspec: letters, digits and
@@ -231,11 +303,12 @@ const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1)
 // line and each path are clipped so the rest always fits, and the patch gets what is left.
 // Everything the sandbox or the model wrote (title, stat, paths, patch) is escaped: it can't
 // mention anyone, link anywhere, or break out of its code block or span.
-export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged }): string {
+export function approvalCard(o: { repo: RepoRef; branch: string; base: string; title: string; staged: Staged; approver?: PrApprover }): string {
   const { staged } = o;
   const head =
     `*Open a pull request?*\n${o.repo.owner}/${o.repo.name}: \`${o.branch}\` → \`${o.base}\` (${staged.sha.slice(0, 8)}, ` +
-    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${clip(escapeSlack(o.title.replace(/\s+/g, " ").trim()), 150)}*\n`;
+    `${staged.commits} commit${staged.commits === 1 ? "" : "s"})\n*${clip(escapeSlack(o.title.replace(/\s+/g, " ").trim()), 150)}*\n` +
+    (o.approver === "not-requester" ? "_Approved or denied by someone other than the person who asked for it._\n" : "");
   const statLines = inBlock(staged.stat.trimEnd()).split("\n").map((l) => clip(l, 100));
   const stat = statLines.length <= 15 ? statLines.join("\n") : [...statLines.slice(0, 12), "…", statLines.at(-1)!].join("\n");
   const sensitive = staged.files.filter((f) => SENSITIVE.test(f));

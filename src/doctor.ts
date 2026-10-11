@@ -84,6 +84,17 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   add("configuration", "environment", "ok", `every required setting is present; agent @${identity.name}, code tools ${config.sandbox ? `on (${config.sandbox.mode})` : "off"}`);
   // Not a problem, but never a surprise: the agent tells each channel, and so does this.
   if (config.usage.recordPeople) add("configuration", "USAGE_RECORD_PEOPLE", "info", "on: usage records who asks the agent things, and each channel is told so");
+  // Who may click Approve on a pull request card (ADR 0002 §6); it matters with code tools.
+  if (config.sandbox) {
+    const says: Record<typeof config.prApprover, string> = {
+      requester: "only the person who asked for a pull request may approve (or deny) opening it; PR_APPROVER=anyone widens that to the thread, PR_APPROVER=not-requester asks for a second person",
+      anyone: "anyone in the thread may approve opening a pull request, the person who asked for it included; PR_APPROVER=not-requester asks for a second person",
+      "not-requester": "someone other than the person who asked for a pull request approves (or denies) opening it",
+    };
+    add("configuration", "PR_APPROVER", "info", `${config.prApprover}: ${says[config.prApprover]}`);
+  } else if (config.prApprover !== "requester") {
+    add("configuration", "PR_APPROVER", "info", `${config.prApprover}: no effect while code tools are off`);
+  }
 
   // ── slack ──
   const slackBase = (config.slack.apiUrl ?? "https://slack.com/api").replace(/\/$/, "");

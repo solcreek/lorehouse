@@ -137,7 +137,19 @@ These are Lorehouse's position, not settings:
   ingested or seeded into it, and nothing is filtered at read time. So only public
   material may go into the index; what is indexed and when it leaves is the ingest's
   rule, not the DM's (#82). It never has code tools (#58). A profile can't loosen that.
-- A pull request opens only after a person approves it in the thread.
+- A pull request opens only after a person approves it in the thread. The Approve in
+  Slack authorizes opening the pull request, not merging it: it opens as a draft, and the
+  merge is gated on GitHub, by its review and branch protection (#60). By default only the
+  requester may approve: the person whose message got the agent to post the card. An
+  install may widen that to anyone in the thread (`PR_APPROVER=anyone`), or require
+  someone else (`PR_APPROVER=not-requester`), #67. Under `not-requester` the requester's
+  clicks are refused, Deny included, because June's `authorizeAnswer` decides who may
+  answer, not which answer; and a refused click gets June's fixed reply, not a reason of
+  ours (both asked of June in junebuild/june#359). June doesn't tell the tool who answered,
+  so Lorehouse records it in its own database, per card and turn, and checks the rule
+  against that person again before it pushes; a card with no record (one parked before the
+  rule) is pushed only under `requester` or `anyone`, where June let only the requester
+  answer it. The rule is the install's, read as each click arrives; a profile can't loosen it.
 - With a GitHub App, a write token never enters a sandbox. The sandbox host stages the
   commits and, after the approval, pushes exactly the staged commit with the write token
   (`sandbox/host/src/publish.rs`, #31; `src/tools/pull-request.ts`, #32). The

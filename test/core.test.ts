@@ -3,7 +3,8 @@ import { Database } from "bun:sqlite";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertDistinctDatabases, loadConfig } from "../src/config";
+import { assertDistinctDatabases, ConfigError, loadConfig } from "../src/config";
+import { loadEnv } from "../src/settings";
 import { countDocuments, deleteDocument, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 import { render, systemPrompt, toolDescription } from "../src/prompts";
@@ -336,6 +337,27 @@ describe("config", () => {
   test("DM_MODE is redirect, ignore or answer; anything else is reported", () => {
     for (const mode of ["redirect", "ignore", "answer"] as const) expect(loadConfig({ ...base, DM_MODE: mode }).agent.dm).toBe(mode);
     expect(() => loadConfig({ ...base, DM_MODE: "reply" })).toThrow(/DM_MODE \(one of redirect, ignore, answer, got "reply"\)/);
+  });
+
+  test("PR_APPROVER is requester by default, or anyone, or not-requester; anything else is reported", () => {
+    expect(loadConfig(base).prApprover).toBe("requester");
+    expect(loadConfig({ ...base, PR_APPROVER: "" }).prApprover).toBe("requester");
+    for (const rule of ["requester", "anyone", "not-requester"] as const) expect(loadConfig({ ...base, PR_APPROVER: rule }).prApprover).toBe(rule);
+    expect(() => loadConfig({ ...base, PR_APPROVER: "someone-else" })).toThrow(ConfigError);
+    expect(() => loadConfig({ ...base, PR_APPROVER: "Not-Requester" })).toThrow(/PR_APPROVER \(one of requester, anyone, not-requester, got "Not-Requester"\)/);
+  });
+
+  test("PR_APPROVER can come from settings.json, under the environment", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lorehouse-approver-"));
+    try {
+      const settings = join(dir, "settings.json");
+      writeFileSync(settings, JSON.stringify({ env: { PR_APPROVER: "not-requester" } }));
+      const proc = { ...base, LOREHOUSE_SETTINGS: settings, LOREHOUSE_ENV_FILE: join(dir, "missing.env") };
+      expect(loadConfig(loadEnv(proc).env).prApprover).toBe("not-requester");
+      expect(loadConfig(loadEnv({ ...proc, PR_APPROVER: "anyone" }).env).prApprover).toBe("anyone");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("DM_MODE=answer can't be combined with code tools: code work stays public", () => {

@@ -187,6 +187,7 @@ To set up Slack:
 | `SANDBOX_URL` `SANDBOX_TOKEN` | (off) | code tools with one sandbox host Lorehouse calls, e.g. on the same machine; `https://`, or `http://` only to this machine (localhost, 127.0.0.0/8, `[::1]`); not together with `SANDBOX_RUNNER_TOKEN` |
 | `GITHUB_APP_ID` `GITHUB_APP_PRIVATE_KEY` | (none) | the GitHub App the code tools clone and open pull requests as: a short-lived token per repo, and write access only once a pull request is approved ([setup](docs/github-app.md)). Required with a sandbox |
 | `GITHUB_TOKEN` | (none) | instead of an App, for development only: one long-lived token with everything it can reach |
+| `PR_APPROVER` | `requester` | who may click Approve or Deny on a pull request card: only the `requester`; `anyone` in the thread, the requester included; or `not-requester`, anyone but the requester (who can't click Deny either). The requester is the person whose message got the agent to post the card. Approve opens a draft pull request; merging it is up to GitHub's review. `GET /status` shows it (`pullRequestApprover`), and `lorehouse doctor` says it |
 
 ## One contract, more than one implementation
 
