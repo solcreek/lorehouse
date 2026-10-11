@@ -25,8 +25,8 @@
 // same card), requestInput then returns the stored answer, and the post-approval part is
 // idempotent: an already-open PR for the branch is returned instead of creating a second one.
 // That holds under every PR_APPROVER: the approval record outlives the PR's opening until the
-// turn ends (src/approvals.ts), so a second run of this tool in the turn (a retry, or June
-// running a remote tool again, at least once) finds it and reports the PR as existing. The
+// turn ends or parks on another card (src/approvals.ts), so a second run of this tool in the
+// turn before it moves on (a retry, or June running a remote tool again, at least once) finds it and reports the PR as existing. The
 // same record lets such a run open a new PR for the same commit if the first was closed in
 // between: same card, same approver, same turn.
 
@@ -171,8 +171,8 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       const approved = await ctx.requestInput({ id: inputId, prompt: card, answerers });
       // This card in this turn. A Deny or a refusal deletes its approval record at once (done):
       // nothing was pushed, and nothing in this turn may use it. Every other outcome keeps it
-      // until the turn ends (src/approvals.ts): a second run in the turn, after a failure or after
-      // the PR opened, gets the same stored answer from June and needs the same record.
+      // until the turn ends or parks on another card (src/approvals.ts): a second run before
+      // then, after a failure or after the PR opened, gets the same stored answer from June and needs the same record.
       const key: CardKey | undefined = ctx.event?.ts ? { session: ctx.sessionId, turn: ctx.event.ts, card: inputId } : undefined;
       const done = <T>(result: T): T => {
         if (key) opts.approvals?.forget(key);
