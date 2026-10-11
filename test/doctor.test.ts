@@ -243,6 +243,13 @@ describe("code tools", () => {
     expect(find(checks, "token")[0]).toMatchObject({ level: "warn" });
   });
 
+  test("code tools with GITHUB_TOKEN warn that the token reaches the sandbox; with an App they don't", async () => {
+    const checks = await run({ SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" });
+    expect(find(checks, "in the sandbox")[0]).toMatchObject({ level: "warn" });
+    expect(find(checks, "in the sandbox")[0]!.detail).toContain("workspace_clone puts it in the sandbox");
+    expect(find(await run(app), "in the sandbox")).toEqual([]);
+  });
+
   test("asks GitHub where the app would (GITHUB_API_URL)", async () => {
     const { f, seen } = world();
     await doctor({ env: { ...ENV, SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1", GITHUB_API_URL: "http://github.test/api/" }, fetch: f });

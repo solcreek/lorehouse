@@ -206,6 +206,8 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       if (!res) add("github", "token", "fail", `${api}: ${error}`);
       else if (!res.ok) add("github", "token", "fail", `refused (${res.status}): check GITHUB_TOKEN`);
       else add("github", "token", "warn", `works, as ${(await json<{ login?: string }>(res))?.login ?? "?"}; a long-lived token is for development: use a GitHub App (docs/github-app.md)`);
+      // GitHub credentials need code tools (loadConfig), so this is always the case here.
+      add("github", "in the sandbox", "warn", "code tools are on with GITHUB_TOKEN: workspace_clone puts it in the sandbox to clone with, and it can write too, so code in the sandbox could push without an approval. A GitHub App's clone token is read-only (docs/github-app.md)");
     }
 
     // ── sandbox ──
