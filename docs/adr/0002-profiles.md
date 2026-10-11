@@ -131,7 +131,14 @@ These are Lorehouse's position, not settings:
 - It works only in public channels; private channels and group DMs stay shut. A DM is
   never knowledge, and is answered at all only where the install's `DM_MODE` allows it,
   from public knowledge and without code tools. A profile can't loosen that.
-- A pull request opens only after a person approves it in the thread.
+- A pull request opens only after a person approves it in the thread. The Approve in
+  Slack authorizes opening the pull request, not merging it: it opens as a draft, and the
+  merge is gated on GitHub, by its review and branch protection (#60). By default anyone
+  in the thread may approve, the person who asked for the pull request included. An
+  install can require someone else (`PR_APPROVER=not-requester`, #67); the requester's
+  clicks are then refused, Deny included, because June's `authorizeAnswer` decides who
+  may answer, not which answer. The rule is the install's, read as each click arrives; a
+  profile can't loosen it.
 - With a GitHub App, a write token never enters a sandbox. The sandbox host stages the
   commits and, after the approval, pushes exactly the staged commit with the write token
   (`sandbox/host/src/publish.rs`, #31; `src/tools/pull-request.ts`, #32). The
