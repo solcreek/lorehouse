@@ -233,10 +233,13 @@ describe("open_pull_request — the approval gate", () => {
     await ask({ branch: "scout/x", title: "x", base: "develop" });
     await ask({ branch: "scout/y", title: "x" });
     await ask({ branch: "scout/x", title: "x" }, "https://github.com/acme/other.git");
-    // The same commit with another diff (a replay after the base was rewritten).
+    // The same commit with another diff (a replay after the base was rewritten), also when
+    // the difference is past the excerpt the card shows.
     await ask({ branch: "scout/x", title: "x" }, undefined, "--- a/src/a.ts\n+++ b/src/a.ts\n-older\n+new\n");
+    await ask({ branch: "scout/x", title: "x" }, undefined, "+x\n".repeat(5000) + "+y\n");
+    await ask({ branch: "scout/x", title: "x" }, undefined, "+x\n".repeat(5000) + "+z\n");
     expect(ids[0]).toBe(ids[1]!);
-    expect(new Set(ids).size).toBe(6);
+    expect(new Set(ids).size).toBe(8);
   });
 
   test("a replay after the push (cut off before its result was saved) still reaches the PR", async () => {

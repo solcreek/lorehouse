@@ -129,13 +129,16 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         }
       }
 
-      // An approval is for what its card shows: this commit, to this branch of this repo,
-      // against this base, under this title, with this diff. A call that changes any of them
-      // (a replay after the base was rewritten can stage the same commit with another diff)
-      // is asked again, never answered by an earlier click. The stage id isn't in it: a
-      // replay stages again under a new id and shows the same card.
+      // An approval is for what its card was made from: this commit, to this branch of this
+      // repo, against this base, under this title, with these staged facts (the stat, the
+      // files, the authors, and the patch as the host read it, past what the card shows
+      // too). A call that changes any of them is asked again, never answered by an earlier
+      // click: a replay after the base was rewritten can stage the same commit with another
+      // diff. Neither the stage id nor the base's commit is in it: a replay stages again
+      // under a new id, and a base that only moved on leaves the diff as it was.
       const card = approvalCard({ repo, branch: input.branch, base, title: input.title, staged });
-      const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, staged.sha, card])).digest("hex");
+      const facts = [staged.sha, staged.commits, staged.stat, staged.files, staged.authors, staged.patch, staged.patchTruncated];
+      const approval = createHash("sha256").update(JSON.stringify([repo.owner, repo.name, base, input.branch, input.title, facts])).digest("hex");
       const approved = await ctx.requestInput({ id: `pr:${staged.sha.slice(0, 12)}:${approval.slice(0, 32)}`, prompt: card });
       if (approved !== true) return { status: "denied", note: "Nothing was pushed. Ask the requester what to change." };
 
