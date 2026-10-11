@@ -22,8 +22,11 @@
 //
 // Replay: after resume the engine re-runs this tool from the top. The pre-approval part
 // stages again (the same commits give the same sha and, unless the base was rewritten, the
-// same card), requestInput then returns the stored answer, and the post-approval part is idempotent: an already-open PR
-// for the branch is returned instead of creating a second one.
+// same card), requestInput then returns the stored answer, and the post-approval part is
+// idempotent: an already-open PR for the branch is returned instead of creating a second one.
+// Except under PR_APPROVER=not-requester after a crash between opening the PR and June saving
+// the tool's result: the approval record was already deleted, so the replay is refused (it
+// fails closed, though the PR is open).
 
 import { createHash } from "node:crypto";
 import type { Answerers, Tool, ToolContext } from "@junejs/core/agent-runtime";
