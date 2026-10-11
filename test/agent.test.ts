@@ -741,11 +741,11 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
       expect(t.approvals.count()).toBe(0);
       return t;
     };
-    test("opened: kept until the turn ends, then gone", async () => {
+    test("opened: gone once the turn ends", async () => {
       const t = await outcome({});
       expect(t.toolResults()[0]).toMatchObject({ status: "opened" });
     });
-    test("an open pull request for the branch already exists: kept until the turn ends, then gone", async () => {
+    test("an open pull request for the branch already exists: gone once the turn ends", async () => {
       const t = await outcome({ existing: [{ html_url: "https://github.com/acme/widgets/pull/3", number: 3 }] });
       expect(t.toolResults()[0]).toMatchObject({ status: "exists" });
     });
