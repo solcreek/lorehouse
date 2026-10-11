@@ -99,6 +99,8 @@ describe("mentionStream", () => {
     expect(await s.push("plain words ")).toBe("plain words ");
     expect(await s.push("then <!ch")).toBe("then ");
     expect(await s.flush()).toBe("<!ch"); // never closed: not markup, so it goes out
+    expect(await s.push(" hi @her")).toBe(" hi ");
+    expect(await s.push("o and")).toBe("@hero and"); // the word went on: not a broadcast
   });
 
   test("a < with no > for a long stretch isn't held forever", async () => {
