@@ -1130,7 +1130,8 @@ let app: ReturnType<typeof Bun.spawn> | undefined;
 // Nor its settings files, which the app reads after the environment and could fill
 // SESSIONS_DB back in: LOREHOUSE_ENV_FILE points at a missing file beside the database
 // (startApp), and LOREHOUSE_SETTINGS at settings.json, also beside the database.
-const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, ...inherited } = process.env;
+// Nor its PR_APPROVER: a scenario that leaves it unset tests the default.
+const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, PR_APPROVER: _prApprover, ...inherited } = process.env;
 
 // Start the app and wait until it listens, owns its port, and (unless waitReady is off,
 // for a start where /status is closed) has finished its Slack backfill/reconcile
