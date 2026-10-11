@@ -190,6 +190,7 @@ export class SlackIngester {
   // Channels found private or archived since the start, with why: never read again.
   private closed = new Map<string, string>();
   private rechecking?: Promise<string[]>;
+  private stopped = false;
 
   constructor(
     private readonly api: SlackApi,
@@ -401,14 +402,22 @@ export class SlackIngester {
   // Re-reads the thread once things settle.
   onRawEvent(ev: Record<string, unknown> | undefined): void {
     const t = threadOfEvent(ev);
-    if (!t || !this.opts.channels.has(t.channel) || this.closed.has(t.channel)) return;
+    if (this.stopped || !t || !this.opts.channels.has(t.channel) || this.closed.has(t.channel)) return;
     const key = `${t.channel}:${t.threadTs}`;
     clearTimeout(this.pending.get(key));
     this.pending.set(key, setTimeout(() => {
       this.pending.delete(key);
-      if (this.closed.has(t.channel)) return;
+      if (this.stopped || this.closed.has(t.channel)) return;
       this.refreshThread(t.channel, t.threadTs).catch((err) => this.opts.log?.(`ingest: thread ${key}: ${err}`));
     }, this.opts.debounceMs));
+  }
+
+  // Shutting down: no thread waiting out its debounce is read, and no new event arms one.
+  // A read already in flight may still finish and write (before the store is closed).
+  stop(): void {
+    this.stopped = true;
+    for (const timer of this.pending.values()) clearTimeout(timer);
+    this.pending.clear();
   }
 
   status(): IngestStatus {

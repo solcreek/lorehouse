@@ -16,11 +16,12 @@
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
 // 404 when STATUS_TOKEN is unset). The admin API under /api/v1 (docs/admin-api.md) answers
-// only to ADMIN_TOKEN, the same way.
+// only to ADMIN_TOKEN, the same way. On SIGTERM it must exit 0 within 5 s, and a
+// deleted message's text must not stay in LOREHOUSE_DB's files (the -wal included).
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pollRunner, wsRunner } from "./fake-runner";
@@ -682,6 +683,71 @@ const scenarios: Scenario[] = [
         if (results.some((x) => x.id === doc)) return `${doc} is still found by "${q}"`;
       }
       return null;
+    },
+  },
+  {
+    // #89: secure_delete (#65) clears the database file, but the WAL's earlier frames held
+    // the text until a checkpoint truncated it, and a stop never ran one. A backup of the
+    // directory carried what was deleted.
+    name: "a deleted message leaves LOREHOUSE_DB's files, its -wal too; a stop (SIGTERM) exits 0 within 5 s and leaves none",
+    run: async () => {
+      const db = freshDb();
+      const wal = `${db}-wal`;
+      const copies = (file: string, word: string) => (existsSync(file) ? readFileSync(file).toString("latin1").split(word).length - 1 : 0);
+      const inFiles = (word: string) => copies(db, word) + copies(wal, word);
+      const until = async (ok: () => boolean | Promise<boolean>, ms = 5000) => {
+        const t0 = Date.now();
+        while (!(await ok())) {
+          if (Date.now() - t0 > ms) return false;
+          await Bun.sleep(50);
+        }
+        return true;
+      };
+      return inMode({ LOREHOUSE_DB: db }, async () => {
+        // A message alone (its document is deleted), and a reply in a thread that stays (its
+        // document is rewritten without it).
+        const alone = `okapiwalone${++seq}`;
+        const reply = `okapiwalreply${++seq}`;
+        const aloneTs = await liveMessage(ALLOWED, "channel", `the okapi vault code is ${alone}, keep it here`);
+        const root = await liveMessage(ALLOWED, "channel", "where is the okapi vault runbook?");
+        const replyTs = `${1980000000 + ++seq}.000100`;
+        const replyText = `the okapi runbook password is ${reply}`;
+        await post("/fixtures/messages", { channel: ALLOWED, message: { ts: replyTs, thread_ts: root, user: "U7", text: replyText } });
+        await sendEvent({ type: "message", channel: ALLOWED, channel_type: "channel", user: "U7", text: replyText, ts: replyTs, thread_ts: root, event_ts: replyTs });
+        const found = async (word: string) => (await admin<{ results: { id: string }[] }>(`/api/v1/search?q=${word}`)).results.length > 0;
+        if (!(await until(async () => (await found(alone)) && (await found(reply))))) return "the messages were never indexed";
+        // What this checks is there to begin with: the WAL holds both words.
+        if (!copies(wal, alone) || !copies(wal, reply)) return `before deleting, the -wal holds ${copies(wal, alone)}/${copies(wal, reply)} copies; want some of each (the check below would prove nothing)`;
+        await deleteMessage(ALLOWED, aloneTs);
+        // A reply's deletion names its thread, as Slack's does.
+        await post("/fixtures/delete", { channel: ALLOWED, ts: replyTs });
+        const now = `${1990000000 + ++seq}.000100`;
+        await sendEvent({ type: "message", subtype: "message_deleted", hidden: true, channel: ALLOWED, channel_type: "channel", ts: now, event_ts: now, deleted_ts: replyTs, previous_message: { ts: replyTs, thread_ts: root } });
+        if (!(await until(async () => !(await found(alone)) && !(await found(reply))))) return "the deleted messages are still found";
+        // Removed from the index; out of both files within seconds, while the app runs.
+        if (!(await until(() => inFiles(alone) + inFiles(reply) === 0))) {
+          return `while running, the deleted text is still in LOREHOUSE_DB's files: file ${copies(db, alone)}+${copies(db, reply)}, -wal ${copies(wal, alone)}+${copies(wal, reply)}`;
+        }
+        // Delete one more and stop straight away, before the checkpoint it asked for has run:
+        // the stop must do it.
+        const last = `okapiwallast${++seq}`;
+        const lastTs = await liveMessage(ALLOWED, "channel", `the okapi door code is ${last}`);
+        if (!(await until(() => found(last)))) return "the last message was never indexed";
+        await deleteMessage(ALLOWED, lastTs);
+        await deleteMessage(ALLOWED, root); // nothing of this scenario stays in Slack's history
+        if (!(await until(async () => !(await found(last))))) return "the last deleted message is still found";
+        const proc = app!;
+        const t0 = Date.now();
+        proc.kill("SIGTERM");
+        const code = await Promise.race([proc.exited, Bun.sleep(5000).then(() => "timeout" as const)]);
+        if (code === "timeout") return "still running 5 s after SIGTERM (Fly's default kill_timeout)";
+        app = undefined;
+        const t0Free = Date.now();
+        while ((await listenerPids(APP_PORT)).length && Date.now() - t0Free < 5000) await Bun.sleep(20);
+        if (code !== 0) return `exited ${code} (signal ${proc.signalCode}) on SIGTERM, want 0`;
+        const left = [alone, reply, last].map((w) => `${copies(db, w)}/${copies(wal, w)}`);
+        return [alone, reply, last].every((w) => inFiles(w) === 0) ? null : `after the stop (${Date.now() - t0} ms), copies in file/-wal: ${left.join(", ")}; want 0`;
+      }).finally(() => removeDb(db));
     },
   },
   {

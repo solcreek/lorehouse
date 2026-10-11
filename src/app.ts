@@ -9,7 +9,7 @@ import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import { assertDistinctDatabases, type Config } from "./config";
 import { agentIdentity } from "./identity";
-import { countDocuments, openKnowledge, recentDocuments, searcher, seedFromJsonl } from "./knowledge";
+import { closeKnowledge, countDocuments, openKnowledge, recentDocuments, searcher, seedFromJsonl } from "./knowledge";
 import { recentKnowledgeTool } from "./tools/recent-knowledge";
 import { SlackIngester } from "./ingest/slack";
 import { slackApi } from "./slack-api";
@@ -115,7 +115,9 @@ export async function createApp(config: Config) {
   // Opted in, a channel's askers are recorded only once it has been told (the notices go
   // out after the server is up, so the first asks may come before them).
   const told = recordPeople ? notifiedChannels(knowledge) : new Set<string>();
-  setInterval(() => tally(() => pruneUsage(knowledge)), 86_400_000).unref();
+  // Every timer the app arms, cleared on close.
+  const timers: ReturnType<typeof setInterval>[] = [];
+  timers.push(setInterval(() => tally(() => pruneUsage(knowledge)), 86_400_000).unref());
 
   const tools: Tool[] = [
     // A search is counted in the Slack thread it ran for (a top-level question is its own
@@ -136,7 +138,7 @@ export async function createApp(config: Config) {
   // restart left behind is pruned on start, then daily.
   const approvals = approvalStore(knowledge);
   tally(() => approvals.prune());
-  setInterval(() => tally(() => approvals.prune()), 86_400_000).unref();
+  timers.push(setInterval(() => tally(() => approvals.prune()), 86_400_000).unref());
   let runtime: Awaited<ReturnType<typeof createNativeRuntime>> | undefined;
   const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session));
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
@@ -304,7 +306,7 @@ export async function createApp(config: Config) {
       // A channel can turn private (or be archived) while the app runs: look again
       // (INGEST_CHANNEL_RECHECK_MS, hourly by default), armed before anything here can fail.
       if (ingester && config.ingest.recheckMs > 0) {
-        setInterval(() => void ingester.recheckChannels().catch((err) => console.error("ingest:", err)), config.ingest.recheckMs).unref();
+        timers.push(setInterval(() => void ingester.recheckChannels().catch((err) => console.error("ingest:", err)), config.ingest.recheckMs).unref());
       }
       await announceRecordPeople();
       await ingester?.start();
@@ -333,8 +335,24 @@ export async function createApp(config: Config) {
       if (runnerReply) return runnerReply;
       return (await mounted.fetch(req)) ?? new Response("not found", { status: 404 });
     },
-    close() {
-      knowledge.close();
+    // Shut down (server.ts, on SIGTERM/SIGINT, once the server takes no more requests): no
+    // timer or debounced ingest read starts again; turns in flight get up to `waitMs` to
+    // finish while June's runtime closes (and with it SESSIONS_DB); then the knowledge store
+    // is checkpointed, its WAL truncated (#89: a deleted message's frames leave
+    // lorehouse.db-wal), and closed. A turn still running after `waitMs` is cut off: its
+    // later writes to the store fail, and are logged.
+    async close({ waitMs = 2500 }: { waitMs?: number } = {}) {
+      for (const t of timers) clearInterval(t);
+      ingester?.stop();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), waitMs); });
+      const runtimeClosed = runtime!.close().then(
+        () => "closed" as const,
+        (err) => { console.error("lorehouse: closing the agent runtime:", err); return "closed" as const; },
+      );
+      if ((await Promise.race([runtimeClosed, timeout])) === "timeout") console.error(`lorehouse: turns still running after ${waitMs} ms; closing without them`);
+      clearTimeout(timer);
+      closeKnowledge(knowledge);
     },
   };
 }

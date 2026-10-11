@@ -53,4 +53,28 @@ if (config) {
   const keepAlive = () => void configToken(settingsPath).catch(() => {});
   keepAlive();
   setInterval(keepAlive, 5 * 60_000).unref();
+
+  // A stop (Fly sends SIGTERM, then SIGKILL after its kill_timeout, 5 s by default; Ctrl-C
+  // is SIGINT) shuts down in order, well inside that: the server stops taking requests
+  // (those in flight get STOP_REQUESTS_MS), app.close() gives running turns the rest and
+  // checkpoints and closes the databases, and the process exits 0. Without this the
+  // process died with the knowledge DB's WAL as it was, deleted text included (#89).
+  const STOP_REQUESTS_MS = 1000;
+  let stopping = false;
+  const shutdown = async (signal: string) => {
+    if (stopping) return; // a second signal changes nothing: the first is already bounded
+    stopping = true;
+    console.log(`lorehouse: ${signal}: shutting down`);
+    try {
+      await Promise.race([server.stop(), Bun.sleep(STOP_REQUESTS_MS)]);
+      void server.stop(true); // whatever is still open (a runner's socket) is cut
+      await app.close({ waitMs: 2500 });
+    } catch (err) {
+      console.error("lorehouse: shutting down:", err);
+      process.exit(1);
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
