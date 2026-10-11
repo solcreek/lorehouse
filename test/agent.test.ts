@@ -546,6 +546,35 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(gh.reqs).toHaveLength(0);
   });
 
+  test("not-requester: a retry in the same turn after a failed push still has the approval, and names the approver", async () => {
+    const { sb, published } = fakeRepo();
+    let pushes = 0;
+    const push = sb.push.bind(sb);
+    sb.push = async (args) => {
+      const r = await push(args);
+      if (++pushes === 1) throw new Error("host busy");
+      return r;
+    };
+    const gh = fakeGithub();
+    const gate = approverGate("not-requester");
+    const tool = pullRequestTool({ sandboxFor: () => sb, github: staticToken("t"), fetch: gh.f, approver: "not-requester", approvedBy: gate.approvedBy, approverName: async (id) => (id === "U2" ? "Ada Park" : undefined) });
+    // June stores the answer per turn: U2's click is authorized once, and the retry's
+    // requestInput returns the stored answer without asking again.
+    let clicked = false;
+    const once = {
+      sessionId: "s",
+      event: { source: "slack", user: { id: "U1", attested: true } },
+      requestInput: async (r: { id: string }) => {
+        if (!clicked) clicked = (await gate.authorize({ policy: APPROVER_POLICY, scope: { requester: "U1" }, by: "U2", agent: "a", session: "s", request: { id: r.id, prompt: "" } })) === true;
+        return clicked;
+      },
+    } as never;
+    expect(await tool.run({ branch: "scout/x", title: "x" }, once)).toMatchObject({ error: expect.stringContaining("push failed") });
+    expect(await tool.run({ branch: "scout/x", title: "x" }, once)).toMatchObject({ status: "opened" });
+    expect(published.filter((p) => p.op === "push")).toHaveLength(2);
+    expect((gh.reqs.find((r) => r.method === "POST")!.body as { body: string }).body).toContain("approved there by Ada Park.");
+  });
+
   test("a Deny uses up its grant: the same card asked for again never names the person who denied it", async () => {
     const t = slackTurn("anyone");
     const inputId = ((await t.s.result(t.t1)) as { request: { id: string } }).request.id;
