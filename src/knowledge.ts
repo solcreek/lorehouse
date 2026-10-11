@@ -34,7 +34,7 @@ export function indexText(s: string): string {
   });
 }
 
-export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
+export function openKnowledge(path: string, migrations = MIGRATIONS, wal: WalOptions = {}): Database {
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL");
   // Freed pages are zeroed, not left holding what was deleted (a pragma lasts one
@@ -53,7 +53,93 @@ export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
     ensureIndex(db);
     if (path !== ":memory:") compactOnce(db);
   }
+  if (path !== ":memory:" && path !== "") checkpoints.set(db, new WalCheckpoint(db, wal));
   return db;
+}
+
+// ── removed text leaves the WAL too (#89) ───────────────────────────────────────
+//
+// secure_delete zeroes what a delete or an overwrite frees, in the page it rewrites. But in
+// WAL mode that page is written to lorehouse.db-wal first, and the frames written before
+// the delete still hold the old page, text and all, until the WAL is checkpointed and
+// truncated: SQLite's own checkpoints copy the frames back but leave the file's bytes, and
+// the WAL is only removed when the last connection closes cleanly. So whatever removes
+// text (a deleted or edited message, a purged channel, erased usage) asks for a TRUNCATE
+// checkpoint here, and closeKnowledge runs one before closing.
+//
+// A request arms one timer: a burst of deletes within `delayMs` shares a checkpoint, and a
+// steady stream of them can't put it off (the first request sets when it runs). A busy
+// checkpoint (another connection reading) is logged and tried again `retryMs` later; it
+// never throws into the write that asked for it.
+
+export type WalOptions = { delayMs?: number; retryMs?: number; log?: (msg: string) => void };
+
+class WalCheckpoint {
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private stopped = false;
+  private readonly delayMs: number;
+  private readonly retryMs: number;
+  private readonly log: (msg: string) => void;
+  runs = 0; // checkpoints attempted, for tests
+
+  constructor(private readonly db: Database, opts: WalOptions) {
+    this.delayMs = opts.delayMs ?? 1000;
+    this.retryMs = opts.retryMs ?? 30_000;
+    this.log = opts.log ?? ((m) => console.error(m));
+  }
+
+  request(delayMs = this.delayMs): void {
+    if (this.stopped || this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      if (!this.now()) this.request(this.retryMs);
+    }, delayMs);
+    // Never what keeps a process alive: closeKnowledge checkpoints on the way out.
+    (this.timer as { unref?: () => void }).unref?.();
+  }
+
+  // Checkpoint and truncate now. True when the WAL is empty afterwards.
+  now(): boolean {
+    this.runs++;
+    try {
+      const { busy } = this.db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+      if (!busy) return true;
+      this.log("knowledge: couldn't empty the WAL of removed text (the database is in use); trying again");
+    } catch (err) {
+      this.log(`knowledge: couldn't empty the WAL of removed text; trying again: ${err}`);
+    }
+    return false;
+  }
+
+  stop(): void {
+    this.stopped = true;
+    clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+}
+
+const checkpoints = new WeakMap<Database, WalCheckpoint>();
+
+// Text was removed from `db`: have it leave the WAL soon (a no-op for :memory:).
+export function checkpointSoon(db: Database): void {
+  checkpoints.get(db)?.request();
+}
+
+// How many checkpoints `db` has attempted since it was opened (tests).
+export function checkpointRuns(db: Database): number {
+  return checkpoints.get(db)?.runs ?? 0;
+}
+
+// Close the knowledge store for good: no checkpoint pending, the WAL checkpointed and
+// truncated, then the connection closed. False when the checkpoint was busy (logged): the
+// WAL then keeps its frames until the next open checkpoints it.
+export function closeKnowledge(db: Database): boolean {
+  const c = checkpoints.get(db);
+  c?.stop();
+  checkpoints.delete(db);
+  const done = c ? c.now() : true;
+  db.close();
+  return done;
 }
 
 // PRAGMA secure_delete is not retroactive: rows deleted before it was on (by a build
@@ -102,9 +188,11 @@ function ensureIndex(db: Database): void {
 }
 
 // Insert, or replace in place (a Slack thread grows; its id doesn't change). The document
-// and its index row change together.
+// and its index row change together. A replaced document may have lost text (a deleted
+// reply, an edit), so replacing one asks for a checkpoint, as a delete does.
 export function upsertDocument(db: Database, doc: Document): void {
-  db.transaction(() => {
+  const replaced = db.transaction(() => {
+    const existed = !!db.query("SELECT 1 FROM knowledge_documents WHERE doc_id = ?").get(doc.docId);
     const { id } = db.query(
       `INSERT INTO knowledge_documents (doc_id, kind, source, title, text, updated_at, source_version) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(doc_id) DO UPDATE SET kind = excluded.kind, source = excluded.source, title = excluded.title,
@@ -113,16 +201,21 @@ export function upsertDocument(db: Database, doc: Document): void {
     ).get(doc.docId, doc.kind, doc.source, doc.title, doc.text, new Date().toISOString(), doc.sourceVersion ?? null) as { id: number };
     db.query("DELETE FROM knowledge_fts WHERE rowid = ?").run(id);
     db.query("INSERT INTO knowledge_fts (rowid, title, text) VALUES (?, ?, ?)").run(id, indexText(doc.title), indexText(doc.text));
+    return existed;
   })();
+  if (replaced) checkpointSoon(db);
 }
 
-// Remove a document and its index row. True if it existed.
+// Remove a document and its index row; its text leaves the WAL soon after (checkpointSoon).
+// True if it existed.
 export function deleteDocument(db: Database, docId: string): boolean {
-  return db.transaction(() => {
+  const removed = db.transaction(() => {
     const row = db.query("DELETE FROM knowledge_documents WHERE doc_id = ? RETURNING id").get(docId) as { id: number } | null;
     if (row) db.query("DELETE FROM knowledge_fts WHERE rowid = ?").run(row.id);
     return !!row;
   })();
+  if (removed) checkpointSoon(db);
+  return removed;
 }
 
 export function documentVersion(db: Database, docId: string): string | null | undefined {
