@@ -82,8 +82,8 @@ quotable. DMs are never indexed.
 
 **Policy.** `src/policy.ts` restricts every channel event to channels in
 `AGENT_CHANNELS` (empty means nowhere) and refuses private channels and group DMs where the
-payload says so; mentions and reactions carry no channel type, so the list must hold only
-public channel ids. On start, `src/purge.ts` removes what was kept for
+payload says so; mentions and reactions carry no channel type, and ingest reads every listed
+channel, so the list must hold only public channel ids. On start, `src/purge.ts` removes what was kept for
 a channel no longer listed from `LOREHOUSE_DB` (its documents, joined threads, cursor, asks
 and searches; not June's sessions); `src/threads.ts`
 decides follow-ups (reply in a joined thread without a new mention, but not when it
