@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { assertPublicChannels, classifyChannel, describeVerdict, isDefiniteFailure, lookUpChannel, lookUpChannels, type ChannelInfo } from "../src/channel-check";
 import { ConfigError } from "../src/config";
-import { openKnowledge } from "../src/knowledge";
+import { docIdsWithPrefix, getCursor, openKnowledge } from "../src/knowledge";
 import { SlackIngester } from "../src/ingest/slack";
 import { SlackApiError, type SlackApi } from "../src/slack-api";
 
@@ -218,6 +218,61 @@ describe("ingest looks channels up", () => {
     await ing.recheckChannels();
     await Bun.sleep(60);
     expect(read).toEqual([]);
+  });
+
+  // A Web API whose history and replies for C1 run a hook before answering, so a test can
+  // close the channel while ingest is mid-read.
+  function midReadApi(info: Record<string, ChannelInfo | string>, onRead: (method: string, n: number) => Promise<void>) {
+    const base = infoApi(info);
+    let n = 0;
+    const msg = (ts: string) => ({ type: "message", user: "U1", text: `note ${ts}`, ts });
+    const api: SlackApi = {
+      call: <T>(method: string, params?: Record<string, string | number | undefined>) =>
+        method === "users.info" ? Promise.resolve({ user: { id: "U1", name: "ana", profile: { display_name: "Ana" } } } as T) : base.api.call<T>(method, params),
+      async *paginate<T>(method: string, params: Record<string, unknown>) {
+        if (method === "conversations.history") {
+          for (const ts of ["1790000001.000100", "1790000002.000100"]) {
+            await onRead(method, n++);
+            yield msg(ts) as T;
+          }
+        } else if (method === "conversations.replies") {
+          await onRead(method, n++);
+          yield msg(String(params.ts)) as T;
+        }
+      },
+    };
+    return { api, info };
+  }
+
+  test("a channel closed while its history is being read keeps nothing read after, and no cursor", async () => {
+    const db = openKnowledge(":memory:");
+    let ing!: SlackIngester;
+    const { api, info } = midReadApi({ C1: PUBLIC }, async (_method, n) => {
+      if (n !== 1) return;
+      info.C1 = { ...PUBLIC, is_private: true };
+      await ing.recheckChannels();
+    });
+    ing = new SlackIngester(api, db, { channels: new Set(["C1"]), backfillDays: 30, refreshDays: 0, debounceMs: 0, now: () => 1790100000 * 1000, lookUp: (c) => lookUpChannel(api, c) });
+    await ing.start();
+    expect(ing.status().state).toBe("ready");
+    expect(ing.isClosed("C1")).toBe(true);
+    expect(docIdsWithPrefix(db, "slack:C1:")).toEqual(["slack:C1:1790000001.000100"]);
+    expect(getCursor(db, "slack:C1")).toBeUndefined();
+  });
+
+  test("a live thread read in flight when the channel closes is not kept", async () => {
+    const db = openKnowledge(":memory:");
+    let ing!: SlackIngester;
+    const { api, info } = midReadApi({ C1: PUBLIC }, async (method) => {
+      if (method !== "conversations.replies") return;
+      info.C1 = { ...PUBLIC, is_archived: true };
+      await ing.recheckChannels();
+    });
+    ing = new SlackIngester(api, db, { channels: new Set(["C1"]), backfillDays: 0, refreshDays: 0, debounceMs: 0, now: () => 1790100000 * 1000, lookUp: (c) => lookUpChannel(api, c) });
+    await ing.start();
+    expect(await ing.refreshThread("C1", "1790000003.000100")).toBe("absent");
+    expect(ing.isClosed("C1")).toBe(true);
+    expect(docIdsWithPrefix(db, "slack:C1:")).toEqual([]);
   });
 
   test("a recheck called while one is still waiting on Slack shares it: one lookup per channel in flight", async () => {

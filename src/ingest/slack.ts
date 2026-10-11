@@ -302,10 +302,12 @@ export class SlackIngester {
     let newest = oldest;
     for await (const m of this.api.paginate<SlackMessage>("conversations.history", { channel, oldest, limit: 200 }, "messages")) {
       if (Number(m.ts) > Number(newest)) newest = m.ts;
+      if (this.closed.has(channel)) return; // closed by a recheck while reading: keep nothing more
       if (m.thread_ts && m.thread_ts !== m.ts) continue; // a broadcast reply; its thread is indexed from the root
       const thread = m.reply_count ? await this.readThread(channel, m.ts) : [m];
       await this.store(channel, thread);
     }
+    if (this.closed.has(channel)) return;
     setCursor(this.db, source, newest);
     this.opts.log?.(`ingest: ${channel} backfilled up to ${newest}`);
   }
@@ -316,6 +318,7 @@ export class SlackIngester {
     const seen = new Set<string>();
     const live = new Set<string>(); // top-level messages still there, for onReconciled
     for await (const root of this.api.paginate<SlackMessage>("conversations.history", { channel, oldest: String(oldest), limit: 200 }, "messages")) {
+      if (this.closed.has(channel)) return; // closed by a recheck while reading
       if (root.thread_ts && root.thread_ts !== root.ts) continue;
       const docId = threadDocId(channel, root.ts);
       seen.add(docId);
@@ -334,6 +337,7 @@ export class SlackIngester {
       const rootTs = docId.slice(`slack:${channel}:`.length);
       if (Number(rootTs) >= oldest && !seen.has(docId)) await this.refreshThread(channel, rootTs, "reconcile");
     }
+    if (this.closed.has(channel)) return;
     await this.opts.onReconciled?.(channel, oldest, live);
   }
 
@@ -356,7 +360,9 @@ export class SlackIngester {
   private async store(channel: string, thread: SlackMessage[]): Promise<boolean> {
     const names = await this.users.names(userIdsIn(thread));
     const doc = threadDocument(channel, thread, this.workspaceUrl, this.botUserId, names);
-    if (!doc) return false;
+    // A recheck may have closed the channel while this thread was being read: what was
+    // read then is not kept.
+    if (!doc || this.closed.has(channel)) return false;
     upsertDocument(this.db, doc);
     return true;
   }
@@ -371,6 +377,8 @@ export class SlackIngester {
       if (!(err instanceof SlackApiError && (err.code === "thread_not_found" || err.code === "message_not_found"))) throw err;
       thread = [];
     }
+    // Closed while the read was in flight: leave the index as it was (see the class comment).
+    if (this.closed.has(channel)) return "absent";
     const docId = threadDocId(channel, threadTs);
     if (await this.store(channel, thread)) {
       if (why === "reconcile") this.reconciled.refreshed++;
