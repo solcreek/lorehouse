@@ -129,8 +129,12 @@ junebuild/june#195, already fixed in June; it goes with the upgrade (#38).
 These are Lorehouse's position, not settings:
 
 - It works only in public channels; private channels and group DMs stay shut. A DM is
-  never knowledge, and is answered at all only where the install's `DM_MODE` allows it,
-  from public knowledge and without code tools. A profile can't loosen that.
+  never knowledge. By default it is not answered either (`DM_MODE=redirect`): it gets a
+  one-line pointer to the public channels, with no model call and nothing read. An admin
+  may turn answering on with `DM_MODE=answer`, and that choice includes reading the DM
+  conversation itself (any thread in it), whose only reader is its author. Beyond it, the
+  answer reads only public channels (the knowledge index and allowlisted threads), and
+  never with code tools (#58). A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread.
 - With a GitHub App, a write token never enters a sandbox. The sandbox host stages the
   commits and, after the approval, pushes exactly the staged commit with the write token
