@@ -107,6 +107,8 @@ describe("knowledge store", () => {
       deleteDocument(old, secret.docId);
       expect(fileHolds(old, path, "zebrasecretword9")).toBe(true); // the residue this cleans up
       const db = openKnowledge(path);
+      // Already out of the file while the app holds it open, not only after a later checkpoint.
+      expect(readFileSync(path).toString("latin1").includes("zebrasecretword9")).toBe(false);
       expect(searcher(db)("filler")).toHaveLength(5); // the index still works after the clean-up
       expect(fileHolds(db, path, "zebrasecretword9")).toBe(false);
     }));

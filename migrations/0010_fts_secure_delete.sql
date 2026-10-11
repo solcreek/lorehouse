@@ -13,8 +13,9 @@
 --
 -- That pragma is not retroactive: rows deleted from knowledge_documents (and every other
 -- table) before it was on left their bytes in free space. So after this file applies, the
--- runner runs VACUUM, outside the transaction, to rewrite the whole file (`vacuum: true`
--- in src/migrations.ts). The version is recorded only once VACUUM succeeds, so a failed
--- one is retried on the next start; both statements below are safe to run twice.
+-- runner runs VACUUM, outside the transaction, to rewrite the whole file, and checkpoints
+-- the WAL so the rewrite reaches the .db file at once (`vacuum: true` in
+-- src/migrations.ts). The version is recorded only once both succeed, so a failed one is
+-- retried on the next start; both statements below are safe to run twice.
 INSERT INTO knowledge_fts (knowledge_fts, rank) VALUES ('secure-delete', 1);
 INSERT INTO knowledge_fts (knowledge_fts) VALUES ('optimize');

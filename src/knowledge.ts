@@ -52,11 +52,15 @@ export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
       })();
       continue;
     }
-    // VACUUM can't run inside a transaction. It is recorded only once it succeeds, so a
-    // failure (e.g. no disk for the copy) is retried on the next open: such a migration's
-    // SQL must be safe to run twice.
+    // VACUUM can't run inside a transaction. In WAL mode it writes the rebuilt pages to the
+    // WAL, and the .db file keeps the old ones until a checkpoint, so checkpoint at once.
+    // The version is recorded only once both succeed, so a failure (no disk for the copy, a
+    // busy checkpoint) is retried on the next open: such a migration's SQL must be safe to
+    // run twice.
     db.transaction(() => db.exec(m.sql))();
     db.exec("VACUUM");
+    const { busy } = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+    if (busy) continue;
     record();
   }
   if (hasTable(db, "knowledge_index_meta")) ensureIndex(db);
