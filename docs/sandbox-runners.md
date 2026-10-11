@@ -163,10 +163,10 @@ as base64 JSON in `bodyBase64`, and its result is JSON. In serve mode, the same 
 are `POST /v1/sandboxes/{id}/stage` and `/push`, with the JSON as the plain request body:
 
 ```json
-stage → { "owner": "acme", "name": "widgets", "base": "main", "token": "<read token>" }
-     ← { "sha": "…", "baseSha": "…", "commits": 1, "stat": "…", "authors": ["bot <…>|bot <…>"],
+stage → { "owner": "acme", "name": "widgets", "base": "main", "branch": "scout/x", "token": "<read token>" }
+     ← { "stage": "<id>", "sha": "…", "baseSha": "…", "commits": 1, "stat": "…", "authors": ["bot <…>|bot <…>"],
          "files": ["…"], "patch": "…", "patchTruncated": false }
-push → { "owner": "acme", "name": "widgets", "sha": "…", "branch": "scout/x", "token": "<write token>" }
+push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "branch": "scout/x", "token": "<write token>" }
      ← { "sha": "…", "branch": "scout/x" }
 ```
 
@@ -175,14 +175,31 @@ push → { "owner": "acme", "name": "widgets", "sha": "…", "branch": "scout/x"
   2. It has the VM bundle what the checkout has that `origin` doesn't, and reads the bundle out in 12 MiB parts, at most 96 MiB in all.
   3. It fetches the bundle into `refs/stage/<id>`, with fsck on, no tags and only that one ref. A forged bundle, a `.git` tree entry, or a tag or replace ref riding along never reaches the mirror.
   4. The facts the approval shows (diff, files, authors) are computed in the mirror, never taken from the VM.
-- **push**, after approval: the host pushes a staged commit, and nothing else, to
-  `refs/heads/<branch>`. It never forces and never deletes.
+     `files` is every path the commits change, complete: a rename is listed as both its
+     old and its new path (no rename detection), and no path is quoted or escaped. What
+     the approval card warns about is decided on this list.
+  5. Only once all of that has succeeded, the host writes a stage record (sandbox, repo,
+     base, branch, commit, time) under an unguessable id, and returns the id. A stage that
+     fails, or is cut off by its deadline or cancelled, writes none.
+- **push**, after approval: the host pushes the commit a stage record names to the branch
+  it names, and nothing else, to `refs/heads/<branch>`. It never forces and never deletes.
+  The record is the only authorization (a `refs/stage/` ref alone authorizes nothing):
+  - The request must restate the record's sandbox, repo, commit and branch.
+  - A record is single-use: push removes it before checking or pushing anything, so it
+    covers one attempt whatever its outcome. A failed push needs a new stage; Lorehouse
+    stages on every run of `open_pull_request`, so a replay stages again.
+  - A record expires 24 h after it was made. Expired records and refs, and refs with no
+    record, are dropped by the host's housekeeping.
 - **Every git command** on the host runs with no user or system config, no prompts, no
   replace objects and no hooks. A token travels as an HTTP header in the command's
   environment, never in argv. Tokens are in jobs only, never logged or recorded.
 - **Failures** come back as statuses with a reason:
   - 409: nothing new to publish, or a branch that has moved on.
-  - 404: the base isn't on GitHub, or the commit wasn't staged.
+  - 404: the base isn't on GitHub, or the stage isn't there (never completed, already
+    used, or dropped).
+  - 403: the push doesn't match its stage's record (nothing pushed, the stage is used up).
+  - 410: the stage has expired.
+  - 500: the record can't be read, is malformed, or can't be consumed (nothing pushed).
   - 422: the bundle was refused.
   - 413: the commits are too large, or what the approval shows (stat, files, authors) is
     over 1 MiB each. The host reads only that much of any of it; the patch is cut at 64 KiB.

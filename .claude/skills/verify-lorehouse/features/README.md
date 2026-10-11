@@ -7,7 +7,7 @@ This directory is the maintained source for verifying what a Slack teammate can 
 - Launch and doctor as [SKILL.md](../SKILL.md) describes. Drive only a run whose doctor exits 0.
 - The instance's only allowed public channel is `C1`. The agent is `@scout`. Channel history is `conformance/fixtures/slack-history.json`.
 - The thread `slack:C1:1790000001.000100` is Wendy's message that the quarterly wombat review moves to Thursdays. Its permalink is `https://acme.slack.com/archives/C1/p1790000001000100`.
-- Commands run from the repo root through `bun .cursor/skills/verify-lorehouse/control.ts`.
+- Commands run from the repo root through `bun .claude/skills/verify-lorehouse/control.ts`.
 - Pass `--run <runId>` when more than one verification run is up. `current` is only the latest launch.
 - Never send these events to a `bun start` you did not launch here.
 

@@ -20,9 +20,9 @@ Preconditions:
 - `doctor` exits 0 for this run.
 - The indexed document `slack:C1:1790000001.000100` contains `quarterly wombat review`.
 
-- **Ask.** Mention `@scout` with the question. Run `bun .cursor/skills/verify-lorehouse/control.ts ask --text "when is the quarterly wombat review" --evidence ask-in-channel/reply.json`. `ok` is true, `reply.cite` is `slack:C1:1790000001.000100`, and `reply.src` is `https://acme.slack.com/archives/C1/p1790000001000100`. `methods` includes `chat.startStream` and `chat.stopStream`.
-- **Confirm the source.** Open that document. Run `bun .cursor/skills/verify-lorehouse/control.ts admin --path /api/v1/documents/slack:C1:1790000001.000100 --evidence ask-in-channel/document.json`. `status` is 200 and `body.text` contains `quarterly wombat review` and `Thursdays`.
-- **Question is not knowledge.** Read the document id the mention would have if it had been indexed: `slack:C1:` plus the `ts` from the ask. Run `bun .cursor/skills/verify-lorehouse/control.ts admin --path /api/v1/documents/slack:C1:<ts> --evidence ask-in-channel/question-not-indexed.json`. `status` is 404.
+- **Ask.** Mention `@scout` with the question. Run `bun .claude/skills/verify-lorehouse/control.ts ask --text "when is the quarterly wombat review" --evidence ask-in-channel/reply.json`. `ok` is true, `reply.cite` is `slack:C1:1790000001.000100`, and `reply.src` is `https://acme.slack.com/archives/C1/p1790000001000100`. `methods` includes `chat.startStream` and `chat.stopStream`.
+- **Confirm the source.** Open that document. Run `bun .claude/skills/verify-lorehouse/control.ts admin --path /api/v1/documents/slack:C1:1790000001.000100 --evidence ask-in-channel/document.json`. `status` is 200 and `body.text` contains `quarterly wombat review` and `Thursdays`.
+- **Question is not knowledge.** Read the document id the mention would have if it had been indexed: `slack:C1:` plus the `ts` from the ask. Run `bun .claude/skills/verify-lorehouse/control.ts admin --path /api/v1/documents/slack:C1:<ts> --evidence ask-in-channel/question-not-indexed.json`. `status` is 404.
 
 ## Gotchas
 

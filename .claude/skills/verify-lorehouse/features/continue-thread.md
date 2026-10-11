@@ -19,10 +19,10 @@ Preconditions:
 - `doctor` exits 0 for this run.
 - You have the `ts` from an `ask` in this run. That `ts` is the thread.
 
-- **Open the thread.** Ask once. Run `bun .cursor/skills/verify-lorehouse/control.ts ask --text "where is the wombat review" --evidence continue-thread/open.json`. `ok` is true. Keep `ts`.
-- **Follow up.** Clear the call log and reply without a mention. Run `bun .cursor/skills/verify-lorehouse/control.ts reset-log` and `bun .cursor/skills/verify-lorehouse/control.ts reply --thread <ts> --text "and which floor is that on?" --evidence continue-thread/follow-up.json`. `ok` is true.
-- **See the answer.** Wait on the same thread. Run `bun .cursor/skills/verify-lorehouse/control.ts wait --thread <ts> --evidence continue-thread/answer.json`. `ok` is true, `reply.text` is non-empty, and `methods` includes `chat.stopStream`.
-- **Unasked thread.** Clear the call log and reply in a thread that does not exist yet. Run `bun .cursor/skills/verify-lorehouse/control.ts reset-log` and `bun .cursor/skills/verify-lorehouse/control.ts reply --thread 1995000099.000100 --text "unrelated thread, no mention" --evidence continue-thread/unasked.json`. Then run `bun .cursor/skills/verify-lorehouse/control.ts quiet --ms 1500 --evidence continue-thread/unasked-quiet.json`. `stats.modelCalls` is 0 and `stats.byMethod` has no `chat.stopStream`.
+- **Open the thread.** Ask once. Run `bun .claude/skills/verify-lorehouse/control.ts ask --text "where is the wombat review" --evidence continue-thread/open.json`. `ok` is true. Keep `ts`.
+- **Follow up.** Clear the call log and reply without a mention. Run `bun .claude/skills/verify-lorehouse/control.ts reset-log` and `bun .claude/skills/verify-lorehouse/control.ts reply --thread <ts> --text "and which floor is that on?" --evidence continue-thread/follow-up.json`. `ok` is true.
+- **See the answer.** Wait on the same thread. Run `bun .claude/skills/verify-lorehouse/control.ts wait --thread <ts> --evidence continue-thread/answer.json`. `ok` is true, `reply.text` is non-empty, and `methods` includes `chat.stopStream`.
+- **Unasked thread.** Clear the call log and reply in a thread that does not exist yet. Run `bun .claude/skills/verify-lorehouse/control.ts reset-log` and `bun .claude/skills/verify-lorehouse/control.ts reply --thread 1995000099.000100 --text "unrelated thread, no mention" --evidence continue-thread/unasked.json`. Then run `bun .claude/skills/verify-lorehouse/control.ts quiet --ms 1500 --evidence continue-thread/unasked-quiet.json`. `stats.modelCalls` is 0 and `stats.byMethod` has no `chat.stopStream`.
 
 ## Gotchas
 

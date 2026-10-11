@@ -3,7 +3,8 @@ name: release
 # A tag vX.Y.Z publishes the binaries install.sh downloads:
 #   lorehouse-linux-x64, lorehouse-linux-arm64, SHA256SUMS, install.sh
 # install.sh reads them from releases/latest/download, so the newest release is what a
-# fresh server gets.
+# fresh server gets. The container image goes to ghcr.io/solcreek/lorehouse as :vX.Y.Z
+# and :latest.
 on:
   push:
     tags: ["v*"]
@@ -43,3 +44,14 @@ jobs:
           sha256sum lorehouse-linux-x64 lorehouse-linux-arm64 > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
             lorehouse-linux-x64 lorehouse-linux-arm64 SHA256SUMS install.sh
+
+  # After the gates above pass, and only from this repository.
+  image:
+    if: github.repository == 'solcreek/lorehouse'
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      tags: ${{ github.ref_name }} latest

@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../src/config";
+import { assertDistinctDatabases, loadConfig } from "../src/config";
 import { countDocuments, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 import { render, systemPrompt, toolDescription } from "../src/prompts";
@@ -167,13 +168,79 @@ describe("config", () => {
     expect(() => loadConfig({ ...base, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: pem })).toThrow(/GitHub credentials are set, but no sandbox/);
   });
 
-  test("defaults: port 3000, claude-opus-5, sessions in memory, empty channel allowlist", () => {
+  test("defaults: port 3000, claude-opus-5, sessions beside the database, empty channel allowlist", () => {
     const c = loadConfig(base);
     expect(c.port).toBe(3000);
     expect(c.anthropic.model).toBe("claude-opus-5");
-    expect(c.db.sessions).toBe(":memory:");
+    expect(c.db).toMatchObject({ lorehouse: "lorehouse.db", sessions: "sessions.db" });
     expect(c.agent.channels.size).toBe(0);
     expect(c.agent.dm).toBe("redirect");
+  });
+
+  // ADR 0002 §8: a turn parked on an Approve must survive a restart.
+  test("SESSIONS_DB: unset, a file beside LOREHOUSE_DB; an explicit one kept; in memory only with LOREHOUSE_DB in memory", () => {
+    const sessions = (env: Record<string, string>) => loadConfig({ ...base, ...env }).db.sessions;
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db" })).toBe("/data/sessions.db");
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db", SESSIONS_DB: "" })).toBe("/data/sessions.db");
+    expect(sessions({ LOREHOUSE_DB: "var/knowledge.sqlite" })).toBe("var/sessions.db");
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db", SESSIONS_DB: ":memory:" })).toBe(":memory:");
+    expect(sessions({ LOREHOUSE_DB: "/data/lorehouse.db", SESSIONS_DB: "/state/june.db" })).toBe("/state/june.db");
+    expect(sessions({ LOREHOUSE_DB: ":memory:" })).toBe(":memory:");
+    expect(sessions({ LOREHOUSE_DB: ":memory:", SESSIONS_DB: "/state/june.db" })).toBe("/state/june.db");
+  });
+
+  test("GITHUB_API_URL: unset, GitHub itself (the tools' default); set, kept", () => {
+    expect(loadConfig(base).githubApiUrl).toBeUndefined();
+    expect(loadConfig({ ...base, GITHUB_API_URL: "" }).githubApiUrl).toBeUndefined();
+    expect(loadConfig({ ...base, GITHUB_API_URL: "http://localhost:9000/github" }).githubApiUrl).toBe("http://localhost:9000/github");
+  });
+
+  test("SESSIONS_DB never shares LOREHOUSE_DB's file, defaulted or explicit", () => {
+    expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/sessions.db" })).toThrow(/SESSIONS_DB \(must be a different file from LOREHOUSE_DB/);
+    expect(() => loadConfig({ ...base, LOREHOUSE_DB: "/data/x.db", SESSIONS_DB: "/data/../data/x.db" })).toThrow(/SESSIONS_DB/);
+  });
+
+  test("SESSIONS_DB and LOREHOUSE_DB are compared as files once both exist, where paths can't tell", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lorehouse-identity-"));
+    try {
+      const db = join(dir, "lorehouse.db");
+      // A link to a LOREHOUSE_DB not created yet: its path check can't see it…
+      symlinkSync(db, join(dir, "dangling.db"));
+      expect(loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "dangling.db") }).db.sessions).toBe(join(dir, "dangling.db"));
+      // …once the knowledge store has created it, the identity check does.
+      writeFileSync(db, "");
+      expect(() => assertDistinctDatabases(db, join(dir, "dangling.db"))).toThrow(/SESSIONS_DB \(must be a different file from LOREHOUSE_DB; .* are one file\)/);
+      // Two different files pass, and a SESSIONS_DB not created yet is created empty.
+      expect(() => assertDistinctDatabases(db, join(dir, "sessions.db"))).not.toThrow();
+      expect(existsSync(join(dir, "sessions.db"))).toBe(true);
+      expect(() => assertDistinctDatabases(db, ":memory:")).not.toThrow();
+      expect(() => assertDistinctDatabases(":memory:", join(dir, "other.db"))).not.toThrow();
+      // On a case-insensitive filesystem (macOS by default) a differently cased name is the same file.
+      if (existsSync(join(dir, "LOREHOUSE.DB"))) {
+        expect(() => assertDistinctDatabases(db, join(dir, "LOREHOUSE.DB"))).toThrow(/are one file/);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("SESSIONS_DB never reaches LOREHOUSE_DB's file by another name: a symlink, a hard link, a linked directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lorehouse-config-"));
+    try {
+      const db = join(dir, "lorehouse.db");
+      writeFileSync(db, "");
+      symlinkSync(db, join(dir, "symlink.db"));
+      linkSync(db, join(dir, "hardlink.db"));
+      mkdirSync(join(dir, "real"));
+      symlinkSync(join(dir, "real"), join(dir, "linked"));
+      expect(() => loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "symlink.db") })).toThrow(/SESSIONS_DB \(must be a different file/);
+      expect(() => loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "hardlink.db") })).toThrow(/SESSIONS_DB \(must be a different file/);
+      // Neither file exists yet: the directories they name are the same one.
+      expect(() => loadConfig({ ...base, LOREHOUSE_DB: join(dir, "real", "x.db"), SESSIONS_DB: join(dir, "linked", "x.db") })).toThrow(/SESSIONS_DB \(must be a different file/);
+      expect(loadConfig({ ...base, LOREHOUSE_DB: db, SESSIONS_DB: join(dir, "linked", "sessions.db") }).db.sessions).toBe(join(dir, "linked", "sessions.db"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("DM_MODE is redirect, ignore or answer; anything else is reported", () => {

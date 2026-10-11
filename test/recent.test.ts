@@ -28,7 +28,8 @@ describe("recent documents", () => {
 
 describe("recent_knowledge tool", () => {
   const tool = (db = withDocs()) => recentKnowledgeTool((o) => recentDocuments(db, o), () => NOW * 1000);
-  const run = (input: Record<string, unknown>) => JSON.parse(tool().run(input, {} as never) as string) as ({ id: string } & Record<string, unknown>)[];
+  const result = (input: Record<string, unknown>) => JSON.parse(tool().run(input, {} as never) as string) as { now: string; threads: ({ id: string } & Record<string, unknown>)[] };
+  const run = (input: Record<string, unknown>) => result(input).threads;
 
   test("with no window it returns the newest threads however old — a quiet channel still has an answer", () => {
     expect(run({}).map((d) => d.id)).toEqual(["slack:C1:new", "slack:C1:mid", "slack:C1:old"]);
@@ -38,6 +39,10 @@ describe("recent_knowledge tool", () => {
     expect(run({ days: 5 }).map((d) => d.id)).toEqual(["slack:C1:new"]);
     expect(run({ limit: 0 })).toHaveLength(1);
     expect(run({ limit: 999 })).toHaveLength(3);
+  });
+
+  test("it tells the model what time it is, so a period like \"since August\" has a date to count from", () => {
+    expect(result({}).now).toBe(new Date(NOW * 1000).toISOString());
   });
 
   test("each hit carries what an answer needs: id, title, source link, activity time, excerpt", () => {

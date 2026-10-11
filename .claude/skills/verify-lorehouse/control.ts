@@ -289,7 +289,7 @@ async function launch(): Promise<never> {
 
   const runId = `verify-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}-${crypto.randomUUID().slice(0, 8)}`;
   const dir = join(RUNS_ROOT, runId);
-  const evidence = join(REPO, ".cursor/skills/verify-lorehouse/artifacts", runId);
+  const evidence = join(REPO, ".claude/skills/verify-lorehouse/artifacts", runId);
   mkdirSync(dir, { recursive: true });
   mkdirSync(evidence, { recursive: true });
   const db = join(dir, "lorehouse.db");

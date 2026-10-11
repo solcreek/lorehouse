@@ -13,7 +13,7 @@
 // E2E_DROP=1 (runner via :8852, every connection cut for 5 s mid-job).
 
 import { createHmac, randomBytes } from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,7 +23,13 @@ const TOKEN = process.env.E2E_TOKEN_FILE ? readFileSync(process.env.E2E_TOKEN_FI
 const STATUS_TOKEN = "e2e-status";
 const WANT = process.env.E2E_TRANSPORT ?? "ws";
 const MOCK = `http://localhost:${MOCK_PORT}`, APP = `http://localhost:${APP_PORT}`;
-const DB = join(tmpdir(), `lorehouse-e2e-${process.pid}.db`);
+// A directory of its own: the app keeps its sessions beside the database, and no two
+// runs may share them.
+const DIR = mkdtempSync(join(tmpdir(), "lorehouse-e2e-"));
+const DB = join(DIR, "lorehouse.db");
+// Nothing from this shell or an installed settings file may point the app elsewhere:
+// LOREHOUSE_ENV_FILE is a missing file in DIR, and settings.json defaults to DIR too.
+const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS: _settings, ...inherited } = process.env;
 
 const mock = Bun.spawn(["bun", join(ROOT, "conformance/mock.ts")], {
   env: { ...process.env, PORT: String(MOCK_PORT), TTFT_MS: "20", TOKEN_DELAY_MS: "1", SLACK_FIXTURES: join(ROOT, "conformance/fixtures/slack-history.json") },
@@ -33,7 +39,8 @@ const mock = Bun.spawn(["bun", join(ROOT, "conformance/mock.ts")], {
 const app = Bun.spawn(["bun", join(ROOT, "src/server.ts")], {
   cwd: ROOT,
   env: {
-    ...process.env,
+    ...inherited,
+    LOREHOUSE_ENV_FILE: join(DIR, "lorehouse.env"),
     PORT: String(APP_PORT),
     SLACK_SIGNING_SECRET: SECRET,
     SLACK_BOT_TOKEN: "xoxb-e2e",
@@ -119,7 +126,7 @@ const cleanup = () => {
   proxy?.stop(true);
   app.kill();
   mock.kill();
-  for (const s of ["", "-wal", "-shm"]) rmSync(DB + s, { force: true });
+  rmSync(DIR, { recursive: true, force: true });
 };
 process.on("SIGINT", () => { cleanup(); process.exit(130); });
 

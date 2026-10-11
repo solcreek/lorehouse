@@ -20,8 +20,8 @@ Preconditions:
 - `doctor` exits 0 for this run.
 - Note `body.knowledge.documents` from `status` before the DM.
 
-- **Count documents.** Run `bun .cursor/skills/verify-lorehouse/control.ts status --evidence direct-message/before.json`. Keep `body.knowledge.documents`.
-- **Send the DM.** Clear the call log first. Run `bun .cursor/skills/verify-lorehouse/control.ts reset-log` and `bun .cursor/skills/verify-lorehouse/control.ts dm --text "where is the wombat review?" --evidence direct-message/dm.json`. `posts` has one item, its `channel` is `D1`, and its `text` is `I only answer in public, so everyone can learn from the question and the answer. Ask me in <#C1>.` `modelCalls` is 0. `readChannels` does not include `D1`. `documents` equals the count from `before.json`.
+- **Count documents.** Run `bun .claude/skills/verify-lorehouse/control.ts status --evidence direct-message/before.json`. Keep `body.knowledge.documents`.
+- **Send the DM.** Clear the call log first. Run `bun .claude/skills/verify-lorehouse/control.ts reset-log` and `bun .claude/skills/verify-lorehouse/control.ts dm --text "where is the wombat review?" --evidence direct-message/dm.json`. `posts` has one item, its `channel` is `D1`, and its `text` is `I only answer in public, so everyone can learn from the question and the answer. Ask me in <#C1>.` `modelCalls` is 0. `readChannels` does not include `D1`. `documents` equals the count from `before.json`.
 
 ## Gotchas
 

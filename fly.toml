@@ -8,8 +8,12 @@
 app = "lorehouse"
 primary_region = "nrt"
 
+# The published image (docs/nix.md#hosts). :main is what this repository's app runs: CI
+# deploys each merge's own :sha-<commit>, and a hand-run `fly deploy` gets the same
+# code, not an older release. For your own install, :latest (the newest release) is the
+# steadier choice. To build from source instead, set dockerfile = "Dockerfile".
 [build]
-  dockerfile = "Dockerfile"
+  image = "ghcr.io/solcreek/lorehouse:main"
 
 # One machine, never stopped: it holds the SQLite file, runs the live ingest and has
 # to answer Slack within 3 s, so it can't wait for a cold start. A deploy restarts it
