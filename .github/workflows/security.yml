@@ -13,6 +13,11 @@ on:
 permissions:
   contents: read
 
+# A pull request from a fork or from Dependabot gets a read-only token, so it can't upload
+# SARIF to code scanning. Those runs still analyze; they report in the job instead.
+env:
+  CAN_UPLOAD: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+
 concurrency:
   group: security-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -58,6 +63,7 @@ jobs:
       - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           category: /language:${{ matrix.language }}
+          upload: ${{ env.CAN_UPLOAD == 'true' && 'always' || 'never' }}
 
   zizmor:
     runs-on: ubuntu-latest
@@ -71,6 +77,11 @@ jobs:
       - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
         with:
           version: 1.30.1
+          # Without an upload the action fails on any finding it prints, so it reports
+          # only what would block: the Low ones are triaged in #62.
+          advanced-security: ${{ env.CAN_UPLOAD }}
+          annotations: ${{ env.CAN_UPLOAD == 'true' && 'false' || 'true' }}
+          min-severity: ${{ env.CAN_UPLOAD == 'true' && '' || 'medium' }}
 
   # The only JS vulnerability check: the dependency graph doesn't read bun.lock (its SBOM
   # has just the direct package.json ranges), so Dependabot alerts never fire for JS.
