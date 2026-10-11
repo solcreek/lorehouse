@@ -11,11 +11,8 @@
 -- The pages it frees are zeroed because the connection runs with PRAGMA secure_delete = ON
 -- (set in openKnowledge before any migration; a pragma is per connection, not stored).
 --
--- That pragma is not retroactive: rows deleted from knowledge_documents (and every other
--- table) before it was on left their bytes in free space. So after this file applies, the
--- runner runs VACUUM, outside the transaction, to rewrite the whole file, and checkpoints
--- the WAL so the rewrite reaches the .db file at once (`vacuum: true` in
--- src/migrations.ts). The version is recorded only once both succeed, so a failed one is
--- retried on the next start; both statements below are safe to run twice.
+-- That pragma is not retroactive: rows deleted before it was on left their bytes in free
+-- space. A one-time VACUUM after the migrations removes them (compactOnce in
+-- src/knowledge.ts); it is not part of this file, so it can't hold back the migrations.
 INSERT INTO knowledge_fts (knowledge_fts, rank) VALUES ('secure-delete', 1);
 INSERT INTO knowledge_fts (knowledge_fts) VALUES ('optimize');

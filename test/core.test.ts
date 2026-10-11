@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -110,6 +111,30 @@ describe("knowledge store", () => {
       // Already out of the file while the app holds it open, not only after a later checkpoint.
       expect(readFileSync(path).toString("latin1").includes("zebrasecretword9")).toBe(false);
       expect(searcher(db)("filler")).toHaveLength(5); // the index still works after the clean-up
+      expect(fileHolds(db, path, "zebrasecretword9")).toBe(false);
+    }));
+
+    test("the one-time compaction never holds back the migrations, and is retried until it succeeds", () => withFile("busy", (path) => {
+      const old = openKnowledge(path, MIGRATIONS.filter((m) => m.version <= 9));
+      old.exec("PRAGMA secure_delete = OFF");
+      filler(old);
+      upsertDocument(old, secret);
+      deleteDocument(old, secret.docId);
+      old.close();
+      // Another process holds a read while the app starts: the compaction can't complete.
+      const reader = new Database(path);
+      reader.exec("BEGIN");
+      reader.query("SELECT count(*) FROM knowledge_documents").get();
+      const first = openKnowledge(path);
+      const versions = (first.query("SELECT version FROM lorehouse_migrations ORDER BY version").all() as { version: number }[]).map((r) => r.version);
+      expect(versions).toEqual(MIGRATIONS.map((m) => m.version)); // every migration recorded, in order
+      expect(first.query("SELECT value FROM knowledge_index_meta WHERE key = 'compacted'").get()).toBeNull();
+      first.close();
+      reader.exec("COMMIT");
+      reader.close();
+      // The next start completes it, and the residue leaves the file.
+      const db = openKnowledge(path);
+      expect(db.query("SELECT value FROM knowledge_index_meta WHERE key = 'compacted'").get()).not.toBeNull();
       expect(fileHolds(db, path, "zebrasecretword9")).toBe(false);
     }));
   });

@@ -44,27 +44,43 @@ export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
   const applied = new Set((db.query("SELECT version FROM lorehouse_migrations").all() as { version: number }[]).map((r) => r.version));
   for (const m of [...migrations].sort((a, b) => a.version - b.version)) {
     if (applied.has(m.version)) continue;
-    const record = () => db.query("INSERT INTO lorehouse_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(m.version, m.name, new Date().toISOString());
-    if (!m.vacuum) {
-      db.transaction(() => {
-        db.exec(m.sql);
-        record();
-      })();
-      continue;
-    }
-    // VACUUM can't run inside a transaction. In WAL mode it writes the rebuilt pages to the
-    // WAL, and the .db file keeps the old ones until a checkpoint, so checkpoint at once.
-    // The version is recorded only once both succeed, so a failure (no disk for the copy, a
-    // busy checkpoint) is retried on the next open: such a migration's SQL must be safe to
-    // run twice.
-    db.transaction(() => db.exec(m.sql))();
+    db.transaction(() => {
+      db.exec(m.sql);
+      db.query("INSERT INTO lorehouse_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(m.version, m.name, new Date().toISOString());
+    })();
+  }
+  if (hasTable(db, "knowledge_index_meta")) {
+    ensureIndex(db);
+    if (path !== ":memory:") compactOnce(db);
+  }
+  return db;
+}
+
+// PRAGMA secure_delete is not retroactive: rows deleted before it was on (by a build
+// without it) left their bytes in free pages. Rewriting the whole file once removes them.
+// It is its own step after the migrations, never one of them, so a failure here can't hold
+// back or reorder the migrations: it is marked done only once VACUUM and a full checkpoint
+// (the .db file itself rewritten, not only the WAL) both succeed, and retried on the next
+// open otherwise, e.g. while another process holds a read.
+const COMPACTED = "secure-delete-1";
+
+function compactOnce(db: Database): void {
+  // Only once secure_delete governs the file (migration 10): compacting earlier would be
+  // undone by the next delete.
+  if (!db.query("SELECT 1 FROM lorehouse_migrations WHERE version = 10").get()) return;
+  const row = db.query("SELECT value FROM knowledge_index_meta WHERE key = 'compacted'").get() as { value: string } | null;
+  if (row?.value === COMPACTED) return;
+  try {
     db.exec("VACUUM");
     const { busy } = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
-    if (busy) continue;
-    record();
+    if (busy) {
+      console.error("knowledge: the one-time compaction couldn't checkpoint (the database is in use); retrying on the next start");
+      return;
+    }
+    db.query("INSERT INTO knowledge_index_meta (key, value) VALUES ('compacted', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(COMPACTED);
+  } catch (err) {
+    console.error("knowledge: the one-time compaction failed; retrying on the next start:", err);
   }
-  if (hasTable(db, "knowledge_index_meta")) ensureIndex(db);
-  return db;
 }
 
 function hasTable(db: Database, name: string): boolean {
