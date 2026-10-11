@@ -70,9 +70,8 @@ further approval step for reading:
 
 - **Who**: anyone who can ask the agent, which is anyone in a channel listed in
   `AGENT_CHANNELS`. List only public channels there: a private one listed would be
-  answered too. One exception: while `AGENT_CHANNELS` is empty, a reply in any public
-  thread the agent was asked into earlier is still answered, because joined threads are
-  kept and an empty list admits every public channel's messages. With the code tools on,
+  answered too. An empty list means nowhere: no mention or follow-up is answered in any
+  channel, and the next start forgets the threads it was asked into. With the code tools on,
   a DM never reaches the model (`DM_MODE=answer` and a sandbox are refused together).
 - **What**: the whole contents of any repository the App is installed on, **private
   repositories included**. `workspace_clone` asks for a read-only token (`contents:
@@ -92,9 +91,9 @@ To limit it:
   channel in `AGENT_CHANNELS` may read. Remove one from the same page as in
   step 4.
 - Keep the agent out of channels with guests (or anyone who shouldn't read those
-  repositories): don't list them in `AGENT_CHANNELS`. Removing a channel from a list
-  that still names another one stops it there, threads included; emptying the list does
-  not (see **Who**). The code tools are on in every listed channel or in none; there is
+  repositories): don't list them in `AGENT_CHANNELS`. Removing a channel stops it there,
+  threads included, and emptying the list stops it everywhere; the next start also
+  purges what was indexed from it. The code tools are on in every listed channel or in none; there is
   no per-channel switch.
 
 Until profiles exist, the install's repository selection is the only limit on which
