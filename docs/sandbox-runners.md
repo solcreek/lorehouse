@@ -61,6 +61,12 @@ sandboxes on the runner with the most free room.
   one's polls are ignored, so it can't take the new one's jobs.
 - `sandboxes` lists the sandboxes whose VM is up, each counted in `running` (see
   [Placement](#placement-and-failure)).
+- `mirrors` is the host's publish mirrors (see [Publishing](#publishing)) as it last
+  measured them: `count`, `bytes`, `maxBytes`, `perMirrorMaxBytes`, `fsFreeBytes`,
+  `garbageBytes`, `stageRefs`, `records`, `largest` (`repo`, `bytes`), `oldestIdleSecs`,
+  `lastGc` (`at`, `ms`, `reclaimedBytes`), and since the runner started `evicted`,
+  `refusedForSpace` and `refreshTimeouts`. Lorehouse only shows it in `/status`; an object
+  over 2 KB of JSON is dropped (not the status).
 - All of these are optional. A runner that omits them loses the guarantees they give but
   still works. A list that is present must be an array of strings, or the whole status
   is refused.
@@ -206,6 +212,22 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   `refs/stage/` ref whose object is missing. A lock file or such a ref fails every fetch
   until it is gone, so a failed refresh that removed one is retried once. A mirror with no
   refs yet (its first fetch failed or was cut off) is removed.
+- **The mirrors' upkeep** (#76; `sandbox/host/src/publish/upkeep.rs`), always under the
+  mirror's lock, a busy mirror skipped and never waited for:
+  - `git gc --prune=now` after a stage whose bundle was over 8 MiB failed, was cut off, or
+    expired unpushed; and once a day for a mirror used since its last gc, once it has had
+    no job for 10 minutes. Its own deadline: 600 s.
+  - A mirror is dropped 14 days after its last stage or push
+    (`SANDBOXD_MIRROR_RETENTION_DAYS`), never while a stage record younger than 24 h
+    names it.
+  - Quotas, failing closed: a mirror may use 4 GiB (`SANDBOXD_MIRROR_MAX_GIB`), all of them
+    24 GiB (`SANDBOXD_MIRRORS_MAX_GIB`), and the filesystem keeps 10% or 20 GiB free,
+    whichever is larger (`SANDBOXD_MIRRORS_FREE_PCT`, `SANDBOXD_MIRRORS_FREE_GIB`).
+    Checked before the refresh (a new mirror counts at its cap), after it, and after the
+    bundle fetch; a mirror over its cap is removed. Before refusing, mirrors idle for over
+    24 h are dropped, least recently used first, down to 80% of the total.
+  - It runs at start (which measures every mirror) and every 5 minutes, plus after every
+    stage and push.
 - **Failures** come back as statuses with a reason:
   - 409: nothing new to publish, or a branch that has moved on.
   - 404: the base isn't on GitHub, or the stage isn't there (never completed, already
@@ -216,3 +238,6 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   - 422: the bundle was refused.
   - 413: the commits are too large, or what the approval shows (stat, files, authors) is
     over 1 MiB each. The host reads only that much of any of it; the patch is cut at 64 KiB.
+  - 507: no room for the repo's mirror on the host (over its own cap, over the total, or
+    the filesystem under its floor): nothing was staged, and the message says which and
+    what an operator can raise or free.

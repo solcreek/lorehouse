@@ -1,5 +1,6 @@
 //! Configuration, all from the environment, with every problem reported at once.
 
+use crate::publish::{Policy, GIB};
 use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,6 +37,8 @@ pub struct Config {
     /// Where repos are published to and mirrored from: https://github.com. Another base (a
     /// file:// directory) is for testing the publish path without GitHub.
     pub github_url: String,
+    /// The publish mirrors' quotas and retention (publish/upkeep.rs).
+    pub mirrors: Policy,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -101,6 +104,13 @@ impl Config {
             }
         };
         let (max_vms, idle, vcpus, mem) = (num("SANDBOXD_MAX_VMS", 4), num("SANDBOXD_IDLE_SECS", 900), num("SANDBOXD_VCPUS", 2), num("SANDBOXD_MEM_MIB", 2048));
+        // The mirrors' quotas and retention: issue #76's measured proposal by default.
+        let d = Policy::default();
+        let mirror_max = num("SANDBOXD_MIRROR_MAX_GIB", d.mirror_max / GIB);
+        let mirrors_max = num("SANDBOXD_MIRRORS_MAX_GIB", d.mirrors_max / GIB);
+        let free_pct = num("SANDBOXD_MIRRORS_FREE_PCT", d.free_min_pct);
+        let free_gib = num("SANDBOXD_MIRRORS_FREE_GIB", d.free_min / GIB);
+        let retention_days = num("SANDBOXD_MIRROR_RETENTION_DAYS", d.retention.as_secs() / 86_400);
         // Checked before the casts below, so an out-of-range value fails here instead of
         // wrapping (4294967297 as u32 is 1).
         if !(1..=32).contains(&vcpus) {
@@ -112,6 +122,22 @@ impl Config {
         if !(1..=64).contains(&max_vms) {
             problems.push("SANDBOXD_MAX_VMS must be 1..=64 (one /30 per VM in 172.30.0.0/24)".into());
         }
+        if !(1..=1024).contains(&mirror_max) {
+            problems.push("SANDBOXD_MIRROR_MAX_GIB must be 1..=1024".into());
+        }
+        if !(mirror_max..=65_536).contains(&mirrors_max) {
+            problems.push("SANDBOXD_MIRRORS_MAX_GIB must be at least SANDBOXD_MIRROR_MAX_GIB, and at most 65536".into());
+        }
+        if free_pct > 90 {
+            problems.push("SANDBOXD_MIRRORS_FREE_PCT must be 0..=90".into());
+        }
+        if free_gib > 65_536 {
+            problems.push("SANDBOXD_MIRRORS_FREE_GIB must be 0..=65536".into());
+        }
+        if !(1..=365).contains(&retention_days) {
+            problems.push("SANDBOXD_MIRROR_RETENTION_DAYS must be 1..=365".into());
+        }
+        let mirrors = Policy { mirror_max: mirror_max * GIB, mirrors_max: mirrors_max * GIB, free_min_pct: free_pct, free_min: free_gib * GIB, retention: Duration::from_secs(retention_days * 86_400), ..d };
         if !problems.is_empty() {
             return Err(format!("sandboxd: invalid configuration:\n  {}", problems.join("\n  ")));
         }
@@ -126,6 +152,7 @@ impl Config {
             vcpus: vcpus as u32,
             mem_mib: mem as u32,
             github_url: var("SANDBOXD_GITHUB_URL").unwrap_or_else(|| "https://github.com".into()),
+            mirrors,
         })
     }
 }
@@ -162,6 +189,28 @@ mod tests {
         std::env::set_var("SANDBOXD_ALLOW_INSECURE_HTTP", "yes"); // only "1" opts in
         assert!(Config::from_env().is_err());
         for k in ["SANDBOXD_APP_URL", "SANDBOXD_ALLOW_INSECURE_HTTP", "SANDBOXD_RUNNER_TOKEN", "SANDBOXD_RUNNER_NAME"] {
+            std::env::remove_var(k);
+        }
+
+        // The mirrors' quotas and retention: the measured proposal by default, else as set.
+        use crate::publish::{Policy, GIB};
+        assert_eq!(ok.mirrors, Policy::default());
+        assert_eq!((ok.mirrors.mirror_max, ok.mirrors.mirrors_max, ok.mirrors.free_min_pct, ok.mirrors.free_min, ok.mirrors.retention.as_secs()), (4 * GIB, 24 * GIB, 10, 20 * GIB, 14 * 86_400));
+        for (k, v) in [("SANDBOXD_MIRROR_MAX_GIB", "8"), ("SANDBOXD_MIRRORS_MAX_GIB", "100"), ("SANDBOXD_MIRRORS_FREE_PCT", "5"), ("SANDBOXD_MIRRORS_FREE_GIB", "50"), ("SANDBOXD_MIRROR_RETENTION_DAYS", "30")] {
+            std::env::set_var(k, v);
+        }
+        let set = Config::from_env().unwrap().mirrors;
+        assert_eq!((set.mirror_max, set.mirrors_max, set.free_min_pct, set.free_min, set.retention.as_secs()), (8 * GIB, 100 * GIB, 5, 50 * GIB, 30 * 86_400));
+        for (k, v) in [("SANDBOXD_MIRRORS_MAX_GIB", "4"), ("SANDBOXD_MIRROR_MAX_GIB", "0"), ("SANDBOXD_MIRRORS_FREE_PCT", "95"), ("SANDBOXD_MIRROR_RETENTION_DAYS", "0"), ("SANDBOXD_MIRROR_MAX_GIB", "x")] {
+            let before = std::env::var(k).ok();
+            std::env::set_var(k, v);
+            assert!(Config::from_env().unwrap_err().contains(k), "{k}={v}");
+            match before {
+                Some(b) => std::env::set_var(k, b),
+                None => std::env::remove_var(k),
+            }
+        }
+        for k in ["SANDBOXD_MIRROR_MAX_GIB", "SANDBOXD_MIRRORS_MAX_GIB", "SANDBOXD_MIRRORS_FREE_PCT", "SANDBOXD_MIRRORS_FREE_GIB", "SANDBOXD_MIRROR_RETENTION_DAYS"] {
             std::env::remove_var(k);
         }
     }

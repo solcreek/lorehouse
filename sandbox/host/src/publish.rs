@@ -24,6 +24,11 @@
 //! leave a `refs/stage/<id>` pointing at a pack it had removed, after which every fetch into
 //! the mirror failed (#76).
 
+mod upkeep;
+
+pub use upkeep::{Policy, GIB};
+use upkeep::{Disk, RealDisk, Stats};
+
 use crate::vm::{self, Manager};
 use crate::vsock;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -129,6 +134,13 @@ pub struct Publisher {
     /// REVIEW_CAP; smaller in tests.
     review_cap: usize,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// The mirrors' quotas, retention and gc (upkeep.rs).
+    policy: Policy,
+    /// Where mirror and filesystem sizes come from; the disk outside tests.
+    disk: Arc<dyn Disk>,
+    /// Unix seconds, for the upkeep and the housekeeping; the system clock outside tests.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    stats: Mutex<Stats>,
     /// Tests only: after verifying, just before its record is written, a stage signals the
     /// first and waits on the second (never signalled), so a test can cut it off at exactly
     /// that moment, however long verifying took.
@@ -421,11 +433,17 @@ struct StageRecord {
 }
 
 /// A new stage id: `<unix seconds>-<32 hex digits from the OS's random source>`.
+#[cfg(test)]
 fn new_stage_id() -> Result<String, String> {
+    new_stage_id_at(unix_secs())
+}
+
+/// A new stage id made at `secs` (the publisher's clock).
+fn new_stage_id_at(secs: u64) -> Result<String, String> {
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(|e| format!("random stage id: {e}"))?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("{}-{hex}", unix_secs()))
+    Ok(format!("{secs}-{hex}"))
 }
 
 /// A stage id as new_stage_id makes them; nothing else is ever a file or ref name.
@@ -456,6 +474,10 @@ impl Publisher {
             remote_base: remote_base.trim_end_matches('/').to_string(),
             review_cap: REVIEW_CAP,
             locks: Mutex::default(),
+            policy: Policy::default(),
+            disk: Arc::new(RealDisk),
+            clock: Arc::new(unix_secs),
+            stats: Mutex::default(),
             #[cfg(test)]
             before_record: None,
         }
@@ -517,20 +539,39 @@ impl Publisher {
         if !vm::valid_id(sandbox) || !plain_name(&req.owner) || !plain_name(&req.name) || !plain_ref(&req.base) || !plain_ref(&req.branch) {
             return Err((400, "stage: a plain sandbox id, owner, name, base branch and branch are needed".into()));
         }
+        self.stage_with(sandbox, &req, |to| async move { bundle_from(vms, sandbox, &to).await }).await
+    }
+
+    /// stage(), with the bundle written to the path given to `read` (by the VM; in tests, by
+    /// hand). Under the mirror's lock: the quotas (upkeep.rs) before and after the refresh,
+    /// the refresh, the bundle, the stage; then the housekeeping and the upkeep after a job.
+    async fn stage_with<F, R>(&self, sandbox: &str, req: &StageRequest, read: F) -> Result<Staged, Failure>
+    where
+        F: FnOnce(PathBuf) -> R,
+        R: std::future::Future<Output = Result<(), Failure>>,
+    {
         let dir = self.mirror(&req.owner, &req.name);
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
-        self.update_mirror(&dir, &req.owner, &req.name, req.token.as_deref()).await.map_err(|e| (502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)))?;
-        let id = new_stage_id().map_err(|e| (500, e))?;
+        self.admit(&dir, &req.owner, &req.name)?;
+        if let Err(e) = self.update_mirror(&dir, &req.owner, &req.name, req.token.as_deref()).await {
+            self.refresh_failed(&dir, &e);
+            return Err((502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)));
+        }
+        self.check_size(&dir, &req.owner, &req.name)?;
+        let id = new_stage_id_at(self.now()).map_err(|e| (500, e))?;
         // Removed however this ends, a deadline that drops this future included.
         let bundle = TempFile(dir.join(format!("stage-{id}.bundle")));
-        let read = bundle_from(vms, sandbox, &bundle.0).await;
-        let staged = match read {
-            Ok(()) => self.stage_and_record(&dir, &bundle.0, sandbox, &req, &id).await,
+        let staged = match read(bundle.0.clone()).await {
+            Ok(()) => {
+                self.mark_heavy(&dir, &bundle.0, &id);
+                self.stage_and_record(&dir, &bundle.0, sandbox, req, &id).await
+            }
             Err(e) => Err(e),
         };
         drop(bundle);
         self.prune(&dir).await;
+        self.after_job(&dir, None).await;
         staged
     }
 
@@ -538,6 +579,11 @@ impl Publisher {
     /// so it can be tested without a VM.
     async fn stage_and_record(&self, dir: &Path, bundle: &Path, sandbox: &str, req: &StageRequest, id: &str) -> Result<Staged, Failure> {
         let mut staged = self.stage_bundle(dir, bundle, &req.base, id).await?;
+        // The bundle is in the mirror now: it must still fit (upkeep.rs).
+        if let Err(e) = self.check_size(dir, &req.owner, &req.name) {
+            let _ = git(dir, &["update-ref", "-d", &format!("refs/stage/{id}")], None, GIT_LOCAL).await;
+            return Err(e);
+        }
         #[cfg(test)]
         if let Some((reached, gate)) = &self.before_record {
             reached.notify_one();
@@ -556,7 +602,7 @@ impl Publisher {
             branch: req.branch.clone(),
             sha: staged.sha.clone(),
             diff_sha256: staged.diff_sha256.clone(),
-            created_at: unix_secs(),
+            created_at: self.now(),
         };
         self.write_record(&record).map_err(|e| (500, format!("recording the stage: {e}")))?;
         staged.stage = id.to_string();
@@ -695,7 +741,7 @@ impl Publisher {
         let _held = lock.lock().await;
         // Consumed first: from here on this stage authorizes nothing more, whatever happens.
         let record = self.claim(&req.stage)?;
-        if expired(record.created_at, unix_secs()) {
+        if expired(record.created_at, self.now()) {
             return Err((410, format!("stage {} has expired (a stage can be pushed for {} h); stage again", req.stage, STAGE_TTL.as_secs() / 3600)));
         }
         let asked = (sandbox, req.owner.as_str(), req.name.as_str(), req.sha.as_str(), req.branch.as_str());
@@ -708,6 +754,7 @@ impl Publisher {
         // The stage's ref is done with either way (its record is gone).
         let _ = git(&dir, &["update-ref", "-d", &format!("refs/stage/{}", record.id)], None, GIT_LOCAL).await;
         self.prune(&dir).await;
+        self.after_job(&dir, pushed.as_ref().ok().map(|_| record.id.as_str())).await;
         if let Err(e) = pushed {
             let status = if e.contains("non-fast-forward") || e.contains("[rejected]") || e.contains("fetch first") { 409 } else { 502 };
             return Err((status, format!("push to {}: {e}", record.branch)));
@@ -724,7 +771,7 @@ impl Publisher {
     /// behind. Whether it removed something that fails every fetch (a ref to a missing
     /// object, a lock file).
     async fn prune(&self, dir: &Path) -> bool {
-        let now = unix_secs();
+        let now = self.now();
         let mut repaired = remove_garbage(dir, SystemTime::now());
         if let Ok(entries) = std::fs::read_dir(self.records()) {
             for entry in entries.flatten() {
@@ -832,6 +879,31 @@ mod tests {
         root: PathBuf,
         vm: PathBuf,
         publisher: Publisher,
+        /// The sizes the publisher's quotas see.
+        disk: Arc<FakeDisk>,
+        /// How far ahead of the system clock the publisher's clock is, in seconds.
+        later: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    /// Sizes set by hand: a mirror (by "owner/name") uses what `sizes` says, else what is on
+    /// disk; the filesystem is what `fs` says (free, size), or unknown (no floor).
+    #[derive(Default)]
+    struct FakeDisk {
+        sizes: Mutex<HashMap<String, u64>>,
+        fs: Mutex<Option<(u64, u64)>>,
+    }
+
+    impl Disk for FakeDisk {
+        fn usage(&self, dir: &Path) -> (u64, u64) {
+            let repo = format!("{}/{}", dir.parent().unwrap().file_name().unwrap().to_string_lossy(), dir.file_name().unwrap().to_string_lossy().trim_end_matches(".git"));
+            match self.sizes.lock().unwrap().get(&repo) {
+                Some(&bytes) => (bytes, 0),
+                None => RealDisk.usage(dir),
+            }
+        }
+        fn fs(&self, _: &Path) -> Option<(u64, u64)> {
+            *self.fs.lock().unwrap()
+        }
     }
 
     /// The scratch area is removed when the test ends, passed or failed (a panic unwinds
@@ -882,8 +954,13 @@ mod tests {
         std::fs::create_dir_all(root.join("acme")).unwrap();
         sh(&root, "git init -q --bare acme/widgets.git && git init -q --bare acme/gadgets.git && git init -q -b main vm && cd vm && echo a > a && git add a && git commit -qm base && git remote add origin ../acme/widgets.git && git push -q origin main && git push -q ../acme/gadgets.git main && git fetch -q origin");
         let vm = root.join("vm");
-        let publisher = Publisher::new(root.join("mirrors"), format!("file://{}", root.display()));
-        Scratch { root, vm, publisher }
+        let mut publisher = Publisher::new(root.join("mirrors"), format!("file://{}", root.display()));
+        let disk = Arc::new(FakeDisk::default());
+        publisher.disk = disk.clone();
+        let later = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ahead = later.clone();
+        publisher.clock = Arc::new(move || unix_secs() + ahead.load(std::sync::atomic::Ordering::SeqCst));
+        Scratch { root, vm, publisher, disk, later }
     }
 
     fn request(branch: &str) -> StageRequest {
@@ -905,6 +982,29 @@ mod tests {
         async fn stage(&self, branch: &str) -> Result<Staged, Failure> {
             let bundle = self.bundle().await;
             self.publisher.stage_and_record(&self.dir(), &bundle, SANDBOX, &request(branch), &new_stage_id().unwrap()).await
+        }
+        /// All of stage but the VM (the quotas, the refresh, the housekeeping and the upkeep
+        /// after it included), with `during` run while the bundle is read.
+        async fn stage_all(&self, req: StageRequest, during: impl FnOnce()) -> Result<Staged, Failure> {
+            let bundle = self.root.join(format!("{}.bundle", new_stage_id().unwrap()));
+            sh(&self.vm, &format!("git bundle create -q {} HEAD --not --remotes=origin", bundle.display()));
+            self.publisher
+                .stage_with(SANDBOX, &req, |to| async move {
+                    during();
+                    std::fs::copy(&bundle, &to).map(|_| ()).map_err(|e| (500, e.to_string()))
+                })
+                .await
+        }
+        /// Move the publisher's clock on.
+        fn advance(&self, secs: u64) {
+            self.later.fetch_add(secs, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn size(&self, repo: &str, bytes: u64) {
+            self.disk.sizes.lock().unwrap().insert(repo.to_string(), bytes);
+        }
+        /// Whether a mirror has an object.
+        fn has(&self, name: &str, oid: &str) -> bool {
+            std::process::Command::new("git").args(["-C", &self.publisher.mirror("acme", name).to_string_lossy(), "cat-file", "-e", oid]).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").status().unwrap().success()
         }
         fn refs(&self) -> Vec<String> {
             sh(&self.dir(), "git for-each-ref --format='%(refname)'").lines().map(String::from).collect()
@@ -1477,6 +1577,211 @@ mod tests {
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
         assert!(!lock.exists());
         assert_eq!(sh(&dir, "git rev-parse refs/heads/main"), head);
+    }
+
+    // ── The mirrors' upkeep (upkeep.rs) ──────────────────────────────────────────────────
+
+    fn on(name: &str, base: &str, branch: &str) -> StageRequest {
+        StageRequest { owner: "acme".into(), name: name.into(), base: base.into(), branch: branch.into(), token: None }
+    }
+
+    /// A commit of a 64 KiB file no mirror has; the file's blob.
+    fn heavy_commit(s: &Scratch, file: &str) -> String {
+        sh(&s.vm, &format!("git reset -q --hard origin/main && head -c 65536 /dev/urandom > {file} && git add {file} && git commit -qm {file} && git rev-parse HEAD:{file}"))
+    }
+
+    #[tokio::test]
+    async fn a_failed_stage_that_brought_a_heavy_bundle_is_collected_before_it_answers() {
+        let mut s = scratch("heavyfail");
+        s.publisher.policy.heavy_bundle = 32 << 10;
+        // A base branch that isn't there: refused (404) once the bundle is in the mirror.
+        let blob = heavy_commit(&s, "big.bin");
+        assert_eq!(s.stage_all(on("widgets", "nope", "scout/h"), || {}).await.unwrap_err().0, 404);
+        assert!(!s.has("widgets", &blob), "collected before the stage answered");
+        // Under the threshold, what a failed stage brought stays (for the daily gc).
+        s.publisher.policy.heavy_bundle = 1 << 20;
+        let light = heavy_commit(&s, "small.bin");
+        assert_eq!(s.stage_all(on("widgets", "nope", "scout/h"), || {}).await.unwrap_err().0, 404);
+        assert!(s.has("widgets", &light));
+    }
+
+    #[tokio::test]
+    async fn a_heavy_stage_cut_off_or_expired_unpushed_is_collected_by_the_upkeep() {
+        let mut s = scratch("heavycut");
+        s.publisher.policy.heavy_bundle = 32 << 10;
+        // No daily gc here: only the heavy stages' rule collects.
+        s.publisher.policy.gc_idle = Duration::from_secs(365 * 86_400);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        s.publisher.before_record = Some((reached.clone(), Arc::new(tokio::sync::Notify::new())));
+        let blob = heavy_commit(&s, "cut.bin");
+        {
+            let stage = s.stage_all(request("scout/cut"), || {});
+            tokio::pin!(stage);
+            tokio::select! {
+                _ = &mut stage => panic!("the gate holds the stage"),
+                _ = reached.notified() => {}
+            }
+        } // cut off: dropped right before its record
+        assert!(s.has("widgets", &blob));
+        s.publisher.maintain().await;
+        assert!(!s.has("widgets", &blob), "cut off: collected by the next upkeep pass");
+        // Recorded, never pushed, expired.
+        s.publisher.before_record = None;
+        let blob = heavy_commit(&s, "old.bin");
+        s.stage_all(request("scout/old"), || {}).await.unwrap();
+        s.publisher.maintain().await;
+        assert!(s.has("widgets", &blob), "a live stage's objects stay");
+        s.advance(STAGE_TTL.as_secs() + 3600);
+        s.publisher.maintain().await;
+        assert!(!s.has("widgets", &blob), "expired unpushed: collected");
+        // Pushed: nothing to collect, and nothing pending.
+        let blob = heavy_commit(&s, "pushed.bin");
+        let staged = s.stage_all(request("scout/pushed"), || {}).await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/pushed")).await.unwrap();
+        assert!(upkeep_state(&s.dir()).heavy.is_empty());
+        assert!(s.has("widgets", &blob));
+    }
+
+    fn upkeep_state(dir: &Path) -> upkeep::MirrorState {
+        serde_json::from_slice(&std::fs::read(dir.join("sandboxd.json")).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_mirror_used_since_its_last_gc_is_collected_once_a_day_after_ten_idle_minutes() {
+        let s = scratch("daily");
+        // What a failed stage leaves: unreachable, kept by git for 2 weeks.
+        let blob = sh(&s.vm, "echo residue > r && git add r && git commit -qm r && git rev-parse HEAD:r");
+        assert_eq!(s.stage_all(on("widgets", "nope", "scout/d"), || {}).await.unwrap_err().0, 404);
+        assert!(s.has("widgets", &blob));
+        s.advance(5 * 60);
+        s.publisher.maintain().await;
+        assert!(s.has("widgets", &blob), "idle for 5 minutes: not yet");
+        s.advance(6 * 60);
+        s.publisher.maintain().await;
+        assert!(!s.has("widgets", &blob), "idle for 11 minutes, never collected: collected");
+        assert!(s.publisher.status()["lastGc"]["at"].is_u64());
+        // Used again and idle again, but collected less than a day ago: left for later.
+        let blob = sh(&s.vm, "git reset -q --hard origin/main && echo again > g && git add g && git commit -qm g && git rev-parse HEAD:g");
+        assert_eq!(s.stage_all(on("widgets", "nope", "scout/d"), || {}).await.unwrap_err().0, 404);
+        s.advance(11 * 60);
+        s.publisher.maintain().await;
+        assert!(s.has("widgets", &blob), "collected under a day ago");
+        s.advance(86_400);
+        s.publisher.maintain().await;
+        assert!(!s.has("widgets", &blob), "a day later: collected");
+    }
+
+    #[tokio::test]
+    async fn a_mirror_is_dropped_two_weeks_after_its_last_stage_unless_a_live_stage_names_it_or_it_is_busy() {
+        let s = scratch("retention");
+        sh(&s.vm, "echo r > r && git add r && git commit -qm r");
+        s.stage_all(request("scout/r"), || {}).await.unwrap();
+        s.advance(13 * 86_400);
+        s.stage_all(on("gadgets", "main", "scout/r"), || {}).await.unwrap();
+        s.publisher.maintain().await;
+        assert!(s.dir().exists(), "13 days: kept");
+        s.advance(2 * 86_400);
+        // 15 days, and a stage of it an hour old: kept.
+        let now = s.publisher.now();
+        let live = StageRecord { id: format!("{}-{}", now - 3600, "a".repeat(32)), sandbox: SANDBOX.into(), owner: "acme".into(), name: "widgets".into(), base: "main".into(), base_sha: String::new(), branch: "scout/r".into(), sha: "a".repeat(40), diff_sha256: String::new(), created_at: now - 3600 };
+        s.publisher.write_record(&live).unwrap();
+        s.publisher.maintain().await;
+        assert!(s.dir().exists(), "a live stage names it");
+        std::fs::remove_file(s.publisher.record_path(&live.id)).unwrap();
+        // Busy: never waited for, never dropped.
+        let lock = s.publisher.lock(&s.dir());
+        let held = lock.lock().await;
+        s.publisher.maintain().await;
+        assert!(s.dir().exists(), "its lock is held");
+        drop(held);
+        s.publisher.maintain().await;
+        assert!(!s.dir().exists(), "15 days idle: dropped");
+        assert!(s.publisher.mirror("acme", "gadgets").exists(), "used 2 days ago: kept");
+        assert_eq!(s.publisher.status()["evicted"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_mirror_over_its_cap_after_the_refresh_or_the_bundle_is_removed_with_a_507() {
+        let s = scratch("overcap");
+        sh(&s.vm, "echo o > o && git add o && git commit -qm o");
+        let over = (507, "the mirror of acme/widgets is 5 GiB, over the 4 GiB a repo may use on this sandbox host: nothing was staged. An operator can raise SANDBOXD_MIRROR_MAX_GIB.".to_string());
+        // After the refresh: refused before the bundle is read out of the VM.
+        s.size("acme/widgets", 5 * GIB);
+        let read = std::cell::Cell::new(false);
+        assert_eq!(s.stage_all(request("scout/o"), || read.set(true)).await.unwrap_err(), over);
+        assert!(!read.get(), "no bundle was read");
+        assert!(!s.dir().exists());
+        // After the bundle: the refresh fits, the bundle takes it over.
+        s.disk.sizes.lock().unwrap().clear();
+        assert_eq!(s.stage_all(request("scout/o"), || s.size("acme/widgets", 5 * GIB)).await.unwrap_err(), over);
+        assert!(!s.dir().exists());
+        assert!(s.records().is_empty());
+        assert_eq!(s.publisher.status()["refusedForSpace"], 2);
+        // Back under the cap, it stages again (from a new mirror).
+        s.disk.sizes.lock().unwrap().clear();
+        s.stage_all(request("scout/o"), || {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_mirror_needs_room_for_its_cap_and_idle_mirrors_make_room_least_recently_used_first() {
+        let mut s = scratch("total");
+        s.publisher.policy.mirrors_max = 10 * GIB;
+        sh(&s.root, "git clone -q --bare acme/gadgets.git acme/gizmos.git");
+        sh(&s.vm, "echo t > t && git add t && git commit -qm t");
+        let half = GIB / 2;
+        s.size("acme/gadgets", 3 * GIB + half);
+        s.size("acme/gizmos", 3 * GIB + half);
+        s.stage_all(on("gadgets", "main", "scout/t"), || {}).await.unwrap();
+        s.advance(3600);
+        s.stage_all(on("gizmos", "main", "scout/t"), || {}).await.unwrap();
+        // 7 of 10 GiB used, and a new mirror counts at its cap (4): no room, none idle.
+        let err = s.stage_all(request("scout/t"), || {}).await.unwrap_err();
+        assert_eq!(err, (507, "the sandbox host has no room for the mirror of acme/widgets (mirrors use 7 of 10 GiB, and this one would need up to 4 GiB): nothing was staged. Try again later, or ask an operator to raise SANDBOXD_MIRRORS_MAX_GIB or free space on the host.".to_string()));
+        assert!(!s.dir().exists());
+        // A day later both are idle: the least recently used one goes, and that is enough.
+        s.advance(86_400 + 60);
+        s.stage_all(request("scout/t"), || {}).await.unwrap();
+        assert!(!s.publisher.mirror("acme", "gadgets").exists());
+        assert!(s.publisher.mirror("acme", "gizmos").exists());
+        let status = s.publisher.status();
+        assert_eq!((status["count"].as_u64(), status["evicted"].as_u64(), status["refusedForSpace"].as_u64()), (Some(2), Some(1), Some(1)));
+    }
+
+    #[tokio::test]
+    async fn the_filesystem_keeps_ten_percent_or_twenty_gib_free() {
+        let s = scratch("floor");
+        sh(&s.vm, "echo f > f && git add f && git commit -qm f");
+        let low = |free: u64, floor: u64| (507, format!("the sandbox host is low on disk space ({free} GiB free, under the {floor} GiB it keeps free), so it has no room for the mirror of acme/widgets: nothing was staged. Try again later, or ask an operator to free space on the host."));
+        // 20 GiB is more than 10% of 100 GiB.
+        *s.disk.fs.lock().unwrap() = Some((15 * GIB, 100 * GIB));
+        assert_eq!(s.stage_all(request("scout/f"), || {}).await.unwrap_err(), low(15, 20));
+        // 10% of 500 GiB is more than 20 GiB.
+        *s.disk.fs.lock().unwrap() = Some((40 * GIB, 500 * GIB));
+        assert_eq!(s.stage_all(request("scout/f"), || {}).await.unwrap_err(), low(40, 50));
+        *s.disk.fs.lock().unwrap() = Some((60 * GIB, 500 * GIB));
+        s.stage_all(request("scout/f"), || {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_status_reports_the_mirrors_as_last_measured() {
+        let s = scratch("status");
+        sh(&s.vm, "echo s > s && git add s && git commit -qm s");
+        s.size("acme/widgets", GIB);
+        *s.disk.fs.lock().unwrap() = Some((300 * GIB, 1000 * GIB));
+        s.stage_all(request("scout/s"), || {}).await.unwrap();
+        s.advance(60);
+        let mut status = s.publisher.status();
+        let idle = status["oldestIdleSecs"].as_u64().unwrap();
+        assert!((60..=62).contains(&idle), "{idle}");
+        status["oldestIdleSecs"] = 60.into();
+        assert_eq!(
+            status,
+            serde_json::json!({
+                "count": 1, "bytes": GIB, "maxBytes": 24 * GIB, "perMirrorMaxBytes": 4 * GIB, "fsFreeBytes": 300 * GIB,
+                "garbageBytes": 0, "stageRefs": 1, "records": 1, "largest": { "repo": "acme/widgets", "bytes": GIB },
+                "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0,
+            })
+        );
     }
 
     #[test]
