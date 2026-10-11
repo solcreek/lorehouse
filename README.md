@@ -171,7 +171,7 @@ To set up Slack:
 |---|---|---|
 | `AGENT_NAME` | `scout` | the agent's handle; must match the Slack app's display name |
 | `AGENT_CHANNELS` | (none) | channel ids it may answer mentions in. It never works in private channels |
-| `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call, nothing read), `ignore`, or `answer` (from public channels and the DM conversation itself; not with the code tools). A DM is never indexed |
+| `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call, nothing read), `ignore`, or `answer` (from the channels in `AGENT_CHANNELS` and the DM conversation itself; not with the code tools). A DM is never indexed |
 | `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). `/healthz` is always open and says only `ok` |
 | `ADMIN_TOKEN` | (none) | bearer token for the read-only [admin API](docs/admin-api.md) under `/api/v1`: the indexed threads and their text, search, the agent's threads, the sandboxes. 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |
 | `USAGE_RECORD_PEOPLE` | (off) | `1` makes [usage](docs/admin-api.md#usage) record who asks the agent things; each channel is told, and turning it off erases them. Off, usage never says who asked |
