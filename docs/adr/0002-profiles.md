@@ -136,7 +136,10 @@ These are Lorehouse's position, not settings:
   answer reads what any public answer can: the whole knowledge index, whatever was
   ingested or seeded into it, and nothing is filtered at read time. So only public
   material may go into the index; what is indexed and when it leaves is the ingest's
-  rule, not the DM's (#82). It never has code tools (#58). A profile can't loosen that.
+  rule, not the DM's (#82). Leaving the index is not leaving the agent's memory: a
+  conversation that already quoted something (a thread, or a DM) keeps it in `SESSIONS_DB`
+  and can quote it again, after the message is deleted or its channel unlisted, until
+  June supports redaction (#66). It never has code tools (#58). A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread. The Approve in
   Slack authorizes opening the pull request, not merging it: it opens as a draft, and the
   merge is gated on GitHub, by its review and branch protection (#60). By default only the

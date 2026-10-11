@@ -10,9 +10,13 @@
 // A 👍/👎 (agent_feedback) stays until retention: it holds no text and no thread. An empty
 // list purges everything learned from Slack.
 //
-// Not here: June's saved conversations in SESSIONS_DB (the agent's turns in those
-// threads, with what it quoted). They are the framework's tables, which Lorehouse code
-// doesn't touch (AGENTS.md); they are no longer reachable once the channel is unlisted.
+// Not here: June's saved conversations in SESSIONS_DB (the agent's turns, with what its
+// searches returned and what it answered). They are the framework's tables, which
+// Lorehouse code doesn't touch (AGENTS.md). The channel's own threads are no longer
+// answered once it is unlisted, but its text stays reachable from any conversation that
+// quoted it: a thread in a channel still listed, or a DM, sends its whole history to the
+// model on every turn, quotes included (#66 POC: 3 copies in each request of a follow-up
+// in a listed channel's thread). Until June can redact or purge sessions (#66).
 //
 // pendingPurge counts the same rows without changing anything, for `lorehouse doctor`.
 

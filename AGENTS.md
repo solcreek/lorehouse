@@ -77,8 +77,10 @@ embeds them; the binary conformance run proves it. Consequences:
 (`INGEST_BACKFILL_DAYS`), re-checks recent threads on every start (`INGEST_REFRESH_DAYS`)
 to catch edits/deletes made while down, and re-indexes a thread live after it goes quiet
 (`INGEST_DEBOUNCE_MS`). One document per thread (`slack:<channel>:<root ts>`).
-`src/knowledge.ts` is SQLite FTS with CJK bigram indexing. Deleted messages must stop being
-quotable. DMs are never indexed.
+`src/knowledge.ts` is SQLite FTS with CJK bigram indexing. Deleted messages must leave the
+index and `LOREHOUSE_DB`'s files, the `-wal` included (`checkpointSoon` after whatever
+removes text, `closeKnowledge` on SIGTERM). June's `SESSIONS_DB` still keeps what a
+conversation already quoted (#66). DMs are never indexed.
 
 **Policy.** `src/policy.ts` restricts every channel event to channels in
 `AGENT_CHANNELS` (empty means nowhere) and refuses private channels and group DMs where the
