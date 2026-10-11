@@ -29,6 +29,7 @@ type World = {
   displayName?: string;
   usersInfoError?: string;
   history?: Record<string, string>; // channel → Slack error
+  info?: Record<string, Record<string, unknown> | string>; // conversations.info: channel → its fields, or a Slack error (default: public)
   anthropic?: number; // status of GET /v1/models/…
   appPermissions?: Record<string, string>;
   installations?: number | "http_500" | "not_a_list";
@@ -47,6 +48,11 @@ function world(w: World = {}) {
       if (method === "auth.test") return Response.json(w.authError ? { ok: false, error: w.authError } : { ok: true, team: "Acme", user_id: "UBOT" }, { headers });
       if (method === "users.info" && w.usersInfoError) return Response.json({ ok: false, error: w.usersInfoError });
       if (method === "users.info") return Response.json({ ok: true, user: { name: "scout", profile: { display_name: w.displayName ?? "scout" } } });
+      if (method === "conversations.info") {
+        const channel = url.searchParams.get("channel")!;
+        const info = w.info?.[channel] ?? { name: "general", is_channel: true, is_private: false, is_archived: false };
+        return Response.json(typeof info === "string" ? { ok: false, error: info } : { ok: true, channel: { id: channel, ...info } });
+      }
       if (method === "conversations.history") {
         const err = w.history?.[url.searchParams.get("channel")!];
         return Response.json(err ? { ok: false, error: err } : { ok: true, messages: [] });
@@ -199,6 +205,24 @@ describe("channels", () => {
 
   test("an unknown channel fails", async () => {
     expect(find(await run({}, { history: { C1: "channel_not_found" } }), "C1")[0]?.level).toBe("fail");
+  });
+
+  // What a start refuses on (#86), per channel, read-only; its history isn't read then.
+  test("a private or archived channel with a C… id fails, named, as conversations.info says; the public one passes", async () => {
+    const { f, seen } = world({ info: { C7: { name: "board", is_channel: true, is_private: true }, C8: { name: "old", is_channel: true, is_private: false, is_archived: true } } });
+    const checks = await doctor({ env: { ...ENV, AGENT_CHANNELS: "C1,C7,C8" }, fetch: f });
+    expect(find(checks, "C1")[0]).toMatchObject({ level: "ok", detail: "public (#general), and the bot can read its history" });
+    expect(find(checks, "C7")[0]?.level).toBe("fail");
+    expect(find(checks, "C7")[0]?.detail).toStartWith("C7 (#board) is a private channel: lorehouse refuses to start");
+    expect(find(checks, "C8")[0]?.level).toBe("fail");
+    expect(find(checks, "C8")[0]?.detail).toStartWith("C8 (#old) is archived");
+    expect(seen.filter((s) => s.includes("conversations.history"))).toEqual(["GET slack.test/api/conversations.history"]);
+  });
+
+  test("a channel that can't be looked up fails closed: not found, a missing scope", async () => {
+    const checks = await run({ AGENT_CHANNELS: "C1,C2" }, { info: { C1: "channel_not_found", C2: "missing_scope" } });
+    expect(find(checks, "C1")[0]).toMatchObject({ level: "fail", detail: expect.stringContaining("conversations.info said channel_not_found") });
+    expect(find(checks, "C2")[0]).toMatchObject({ level: "fail", detail: expect.stringContaining("conversations.info said missing_scope (the app needs channels:read") });
   });
 
   test("no channels at all is a warning that says the agent works nowhere, and what a start purges", async () => {

@@ -8,8 +8,9 @@
 //
 //   configuration  every setting loadConfig checks, all problems at once
 //   slack          the bot token, its scopes (against slack/manifest.yaml), the agent's name
-//   channels       each AGENT_CHANNELS id: public, and readable by the bot; what the next
-//                  start would purge for channels no longer listed (read from the database)
+//   channels       each AGENT_CHANNELS id: public as Slack says (conversations.info, the
+//                  check a start refuses on), and readable by the bot; what the next start
+//                  would purge for channels no longer listed (read from the database)
 //   anthropic      the API key, and that ANTHROPIC_MODEL exists
 //   github         the App's key and permissions, or the token (code tools only)
 //   sandbox        the direct sandbox host answers (code tools only)
@@ -25,6 +26,7 @@ import { createHmac } from "node:crypto";
 import manifest from "../slack/manifest.yaml";
 import { ConfigError, isLoopbackUrl as isLoopback, loadConfig, type Config } from "./config";
 import { appJwt } from "./github-auth";
+import { classifyChannel, describeVerdict, type ChannelInfo, type ChannelVerdict } from "./channel-check";
 import { agentIdentity, type AgentIdentity } from "./identity";
 import { pendingPurge, type ChannelPurge } from "./purge";
 import { loadEnv, readSettings } from "./settings";
@@ -156,9 +158,20 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
         add("channels", channel, "info", "not checked: needs a working bot token");
         continue;
       }
+      // The lookup a start refuses on (channel-check.ts): private, archived or not found
+      // fails here as it fails there.
+      const info = await slack("conversations.info", { channel });
+      const verdict: ChannelVerdict = info.error
+        ? { channel, public: false, reason: "lookup_failed", error: info.error }
+        : classifyChannel(channel, info.body?.channel as ChannelInfo | undefined);
+      if (!verdict.public) {
+        add("channels", channel, "fail", `${describeVerdict(verdict)}: lorehouse refuses to start until it is public or off AGENT_CHANNELS`);
+        continue;
+      }
+      const named = verdict.name ? ` (#${verdict.name})` : "";
       // The same read the backfill makes first.
       const h = await slack("conversations.history", { channel, limit: "1" });
-      if (!h.error) add("channels", channel, "ok", "public, and the bot can read its history");
+      if (!h.error) add("channels", channel, "ok", `public${named}, and the bot can read its history`);
       else if (h.error === "not_in_channel") add("channels", channel, "fail", `the bot isn't a member: in that channel, /invite @${identity.name}`);
       else if (h.error === "channel_not_found") add("channels", channel, "fail", "no such public channel in this workspace (or it's private)");
       else add("channels", channel, "fail", `conversations.history: ${h.error}`);
