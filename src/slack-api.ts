@@ -17,7 +17,8 @@ export type SlackApiOptions = {
 };
 
 export type SlackApi = {
-  call<T = Record<string, unknown>>(method: string, params?: Record<string, string | number | undefined>): Promise<T>;
+  // signal: abort the request (and any wait out of a 429) when it fires.
+  call<T = Record<string, unknown>>(method: string, params?: Record<string, string | number | undefined>, opts?: { signal?: AbortSignal }): Promise<T>;
   // Every page of a cursor-paginated method, yielding the array under `key`.
   paginate<T>(method: string, params: Record<string, string | number | undefined>, key: string): AsyncGenerator<T>;
 };
@@ -28,11 +29,13 @@ export function slackApi(opts: SlackApiOptions): SlackApi {
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const maxRetries = opts.maxRetries ?? 5;
 
-  async function call<T>(method: string, params: Record<string, string | number | undefined> = {}): Promise<T> {
+  async function call<T>(method: string, params: Record<string, string | number | undefined> = {}, callOpts: { signal?: AbortSignal } = {}): Promise<T> {
+    const { signal } = callOpts;
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) if (v !== undefined) qs.set(k, String(v));
     for (let attempt = 0; ; attempt++) {
-      const res = await f(`${base}/${method}?${qs}`, { headers: { authorization: `Bearer ${opts.token}` } });
+      signal?.throwIfAborted();
+      const res = await f(`${base}/${method}?${qs}`, { headers: { authorization: `Bearer ${opts.token}` }, signal });
       if (res.status === 429 && attempt < maxRetries) {
         // Slack says how long to wait; honor it (plus a little), fall back to 1 s.
         const retryAfter = Number(res.headers.get("retry-after") ?? 1);

@@ -90,6 +90,19 @@ describe("lookUpChannel", () => {
     expect(await lookUpChannel(api, "C1", 20)).toMatchObject({ public: false, reason: "lookup_failed", error: "no answer in 0.02 s" });
   });
 
+  test("a lookup that times out aborts its request", async () => {
+    let signal: AbortSignal | undefined;
+    const api: SlackApi = {
+      call: (_m, _p, opts) => new Promise((_, reject) => {
+        signal = opts?.signal;
+        signal?.addEventListener("abort", () => reject(signal!.reason));
+      }),
+      async *paginate() {},
+    };
+    expect(await lookUpChannel(api, "C1", 20)).toMatchObject({ public: false, reason: "lookup_failed", error: "no answer in 0.02 s" });
+    expect(signal?.aborted).toBe(true);
+  });
+
   test("Slack's answer about a channel is definite; an outage isn't", () => {
     const failed = (error: string) => ({ channel: "C1", public: false as const, reason: "lookup_failed" as const, error });
     for (const e of ["channel_not_found", "missing_scope", "not_in_channel"]) expect(isDefiniteFailure(failed(e))).toBe(true);

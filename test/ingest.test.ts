@@ -157,6 +157,18 @@ describe("slackApi", () => {
     expect(slept).toEqual([2100]);
   });
 
+  test("a signal reaches fetch, and one that fires while a 429 is waited out stops the retry", async () => {
+    const signals: (AbortSignal | null | undefined)[] = [];
+    const f = (async (_url: string, init?: RequestInit) => {
+      signals.push(init?.signal);
+      return new Response("", { status: 429, headers: { "retry-after": "1" } });
+    }) as unknown as typeof fetch;
+    const abort = new AbortController();
+    const api = slackApi({ token: "t", fetch: f, sleep: async () => { abort.abort(new Error("gave up")); } });
+    await expect(api.call("conversations.info", { channel: "C1" }, { signal: abort.signal })).rejects.toThrow("gave up");
+    expect(signals).toEqual([abort.signal]);
+  });
+
   test("ok:false becomes a SlackApiError naming the method", async () => {
     const f = (async () => Response.json({ ok: false, error: "not_in_channel" })) as unknown as typeof fetch;
     await expect(slackApi({ token: "t", fetch: f }).call("conversations.history")).rejects.toThrow("slack conversations.history: not_in_channel");

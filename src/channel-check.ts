@@ -61,12 +61,19 @@ export const isDefiniteFailure = (v: ChannelVerdict): boolean => !v.public && v.
 export const LOOKUP_TIMEOUT_MS = 10_000;
 
 // Look one channel up. Never throws: a failure is a verdict (lookup_failed), and so is no
-// answer within timeoutMs (a start must not hang on Slack before it listens).
+// answer within timeoutMs (a start must not hang on Slack before it listens). The request
+// is aborted then too, so a Slack that never answers doesn't leave one behind per recheck.
 export async function lookUpChannel(api: SlackApi, channel: string, timeoutMs = LOOKUP_TIMEOUT_MS): Promise<ChannelVerdict> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const abort = new AbortController();
   try {
-    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer in ${timeoutMs / 1000} s`)), timeoutMs); });
-    const res = await Promise.race([api.call<{ channel?: ChannelInfo }>("conversations.info", { channel }), timeout]);
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`no answer in ${timeoutMs / 1000} s`));
+        abort.abort();
+      }, timeoutMs);
+    });
+    const res = await Promise.race([api.call<{ channel?: ChannelInfo }>("conversations.info", { channel }, { signal: abort.signal }), timeout]);
     return classifyChannel(channel, res.channel);
   } catch (err) {
     // SlackApiError's code (channel_not_found, missing_scope, http_500), or why fetch failed.
