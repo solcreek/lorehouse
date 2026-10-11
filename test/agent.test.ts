@@ -31,6 +31,7 @@ const scripted = (script: ModelReply[]): Model => (msgs) =>
   replyStream(script[Math.min(msgs.filter((m) => m.role === "assistant").length, script.length - 1)]!);
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
+const STAGE_ID = `1790000000-${"0".repeat(32)}`;
 
 // A sandbox whose checkout answers the few git commands open_pull_request still runs there
 // (status, origin, default branch), and whose host stages and pushes: every exec and every
@@ -38,6 +39,7 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; files?: string[]; patch?: string; stageError?: string; pushError?: string } = {}) {
   const calls: { command: string; opts?: ExecOptions }[] = [];
   const published: { op: "stage" | "push"; args: Record<string, unknown> }[] = [];
+  let stages = 0;
   const sb: Sandbox = {
     async exec(command, opts) {
       calls.push({ command, opts });
@@ -57,7 +59,9 @@ function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; fil
       if (calls.some((c) => c.command.startsWith("git update-ref refs/remotes/origin/"))) {
         throw new Error("stage: 409 no commits to publish: HEAD has nothing that isn't on GitHub already");
       }
+      // As the host does: every stage gets a new id, the one its push must name.
       return {
+        stage: `1790000000-${String(++stages).padStart(32, "0")}`,
         sha: SHA, baseSha: "f".repeat(40), commits: (o.authors ?? ["x"]).length,
         stat: " src/a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
         authors: o.authors ?? ["bot <b@x>|bot <b@x>"], files: o.files ?? ["src/a.ts"],
@@ -107,15 +111,19 @@ describe("open_pull_request — the approval gate", () => {
     expect(parked).toMatchObject({ status: "suspended" });
     expect(JSON.stringify(parked)).toContain("src/a.ts | 2 +-"); // the human sees the host's stat…
     expect(JSON.stringify(parked)).toContain("+new"); // …and the patch
-    expect(published).toEqual([{ op: "stage", args: { repo: { owner: "acme", name: "widgets" }, base: "main", token: "ghs_secret" } }]);
+    expect(published).toEqual([{ op: "stage", args: { repo: { owner: "acme", name: "widgets" }, base: "main", branch: "scout/fix-a", token: "ghs_secret" } }]);
     expect(gh.reqs).toHaveLength(0);
 
     const inputId = (parked as { request: { id: string } }).request.id;
     s.resume(t1, inputId, true);
     expect(await s.result(t1)).toMatchObject({ status: "completed", text: "done" });
 
-    // The host pushes exactly the staged commit; the token never enters the sandbox.
-    expect(published.filter((p) => p.op === "push")).toEqual([{ op: "push", args: { repo: { owner: "acme", name: "widgets" }, sha: SHA, branch: "scout/fix-a", token: "ghs_secret" } }]);
+    // The host pushes exactly the staged commit, naming the stage that recorded it: the
+    // resumed run stages again (a stage authorizes one push) and pushes under that new
+    // stage. The token never enters the sandbox.
+    expect(published.map((p) => p.op)).toEqual(["stage", "stage", "push"]);
+    const stage = `1790000000-${"2".padStart(32, "0")}`;
+    expect(published.filter((p) => p.op === "push")).toEqual([{ op: "push", args: { stage, repo: { owner: "acme", name: "widgets" }, sha: SHA, branch: "scout/fix-a", token: "ghs_secret" } }]);
     expect(calls.some((c) => c.command.includes("push") || JSON.stringify(c.opts ?? {}).includes("ghs_secret"))).toBe(false);
 
     const post = gh.reqs.find((r) => r.method === "POST")!;
@@ -222,6 +230,9 @@ describe("open_pull_request — the approval gate", () => {
     expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened" });
     expect(await tool.run({ branch: "scout/x", title: "x" }, ctx)).toMatchObject({ status: "opened" });
     expect(published.map((p) => p.op)).toEqual(["stage", "push", "stage", "push"]);
+    // A stage authorizes one push: the replay stages again and pushes under the new stage.
+    const pushedStages = published.filter((p) => p.op === "push").map((p) => p.args.stage);
+    expect(pushedStages).toEqual(published.filter((p) => p.op === "stage").map((_, i) => `1790000000-${String(i + 1).padStart(32, "0")}`));
   });
 
   test("a staging failure (nothing new, a base not on GitHub, refused commits) reaches the model; nobody is asked", async () => {
@@ -242,7 +253,7 @@ describe("open_pull_request — the approval gate", () => {
   });
 
   test("the card flags changes under .github/ and keeps within Slack's 3000 characters, the patch cut to fit", () => {
-    const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 2, stat: " .github/workflows/ci.yml | 3 +\n src/a.ts | 1 +\n 2 files changed\n", authors: [], files: [".github/workflows/ci.yml", "src/a.ts"], patch: "+x\n".repeat(5000) + "```", patchTruncated: false };
+    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 2, stat: " .github/workflows/ci.yml | 3 +\n src/a.ts | 1 +\n 2 files changed\n", authors: [], files: [".github/workflows/ci.yml", "src/a.ts"], patch: "+x\n".repeat(5000) + "```", patchTruncated: false };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
     expect(card).toContain("2 commits");
     expect(card).toContain(":warning: Changes `.github/workflows/ci.yml`");
@@ -257,7 +268,7 @@ describe("open_pull_request — the approval gate", () => {
 
   test("nothing the sandbox or the model wrote can add markup to the card", () => {
     const staged = {
-      sha: SHA, baseSha: "f".repeat(40), commits: 1, authors: [],
+      stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, authors: [],
       stat: " .github/x`y | 1 +\n``````\n<!here> | 1 +\n",
       files: [".github/a`<@U1>`b"],
       patch: "+<https://evil.example|click> &lt; ``````\n",
@@ -275,7 +286,7 @@ describe("open_pull_request — the approval gate", () => {
   test("the card fits Slack's 3000 characters whatever the title, branch, stat and paths", () => {
     const long = (n: number) => "a".repeat(n);
     const staged = {
-      sha: SHA, baseSha: "f".repeat(40), commits: 2, authors: [], patch: "+x\n".repeat(5000), patchTruncated: true,
+      stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 2, authors: [], patch: "+x\n".repeat(5000), patchTruncated: true,
       stat: Array.from({ length: 30 }, (_, i) => ` ${long(500)}${i} | 1 +`).join("\n") + "\n",
       files: Array.from({ length: 10 }, (_, i) => `.github/${long(500)}${i}`),
     };
@@ -286,13 +297,13 @@ describe("open_pull_request — the approval gate", () => {
   });
 
   test("the card flags a .github/ path that git quoted", () => {
-    const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: ['".github/workflows/\\303\\251.yml"'], patch: "", patchTruncated: false };
+    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 1 file changed\n", authors: [], files: ['".github/workflows/\\303\\251.yml"'], patch: "", patchTruncated: false };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
     expect(card).toContain(":warning: Changes");
   });
 
   test("the card flags CODEOWNERS wherever GitHub reads it", () => {
-    const staged = { sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false };
+    const staged = { stage: STAGE_ID, sha: SHA, baseSha: "f".repeat(40), commits: 1, stat: " 2 files changed\n", authors: [], files: ["CODEOWNERS", "docs/CODEOWNERS", "src/CODEOWNERS"], patch: "", patchTruncated: false };
     const card = approvalCard({ repo: { owner: "acme", name: "widgets" }, branch: "scout/x", base: "main", title: "Fix", staged });
     expect(card).toContain(":warning: Changes `CODEOWNERS`, `docs/CODEOWNERS`:");
   });
@@ -518,24 +529,25 @@ describe("remoteSandbox client", () => {
   });
 
   test("stage and push are POSTs with the request as JSON; any non-2xx is the daemon's reason", async () => {
+    const STAGE = `1790000000-${"c".repeat(32)}`;
     const reqs: { url: string; body: unknown }[] = [];
     const f = (async (url: string, init: RequestInit) => {
       reqs.push({ url, body: JSON.parse(init.body as string) });
-      if (url.endsWith("/stage")) return Response.json({ sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: "", authors: [], files: [], patch: "", patchTruncated: false });
-      return Response.json({ error: "a".repeat(40) + " wasn't staged here; stage it first" }, { status: 404 });
+      if (url.endsWith("/stage")) return Response.json({ stage: STAGE, sha: "a".repeat(40), baseSha: "b".repeat(40), commits: 1, stat: "", authors: [], files: [], patch: "", patchTruncated: false });
+      return Response.json({ error: `stage ${STAGE} isn't here: it never completed, was already used, or expired; stage again` }, { status: 404 });
     }) as typeof fetch;
     const sb = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f });
-    expect((await sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", token: "r" })).commits).toBe(1);
-    await expect(sb.push({ repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "w" })).rejects.toThrow("push: 404 " + "a".repeat(40) + " wasn't staged here");
+    expect((await sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", branch: "scout/x", token: "r" })).stage).toBe(STAGE);
+    await expect(sb.push({ stage: STAGE, repo: { owner: "acme", name: "widgets" }, sha: "a".repeat(40), branch: "scout/x", token: "w" })).rejects.toThrow(`push: 404 stage ${STAGE} isn't here`);
     expect(reqs.map((r) => r.url)).toEqual(["https://fb.example/v1/sandboxes/s1/stage", "https://fb.example/v1/sandboxes/s1/push"]);
-    expect(reqs[0]!.body).toEqual({ owner: "acme", name: "widgets", base: "main", token: "r" });
-    expect(reqs[1]!.body).toEqual({ owner: "acme", name: "widgets", sha: "a".repeat(40), branch: "scout/x", token: "w" });
+    expect(reqs[0]!.body).toEqual({ owner: "acme", name: "widgets", base: "main", branch: "scout/x", token: "r" });
+    expect(reqs[1]!.body).toEqual({ stage: STAGE, owner: "acme", name: "widgets", sha: "a".repeat(40), branch: "scout/x", token: "w" });
   });
 
   test("a publish error that isn't JSON still surfaces with its status and text", async () => {
     const f = (async () => new Response("unauthorized", { status: 401 })) as unknown as typeof fetch;
     const sb = remoteSandbox("s1", { url: "https://fb.example", token: "bad", fetch: f });
-    await expect(sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main" })).rejects.toThrow("stage: 401 unauthorized");
+    await expect(sb.stage({ repo: { owner: "acme", name: "widgets" }, base: "main", branch: "scout/x" })).rejects.toThrow("stage: 401 unauthorized");
   });
 
   test("a daemon error surfaces with its status", async () => {

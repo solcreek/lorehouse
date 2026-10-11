@@ -326,11 +326,11 @@ export class RunnerHub {
         await guest("PUT", `/file?path=${encodeURIComponent(path)}`, content, 30_000);
       },
       async stage(o): Promise<Staged> {
-        const body = { owner: o.repo.owner, name: o.repo.name, base: o.base, token: o.token };
+        const body = { owner: o.repo.owner, name: o.repo.name, base: o.base, branch: o.branch, token: o.token };
         return publish("stage", body, STAGE_TIMEOUT_MS) as Promise<Staged>;
       },
       async push(o) {
-        const body = { owner: o.repo.owner, name: o.repo.name, sha: o.sha, branch: o.branch, token: o.token };
+        const body = { stage: o.stage, owner: o.repo.owner, name: o.repo.name, sha: o.sha, branch: o.branch, token: o.token };
         return publish("push", body, PUSH_TIMEOUT_MS) as Promise<{ sha: string; branch: string }>;
       },
     };

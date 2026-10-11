@@ -95,7 +95,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
       }
       let staged: Staged;
       try {
-        staged = await sb.stage({ repo, base, token: readToken });
+        staged = await sb.stage({ repo, base, branch: input.branch, token: readToken });
       } catch (e) {
         return { error: `couldn't stage the commits: ${(e as Error).message}` };
       }
@@ -144,7 +144,7 @@ export function pullRequestTool(opts: PullRequestOptions): Tool {
         return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
       }
       try {
-        await sb.push({ repo, sha: staged.sha, branch: input.branch, token });
+        await sb.push({ stage: staged.stage, repo, sha: staged.sha, branch: input.branch, token });
       } catch (e) {
         return { error: `push failed: ${(e as Error).message}` };
       }
