@@ -44,10 +44,20 @@ export function openKnowledge(path: string, migrations = MIGRATIONS): Database {
   const applied = new Set((db.query("SELECT version FROM lorehouse_migrations").all() as { version: number }[]).map((r) => r.version));
   for (const m of [...migrations].sort((a, b) => a.version - b.version)) {
     if (applied.has(m.version)) continue;
-    db.transaction(() => {
-      db.exec(m.sql);
-      db.query("INSERT INTO lorehouse_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(m.version, m.name, new Date().toISOString());
-    })();
+    const record = () => db.query("INSERT INTO lorehouse_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(m.version, m.name, new Date().toISOString());
+    if (!m.vacuum) {
+      db.transaction(() => {
+        db.exec(m.sql);
+        record();
+      })();
+      continue;
+    }
+    // VACUUM can't run inside a transaction. It is recorded only once it succeeds, so a
+    // failure (e.g. no disk for the copy) is retried on the next open: such a migration's
+    // SQL must be safe to run twice.
+    db.transaction(() => db.exec(m.sql))();
+    db.exec("VACUUM");
+    record();
   }
   if (hasTable(db, "knowledge_index_meta")) ensureIndex(db);
   return db;

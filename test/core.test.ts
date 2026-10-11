@@ -101,6 +101,7 @@ describe("knowledge store", () => {
 
     test("a document deleted before this was enforced, once the database is opened", () => withFile("upgraded", (path) => {
       const old = openKnowledge(path, MIGRATIONS.filter((m) => m.version <= 9));
+      old.exec("PRAGMA secure_delete = OFF"); // as a build before this one deleted: freed bytes stay
       filler(old);
       upsertDocument(old, secret);
       deleteDocument(old, secret.docId);

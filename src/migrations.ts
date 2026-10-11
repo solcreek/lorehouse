@@ -11,7 +11,9 @@ import m0008 from "../migrations/0008_sandbox_placements.sql" with { type: "text
 import m0009 from "../migrations/0009_usage.sql" with { type: "text" };
 import m0010 from "../migrations/0010_fts_secure_delete.sql" with { type: "text" };
 
-export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
+// `vacuum`: rewrite the whole database file once the SQL has applied (outside its
+// transaction), so bytes earlier deletes left in freed pages are gone too.
+export const MIGRATIONS: { version: number; name: string; sql: string; vacuum?: true }[] = [
   { version: 1, name: "0001_knowledge.sql", sql: m0001 },
   { version: 2, name: "0002_documents.sql", sql: m0002 },
   { version: 3, name: "0003_source_version.sql", sql: m0003 },
@@ -21,5 +23,5 @@ export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   { version: 7, name: "0007_agent_threads.sql", sql: m0007 },
   { version: 8, name: "0008_sandbox_placements.sql", sql: m0008 },
   { version: 9, name: "0009_usage.sql", sql: m0009 },
-  { version: 10, name: "0010_fts_secure_delete.sql", sql: m0010 },
+  { version: 10, name: "0010_fts_secure_delete.sql", sql: m0010, vacuum: true },
 ];

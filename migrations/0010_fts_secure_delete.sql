@@ -10,5 +10,11 @@
 -- 'optimize' merges the segments into one, dropping what earlier deletes left behind.
 -- The pages it frees are zeroed because the connection runs with PRAGMA secure_delete = ON
 -- (set in openKnowledge before any migration; a pragma is per connection, not stored).
+--
+-- That pragma is not retroactive: rows deleted from knowledge_documents (and every other
+-- table) before it was on left their bytes in free space. So after this file applies, the
+-- runner runs VACUUM, outside the transaction, to rewrite the whole file (`vacuum: true`
+-- in src/migrations.ts). The version is recorded only once VACUUM succeeds, so a failed
+-- one is retried on the next start; both statements below are safe to run twice.
 INSERT INTO knowledge_fts (knowledge_fts, rank) VALUES ('secure-delete', 1);
 INSERT INTO knowledge_fts (knowledge_fts) VALUES ('optimize');
