@@ -834,12 +834,12 @@ mod tests {
                 String::from_utf8(req).unwrap().to_ascii_lowercase()
             });
             let runner = Runner::new(vms, publisher, format!("http://{addr}"), "tok".into(), "box-1".into(), crate::config::Transport::Ws, dir.join("jobs"));
-            let end = match runner.ws_session().await {
+            let end = match tokio::time::timeout(Duration::from_secs(20), runner.ws_session()).await.expect("the handshake hung") {
                 WsEnd::Lost(m) => format!("Lost:{m}"),
                 WsEnd::Refused(m) => format!("Refused:{m}"),
             };
             assert!(end.starts_with(want), "{status}: {end}");
-            let req = server.await.unwrap();
+            let req = tokio::time::timeout(Duration::from_secs(20), server).await.expect("the server hung").unwrap();
             assert!(req.starts_with("get /runners/connect http/1.1\r\n"), "{req}");
             for header in ["authorization: bearer tok\r\n", "x-lorehouse-runner: box-1\r\n", "upgrade: websocket\r\n"] {
                 assert!(req.contains(header), "{header:?} missing from {req}");
