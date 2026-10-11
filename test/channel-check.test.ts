@@ -36,6 +36,11 @@ describe("classifyChannel", () => {
     const { is_private: _, ...unsaid } = PUBLIC;
     expect(classifyChannel("C1", unsaid)).toMatchObject({ public: false, reason: "lookup_failed", error: "Slack didn't say whether it is private" });
   });
+
+  test("a conversation not said to be a channel fails closed, even with is_private false", () => {
+    expect(classifyChannel("C1", { is_private: false })).toMatchObject({ public: false, reason: "lookup_failed", error: "Slack didn't say it is a channel" });
+    expect(classifyChannel("C1", { ...PUBLIC, is_channel: false })).toMatchObject({ public: false, reason: "lookup_failed", error: "Slack didn't say it is a channel" });
+  });
 });
 
 describe("describeVerdict", () => {

@@ -37,8 +37,9 @@ export type ChannelVerdict =
   | { channel: string; name?: string; public: false; reason: "private" | "group_dm" | "dm" | "archived" }
   | { channel: string; name?: string; public: false; reason: "lookup_failed"; error: string };
 
-// Public means Slack said so: not a DM, group DM or private channel, not archived, and
-// is_private present and false. Anything Slack left unsaid fails closed.
+// Public means Slack said so: not a DM, group DM or private channel, not archived,
+// is_private present and false, and is_channel true (a conversation of a kind this doesn't
+// know is not vouched for). Anything Slack left unsaid fails closed.
 export function classifyChannel(channel: string, info: ChannelInfo | undefined): ChannelVerdict {
   if (!info || typeof info !== "object") return { channel, public: false, reason: "lookup_failed", error: "Slack's answer had no channel" };
   const name = typeof info.name === "string" && info.name ? info.name : undefined;
@@ -47,6 +48,7 @@ export function classifyChannel(channel: string, info: ChannelInfo | undefined):
   if (info.is_mpim) return { ...base, public: false, reason: "group_dm" };
   if (info.is_private || info.is_group) return { ...base, public: false, reason: "private" };
   if (info.is_private !== false) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say whether it is private" };
+  if (info.is_channel !== true) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say it is a channel" };
   if (info.is_archived) return { ...base, public: false, reason: "archived" };
   return { ...base, public: true };
 }
