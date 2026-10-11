@@ -641,7 +641,9 @@ async fn bundle_from(vms: &Manager, sandbox: &str, to: &Path) -> Result<(), Fail
         }
     }
     let cleanup = serde_json::json!({ "command": "rm -f /tmp/lorehouse-stage.*", "timeoutMs": 30_000 }).to_string();
-    let _ = vsock::request(&uds, Method::POST, "/exec", Bytes::from(cleanup)).await;
+    // Bounded like every other guest call: the guest is untrusted, and an answer it never
+    // sends would otherwise hold this stage, and the repo's lock, for good.
+    let _ = tokio::time::timeout(Duration::from_secs(35), vsock::request(&uds, Method::POST, "/exec", Bytes::from(cleanup))).await;
     tokio::fs::write(to, out).await.map_err(|e| (500, format!("bundle file: {e}")))
 }
 
