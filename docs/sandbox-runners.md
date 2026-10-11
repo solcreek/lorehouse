@@ -199,11 +199,13 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   environment, never in argv. Tokens are in jobs only, never logged or recorded.
 - **A mirror is written by one job at a time**, under its lock. Git's automatic maintenance
   is off (`maintenance.auto=false`, `gc.auto=0`): it runs detached, after the lock is
-  released, and a gc from outside the lock was seen to wedge a mirror (#76). After every
-  stage and push, and after a failed refresh, the housekeeping also removes git's partial
-  packs (`tmp_pack_*`, `tmp_idx_*`) and stage bundles older than 10 minutes, and any
-  `refs/stage/` ref whose object is missing (which fails every fetch until it is gone; the
-  refresh is then retried once). A mirror whose first fetch fails or is cut off is removed.
+  released, and a gc from outside the lock was seen to wedge a mirror (#76). After a stage
+  or push that runs to its end, and after a failed refresh, the housekeeping also removes
+  what a git process that died or was killed left once it is older than 10 minutes (partial
+  packs `tmp_pack_*` and `tmp_idx_*`, lock files `*.lock`, stage bundles), and any
+  `refs/stage/` ref whose object is missing. A lock file or such a ref fails every fetch
+  until it is gone, so a failed refresh that removed one is retried once. A mirror with no
+  refs yet (its first fetch failed or was cut off) is removed.
 - **Failures** come back as statuses with a reason:
   - 409: nothing new to publish, or a branch that has moved on.
   - 404: the base isn't on GitHub, or the stage isn't there (never completed, already

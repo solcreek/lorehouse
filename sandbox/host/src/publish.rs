@@ -222,6 +222,18 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
     }
 }
 
+/// One git command, in `dir`, in the guarded environment, for its answer alone: whether it
+/// succeeded, or None if it couldn't run or didn't finish within GIT_LOCAL.
+async fn git_says(dir: &Path, args: &[&str]) -> Option<bool> {
+    let mut cmd = git_command(dir, args, None);
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    match tokio::time::timeout(GIT_LOCAL, child.wait()).await {
+        Ok(Ok(status)) => Some(status.success()),
+        _ => None,
+    }
+}
+
 /// One git command, in `dir`, in the guarded environment: the SHA-256 (hex) of all of its
 /// stdout, however long, read as it comes and never kept.
 async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
@@ -315,18 +327,10 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// Whether a mirror has a pack yet: a completed fetch leaves one (git's partial ones are
-/// `tmp_pack_*`, with no `.pack` suffix).
-fn has_pack(dir: &Path) -> bool {
-    std::fs::read_dir(dir.join("objects").join("pack")).is_ok_and(|d| d.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".pack")))
-}
-
-/// Remove a mirror, and its owner's directory if that leaves it empty.
+/// Remove a mirror. Its owner's directory stays: another repo of the same owner may be
+/// creating its mirror in it, under its own lock.
 fn remove_mirror(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
-    if let Some(owner) = dir.parent() {
-        let _ = std::fs::remove_dir(owner);
-    }
 }
 
 /// A mirror whose first fetch hasn't completed, removed when this is dropped unless it was
@@ -342,24 +346,32 @@ impl Drop for NewMirror<'_> {
     }
 }
 
-/// Remove git's temporary files in a mirror (`objects/pack/tmp_pack_*`, `tmp_idx_*`: what
-/// a fetch that died or was refused leaves, up to the size of what it was fetching) and
-/// stage bundles a crash left, once they are older than GARBAGE_AGE.
-fn remove_garbage(dir: &Path, now: SystemTime) {
-    let old = |entry: &std::fs::DirEntry| entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > GARBAGE_AGE));
-    type Garbage = fn(&str) -> bool;
-    let pack = dir.join("objects").join("pack");
-    let places: [(&Path, Garbage); 2] = [
-        (&pack, |f| f.starts_with("tmp_pack_") || f.starts_with("tmp_idx_")),
-        (dir, |f| f.starts_with("stage-") && f.ends_with(".bundle")),
-    ];
-    for (place, garbage) in places {
+/// Remove what a git process that died or was killed leaves in a mirror, once it is older
+/// than GARBAGE_AGE: its partial packs (`objects/pack/tmp_pack_*`, `tmp_idx_*`, up to the
+/// size of what it was fetching), its lock files (`*.lock`: a `refs/heads/<b>.lock` or
+/// `packed-refs.lock` fails every later fetch), and stage bundles a crash left. Whether it
+/// removed a lock file.
+fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
+    fn walk(place: &Path, top: bool, now: SystemTime, unlocked: &mut bool) {
         for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
-            if garbage(&entry.file_name().to_string_lossy()) && entry.file_type().is_ok_and(|t| t.is_file()) && old(&entry) {
-                let _ = std::fs::remove_file(entry.path());
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                walk(&entry.path(), false, now, unlocked);
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let lock = name.ends_with(".lock");
+            let garbage = lock || name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_") || (top && name.starts_with("stage-") && name.ends_with(".bundle"));
+            let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > GARBAGE_AGE));
+            if garbage && kind.is_file() && old() && std::fs::remove_file(entry.path()).is_ok() {
+                *unlocked |= lock;
             }
         }
     }
+    let mut unlocked = false;
+    walk(dir, true, now, &mut unlocked);
+    unlocked
 }
 
 fn unix_secs() -> u64 {
@@ -483,11 +495,12 @@ impl Publisher {
     }
 
     /// refresh(), and what a failed one needs, under the mirror's lock: the housekeeping
-    /// (prune), and once more if that dropped a stage ref to a missing object, which fails
-    /// every fetch into the mirror until it is gone. A mirror whose first fetch didn't
-    /// complete, failed or cut off, is removed.
+    /// (prune), and once more if that removed what fails every fetch into the mirror until
+    /// it is gone (a stage ref to a missing object, a lock file a killed git left). A mirror
+    /// with no refs yet (its first fetch didn't complete), failed or cut off, is removed.
     async fn update_mirror(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
-        let mut new = NewMirror((!has_pack(dir)).then_some(dir));
+        let fetched = git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await.is_ok_and(|refs| !refs.trim().is_empty());
+        let mut new = NewMirror((!fetched).then_some(dir));
         let mut updated = self.refresh(dir, owner, name, token).await;
         if updated.is_err() && self.prune(dir).await {
             updated = self.refresh(dir, owner, name, token).await;
@@ -705,13 +718,14 @@ impl Publisher {
 
     /// Housekeeping, never authorization: drop expired records (all repos'), this mirror's
     /// stage refs that are expired, have no record (a stage that failed, was cut off, or was
-    /// pushed) or name a missing object, and git's temporary files and stage bundles older
-    /// than GARBAGE_AGE. Runs under the mirror's lock, so no stage of this mirror is between
-    /// its ref and its record, and no fetch into it is running. Any failure here only leaves
-    /// garbage behind. Whether it dropped a ref to a missing object.
+    /// pushed) or name a missing object, and what dead git processes left (remove_garbage).
+    /// Runs under the mirror's lock, so no stage of this mirror is between its ref and its
+    /// record, and no git command is running in it. Any failure here only leaves garbage
+    /// behind. Whether it removed something that fails every fetch (a ref to a missing
+    /// object, a lock file).
     async fn prune(&self, dir: &Path) -> bool {
         let now = unix_secs();
-        remove_garbage(dir, SystemTime::now());
+        let mut repaired = remove_garbage(dir, SystemTime::now());
         if let Ok(entries) = std::fs::read_dir(self.records()) {
             for entry in entries.flatten() {
                 let file = entry.file_name();
@@ -722,7 +736,6 @@ impl Publisher {
                 }
             }
         }
-        let mut repaired = false;
         // for-each-ref lists a ref whose object is missing too, with the id it names.
         for line in git(dir, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/stage/"], None, GIT_LOCAL).await.unwrap_or_default().lines() {
             let Some((name, oid)) = line.split_once(' ') else { continue };
@@ -731,7 +744,9 @@ impl Publisher {
                 Some(t) => expired(t, now) || matches!(std::fs::metadata(self.record_path(id)), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
                 None => true,
             };
-            let missing = git(dir, &["cat-file", "-e", oid], None, GIT_LOCAL).await.is_err();
+            // Missing only when git ran and said so; a git that couldn't run or timed out
+            // says nothing about the ref.
+            let missing = git_says(dir, &["cat-file", "-e", oid]).await == Some(false);
             if (stale || missing) && git(dir, &["update-ref", "-d", name], None, GIT_LOCAL).await.is_ok() {
                 repaired |= missing;
             }
@@ -1381,7 +1396,7 @@ mod tests {
         // left behind.
         let s = scratch("dangling");
         sh(&s.vm, "echo d > d && git add d && git commit -qm d");
-        s.stage("scout/d").await.unwrap();
+        let live = s.stage("scout/d").await.unwrap();
         let dir = s.dir();
         // A live-looking stage (a record, a fresh id), whose ref names a missing object.
         let id = new_stage_id().unwrap();
@@ -1390,7 +1405,7 @@ mod tests {
         let err = s.publisher.refresh(&dir, "acme", "widgets", None).await.unwrap_err();
         assert!(err.contains("refs/stage/"), "the mirror is wedged: {err}");
         let pack = dir.join("objects/pack");
-        let garbage = [pack.join("tmp_pack_old"), pack.join("tmp_idx_old"), dir.join(format!("stage-{}.bundle", new_stage_id().unwrap()))];
+        let garbage = [pack.join("tmp_pack_old"), pack.join("tmp_idx_old"), dir.join(format!("stage-{}.bundle", new_stage_id().unwrap())), dir.join("packed-refs.lock")];
         for g in &garbage {
             std::fs::write(g, b"x").unwrap();
             age(g, GARBAGE_AGE.as_secs() + 60);
@@ -1400,11 +1415,15 @@ mod tests {
         age(&fresh, 60);
         // The next stage's refresh: it fails, the housekeeping drops the ref, and it is retried.
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
-        assert!(!dir.join(format!("refs/stage/{id}")).exists());
+        assert_eq!(s.stage_refs(), vec![format!("refs/stage/{}", live.stage)], "the live stage's ref is kept");
         for g in &garbage {
             assert!(!g.exists(), "{}", g.display());
         }
         assert!(fresh.exists(), "younger than GARBAGE_AGE: kept");
+        // The housekeeping after every job drops such a ref too, before any fetch trips on it.
+        std::fs::write(dir.join(format!("refs/stage/{id}")), format!("{}\n", "1".repeat(40))).unwrap();
+        s.publisher.prune(&dir).await;
+        assert_eq!(s.stage_refs(), vec![format!("refs/stage/{}", live.stage)]);
         // And the stage goes on.
         sh(&s.vm, "echo e > e && git add e && git commit -qm e");
         s.stage("scout/d").await.unwrap();
@@ -1431,13 +1450,33 @@ mod tests {
         let cut = tokio::time::timeout(Duration::from_millis(1500), hanging.update_mirror(&dir, "acme", "slow", None)).await;
         assert!(cut.is_err(), "the fetch was cut off: {cut:?}");
         assert!(!dir.exists());
-        assert!(!s.root.join("mirrors/acme").exists(), "nor its owner's directory, left empty");
         held.abort();
-        // A mirror that has been fetched once stays when a later fetch fails.
+        // A mirror that has been fetched once stays when a later fetch fails, packed or not
+        // (a fetch of under 100 objects leaves them loose).
         s.publisher.update_mirror(&s.dir(), "acme", "widgets", None).await.unwrap();
+        sh(&s.dir(), "for p in objects/pack/*.pack; do mv $p unpack.tmp && rm -f ${p%.pack}.* && git unpack-objects -q < unpack.tmp && rm unpack.tmp; done");
         std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
         s.publisher.update_mirror(&s.dir(), "acme", "widgets", None).await.unwrap_err();
-        assert!(has_pack(&s.dir()));
+        sh(&s.dir(), "git rev-parse --verify -q refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn a_lock_file_a_killed_git_left_is_cleared_and_the_refresh_retried() {
+        let s = scratch("lockfile");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        // GitHub's main moves on, and a killed git left the mirror's main locked.
+        let head = sh(&s.vm, "echo l > l && git add l && git commit -qm l && git push -q origin main && git rev-parse HEAD");
+        let lock = dir.join("refs/heads/main.lock");
+        std::fs::write(&lock, b"").unwrap();
+        // A young lock may be a git still running: left alone, and the refresh fails.
+        age(&lock, 60);
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap_err();
+        assert!(lock.exists());
+        age(&lock, GARBAGE_AGE.as_secs() + 60);
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        assert!(!lock.exists());
+        assert_eq!(sh(&dir, "git rev-parse refs/heads/main"), head);
     }
 
     #[test]
