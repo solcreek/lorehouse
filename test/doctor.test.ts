@@ -230,14 +230,24 @@ describe("code tools", () => {
     expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
   });
 
-  test("a SANDBOX_URL that isn't a URL fails the sandbox check instead of crashing", async () => {
-    const checks = await run({ SANDBOX_URL: "http://[bad", SANDBOX_TOKEN: "t".repeat(32), GITHUB_TOKEN: "ghp_1" });
-    expect(find(checks, "host").map((c) => c.level)).toEqual(["fail"]);
+  test("a SANDBOX_URL that isn't a URL, or is plain HTTP off this machine, fails the configuration instead of crashing", async () => {
+    for (const url of ["http://[bad", "http://sandbox.internal:8080"]) {
+      const checks = await run({ SANDBOX_URL: url, SANDBOX_TOKEN: "t".repeat(32), GITHUB_TOKEN: "ghp_1" });
+      expect(find(checks, "environment").find((c) => c.level === "fail")?.detail).toContain("SANDBOX_URL must be https://");
+      expect(find(checks, "host")).toEqual([]);
+    }
   });
 
   test("a plain GitHub token works, with a warning that it's for development", async () => {
     const checks = await run({ SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" });
     expect(find(checks, "token")[0]).toMatchObject({ level: "warn" });
+  });
+
+  test("code tools with GITHUB_TOKEN warn that the token reaches the sandbox; with an App they don't", async () => {
+    const checks = await run({ SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" });
+    expect(find(checks, "in the sandbox")[0]).toMatchObject({ level: "warn" });
+    expect(find(checks, "in the sandbox")[0]!.detail).toContain("workspace_clone puts it in the sandbox");
+    expect(find(await run(app), "in the sandbox")).toEqual([]);
   });
 
   test("asks GitHub where the app would (GITHUB_API_URL)", async () => {

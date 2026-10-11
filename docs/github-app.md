@@ -9,15 +9,19 @@ holds a long-lived token:
 - Cloning asks for `contents: read`. Pushing a branch and opening a pull request asks for
   `contents: write` and `pull_requests: write`, and only after someone approves the pull
   request in Slack.
-- The token reaches the sandbox only in the environment of the one git command that needs
-  it, through a credential helper. It is never in the command line or the remote URL.
-  That command runs with hooks off and every other credential helper dropped, and the
-  helper answers only for `https://github.com`, so nothing the checkout configures (a
-  hook, a helper, an `insteadOf` redirect) can capture it. A push goes to the repo's
-  github.com URL, never to whatever `origin` points at.
-- What that can't stop: code run earlier in the sandbox replacing `git` itself. The
-  sandbox is the model's, so a token handed into it is protected by its scope (one repo,
-  the least permission, an hour) and by the approval before any write token exists.
+- **A write token never enters the sandbox.** The sandbox host publishes instead (see
+  [Publishing](sandbox-runners.md#publishing)):
+  - Before approval, it stages the commits. It verifies them into its own mirror of the
+    repo, and computes the diff, patch and authors the approval card shows. None of that
+    comes from the sandbox's git, which the model controls.
+  - After approval, the host pushes exactly the staged commit with the write token.
+- The read token for cloning does enter the sandbox, for the clone or fetch command only.
+  - It travels through a credential helper, in that one command's environment; it is never
+    in the command line or the remote URL.
+  - The command runs with hooks off and every other credential helper dropped, and the
+    helper answers only for `https://github.com`.
+  - What that can't stop is code run earlier in the sandbox replacing `git` itself. The
+    exposure is read access to one repo for an hour: code the sandbox could read anyway.
 - Commits are by the App's bot too, `<app>[bot]` at its noreply address, so GitHub links
   each commit to the bot. Every command the agent runs has git's author and committer
   set to it (they outrank any git config), and a pull request whose commits are by
