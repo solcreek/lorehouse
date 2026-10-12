@@ -527,7 +527,9 @@ fn vm_config(cfg: &Config, slot_index: usize) -> serde_json::Value {
     serde_json::json!({
         "boot-source": {
             "kernel_image_path": "/vmlinux",
-            "boot_args": format!("console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw {}", slot.kernel_ip_arg()),
+            // ipv6.disable=1: the guest has no IPv6 at all, not even link-local. The host's
+            // rules drop it anyway (net.rs); this keeps the guest from trying.
+            "boot_args": format!("console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ipv6.disable=1 root=/dev/vda rw {}", slot.kernel_ip_arg()),
         },
         "drives": [drive],
         "machine-config": { "vcpu_count": cfg.vcpus, "mem_size_mib": cfg.mem_mib },
@@ -584,6 +586,9 @@ mod tests {
         assert_eq!(vm["drives"][0]["path_on_host"], "/rootfs.ext4");
         assert_eq!(vm["vsock"]["uds_path"], "/vsock.sock");
         assert_eq!(vm["network-interfaces"][0]["host_dev_name"], "lhtap1");
+        // No IPv6 in the guest: not even a link-local address to reach the host's tap with.
+        let boot_args = vm["boot-source"]["boot_args"].as_str().unwrap();
+        assert!(boot_args.split_whitespace().any(|a| a == "ipv6.disable=1"), "{boot_args}");
         // No host path leaks in: not the state directory, the golden or the kernel's.
         let text = vm.to_string();
         for host_path in ["/var/lib", "/usr/local"] {

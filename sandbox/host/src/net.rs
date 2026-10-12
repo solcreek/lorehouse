@@ -4,12 +4,19 @@
 //!   • no private destinations (LAN, tailnet, link-local, other sandboxes)
 //!   • no connections into the host (guestd is reached over vsock, never the network)
 //!   • nothing opens a connection into a sandbox; only replies to its own traffic get in
-//! One nftables table (`ip lorehouse_sbx`) holds the rules; accepts that Docker's
-//! FORWARD chain (policy drop) needs are tagged so they can be removed exactly.
+//!   • no IPv6 at all: guests have no IPv6 route, so whatever IPv6 a tap carries (a
+//!     link-local address, the host's sshd over fe80::) is dropped, both into the host and
+//!     through it; the guest kernel also boots with `ipv6.disable=1` (vm.rs)
+//! One nftables table (`inet lorehouse_sbx`, so every rule covers IPv4 and IPv6) holds
+//! the rules; accepts that Docker's FORWARD chain (policy drop) needs are tagged so they
+//! can be removed exactly.
 
 use tokio::process::Command;
 
 pub const TABLE: &str = "lorehouse_sbx";
+/// `inet`: one table for both IPv4 and IPv6. Builds up to 5811498 used an `ip` table,
+/// which IPv6 never passed through; teardown removes that one too.
+pub const FAMILY: &str = "inet";
 const TAG: &str = "lorehouse-sbx";
 const PRIVATE: &str = "{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 }";
 
@@ -81,7 +88,8 @@ pub async fn teardown_all() {
     for h in tagged_forward_handles().await {
         let _ = run(&["nft", "delete", "rule", "ip", "filter", "FORWARD", "handle", &h]).await;
     }
-    let _ = run(&["nft", "delete", "table", "ip", TABLE]).await;
+    let _ = run(&["nft", "delete", "table", FAMILY, TABLE]).await;
+    let _ = run(&["nft", "delete", "table", "ip", TABLE]).await; // from an older build
     for tap in existing_taps().await {
         let _ = run(&["ip", "link", "del", &tap]).await;
     }
@@ -163,23 +171,30 @@ async fn check_forwarding() -> Result<(), String> {
 /// some providers, the server locked).
 pub const MAIL_PORTS: &str = "{ 25, 465, 587 }";
 
-/// The table's rules, in order, as `nft` commands.
+/// The table's rules, in order, as `nft` commands. The table is `inet`, so a rule with no
+/// family match (`iifname "lhtap*" drop`) covers IPv4 and IPv6 alike.
 fn rules(uplink: &str) -> Vec<String> {
+    let t = format!("{FAMILY} {TABLE}");
     vec![
-        format!("add table ip {TABLE}"),
+        format!("add table {t}"),
         // Priority -1: before Docker's filter chains, so a drop here is final.
-        format!("add chain ip {TABLE} forward {{ type filter hook forward priority -1; }}"),
-        format!("add rule ip {TABLE} forward iifname \"lhtap*\" ip daddr {PRIVATE} drop"),
-        format!("add rule ip {TABLE} forward iifname \"lhtap*\" oifname != \"{uplink}\" drop"),
-        format!("add rule ip {TABLE} forward iifname \"lhtap*\" tcp dport {MAIL_PORTS} drop"),
+        format!("add chain {t} forward {{ type filter hook forward priority -1; }}"),
+        // Guests have no IPv6 route (and no IPv6 at all with ipv6.disable=1): nothing of it
+        // goes through the host, whatever the host's own IPv6 forwarding is.
+        format!("add rule {t} forward iifname \"lhtap*\" meta nfproto ipv6 drop"),
+        format!("add rule {t} forward iifname \"lhtap*\" ip daddr {PRIVATE} drop"),
+        format!("add rule {t} forward iifname \"lhtap*\" oifname != \"{uplink}\" drop"),
+        format!("add rule {t} forward iifname \"lhtap*\" tcp dport {MAIL_PORTS} drop"),
         // Into a sandbox: only replies to what it started. Nothing may open a connection to
         // a guest, whatever the host's own FORWARD policy is (Docker's drop is not assumed).
-        format!("add rule ip {TABLE} forward oifname \"lhtap*\" ct state established,related accept"),
-        format!("add rule ip {TABLE} forward oifname \"lhtap*\" drop"),
-        format!("add chain ip {TABLE} input {{ type filter hook input priority -1; }}"),
-        format!("add rule ip {TABLE} input iifname \"lhtap*\" drop"),
-        format!("add chain ip {TABLE} post {{ type nat hook postrouting priority srcnat; }}"),
-        format!("add rule ip {TABLE} post ip saddr 172.30.0.0/24 oifname \"{uplink}\" masquerade"),
+        format!("add rule {t} forward oifname \"lhtap*\" ct state established,related accept"),
+        format!("add rule {t} forward oifname \"lhtap*\" drop"),
+        // Into the host from a tap, IPv4 and IPv6: a tap has an IPv6 link-local address by
+        // default, and the host's IPv6 firewall (ufw on starship) allows sshd from anywhere.
+        format!("add chain {t} input {{ type filter hook input priority -1; }}"),
+        format!("add rule {t} input iifname \"lhtap*\" drop"),
+        format!("add chain {t} post {{ type nat hook postrouting priority srcnat; }}"),
+        format!("add rule {t} post ip saddr 172.30.0.0/24 oifname \"{uplink}\" masquerade"),
     ]
 }
 
@@ -222,15 +237,31 @@ mod tests {
     #[test]
     fn a_sandbox_reaches_the_internet_but_not_mail_ports() {
         let rules = super::rules("enp2s0");
-        let drop_mail = "add rule ip lorehouse_sbx forward iifname \"lhtap*\" tcp dport { 25, 465, 587 } drop";
+        let drop_mail = "add rule inet lorehouse_sbx forward iifname \"lhtap*\" tcp dport { 25, 465, 587 } drop";
         let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
         // Before anything in the chain could accept it.
-        assert!(at(drop_mail) < at("add rule ip lorehouse_sbx forward oifname \"lhtap*\" ct state established,related accept"));
+        assert!(at(drop_mail) < at("add rule inet lorehouse_sbx forward oifname \"lhtap*\" ct state established,related accept"));
         // The rules from before are all still there.
-        at("add rule ip lorehouse_sbx forward iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop");
-        at("add rule ip lorehouse_sbx forward iifname \"lhtap*\" oifname != \"enp2s0\" drop");
-        at("add rule ip lorehouse_sbx input iifname \"lhtap*\" drop");
-        at("add rule ip lorehouse_sbx post ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade");
+        at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop");
+        at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" oifname != \"enp2s0\" drop");
+        at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop");
+        at("add rule inet lorehouse_sbx post ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade");
+    }
+
+    #[test]
+    fn ipv6_from_a_sandbox_goes_nowhere() {
+        let rules = super::rules("enp2s0");
+        // One inet table: every rule sees IPv4 and IPv6. An `ip` table never sees IPv6, which
+        // left the host's sshd reachable over a tap's link-local address.
+        assert!(rules.iter().all(|r| r.contains(" inet lorehouse_sbx")), "{rules:#?}");
+        assert!(!rules.iter().any(|r| r.contains(" ip lorehouse_sbx")));
+        let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
+        // Through the host: dropped first, before any rule could accept it.
+        let v6 = at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" meta nfproto ipv6 drop");
+        assert_eq!(v6, 2, "the first rule of the forward chain");
+        // Into the host: the input drop names no family, so it covers both.
+        at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop");
+        assert!(at("add chain inet lorehouse_sbx input { type filter hook input priority -1; }") < at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop"));
     }
 
     #[test]

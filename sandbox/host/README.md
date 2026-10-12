@@ -16,7 +16,10 @@ thread). Rust. Work reaches it one of two ways:
 - **Stopping** always flushes the guest's disk cache first.
 - **Network**: a sandbox reaches the internet and nothing else. There is no route to
   private networks (LAN, tailnet, link-local, other sandboxes), no connection into the
-  host, and no mail out (TCP 25, 465, 587). The agent inside, guestd, is reached over vsock.
+  host, and no mail out (TCP 25, 465, 587). No IPv6 either: the guest kernel boots with
+  `ipv6.disable=1`, and the host's rules (one `inet` table, so IPv4 and IPv6 alike) drop
+  any IPv6 from a tap, into the host or through it. The agent inside, guestd, is reached
+  over vsock.
 
 ## Needs
 
@@ -164,8 +167,8 @@ What one sandbox can take from the host and send to the internet, each per VM:
   out bounds what a flood from a sandbox can send. Packets per second are not limited.
 - **Mail**: TCP 25, 465 and 587 out are dropped (the nftables table in
   [`net.rs`](src/net.rs)). Spam from a sandbox would get the host's address blocklisted.
-  IPv4 only, like the rest of the table: guests get no IPv6 address. Other ports (2525)
-  stay open.
+  The table is `inet`, so this holds for IPv6 too, though a guest has none. Other ports
+  (2525) stay open.
 - **Disk**: a sandbox's disk is a reflink of the golden, so it costs only what the guest
   writes, and that is capped at `SANDBOXD_DISK_QUOTA_GIB` (8 GiB). A write past it fails:
   the guest sees I/O errors on its disk, and ext4 may abort its journal and go read-only
