@@ -15,6 +15,7 @@
 //! Every /v1 request needs `Authorization: Bearer <SANDBOXD_TOKEN>`. Requests for a
 //! stopped sandbox boot it first; idle ones are stopped with their disk kept.
 
+mod child;
 mod config;
 mod jail;
 mod net;
@@ -190,13 +191,51 @@ async fn main() {
     // before their taps, and before any request can boot a disk one of them still holds.
     vm::stop_stale_vmms(&cfg.state_dir, &host).await;
     net::teardown_all().await;
-    if let Err(e) = net::setup(&cfg.uplink).await {
+    let fw = net::Firewall::new(&cfg.uplink, cfg.max_vms);
+    if let Err(e) = net::setup(&fw).await {
         eprintln!("sandboxd: network setup: {e}");
         net::teardown_all().await;
         std::process::exit(1);
     }
 
-    let vms = Manager::new(cfg.clone(), host, quota);
+    let vms = Manager::new(cfg.clone(), host, quota, fw.clone());
+    // The table, kept as loaded: checked every SANDBOXD_NET_CHECK_SECS (and before every
+    // boot, in vm.rs). One that is gone or changed is loaded again; one that can't be takes
+    // every tap down and stops every VM, and none boots until it is back (fail closed).
+    let watch = (fw.clone(), vms.clone());
+    let every = cfg.net_check;
+    tokio::spawn(async move {
+        let (fw, vms) = watch;
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = fw.alarm.notified() => {}
+            }
+            if fw.is_closed() {
+                break;
+            }
+            if fw.ensure().await.is_err() && !fw.is_closed() {
+                // Cut off at once (taps down), then stopped in a task of its own so the checks
+                // go on meanwhile: gracefully (the guest's sync, seconds each) where its tap is
+                // confirmed down, killed at once where it isn't. sandboxd keeps running, and
+                // refusing boots, so the runner can report the state.
+                let down = net::taps_down().await;
+                if !down.errors.is_empty() {
+                    eprintln!("sandboxd: ALERT: {}; their VMs are killed now, without a sync", down.errors.join("; "));
+                }
+                // On every failed check, not only the first: a tap that fails to go down later
+                // is still acted on (its kill needs no lock), and a VM a stop is already
+                // under way for is found stopped once that stop is done.
+                if vms.running_count().await > 0 {
+                    eprintln!("sandboxd: ALERT: the network rules are gone; stopping every running VM (killed where its tap isn't confirmed down)");
+                    let vms = vms.clone();
+                    tokio::spawn(async move { vms.fail_closed(&down).await });
+                }
+            }
+        }
+    });
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
     let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()).with_policy(cfg.mirrors.clone()));
 
@@ -272,6 +311,7 @@ async fn main() {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("sandboxd: listen {listen}: {e}");
+                    fw.close().await;
                     net::teardown_all().await;
                     std::process::exit(1);
                 }
@@ -290,6 +330,7 @@ async fn main() {
         }
     }
     eprintln!("sandboxd: stopping every VM (disks kept)");
+    fw.close().await;
     vms.stop_all().await;
     net::teardown_all().await;
 }

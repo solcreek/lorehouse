@@ -130,3 +130,12 @@ fn a_stop_reaches_sandboxd_before_the_vms() {
     assert_eq!(one("KillMode"), "mixed");
     assert_eq!(one("KillSignal"), "SIGTERM");
 }
+
+#[test]
+fn the_runner_token_can_come_as_a_credential() {
+    // Shipped commented out (a missing file would fail the start), naming the credential
+    // config.rs reads.
+    let line = format!("#LoadCredential={}:/etc/lorehouse/sandboxd-runner-token", crate::config::RUNNER_TOKEN_CREDENTIAL);
+    assert!(UNIT.lines().any(|l| l.trim() == line), "{line}");
+    assert!(UNIT.contains(&format!("LoadCredential={}:", crate::config::API_TOKEN_CREDENTIAL)));
+}

@@ -294,12 +294,10 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
 /// and stderr piped.
 fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
     use std::process::Stdio;
-    let mut cmd = Command::new("git");
+    // A clean environment (child::command), plus git's own settings.
+    let mut cmd = crate::child::command("git");
     cmd.arg("-C").arg(dir).args(args);
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
-        .env("HOME", dir)
-        .env("LC_ALL", "C")
+    cmd.env("HOME", dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")

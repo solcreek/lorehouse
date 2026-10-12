@@ -12,7 +12,7 @@
 
 use crate::config::DiskQuota;
 use std::path::Path;
-use tokio::process::Command;
+use crate::child::command;
 
 // Compared as u32: statfs's f_type is signed and 32 bits wide on some targets.
 const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
@@ -124,7 +124,7 @@ async fn probe(state_dir: &Path) -> Result<Fs, String> {
     }
     #[allow(clippy::unnecessary_cast)] // f_type's type differs by target
     Ok(match fs_kind(magic(buf.f_type as i64)) {
-        Some(true) => Fs::Btrfs(match Command::new("btrfs").args(["quota", "status"]).arg(state_dir).output().await {
+        Some(true) => Fs::Btrfs(match command("btrfs").args(["quota", "status"]).arg(state_dir).output().await {
             Ok(out) if out.status.success() => quota_mode(&String::from_utf8_lossy(&out.stdout)),
             _ => BtrfsQuotas::NoTool,
         }),
@@ -151,7 +151,7 @@ pub async fn detect(state_dir: &Path, setting: &DiskQuota) -> Result<Quota, Stri
 }
 
 async fn btrfs(args: &[&str]) -> Result<(), String> {
-    let out = Command::new("btrfs").args(args).output().await.map_err(|e| format!("btrfs: {e}"))?;
+    let out = command("btrfs").args(args).output().await.map_err(|e| format!("btrfs: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {

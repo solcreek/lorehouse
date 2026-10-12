@@ -16,7 +16,11 @@ thread). Rust. Work reaches it one of two ways:
 - **Stopping** always flushes the guest's disk cache first.
 - **Network**: a sandbox reaches the internet and nothing else. There is no route to
   private networks (LAN, tailnet, link-local, other sandboxes), no connection into the
-  host, and no mail out (TCP 25, 465, 587). The agent inside, guestd, is reached over vsock.
+  host, and no mail out (TCP 25, 465, 587, 2525). A packet from a sandbox must carry its own
+  address: one forging another sandbox's, or any other, is dropped. No IPv6 either: the guest kernel boots with
+  `ipv6.disable=1`, and the host's rules (one `inet` table, so IPv4 and IPv6 alike) drop
+  any IPv6 from a tap, into the host or through it. The agent inside, guestd, is reached
+  over vsock.
 
 ## Needs
 
@@ -45,10 +49,10 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 |---|---|---|
 | `SANDBOXD_APP_URL` | (none) | runner mode: Lorehouse's URL, e.g. `https://lorehouse.example.com`. Must be HTTPS: the runner token travels with every request |
 | `SANDBOXD_ALLOW_INSECURE_HTTP` | (off) | `1` allows an `http://` app URL, only for loopback or an already-encrypted private link (e.g. a WireGuard tailnet) in development |
-| `SANDBOXD_RUNNER_TOKEN` | (required with `SANDBOXD_APP_URL`) | Lorehouse's `SANDBOX_RUNNER_TOKEN` |
+| `SANDBOXD_RUNNER_TOKEN` | (required with `SANDBOXD_APP_URL`, unless the `runner-token` credential is set) | Lorehouse's `SANDBOX_RUNNER_TOKEN`. Deprecated here: pass it as a credential instead ([Tokens](#tokens)) |
 | `SANDBOXD_RUNNER_NAME` | the hostname | how Lorehouse knows this host (sandboxes stick to it) |
 | `SANDBOXD_TRANSPORT` | `auto` | `ws`, `poll`, or `auto`: WebSocket, falling back to long poll when an upgrade is refused |
-| `SANDBOXD_TOKEN` | (required without `SANDBOXD_APP_URL`) | serve mode: bearer token for every `/v1` request, 32+ characters |
+| `SANDBOXD_TOKEN` | (required without `SANDBOXD_APP_URL`, unless the `api-token` credential is set) | serve mode: bearer token for every `/v1` request, 32+ characters. Deprecated here, like the runner token |
 | `SANDBOXD_GOLDEN` | (required) | the prepared rootfs |
 | `SANDBOXD_KERNEL` | (required) | guest kernel image |
 | `SANDBOXD_UPLINK` | (required) | the host's internet-facing interface |
@@ -58,6 +62,7 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_DISK_MIBPS` `SANDBOXD_DISK_IOPS` | `200`, `5000` | per VM, its disk (0 = unlimited) |
 | `SANDBOXD_DISK_QUOTA_GIB` | `8` | what one sandbox may write to its disk. Unset: enforced where the state directory can (btrfs with quotas on), else a warning at start; set: enforced or sandboxd won't start; `0`: off. Either way, sandboxes made before quotas were on stay uncapped; `0` doesn't lift a limit already set |
 | `SANDBOXD_VM_MEM_HEADROOM_MIB` | `512` | a VM's cgroup memory limit is its RAM plus this (Firecracker itself, and the page cache its disk IO is charged with) |
+| `SANDBOXD_NET_CHECK_SECS` | `10` | how often the nftables table is checked against what sandboxd loaded (1–3600); see [Network rules](#network-rules) |
 | `SANDBOXD_LISTEN` | `127.0.0.1:8787` | serve mode: where the API listens; keep it on loopback |
 | `SANDBOXD_STATE` | `/var/lib/lorehouse-sandboxes` | one directory per sandbox |
 | `SANDBOXD_MAX_VMS` | `4` | running at once (1–64); more gets a 503 |
@@ -67,6 +72,34 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_MIRRORS_MAX_GIB` | `24` | the most all mirrors may use; idle ones (over 24 h) are dropped first. New mirrors are made one at a time (a second new repo's stage waits for the first's fetch); existing mirrors growing at once can pass it by what those stages fetch (about 10 KB for a typical stage); a refused stage's bundle is collected by the gc, its refresh stays with the mirror |
 | `SANDBOXD_MIRRORS_FREE_PCT` `SANDBOXD_MIRRORS_FREE_GIB` | `10`, `20` | stages are refused (507) while the state directory's filesystem has less free, whichever is larger. On a large shared disk 10% is a lot (93 GiB of 932): lower the percentage there |
 | `SANDBOXD_MIRROR_RETENTION_DAYS` | `14` | a mirror is dropped this long after its last stage or push |
+
+### Tokens
+
+The runner token (and serve mode's API token) are best passed as systemd credentials:
+a root-only file that systemd hands to sandboxd alone, in `$CREDENTIALS_DIRECTORY`, and
+that is never part of any process's environment. A variable in `sandboxd.env` ends up in
+sandboxd's environment, readable in `/proc/<pid>/environ` by root for as long as it runs
+(sandboxd starts every child with a clean environment, so they don't inherit it).
+
+| credential | file (suggested) | replaces |
+|---|---|---|
+| `runner-token` | `/etc/lorehouse/sandboxd-runner-token` | `SANDBOXD_RUNNER_TOKEN` |
+| `api-token` | `/etc/lorehouse/sandboxd-api-token` | `SANDBOXD_TOKEN` |
+
+sandboxd reads the credential first. The variable still works, with a deprecation
+warning at every start; with both set, the credential wins and the warning says the
+variable is ignored. To switch a host:
+
+```bash
+sudo install -m 0600 /dev/null /etc/lorehouse/sandboxd-runner-token
+# write the token into it (from where it is now, never through argv), then
+# uncomment LoadCredential=runner-token:/etc/lorehouse/sandboxd-runner-token in
+# the unit, remove SANDBOXD_RUNNER_TOKEN from sandboxd.env, and:
+sudo systemctl daemon-reload && sudo systemctl restart sandboxd
+```
+
+A token rotation then writes that file instead of `sandboxd.env`. The unit ships with
+the line commented out: `LoadCredential=` naming a missing file fails the start.
 
 Then install [`sandboxd.service`](sandboxd.service). It creates the default state
 directory itself (`StateDirectory=`); with another `SANDBOXD_STATE`, create it and add a
@@ -127,6 +160,7 @@ same disk in 0.94 s. With sandboxd SIGKILLed, systemd killed the VM and restarte
 | | |
 |---|---|
 | capabilities | `CAP_NET_ADMIN` (taps, nftables), and for the jailer `SYS_ADMIN`, `SYS_CHROOT`, `MKNOD`, `CHOWN`, `SETUID`, `SETGID`; `DAC_OVERRIDE` and `KILL` to reach into and stop a jailed VM; `NoNewPrivileges=yes`. `git`, which reads what a VM hands over, runs with none of them (dropped between fork and exec) |
+| environment | every process sandboxd starts begins from a clean environment, `PATH` and `LC_ALL=C` and nothing inherited ([`src/child.rs`](src/child.rs)), so none of them, the jailer and Firecracker above all, inherits `SANDBOXD_RUNNER_TOKEN` or `SANDBOXD_TOKEN`; a test fails a spawn that bypasses it. A caller adds only what its tool needs on top: `git` gets its own `HOME`, `GIT_*` settings and, when it talks to GitHub, that request's short-lived token ([`src/publish.rs`](src/publish.rs)) |
 | file system | read-only (`ProtectSystem=strict`) but the state directory; no `/home` or `/root`; private `/tmp` |
 | devices | `/dev/kvm` and `/dev/net/tun`, beyond the standard pseudo-devices (`DevicePolicy=closed`; `ProtectClock` adds read access to the RTC), plus making nodes of those, `/dev/userfaultfd` and `/dev/urandom` in a jail |
 | sockets | `AF_UNIX` (vsock, API), `AF_INET`/`AF_INET6` (Lorehouse, GitHub), `AF_NETLINK` (ip, nft) |
@@ -153,6 +187,40 @@ Firecracker had `CapEff` `CAP_NET_ADMIN` only, `NoNewPrivs` 1 and `Seccomp` 2. A
 guest wrote just before `systemctl stop` (not yet flushed) was there after the next boot;
 with `KillMode=control-group` it was lost.
 
+## Network rules
+
+One nftables table, `inet lorehouse_sbx` ([`net.rs`](src/net.rs)), so every rule covers
+IPv4 and IPv6:
+
+| chain | |
+|---|---|
+| `spoof` | from tap *n*, only slot *n*'s guest address gets through; anything else is counted and dropped |
+| `forward` (priority -1, before Docker's) | from a tap: IPv6 dropped (guests have none), then the source check, private destinations (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16), anything but the uplink, and mail ports (TCP 25, 465, 587, 2525) dropped; to a tap: only replies (`ct state established,related`) |
+| `input` (priority -1) | nothing from a tap reaches the host, IPv4 or IPv6 (spoofed sources counted first) |
+| `post` | masquerade of 172.30.0.0/24 out of the uplink |
+
+The table is loaded as one `nft -f`
+transaction: the old one (or an older build's `ip lorehouse_sbx`) is deleted and the new
+one added together, or nothing changes.
+
+The guest kernel boots with `ipv6.disable=1`, and the host's side of each tap gets no
+IPv6 address either (`addrgenmode none`).
+
+The host is shared, so the table is checked against what sandboxd loaded every
+`SANDBOXD_NET_CHECK_SECS` (10 s) and before every boot: an `nft flush ruleset`, a deleted
+table or a rule added to it is noticed, logged (`ALERT: nftables table inet lorehouse_sbx
+is gone …; loading it again`) and the table loaded again, along with sandboxd's accepts in
+Docker's FORWARD chain if those went too. If it can't be loaded, sandboxd fails closed:
+every tap goes down at once, every running VM is stopped, and none boots until a later
+check loads it. A VM whose tap is confirmed down is stopped gracefully (its guest syncs
+first); one whose tap can't be confirmed down is killed at once through its pidfd, without
+a sync, and logged: isolation comes before its disk only there. sandboxd keeps running,
+refusing boots, so the runner reports the state. Between a flush and the next check (up to `SANDBOXD_NET_CHECK_SECS`)
+running guests are unfiltered; a smaller value narrows that, at one `nft list` per check.
+Every `nft` and `ip` run is cut off after 10 s, so a hung one can't stall the checks. An
+nft upgrade that lists the same rules differently shows up as one ALERT and one reload,
+not as a loop.
+
 ## Limits
 
 What one sandbox can take from the host and send to the internet, each per VM:
@@ -162,10 +230,10 @@ What one sandbox can take from the host and send to the internet, each per VM:
   a one-time burst of five seconds' worth for the boot and the start of a clone. 50 MiB/s
   in is above what GitHub gave starship (4.5–22 MB/s), so a clone is no slower; 10 MiB/s
   out bounds what a flood from a sandbox can send. Packets per second are not limited.
-- **Mail**: TCP 25, 465 and 587 out are dropped (the nftables table in
-  [`net.rs`](src/net.rs)). Spam from a sandbox would get the host's address blocklisted.
-  IPv4 only, like the rest of the table: guests get no IPv6 address. Other ports (2525)
-  stay open.
+- **Mail**: TCP 25, 465, 587 and 2525 (the alternative submission port mail services
+  offer) out are dropped (the nftables table in [`net.rs`](src/net.rs)). Spam from a
+  sandbox would get the host's address blocklisted. The table is `inet`, so this holds for
+  IPv6 too, though a guest has none.
 - **Disk**: a sandbox's disk is a reflink of the golden, so it costs only what the guest
   writes, and that is capped at `SANDBOXD_DISK_QUOTA_GIB` (8 GiB). A write past it fails:
   the guest sees I/O errors on its disk, and ext4 may abort its journal and go read-only

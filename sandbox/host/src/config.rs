@@ -43,6 +43,8 @@ pub struct Config {
     pub jail: JailConfig,
     /// Each VM's network and disk rates and its disk quota.
     pub limits: Limits,
+    /// How often the nftables table is checked against what sandboxd loaded (net.rs).
+    pub net_check: Duration,
 }
 
 /// Per VM. A rate of 0 means unlimited.
@@ -93,12 +95,60 @@ pub struct JailConfig {
 /// ids some tools read as signed: 1_900_000_000 + 63 is still under 2^31.
 pub const DEFAULT_JAIL_UID_BASE: u64 = 1_900_000_000;
 
+/// Seconds between checks of the nftables table: how long a flushed table can leave
+/// running guests unfiltered. A check is one `nft list table`.
+pub const DEFAULT_NET_CHECK_SECS: u64 = 10;
+
 /// Where sandboxes live unless SANDBOXD_STATE says otherwise; sandboxd.service's
 /// StateDirectory= creates this directory and makes it writable.
 pub const DEFAULT_STATE: &str = "/var/lib/lorehouse-sandboxes";
 
 fn var(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// The systemd credentials (`LoadCredential=<name>:<file>`) sandboxd reads its tokens
+/// from, in `$CREDENTIALS_DIRECTORY`. Preferred over the environment variables: a
+/// credential is a file only the service can read, never part of any process's environment.
+pub const RUNNER_TOKEN_CREDENTIAL: &str = "runner-token";
+pub const API_TOKEN_CREDENTIAL: &str = "api-token";
+
+/// A credential's contents (trailing newline trimmed), if systemd passed it. Unset or
+/// absent: None; there but unreadable or empty: an error.
+fn credential(name: &str) -> Result<Option<String>, String> {
+    let Some(dir) = env::var_os("CREDENTIALS_DIRECTORY").filter(|d| !d.is_empty()) else { return Ok(None) };
+    let path = PathBuf::from(dir).join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(v) => {
+            let v = v.trim_end_matches(['\n', '\r']).to_string();
+            if v.is_empty() {
+                Err(format!("credential {name} ({}) is empty", path.display()))
+            } else if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                // A token never has them; one that does would only fail later, at the app.
+                Err(format!("credential {name} ({}) holds whitespace or control characters: one line, the token alone", path.display()))
+            } else {
+                Ok(Some(v))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("credential {name} ({}): {e}", path.display())),
+    }
+}
+
+/// A token, from its credential first, else its environment variable (deprecated), and
+/// the warning to log about where it came from.
+fn token(credential: Option<String>, env: Option<String>, name: &str, key: &str) -> (Option<String>, Option<String>) {
+    match (credential, env) {
+        (Some(c), Some(_)) => (Some(c), Some(format!("{key} is set too, and ignored: the {name} credential is used. Remove {key} from the environment file"))),
+        (Some(c), None) => (Some(c), None),
+        (None, Some(e)) => (
+            Some(e),
+            Some(format!(
+                "{key} from the environment is deprecated: anything that reads sandboxd's environment (/proc/<pid>/environ, a child that inherits it) gets it. Put it in a file (root, 0600) and pass it as a systemd credential, LoadCredential={name}:<file> (README.md, \"Tokens\")"
+            )),
+        ),
+        (None, None) => (None, None),
+    }
 }
 
 impl Config {
@@ -114,10 +164,22 @@ impl Config {
         let kernel = need("SANDBOXD_KERNEL");
         let uplink = need("SANDBOXD_UPLINK");
 
+        // A token from its credential, else its variable; a warning for the log about which.
+        let mut secret = |name: &str, key: &str| -> String {
+            let cred = credential(name).unwrap_or_else(|e| {
+                problems.push(e);
+                None
+            });
+            let (value, warning) = token(cred, var(key), name, key);
+            if let Some(w) = warning {
+                eprintln!("sandboxd: WARNING: {w}");
+            }
+            value.unwrap_or_default()
+        };
         let mode = if let Some(app_url) = var("SANDBOXD_APP_URL") {
-            let token = var("SANDBOXD_RUNNER_TOKEN").unwrap_or_default();
+            let token = secret(RUNNER_TOKEN_CREDENTIAL, "SANDBOXD_RUNNER_TOKEN");
             if token.len() < 32 {
-                problems.push("SANDBOXD_RUNNER_TOKEN is required with SANDBOXD_APP_URL (32+ characters, the app's SANDBOX_RUNNER_TOKEN)".into());
+                problems.push(format!("the runner token is required with SANDBOXD_APP_URL (32+ characters, the app's SANDBOX_RUNNER_TOKEN): the {RUNNER_TOKEN_CREDENTIAL} credential, or SANDBOXD_RUNNER_TOKEN"));
             }
             // The runner token travels with every request, and whoever holds it can take
             // this host's jobs, so plain HTTP is refused unless explicitly allowed (a
@@ -143,9 +205,9 @@ impl Config {
             };
             Mode::Runner { app_url: app_url.trim_end_matches('/').to_string(), token, name, transport }
         } else {
-            let token = var("SANDBOXD_TOKEN").unwrap_or_default();
+            let token = secret(API_TOKEN_CREDENTIAL, "SANDBOXD_TOKEN");
             if token.len() < 32 {
-                problems.push("SANDBOXD_TOKEN is required to serve the API (32+ characters); or set SANDBOXD_APP_URL to connect out".into());
+                problems.push(format!("a token is required to serve the API (32+ characters): the {API_TOKEN_CREDENTIAL} credential, or SANDBOXD_TOKEN; or set SANDBOXD_APP_URL to connect out"));
             }
             Mode::Serve { listen: var("SANDBOXD_LISTEN").unwrap_or_else(|| "127.0.0.1:8787".into()), token }
         };
@@ -169,6 +231,7 @@ impl Config {
         let retention_days = num("SANDBOXD_MIRROR_RETENTION_DAYS", d.retention.as_secs() / 86_400);
         let uid_base = num("SANDBOXD_JAIL_UID_BASE", DEFAULT_JAIL_UID_BASE);
         let headroom = num("SANDBOXD_VM_MEM_HEADROOM_MIB", 512);
+        let net_check = num("SANDBOXD_NET_CHECK_SECS", DEFAULT_NET_CHECK_SECS);
         let dl = Limits::default();
         let rates = [
             ("SANDBOXD_NET_RX_MIBPS", num("SANDBOXD_NET_RX_MIBPS", dl.net_rx_mibps)),
@@ -215,6 +278,9 @@ impl Config {
                 problems.push(format!("{key} must be 0 (unlimited)..=100000"));
             }
         }
+        if !(1..=3600).contains(&net_check) {
+            problems.push("SANDBOXD_NET_CHECK_SECS must be 1..=3600".into());
+        }
         if quota_gib.is_some_and(|g| g > 65_536) {
             problems.push("SANDBOXD_DISK_QUOTA_GIB must be 0 (off)..=65536".into());
         }
@@ -252,6 +318,7 @@ impl Config {
             mirrors,
             jail,
             limits,
+            net_check: Duration::from_secs(net_check),
         })
     }
 }
@@ -259,6 +326,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn a_credential_comes_before_its_variable() {
+        let t = |c: Option<&str>, e: Option<&str>| super::token(c.map(String::from), e.map(String::from), "runner-token", "SANDBOXD_RUNNER_TOKEN");
+        let (v, w) = t(Some("cred"), None);
+        assert_eq!((v.as_deref(), w), (Some("cred"), None));
+        // Both: the credential, and a warning that the variable is ignored.
+        let (v, w) = t(Some("cred"), Some("env"));
+        assert_eq!(v.as_deref(), Some("cred"));
+        assert!(w.unwrap().contains("ignored"));
+        // The variable alone still works, loudly.
+        let (v, w) = t(None, Some("env"));
+        assert_eq!(v.as_deref(), Some("env"));
+        assert!(w.unwrap().contains("deprecated"));
+        assert_eq!(t(None, None), (None, None));
+    }
 
     // Env is process-wide, so one test sets and checks every case in order.
     #[test]
@@ -281,6 +364,34 @@ mod tests {
         std::env::set_var("SANDBOXD_RUNNER_NAME", "r1");
         std::env::set_var("SANDBOXD_APP_URL", "https://lorehouse.example.com/");
         assert!(matches!(Config::from_env().expect("https is fine").mode, super::Mode::Runner { .. }));
+        // The token from a systemd credential, ahead of the variable.
+        let creds = std::env::temp_dir().join(format!("sandboxd-creds-{}", std::process::id()));
+        std::fs::create_dir_all(&creds).unwrap();
+        let from_file = "c".repeat(40);
+        std::fs::write(creds.join("runner-token"), format!("{from_file}\n")).unwrap();
+        std::env::set_var("CREDENTIALS_DIRECTORY", &creds);
+        match Config::from_env().expect("a credential is fine").mode {
+            super::Mode::Runner { token, .. } => assert_eq!(token, from_file, "the credential wins, newline trimmed"),
+            other => panic!("{other:?}"),
+        }
+        std::env::remove_var("SANDBOXD_RUNNER_TOKEN");
+        assert!(Config::from_env().is_ok(), "the credential alone is enough");
+        std::fs::write(creds.join("runner-token"), "\n").unwrap();
+        assert!(Config::from_env().unwrap_err().contains("is empty"));
+        for bad in [format!("{from_file} \n"), format!("{from_file}\nsecond line\n"), format!("{from_file}\t")] {
+            std::fs::write(creds.join("runner-token"), bad).unwrap();
+            assert!(Config::from_env().unwrap_err().contains("whitespace or control"));
+        }
+        std::fs::remove_file(creds.join("runner-token")).unwrap();
+        assert!(Config::from_env().unwrap_err().contains("runner token is required"), "neither");
+        std::env::set_var("SANDBOXD_RUNNER_TOKEN", &token);
+        match Config::from_env().expect("the variable still works").mode {
+            super::Mode::Runner { token: t, .. } => assert_eq!(t, token),
+            other => panic!("{other:?}"),
+        }
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
+        std::fs::remove_dir_all(&creds).unwrap();
+
         std::env::set_var("SANDBOXD_APP_URL", "http://10.0.0.5:3000");
         assert!(Config::from_env().unwrap_err().contains("must be https://"));
         std::env::set_var("SANDBOXD_ALLOW_INSECURE_HTTP", "1");
@@ -329,6 +440,16 @@ mod tests {
         std::env::set_var("SANDBOXD_JAILER", "off");
         assert_eq!(Config::from_env().unwrap().jail.jailer.to_str(), Some("off"));
         std::env::remove_var("SANDBOXD_JAILER");
+
+        // The table check: every 10 s by default.
+        assert_eq!(Config::from_env().unwrap().net_check, std::time::Duration::from_secs(10));
+        std::env::set_var("SANDBOXD_NET_CHECK_SECS", "60");
+        assert_eq!(Config::from_env().unwrap().net_check, std::time::Duration::from_secs(60));
+        for v in ["0", "3601", "x"] {
+            std::env::set_var("SANDBOXD_NET_CHECK_SECS", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_NET_CHECK_SECS"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_NET_CHECK_SECS");
 
         // Rates and the disk quota: on by default, 0 turns each off, a set quota is explicit.
         use super::{DiskQuota, Limits};
