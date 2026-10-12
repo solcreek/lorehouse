@@ -328,6 +328,13 @@ fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
     // In a process group of its own, so a command that is cut off is stopped with all of
     // its helpers (Running).
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
+    // git reads bundles and objects a VM produced: it runs with none of sandboxd's
+    // capabilities (jail::drop_capabilities).
+    #[cfg(target_os = "linux")]
+    // SAFETY: drop_capabilities only makes async-signal-safe syscalls.
+    unsafe {
+        cmd.pre_exec(crate::jail::drop_capabilities);
+    }
     cmd
 }
 
@@ -994,6 +1001,22 @@ mod tests {
     use super::*;
 
     const SANDBOX: &str = "slack_C1_1790000001.000100";
+
+    /// git and whatever it starts (here, a shell alias) run with no capabilities and
+    /// no_new_privs, so an exec can't hand root's capabilities back.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn git_runs_without_capabilities() {
+        let dir = std::env::temp_dir();
+        let out = git_command(&dir, &["-c", "alias.status-of-proc=!cat /proc/self/status", "status-of-proc"], None).output().await.unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let status = String::from_utf8_lossy(&out.stdout);
+        let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim).unwrap_or_else(|| panic!("no {name} in {status}")).to_string();
+        assert_eq!(field("NoNewPrivs:"), "1");
+        for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+            assert_eq!(field(cap), "0000000000000000", "{cap}");
+        }
+    }
 
     /// A scratch area: a bare "GitHub" remote with main, a clone standing in for the VM's
     /// checkout, and a Publisher whose remote base is the scratch directory.

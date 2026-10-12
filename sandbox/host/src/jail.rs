@@ -328,6 +328,44 @@ pub async fn prepare(cfg: &Config) -> Result<Host, String> {
     Ok(Host { jailer, firecracker, exec_name, cgroup_parent, uid_base: cfg.jail.uid_base, mem_headroom_mib: cfg.jail.mem_headroom_mib })
 }
 
+/// For a child that needs none of sandboxd's privileges (git, which reads what a VM hands
+/// over), between fork and exec (`Command::pre_exec`): no capabilities, and none regained
+/// at exec. sandboxd is root with the jailer's capabilities (CAP_SYS_ADMIN,
+/// CAP_DAC_OVERRIDE, CAP_SETUID, …), and a child inherits them; a bug such a child hits
+/// on a VM's data would hold them all. Root's execve fills the permitted set from the
+/// bounding set again, unless no_new_privs is set (the unit sets it; this sets it too, for
+/// a run outside the unit), which caps it at the permitted set before the exec: empty.
+/// prctl and capset are async-signal-safe, as pre_exec requires.
+#[cfg(target_os = "linux")]
+pub fn drop_capabilities() -> std::io::Result<()> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let mut header = Header { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let data = [Data { effective: 0, permitted: 0, inheritable: 0 }; 2];
+    // SAFETY: plain syscalls on this process; header and data are the layout capset(2)
+    // takes for version 3 (two Data, for capabilities 0–31 and 32–63).
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::syscall(libc::SYS_capset, &mut header as *mut Header, data.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;

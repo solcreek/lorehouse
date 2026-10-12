@@ -67,9 +67,12 @@ asked for the host to be hardened on 2026-10-12.
   every capability to an unprivileged uid with none.
 - The unit confines sandboxd less than it did without the jailer. With `CAP_SYS_ADMIN`,
   `@mount` and mount namespaces, sandboxd or any child that keeps its capabilities
-  (`ip`, `nft`, `git`) could make a namespace of its own and remount `/` writable, and
+  (`ip`, `nft`) could make a namespace of its own and remount `/` writable, and
   without `ProtectControlGroups` it can write anywhere in the cgroup tree. That matters
   only once sandboxd itself is compromised; the boundary this ADR adds is between a VM
-  and sandboxd. Follow-ups: drop all capabilities for `git` and the other children, and
-  `ProtectControlGroups=private` (systemd 257+) once the jail's cgroup paths are checked
-  under a cgroup namespace.
+  and sandboxd. `git` is the one child that reads what a VM produced (the bundle a
+  publish verifies), so it runs with no capabilities and `no_new_privs`: a git bug
+  reached through a bundle gets root's file ownership in the state directory, not the
+  jailer's privileges. Follow-ups: the same for the other children where they need no
+  capability, and `ProtectControlGroups=private` (systemd 257+) once the jail's cgroup
+  paths are checked under a cgroup namespace.
