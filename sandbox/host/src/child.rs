@@ -47,30 +47,33 @@ mod tests {
         assert!(!names.iter().any(|n| n.starts_with("SANDBOXD_")), "{names:?}");
     }
 
+    /// Every .rs file under src/, read when the test runs: a module added later is checked too.
+    fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push((path.display().to_string(), std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
     #[test]
     fn every_process_sandboxd_starts_goes_through_command() {
-        // Outside tests, no source but this one calls Command::new: a new spawn that forgot
-        // env_clear would inherit the tokens.
-        let sources = [
-            ("config.rs", include_str!("config.rs")),
-            ("jail.rs", include_str!("jail.rs")),
-            ("main.rs", include_str!("main.rs")),
-            ("net.rs", include_str!("net.rs")),
-            ("pidfd.rs", include_str!("pidfd.rs")),
-            ("publish.rs", include_str!("publish.rs")),
-            ("publish/upkeep.rs", include_str!("publish/upkeep.rs")),
-            ("quota.rs", include_str!("quota.rs")),
-            ("runner.rs", include_str!("runner.rs")),
-            ("vm.rs", include_str!("vm.rs")),
-            ("vsock.rs", include_str!("vsock.rs")),
-        ];
+        // Outside tests, no source but this one starts a process itself: a new spawn that
+        // forgot env_clear would inherit the tokens.
+        let mut files = Vec::new();
+        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() >= 10, "{}", files.len());
         let test_mod = ["mod tests", " {"].concat();
-        let spawn = ["Command::", "new("].concat();
-        for (name, src) in sources {
-            let end = src.find(&test_mod).unwrap_or(src.len());
-            assert!(!src[..end].contains(&spawn), "{name} starts a process without child::command");
+        let spawns = [["Command::", "new("].concat(), ["libc::", "exec"].concat(), ["libc::", "fork"].concat(), ["posix_", "spawn"].concat()];
+        for (name, src) in files.iter().filter(|(n, _)| !n.ends_with("/child.rs")) {
+            let code = &src[..src.find(&test_mod).unwrap_or(src.len())];
+            for spawn in &spawns {
+                assert!(!code.contains(spawn.as_str()), "{name} starts a process ({spawn}) without child::command");
+            }
         }
-        let main = include_str!("main.rs");
-        assert!(main.contains("mod child;"));
+        assert!(include_str!("main.rs").contains("mod child;"));
     }
 }
