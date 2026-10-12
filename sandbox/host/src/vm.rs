@@ -76,7 +76,7 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
             }
         }
     }
-    // Their cgroups, once empty. The jails themselves are rebuilt at each sandbox's next boot.
+    // Their cgroups, once empty.
     let parent = Path::new("/sys/fs/cgroup").join(&host.cgroup_parent);
     if let Ok(mut dirs) = tokio::fs::read_dir(&parent).await {
         while let Ok(Some(entry)) = dirs.next_entry().await {
@@ -84,6 +84,18 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
                 let _ = tokio::fs::remove_dir(entry.path()).await;
             }
         }
+    }
+    // And their jails: the disks root's again now, not at each sandbox's next boot, which
+    // may never come.
+    let state = state_dir.to_path_buf();
+    let released = tokio::task::spawn_blocking(move || {
+        let Ok(dirs) = std::fs::read_dir(&state) else { return 0 };
+        dirs.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && jail::release_leftover(&e.path())).count()
+    })
+    .await
+    .unwrap_or(0);
+    if released > 0 {
+        eprintln!("sandboxd: removed {released} jail(s) a previous run left");
     }
 }
 

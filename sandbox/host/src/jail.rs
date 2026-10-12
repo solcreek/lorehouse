@@ -167,6 +167,27 @@ impl<'a> Jail<'a> {
     }
 }
 
+/// A jail a previous run left (sandboxd was killed with VMs running, so `release` never
+/// ran): removed, and the disk root's again, 0600. Until then the disk would stay owned by
+/// that slot's uid, which the next VM in the slot, another sandbox's, runs as. Run at
+/// start, once no VMM of that run is left. Whether there was one.
+pub fn release_leftover(sandbox_dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let base = sandbox_dir.join(JAIL_DIR);
+    if std::fs::symlink_metadata(&base).is_err() {
+        return false;
+    }
+    if let Err(e) = remove_tree(&base) {
+        eprintln!("sandboxd: leftover jail {}: {e}", base.display());
+    }
+    let rootfs = sandbox_dir.join("rootfs.ext4");
+    if std::fs::symlink_metadata(&rootfs).is_ok_and(|m| m.is_file()) {
+        let _ = chown(&rootfs, 0, 0);
+        let _ = std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o600));
+    }
+    true
+}
+
 pub fn jail_id(slot: usize) -> String {
     format!("lorehouse-{slot}")
 }
@@ -369,6 +390,29 @@ pub fn drop_capabilities() -> std::io::Result<()> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn a_leftover_jail_is_removed_and_its_disk_closed_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sandboxd-leftover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join(JAIL_DIR).join("firecracker/lorehouse-0/root");
+        std::fs::create_dir_all(&root).unwrap();
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, b"disk").unwrap();
+        std::fs::hard_link(&rootfs, root.join("rootfs.ext4")).unwrap();
+        // As if the VM's uid had opened it up while it ran.
+        std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(release_leftover(&dir));
+        assert!(!dir.join(JAIL_DIR).exists());
+        let meta = std::fs::metadata(&rootfs).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::os::unix::fs::MetadataExt::nlink(&meta), 1);
+        // Nothing left: nothing to do, and the disk stays.
+        assert!(!release_leftover(&dir));
+        assert!(rootfs.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     pub fn host() -> Host {
         Host {

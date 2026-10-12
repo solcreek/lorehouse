@@ -46,8 +46,8 @@ asked for the host to be hardened on 2026-10-12.
   the host: only a separate machine contains that. The sandbox host should run nothing
   else of value.
 - Per slot rather than per VM uid: the range is small and fixed (`SANDBOXD_MAX_VMS`
-  ids), and a stopped sandbox's disk goes back to root (after a crash, at that
-  sandbox's next boot), and every VM is in its own chroot anyway. The cost: a uid is
+  ids), and a stopped sandbox's disk goes back to root (after a crash, when sandboxd
+  starts again), and every VM is in its own chroot anyway. The cost: a uid is
   reused across sandboxes over time, never at the same time.
 - No network namespace: it would mean a veth pair and a second address plan per VM to
   keep today's "internet, nothing private" rules. What it would add over seccomp's
