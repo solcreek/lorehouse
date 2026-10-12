@@ -21,8 +21,8 @@ thread). Rust. Work reaches it one of two ways:
 ## Needs
 
 A Linux host with KVM, Firecracker on `PATH`, a guest kernel, and a btrfs or XFS
-filesystem for the state and golden files. It runs as root: it creates taps and nftables
-rules.
+filesystem for the state and golden files. It runs as root with only `CAP_NET_ADMIN`: it
+creates taps and nftables rules. systemd confines it (see [Hardening](#hardening)).
 
 ## Set up
 
@@ -30,6 +30,11 @@ rules.
 cargo build --release                                      # → target/release/sandboxd
 (cd ../guest && CGO_ENABLED=0 go build -o guestd .)        # the in-VM agent
 sudo SOURCE=<ubuntu-rootfs.ext4> GUESTD=../guest/guestd ./prepare-golden.sh /var/lib/lorehouse-golden.ext4
+# Settings sandboxd can't make itself under its unit (read-only kernel tunables, no
+# module loading): IPv4 forwarding, and the modules its taps and rules use.
+sudo install -m 0644 sandboxd.sysctl.conf /etc/sysctl.d/90-lorehouse-sandboxd.conf
+sudo install -m 0644 sandboxd.modules.conf /etc/modules-load.d/lorehouse-sandboxd.conf
+sudo sysctl --system && sudo systemctl restart systemd-modules-load
 ```
 
 `/etc/lorehouse/sandboxd.env` (mode 0600):
@@ -55,7 +60,18 @@ sudo SOURCE=<ubuntu-rootfs.ext4> GUESTD=../guest/guestd ./prepare-golden.sh /var
 | `SANDBOXD_MIRRORS_FREE_PCT` `SANDBOXD_MIRRORS_FREE_GIB` | `10`, `20` | stages are refused (507) while the state directory's filesystem has less free, whichever is larger. On a large shared disk 10% is a lot (93 GiB of 932): lower the percentage there |
 | `SANDBOXD_MIRROR_RETENTION_DAYS` | `14` | a mirror is dropped this long after its last stage or push |
 
-Then install [`sandboxd.service`](sandboxd.service). On Lorehouse's side, set
+Then install [`sandboxd.service`](sandboxd.service). It creates the default state
+directory itself (`StateDirectory=`); with another `SANDBOXD_STATE`, create it and add a
+`ReadWritePaths=` for it: sandboxd refuses to start when it can't write there. Keep the
+golden, the kernel and the state out of `/home` and `/root` (`ProtectHome=yes`).
+
+**Upgrading a host** from a sandboxd that predates the unit's hardening: install
+`sandboxd.sysctl.conf` and `sandboxd.modules.conf` as above *before the next reboot*.
+The old sandboxd turned forwarding on at every start, so it is on now and the new one
+starts fine (with a warning that nothing sets it at boot); after a reboot it would be
+off, and sandboxd refuses to start without it.
+
+On Lorehouse's side, set
 `SANDBOX_RUNNER_TOKEN` for runners, or `SANDBOX_URL` and `SANDBOX_TOKEN` for a served
 host, plus `GITHUB_TOKEN` for pull requests either way.
 
@@ -68,6 +84,33 @@ a command only a microVM with internet can answer. Two options test the hard pat
 - `E2E_DROP=1` routes the runner through a TCP relay that cuts every connection for 5 s
   in the middle of a 12 s job. The runner must reconnect and deliver the result it
   finished while cut off, and the job must run only once.
+
+## Hardening
+
+The code in a sandbox is model-written, and KVM guest-to-host escapes exist (one was
+confirmed through Vercel's sandbox bounty on 2026-10-03, still unpatched a week later:
+[The Register](https://www.theregister.com/offbeat/2026/10/06/security-researcher-claims-they-found-kvm-guest-host-escape-flaw/5301267)). So the host is set up assuming a guest may
+get out of its VM, and what it lands in should hold as little as possible.
+
+[`sandboxd.service`](sandboxd.service) confines sandboxd and every process it starts
+(Firecracker, `ip`, `nft`, `git`):
+
+| | |
+|---|---|
+| capabilities | only `CAP_NET_ADMIN` (taps, nftables), which Firecracker, running as root, keeps too; `NoNewPrivileges=yes` |
+| file system | read-only (`ProtectSystem=strict`) but the state directory; no `/home` or `/root`; private `/tmp` |
+| devices | `/dev/kvm` and `/dev/net/tun`, beyond the standard pseudo-devices (`DevicePolicy=closed`; `ProtectClock` adds read access to the RTC) |
+| sockets | `AF_UNIX` (vsock, API), `AF_INET`/`AF_INET6` (Lorehouse, GitHub), `AF_NETLINK` (ip, nft) |
+| kernel | tunables, modules, logs, clock, hostname and cgroups read-only or out of reach; `@system-service` system calls only, without `@privileged` and `@resources`; no W+X memory, no namespaces, no realtime, no set-uid files |
+Because of that, the host sets up two things sandboxd used to do itself:
+`net.ipv4.ip_forward=1` ([`sandboxd.sysctl.conf`](sandboxd.sysctl.conf); sandboxd checks
+it at start and refuses to run without it) and the modules for taps and nftables
+([`sandboxd.modules.conf`](sandboxd.modules.conf)).
+
+`systemd-analyze security --offline=yes sandboxd.service`: **9.4 UNSAFE before, 2.2 OK
+after** (systemd 261, 2026-10-12). What still counts against it is what the job needs:
+root, the host's network, `/dev/kvm`, internet and netlink sockets. Cargo tests parse the
+unit (`src/service_unit.rs`), so dropping one of the directives they check fails CI.
 
 ## Measured
 

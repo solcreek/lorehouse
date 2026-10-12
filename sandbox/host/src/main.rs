@@ -19,6 +19,8 @@ mod config;
 mod net;
 mod publish;
 mod runner;
+#[cfg(test)]
+mod service_unit;
 mod vm;
 mod vsock;
 
@@ -154,9 +156,17 @@ async fn main() {
         }
     };
     if let Err(e) = tokio::fs::create_dir_all(&cfg.state_dir).await {
-        eprintln!("sandboxd: state dir {}: {e}", cfg.state_dir.display());
+        eprintln!("sandboxd: state dir {}: {e}; under sandboxd.service, a SANDBOXD_STATE other than the default must exist and be in ReadWritePaths=", cfg.state_dir.display());
         std::process::exit(1);
     }
+    // sandboxd.service makes everything read-only but /var/lib/lorehouse-sandboxes
+    // (ProtectSystem=strict); another SANDBOXD_STATE would fail at the first boot instead.
+    let probe = cfg.state_dir.join(".write-probe");
+    if let Err(e) = tokio::fs::write(&probe, b"").await {
+        eprintln!("sandboxd: state dir {} isn't writable ({e}); under sandboxd.service, list it in ReadWritePaths=", cfg.state_dir.display());
+        std::process::exit(1);
+    }
+    let _ = tokio::fs::remove_file(&probe).await;
     // Start clean: whatever a previous run left (a crash, a kill) is removed first, VMMs
     // before their taps, and before any request can boot a disk one of them still holds.
     vm::stop_stale_vmms(&cfg.state_dir).await;

@@ -1,15 +1,22 @@
-# systemd unit for sandboxd. Install:
+# systemd unit for sandboxd. Install (README.md, "Set up"):
 #   sudo install -m 0755 target/release/sandboxd /usr/local/bin/sandboxd
 #   sudo install -m 0600 sandboxd.env /etc/lorehouse/sandboxd.env   # see README.md
+#   sudo install -m 0644 sandboxd.sysctl.conf /etc/sysctl.d/90-lorehouse-sandboxd.conf
+#   sudo install -m 0644 sandboxd.modules.conf /etc/modules-load.d/lorehouse-sandboxd.conf
+#   sudo sysctl --system && sudo systemctl restart systemd-modules-load
 #   sudo install -m 0644 sandboxd.service /etc/systemd/system/
 #   sudo systemctl enable --now sandboxd
+#
+# sandboxd runs model-written code in microVMs, so this unit assumes a guest may break
+# out of one: whatever a broken-out guest lands in should hold as little as possible.
+# Score: `systemd-analyze security sandboxd`. src/service_unit.rs checks the directives
+# below, so dropping one fails `cargo test`.
 [Unit]
 Description=Lorehouse sandbox host (Firecracker microVMs)
-After=network-online.target
+After=network-online.target systemd-sysctl.service systemd-modules-load.service
 Wants=network-online.target
 
 [Service]
-# Root: it creates taps and nftables rules, and runs Firecracker with /dev/kvm.
 ExecStart=/usr/local/bin/sandboxd
 EnvironmentFile=/etc/lorehouse/sandboxd.env
 Restart=on-failure
@@ -18,6 +25,48 @@ RestartSec=5
 # requests in flight get 30 s, then all VMs stop at once (≤ 15 s each), well under this.
 KillSignal=SIGTERM
 TimeoutStopSec=120
+
+# Root, but only for what it does: taps and nftables rules (CAP_NET_ADMIN). Firecracker,
+# its child, runs as root with the same single capability (it attaches to the tap).
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+# Read-only everywhere but the state directory (sandbox disks, mirrors, runner ledger),
+# which systemd creates (0700) and makes writable. For a different SANDBOXD_STATE add
+# ReadWritePaths=<it> (it must exist): sandboxd refuses to start when its state
+# directory isn't writable. The golden and the guest kernel are only read, and must not
+# be under /home or /root (ProtectHome).
+ProtectSystem=strict
+StateDirectory=lorehouse-sandboxes
+StateDirectoryMode=0700
+ProtectHome=yes
+PrivateTmp=yes
+PrivateIPC=yes
+UMask=0077
+# /dev/kvm for the VMs and /dev/net/tun for their taps; beyond those, only the standard
+# pseudo-devices (null, zero, random, …) DevicePolicy=closed keeps.
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/net/tun rw
+# AF_INET/AF_INET6: Lorehouse and GitHub. AF_UNIX: each VM's vsock and API sockets.
+# AF_NETLINK: ip and nft.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+# net.ipv4.ip_forward comes from sandboxd.sysctl.conf at boot (sandboxd checks it is on
+# and refuses to start otherwise), and nft's modules from sandboxd.modules.conf.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

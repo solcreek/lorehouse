@@ -41,6 +41,10 @@ pub struct Config {
     pub mirrors: Policy,
 }
 
+/// Where sandboxes live unless SANDBOXD_STATE says otherwise; sandboxd.service's
+/// ReadWritePaths= names the same directory.
+pub const DEFAULT_STATE: &str = "/var/lib/lorehouse-sandboxes";
+
 fn var(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
 }
@@ -143,7 +147,7 @@ impl Config {
         }
         Ok(Config {
             mode,
-            state_dir: var("SANDBOXD_STATE").map(PathBuf::from).unwrap_or_else(|| "/var/lib/lorehouse-sandboxes".into()),
+            state_dir: var("SANDBOXD_STATE").map(PathBuf::from).unwrap_or_else(|| DEFAULT_STATE.into()),
             golden: golden.into(),
             kernel: kernel.into(),
             uplink,
