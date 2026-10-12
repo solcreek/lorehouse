@@ -88,15 +88,19 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
     // And their jails: the disks root's again now, not at each sandbox's next boot, which
     // may never come.
     let state = state_dir.to_path_buf();
-    let released = tokio::task::spawn_blocking(move || {
-        let Ok(dirs) = std::fs::read_dir(&state) else { return 0 };
-        dirs.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && jail::release_leftover(&e.path())).count()
-    })
-    .await
-    .unwrap_or(0);
+    let released = tokio::task::spawn_blocking(move || release_leftover_jails(&state)).await.unwrap_or(0);
     if released > 0 {
         eprintln!("sandboxd: removed {released} jail(s) a previous run left");
     }
+}
+
+/// jail::release_leftover for each sandbox's directory, and nothing else in the state
+/// directory (`.mirrors/<owner>` is not a sandbox, even for an owner named "jail").
+fn release_leftover_jails(state_dir: &Path) -> usize {
+    let Ok(dirs) = std::fs::read_dir(state_dir) else { return 0 };
+    dirs.flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(valid_id) && e.file_type().is_ok_and(|t| t.is_dir()) && jail::release_leftover(&e.path()))
+        .count()
 }
 
 /// Every vsock socket left in a jail named `jail_id`, whichever sandbox's directory holds it.
@@ -470,5 +474,18 @@ mod tests {
         for host_path in ["/var/lib", "/usr/local"] {
             assert!(!text.contains(host_path), "{host_path} in {text}");
         }
+    }
+
+    #[test]
+    fn only_sandbox_directories_have_their_jails_released() {
+        let dir = std::env::temp_dir().join(format!("sandboxd-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mirror = dir.join(".mirrors/jail/widgets.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::create_dir_all(dir.join("slack_C1_1.2/jail/firecracker/lorehouse-0/root")).unwrap();
+        assert_eq!(super::release_leftover_jails(&dir), 1);
+        assert!(mirror.exists(), "a mirror owner named jail was removed");
+        assert!(!dir.join("slack_C1_1.2/jail").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
