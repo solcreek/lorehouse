@@ -139,22 +139,37 @@ async fn check_forwarding() -> Result<(), String> {
     }
 }
 
+/// The ports mail goes out on: SMTP, SMTPS and submission. A sandbox has no business
+/// sending mail, and spam from it would get the host's address blocklisted (and, at
+/// some providers, the server locked).
+pub const MAIL_PORTS: &str = "{ 25, 465, 587 }";
+
+/// The table's rules, in order, as `nft` commands.
+fn rules(uplink: &str) -> Vec<String> {
+    vec![
+        format!("add table ip {TABLE}"),
+        // Priority -1: before Docker's filter chains, so a drop here is final.
+        format!("add chain ip {TABLE} forward {{ type filter hook forward priority -1; }}"),
+        format!("add rule ip {TABLE} forward iifname \"lhtap*\" ip daddr {PRIVATE} drop"),
+        format!("add rule ip {TABLE} forward iifname \"lhtap*\" oifname != \"{uplink}\" drop"),
+        format!("add rule ip {TABLE} forward iifname \"lhtap*\" tcp dport {MAIL_PORTS} drop"),
+        // Into a sandbox: only replies to what it started. Nothing may open a connection to
+        // a guest, whatever the host's own FORWARD policy is (Docker's drop is not assumed).
+        format!("add rule ip {TABLE} forward oifname \"lhtap*\" ct state established,related accept"),
+        format!("add rule ip {TABLE} forward oifname \"lhtap*\" drop"),
+        format!("add chain ip {TABLE} input {{ type filter hook input priority -1; }}"),
+        format!("add rule ip {TABLE} input iifname \"lhtap*\" drop"),
+        format!("add chain ip {TABLE} post {{ type nat hook postrouting priority srcnat; }}"),
+        format!("add rule ip {TABLE} post ip saddr 172.30.0.0/24 oifname \"{uplink}\" masquerade"),
+    ]
+}
+
 /// The shared rules, set up once at start (after teardown_all).
 pub async fn setup(uplink: &str) -> Result<(), String> {
     check_forwarding().await?;
-    nft(&format!("add table ip {TABLE}")).await?;
-    // Priority -1: before Docker's filter chains, so a drop here is final.
-    nft(&format!("add chain ip {TABLE} forward {{ type filter hook forward priority -1; }}")).await?;
-    nft(&format!("add rule ip {TABLE} forward iifname \"lhtap*\" ip daddr {PRIVATE} drop")).await?;
-    nft(&format!("add rule ip {TABLE} forward iifname \"lhtap*\" oifname != \"{uplink}\" drop")).await?;
-    // Into a sandbox: only replies to what it started. Nothing may open a connection to a
-    // guest, whatever the host's own FORWARD policy is (Docker's drop is not assumed).
-    nft(&format!("add rule ip {TABLE} forward oifname \"lhtap*\" ct state established,related accept")).await?;
-    nft(&format!("add rule ip {TABLE} forward oifname \"lhtap*\" drop")).await?;
-    nft(&format!("add chain ip {TABLE} input {{ type filter hook input priority -1; }}")).await?;
-    nft(&format!("add rule ip {TABLE} input iifname \"lhtap*\" drop")).await?;
-    nft(&format!("add chain ip {TABLE} post {{ type nat hook postrouting priority srcnat; }}")).await?;
-    nft(&format!("add rule ip {TABLE} post ip saddr 172.30.0.0/24 oifname \"{uplink}\" masquerade")).await?;
+    for rule in rules(uplink) {
+        nft(&rule).await?;
+    }
     if docker_forward_exists().await {
         // Docker's FORWARD policy is drop; our accepts must live in that chain.
         nft(&format!("insert rule ip filter FORWARD iifname \"{uplink}\" oifname \"lhtap*\" ct state established,related accept comment \"{TAG}\"")).await?;
@@ -185,6 +200,20 @@ pub async fn tap_down(slot: &Slot) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sandbox_reaches_the_internet_but_not_mail_ports() {
+        let rules = super::rules("enp2s0");
+        let drop_mail = "add rule ip lorehouse_sbx forward iifname \"lhtap*\" tcp dport { 25, 465, 587 } drop";
+        let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
+        // Before anything in the chain could accept it.
+        assert!(at(drop_mail) < at("add rule ip lorehouse_sbx forward oifname \"lhtap*\" ct state established,related accept"));
+        // The rules from before are all still there.
+        at("add rule ip lorehouse_sbx forward iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop");
+        at("add rule ip lorehouse_sbx forward iifname \"lhtap*\" oifname != \"enp2s0\" drop");
+        at("add rule ip lorehouse_sbx input iifname \"lhtap*\" drop");
+        at("add rule ip lorehouse_sbx post ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade");
+    }
+
     #[test]
     fn a_tap_belongs_to_its_vms_uid() {
         assert_eq!(super::tap_add("lhtap3", 1_900_000_003).join(" "), "ip tuntap add dev lhtap3 mode tap user 1900000003 group 1900000003");
