@@ -38,7 +38,7 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
         let Ok(cmdline) = tokio::fs::read(format!("/proc/{pid}/cmdline")).await else { continue };
         let args: Vec<String> = cmdline.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-        if !args.first().is_some_and(|a| a.ends_with("firecracker")) {
+        if !args.first().is_some_and(|a| jail::is_firecracker(a)) {
             continue;
         }
         let cgroup = tokio::fs::read_to_string(format!("/proc/{pid}/cgroup")).await.unwrap_or_default();
@@ -77,7 +77,7 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
             }
         }
     }
-    // Their cgroups, once empty. The jails themselves are rebuilt at each sandbox's next boot.
+    // Their cgroups, once empty.
     let parent = Path::new("/sys/fs/cgroup").join(&host.cgroup_parent);
     if let Ok(mut dirs) = tokio::fs::read_dir(&parent).await {
         while let Ok(Some(entry)) = dirs.next_entry().await {
@@ -86,6 +86,22 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
             }
         }
     }
+    // And their jails: the disks root's again now, not at each sandbox's next boot, which
+    // may never come.
+    let state = state_dir.to_path_buf();
+    let released = tokio::task::spawn_blocking(move || release_leftover_jails(&state)).await.unwrap_or(0);
+    if released > 0 {
+        eprintln!("sandboxd: removed {released} jail(s) a previous run left");
+    }
+}
+
+/// jail::release_leftover for each sandbox's directory, and nothing else in the state
+/// directory (`.mirrors/<owner>` is not a sandbox, even for an owner named "jail").
+fn release_leftover_jails(state_dir: &Path) -> usize {
+    let Ok(dirs) = std::fs::read_dir(state_dir) else { return 0 };
+    dirs.flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(valid_id) && e.file_type().is_ok_and(|t| t.is_dir()) && jail::release_leftover(&e.path()))
+        .count()
 }
 
 /// Every vsock socket left in a jail named `jail_id`, whichever sandbox's directory holds it.
@@ -507,5 +523,18 @@ mod tests {
         let vm = super::vm_config(&cfg, 0);
         assert!(vm["network-interfaces"][0].get("rx_rate_limiter").is_none());
         assert_eq!(vm["drives"][0]["rate_limiter"], serde_json::json!({ "bandwidth": bucket(200 * mib) }));
+    }
+
+    #[test]
+    fn only_sandbox_directories_have_their_jails_released() {
+        let dir = std::env::temp_dir().join(format!("sandboxd-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mirror = dir.join(".mirrors/jail/widgets.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::create_dir_all(dir.join("slack_C1_1.2/jail/firecracker/lorehouse-0/root")).unwrap();
+        assert_eq!(super::release_leftover_jails(&dir), 1);
+        assert!(mirror.exists(), "a mirror owner named jail was removed");
+        assert!(!dir.join("slack_C1_1.2/jail").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

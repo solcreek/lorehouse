@@ -94,7 +94,7 @@ pub struct JailConfig {
 pub const DEFAULT_JAIL_UID_BASE: u64 = 1_900_000_000;
 
 /// Where sandboxes live unless SANDBOXD_STATE says otherwise; sandboxd.service's
-/// ReadWritePaths= names the same directory.
+/// StateDirectory= creates this directory and makes it writable.
 pub const DEFAULT_STATE: &str = "/var/lib/lorehouse-sandboxes";
 
 fn var(key: &str) -> Option<String> {

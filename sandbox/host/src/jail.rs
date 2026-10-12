@@ -167,6 +167,27 @@ impl<'a> Jail<'a> {
     }
 }
 
+/// A jail a previous run left (sandboxd was killed with VMs running, so `release` never
+/// ran): removed, and the disk root's again, 0600. Until then the disk would stay owned by
+/// that slot's uid, which the next VM in the slot, another sandbox's, runs as. Run at
+/// start, once no VMM of that run is left. Whether there was one.
+pub fn release_leftover(sandbox_dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let base = sandbox_dir.join(JAIL_DIR);
+    if std::fs::symlink_metadata(&base).is_err() {
+        return false;
+    }
+    if let Err(e) = remove_tree(&base) {
+        eprintln!("sandboxd: leftover jail {}: {e}", base.display());
+    }
+    let rootfs = sandbox_dir.join("rootfs.ext4");
+    if std::fs::symlink_metadata(&rootfs).is_ok_and(|m| m.is_file()) {
+        let _ = chown(&rootfs, 0, 0);
+        let _ = std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o600));
+    }
+    true
+}
+
 pub fn jail_id(slot: usize) -> String {
     format!("lorehouse-{slot}")
 }
@@ -202,10 +223,17 @@ pub fn parse_cgroup(proc_cgroup: &str) -> Option<String> {
     proc_cgroup.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_string())
 }
 
+/// Whether a process's argv[0] is a Firecracker binary: its file name contains
+/// "firecracker", the same rule `prepare` (and the jailer) hold the binary to. A jailed one
+/// is `/<exec_name>`, e.g. `/firecracker-v1.10.1-x86_64` as release tarballs name it.
+pub fn is_firecracker(argv0: &str) -> bool {
+    Path::new(argv0).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("firecracker"))
+}
+
 /// The jail id of a Firecracker process from a previous run, if it is one of ours: its
 /// argv[0] names Firecracker and its cgroup sits under our VMs' parent.
 pub fn jailed_vmm(args: &[String], proc_cgroup: &str, cgroup_parent: &str) -> Option<String> {
-    if !args.first().is_some_and(|a| a.ends_with("firecracker")) {
+    if !args.first().is_some_and(|a| is_firecracker(a)) {
         return None;
     }
     let path = parse_cgroup(proc_cgroup)?;
@@ -328,9 +356,70 @@ pub async fn prepare(cfg: &Config) -> Result<Host, String> {
     Ok(Host { jailer, firecracker, exec_name, cgroup_parent, uid_base: cfg.jail.uid_base, mem_headroom_mib: cfg.jail.mem_headroom_mib })
 }
 
+/// For a child that needs none of sandboxd's privileges (git, which reads what a VM hands
+/// over), between fork and exec (`Command::pre_exec`): no capabilities, and none regained
+/// at exec. sandboxd is root with the jailer's capabilities (CAP_SYS_ADMIN,
+/// CAP_DAC_OVERRIDE, CAP_SETUID, …), and a child inherits them; a bug such a child hits
+/// on a VM's data would hold them all. Root's execve fills the permitted set from the
+/// bounding set again, unless no_new_privs is set (the unit sets it; this sets it too, for
+/// a run outside the unit), which caps it at the permitted set before the exec: empty.
+/// prctl and capset are async-signal-safe, as pre_exec requires.
+#[cfg(target_os = "linux")]
+pub fn drop_capabilities() -> std::io::Result<()> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let mut header = Header { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let data = [Data { effective: 0, permitted: 0, inheritable: 0 }; 2];
+    // SAFETY: plain syscalls on this process; header and data are the layout capset(2)
+    // takes for version 3 (two Data, for capabilities 0–31 and 32–63).
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::syscall(libc::SYS_capset, &mut header as *mut Header, data.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn a_leftover_jail_is_removed_and_its_disk_closed_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sandboxd-leftover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join(JAIL_DIR).join("firecracker/lorehouse-0/root");
+        std::fs::create_dir_all(&root).unwrap();
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, b"disk").unwrap();
+        std::fs::hard_link(&rootfs, root.join("rootfs.ext4")).unwrap();
+        // As if the VM's uid had opened it up while it ran.
+        std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(release_leftover(&dir));
+        assert!(!dir.join(JAIL_DIR).exists());
+        let meta = std::fs::metadata(&rootfs).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::os::unix::fs::MetadataExt::nlink(&meta), 1);
+        // Nothing left: nothing to do, and the disk stays.
+        assert!(!release_leftover(&dir));
+        assert!(rootfs.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     pub fn host() -> Host {
         Host {
@@ -397,6 +486,10 @@ pub mod tests {
         let parent = "system.slice/sandboxd.service/vms";
         let fc = args(&["/firecracker", "--id", "lorehouse-2", "--api-sock", "/api.sock"]);
         assert_eq!(jailed_vmm(&fc, "0::/system.slice/sandboxd.service/vms/lorehouse-2\n", parent).as_deref(), Some("lorehouse-2"));
+        // A release tarball's binary keeps its versioned name in the jail.
+        let versioned = args(&["/firecracker-v1.10.1-x86_64", "--id", "lorehouse-2"]);
+        assert_eq!(jailed_vmm(&versioned, "0::/system.slice/sandboxd.service/vms/lorehouse-2\n", parent).as_deref(), Some("lorehouse-2"));
+        assert!(!is_firecracker("/usr/local/bin/firecracker-wrapper/bash"));
         // Someone else's Firecracker (another cgroup), or not Firecracker at all: not ours.
         assert_eq!(jailed_vmm(&fc, "0::/system.slice/firerunner.service/vm-1\n", parent), None);
         assert_eq!(jailed_vmm(&fc, "0::/system.slice/sandboxd.service/vms-old/lorehouse-2\n", parent), None);
