@@ -262,15 +262,71 @@ async fn version(bin: &Path) -> Result<String, String> {
 }
 
 /// Users or groups that already own an id the jail would use: a VM must never run as
-/// someone who exists.
-fn taken_ids(base: u32, count: usize) -> Vec<u32> {
-    (base..base + count as u32)
-        .filter(|&id| unsafe {
-            // SAFETY: getpwuid/getgrgid return a pointer to static storage or null; only
-            // the null check reads it, at start, before any other thread looks users up.
-            !libc::getpwuid(id).is_null() || !libc::getgrgid(id).is_null()
-        })
-        .collect()
+/// someone who exists. A lookup that fails (an NSS backend down) is an error, not "free".
+fn taken_ids(base: u32, count: usize) -> Result<Vec<u32>, String> {
+    let mut taken = Vec::new();
+    for id in base..base + count as u32 {
+        if id_taken(id, Db::Passwd)? || id_taken(id, Db::Group)? {
+            taken.push(id);
+        }
+    }
+    Ok(taken)
+}
+
+#[derive(Clone, Copy)]
+enum Db {
+    Passwd,
+    Group,
+}
+
+/// Whether `id` is a user (or group), with the reentrant lookups: their return code tells
+/// "not there" from "couldn't tell", which getpwuid's null doesn't.
+fn id_taken(id: u32, db: Db) -> Result<bool, String> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: the record and buf outlive the call; the result is only compared with null.
+        let (rc, found) = unsafe {
+            match db {
+                Db::Passwd => {
+                    let mut pw: libc::passwd = std::mem::zeroed();
+                    let mut out: *mut libc::passwd = std::ptr::null_mut();
+                    (libc::getpwuid_r(id, &mut pw, buf.as_mut_ptr().cast(), buf.len(), &mut out), !out.is_null())
+                }
+                Db::Group => {
+                    let mut gr: libc::group = std::mem::zeroed();
+                    let mut out: *mut libc::group = std::ptr::null_mut();
+                    (libc::getgrgid_r(id, &mut gr, buf.as_mut_ptr().cast(), buf.len(), &mut out), !out.is_null())
+                }
+            }
+        };
+        match lookup_outcome(rc, found) {
+            Lookup::Grow if buf.len() < 1 << 20 => buf.resize(buf.len() * 2, 0),
+            Lookup::Done(taken) => return Ok(taken),
+            _ => {
+                let what = if matches!(db, Db::Passwd) { "user" } else { "group" };
+                return Err(format!("couldn't look up whether a VM's id is a {what} ({}): refusing to start rather than guess", std::io::Error::from_raw_os_error(rc)));
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Lookup {
+    Done(bool),
+    Grow,
+    Failed,
+}
+
+/// getpwuid_r/getgrgid_r's result: 0 with a record (taken) or without one (free); "not
+/// found" as some implementations spell it (ENOENT, ESRCH); ERANGE (a bigger buffer);
+/// anything else a failed lookup.
+fn lookup_outcome(rc: i32, found: bool) -> Lookup {
+    match rc {
+        0 => Lookup::Done(found),
+        libc::ENOENT | libc::ESRCH => Lookup::Done(false),
+        libc::ERANGE => Lookup::Grow,
+        _ => Lookup::Failed,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -346,7 +402,7 @@ pub async fn prepare(cfg: &Config) -> Result<Host, String> {
     if jv != fv {
         return Err(format!("jailer {jv} and firecracker {fv} differ: the jailer must come from the same Firecracker release"));
     }
-    let taken = taken_ids(cfg.jail.uid_base, cfg.max_vms);
+    let taken = taken_ids(cfg.jail.uid_base, cfg.max_vms)?;
     if !taken.is_empty() {
         return Err(format!("SANDBOXD_JAIL_UID_BASE: the VMs' ids {taken:?} belong to existing users or groups; pick a free range of {}", cfg.max_vms));
     }
@@ -419,6 +475,20 @@ pub mod tests {
         assert!(!release_leftover(&dir));
         assert!(rootfs.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_user_lookup_refuses_rather_than_reads_as_free() {
+        assert_eq!(lookup_outcome(0, true), Lookup::Done(true));
+        assert_eq!(lookup_outcome(0, false), Lookup::Done(false));
+        assert_eq!(lookup_outcome(libc::ENOENT, false), Lookup::Done(false));
+        assert_eq!(lookup_outcome(libc::ERANGE, false), Lookup::Grow);
+        // An NSS backend that can't answer: not "free".
+        assert_eq!(lookup_outcome(libc::EIO, false), Lookup::Failed);
+        assert_eq!(lookup_outcome(libc::EAGAIN, false), Lookup::Failed);
+        // Real lookups: root exists, as user and group; the default range is free.
+        assert_eq!(taken_ids(0, 1), Ok(vec![0]));
+        assert_eq!(taken_ids(1_900_000_000, 2), Ok(vec![]));
     }
 
     pub fn host() -> Host {
