@@ -43,6 +43,8 @@ pub struct Config {
     pub jail: JailConfig,
     /// Each VM's network and disk rates and its disk quota.
     pub limits: Limits,
+    /// How often the nftables table is checked against what sandboxd loaded (net.rs).
+    pub net_check: Duration,
 }
 
 /// Per VM. A rate of 0 means unlimited.
@@ -92,6 +94,10 @@ pub struct JailConfig {
 /// Above every regular and system user (and systemd's dynamic users), and below the
 /// ids some tools read as signed: 1_900_000_000 + 63 is still under 2^31.
 pub const DEFAULT_JAIL_UID_BASE: u64 = 1_900_000_000;
+
+/// Seconds between checks of the nftables table: how long a flushed table can leave
+/// running guests unfiltered. A check is one `nft list table`.
+pub const DEFAULT_NET_CHECK_SECS: u64 = 10;
 
 /// Where sandboxes live unless SANDBOXD_STATE says otherwise; sandboxd.service's
 /// StateDirectory= creates this directory and makes it writable.
@@ -222,6 +228,7 @@ impl Config {
         let retention_days = num("SANDBOXD_MIRROR_RETENTION_DAYS", d.retention.as_secs() / 86_400);
         let uid_base = num("SANDBOXD_JAIL_UID_BASE", DEFAULT_JAIL_UID_BASE);
         let headroom = num("SANDBOXD_VM_MEM_HEADROOM_MIB", 512);
+        let net_check = num("SANDBOXD_NET_CHECK_SECS", DEFAULT_NET_CHECK_SECS);
         let dl = Limits::default();
         let rates = [
             ("SANDBOXD_NET_RX_MIBPS", num("SANDBOXD_NET_RX_MIBPS", dl.net_rx_mibps)),
@@ -268,6 +275,9 @@ impl Config {
                 problems.push(format!("{key} must be 0 (unlimited)..=100000"));
             }
         }
+        if !(1..=3600).contains(&net_check) {
+            problems.push("SANDBOXD_NET_CHECK_SECS must be 1..=3600".into());
+        }
         if quota_gib.is_some_and(|g| g > 65_536) {
             problems.push("SANDBOXD_DISK_QUOTA_GIB must be 0 (off)..=65536".into());
         }
@@ -305,6 +315,7 @@ impl Config {
             mirrors,
             jail,
             limits,
+            net_check: Duration::from_secs(net_check),
         })
     }
 }
@@ -422,6 +433,16 @@ mod tests {
         std::env::set_var("SANDBOXD_JAILER", "off");
         assert_eq!(Config::from_env().unwrap().jail.jailer.to_str(), Some("off"));
         std::env::remove_var("SANDBOXD_JAILER");
+
+        // The table check: every 10 s by default.
+        assert_eq!(Config::from_env().unwrap().net_check, std::time::Duration::from_secs(10));
+        std::env::set_var("SANDBOXD_NET_CHECK_SECS", "60");
+        assert_eq!(Config::from_env().unwrap().net_check, std::time::Duration::from_secs(60));
+        for v in ["0", "3601", "x"] {
+            std::env::set_var("SANDBOXD_NET_CHECK_SECS", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_NET_CHECK_SECS"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_NET_CHECK_SECS");
 
         // Rates and the disk quota: on by default, 0 turns each off, a set quota is explicit.
         use super::{DiskQuota, Limits};

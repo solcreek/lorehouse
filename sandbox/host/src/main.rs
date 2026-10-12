@@ -191,13 +191,34 @@ async fn main() {
     // before their taps, and before any request can boot a disk one of them still holds.
     vm::stop_stale_vmms(&cfg.state_dir, &host).await;
     net::teardown_all().await;
-    if let Err(e) = net::setup(&cfg.uplink, cfg.max_vms).await {
+    let fw = net::Firewall::new(&cfg.uplink, cfg.max_vms);
+    if let Err(e) = net::setup(&fw).await {
         eprintln!("sandboxd: network setup: {e}");
         net::teardown_all().await;
         std::process::exit(1);
     }
 
-    let vms = Manager::new(cfg.clone(), host, quota);
+    let vms = Manager::new(cfg.clone(), host, quota, fw.clone());
+    // The table, kept as loaded: checked every SANDBOXD_NET_CHECK_SECS (and before every
+    // boot, in vm.rs). One that is gone or changed is loaded again; one that can't be stops
+    // every VM, and none boots until it is back (fail closed).
+    let watch = (fw.clone(), vms.clone());
+    let every = cfg.net_check;
+    tokio::spawn(async move {
+        let (fw, vms) = watch;
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = fw.alarm.notified() => {}
+            }
+            if fw.ensure().await.is_err() && vms.running_count().await > 0 {
+                eprintln!("sandboxd: ALERT: stopping every running VM: their network rules are gone");
+                vms.stop_all().await;
+            }
+        }
+    });
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
     let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()).with_policy(cfg.mirrors.clone()));
 
@@ -273,6 +294,7 @@ async fn main() {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("sandboxd: listen {listen}: {e}");
+                    fw.close().await;
                     net::teardown_all().await;
                     std::process::exit(1);
                 }
@@ -291,6 +313,7 @@ async fn main() {
         }
     }
     eprintln!("sandboxd: stopping every VM (disks kept)");
+    fw.close().await;
     vms.stop_all().await;
     net::teardown_all().await;
 }

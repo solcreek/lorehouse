@@ -10,10 +10,20 @@
 //!     link-local address, the host's sshd over fe80::) is dropped, both into the host and
 //!     through it; the guest kernel also boots with `ipv6.disable=1` (vm.rs)
 //! One nftables table (`inet lorehouse_sbx`, so every rule covers IPv4 and IPv6) holds
-//! the rules; accepts that Docker's FORWARD chain (policy drop) needs are tagged so they
-//! can be removed exactly.
+//! the rules, loaded in one transaction; accepts that Docker's FORWARD chain (policy drop)
+//! needs are tagged so they can be removed exactly.
+//!
+//! The table is checked against what sandboxd loaded every SANDBOXD_NET_CHECK_SECS and
+//! before every boot (Firewall): starship is shared, and an `nft flush ruleset` there
+//! (by hand, or a tool reloading its own firewall) would leave running guests unfiltered.
+//! A table that is gone or changed is loaded again, and logged; one that can't be loaded
+//! again fails closed: no VM boots and every running one is stopped until it is back.
 
 use crate::child::command;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub const TABLE: &str = "lorehouse_sbx";
 /// `inet`: one table for both IPv4 and IPv6. Builds up to 5811498 used an `ip` table,
@@ -249,18 +259,187 @@ async fn load(text: &str) -> Result<(), String> {
 }
 
 /// The shared rules, set up once at start (after teardown_all).
-pub async fn setup(uplink: &str, slots: usize) -> Result<(), String> {
+pub async fn setup(fw: &Firewall) -> Result<(), String> {
     check_forwarding().await?;
-    load(&batch(uplink, slots)).await?;
+    fw.apply().await?;
     if docker_forward_exists().await {
         // Docker's FORWARD policy is drop; our accepts must live in that chain.
+        let uplink = &fw.uplink;
         nft(&format!("insert rule ip filter FORWARD iifname \"{uplink}\" oifname \"lhtap*\" ct state established,related accept comment \"{TAG}\"")).await?;
         nft(&format!("insert rule ip filter FORWARD iifname \"lhtap*\" oifname \"{uplink}\" accept comment \"{TAG}\"")).await?;
     }
     Ok(())
 }
 
-#[cfg(test)]
+type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// How the Firewall reads and loads the table: nft, or a stand-in in tests.
+pub trait Nft: Send + Sync {
+    /// `nft list table inet lorehouse_sbx`; None when it can't be listed (it isn't there).
+    fn list(&self) -> Boxed<'_, Option<String>>;
+    /// `nft -f -`.
+    fn load<'a>(&'a self, text: &'a str) -> Boxed<'a, Result<(), String>>;
+}
+
+struct System;
+
+impl Nft for System {
+    fn list(&self) -> Boxed<'_, Option<String>> {
+        Box::pin(async {
+            let out = command("nft").args(["list", "table", FAMILY, TABLE]).output().await.ok()?;
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+    }
+    fn load<'a>(&'a self, text: &'a str) -> Boxed<'a, Result<(), String>> {
+        Box::pin(load(text))
+    }
+}
+
+/// A table listing with what changes on its own taken out: counters' values, blank
+/// lines, indentation. Two listings of the same rules give the same text.
+fn normalize(listing: &str) -> String {
+    let mut out = String::new();
+    for line in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let mut i = 0;
+        let mut kept = Vec::with_capacity(words.len());
+        while i < words.len() {
+            // `counter packets N bytes M` → `counter`
+            if words[i] == "packets" && i > 0 && words[i - 1] == "counter" && words.get(i + 2) == Some(&"bytes") {
+                i += 4;
+                continue;
+            }
+            kept.push(words[i]);
+            i += 1;
+        }
+        out.push_str(&kept.join(" "));
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether the live table is what was loaded.
+#[derive(Debug, PartialEq)]
+enum Drift {
+    InSync,
+    /// Not there at all (a flush, a delete).
+    Missing,
+    /// There, but not as loaded (a rule added, removed or changed; a chain flushed).
+    Changed,
+}
+
+fn drift(expected: &str, live: Option<&str>) -> Drift {
+    match live {
+        None => Drift::Missing,
+        Some(l) if normalize(l) == expected => Drift::InSync,
+        Some(_) => Drift::Changed,
+    }
+}
+
+/// Whether a listing has the chains `table` declares, each with as many lines: nft
+/// rewrites a rule's text (`priority -1` as `priority filter - 1`, a set's order), so the
+/// text itself can't be compared, but nothing may be missing or added.
+fn same_shape(declared: &str, listing: &str) -> bool {
+    let count = |t: &str| chains(t).into_iter().map(|(n, lines)| (n, lines.len())).collect::<Vec<_>>();
+    count(declared) == count(listing)
+}
+
+/// sandboxd's nftables table, kept as loaded.
+pub struct Firewall {
+    uplink: String,
+    slots: usize,
+    nft: Box<dyn Nft>,
+    /// The live table, normalized, right after sandboxd loaded it.
+    expected: std::sync::Mutex<Option<String>>,
+    /// The table couldn't be loaded again: no VM may boot until it is.
+    broken: AtomicBool,
+    /// Shutting down: teardown removes the table, and nothing may put it back.
+    closed: AtomicBool,
+    /// One check or load at a time.
+    turn: tokio::sync::Mutex<()>,
+    /// Woken when a boot finds the table broken, so the VMs are stopped at once.
+    pub alarm: tokio::sync::Notify,
+}
+
+impl Firewall {
+    pub fn new(uplink: &str, slots: usize) -> Arc<Firewall> {
+        Firewall::with(uplink, slots, Box::new(System))
+    }
+
+    pub fn with(uplink: &str, slots: usize, nft: Box<dyn Nft>) -> Arc<Firewall> {
+        Arc::new(Firewall {
+            uplink: uplink.to_string(),
+            slots,
+            nft,
+            expected: std::sync::Mutex::new(None),
+            broken: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            turn: tokio::sync::Mutex::new(()),
+            alarm: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Load the table (one transaction) and remember what nft then lists as the table to keep.
+    pub async fn apply(&self) -> Result<(), String> {
+        let _turn = self.turn.lock().await;
+        self.apply_locked().await
+    }
+
+    async fn apply_locked(&self) -> Result<(), String> {
+        self.nft.load(&batch(&self.uplink, self.slots)).await?;
+        let listing = self.nft.list().await.ok_or_else(|| format!("{FAMILY} {TABLE} isn't there right after it was loaded"))?;
+        if !same_shape(&table(&self.uplink, self.slots), &listing) {
+            return Err(format!("{FAMILY} {TABLE} as listed isn't the table loaded:\n{listing}"));
+        }
+        *self.expected.lock().unwrap_or_else(|e| e.into_inner()) = Some(normalize(&listing));
+        Ok(())
+    }
+
+    /// Check the live table against what was loaded; load it again if it differs (and log
+    /// it loudly). An error means it couldn't be: the caller must not boot a VM, and the
+    /// running ones must stop.
+    pub async fn ensure(&self) -> Result<(), String> {
+        let _turn = self.turn.lock().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let expected = self.expected.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let live = self.nft.list().await;
+        let found = match &expected {
+            Some(e) => drift(e, live.as_deref()),
+            None => Drift::Missing, // never loaded, or the last load failed
+        };
+        if found == Drift::InSync && !self.broken.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let what = match found {
+            Drift::InSync => "not yet loaded again after a failure",
+            Drift::Missing => "gone (flushed or deleted)",
+            Drift::Changed => "not what sandboxd loaded (rules added, removed or changed)",
+        };
+        eprintln!("sandboxd: ALERT: nftables table {FAMILY} {TABLE} is {what}; loading it again");
+        match self.apply_locked().await {
+            Ok(()) => {
+                self.broken.store(false, Ordering::SeqCst);
+                eprintln!("sandboxd: nftables table {FAMILY} {TABLE} loaded again; sandboxes are filtered");
+                Ok(())
+            }
+            Err(e) => {
+                self.broken.store(true, Ordering::SeqCst);
+                *self.expected.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                eprintln!("sandboxd: ALERT: nftables table {FAMILY} {TABLE} couldn't be loaded again ({e}): no VM boots, and every running one is stopped, until it is");
+                Err(format!("the sandboxes' network rules are missing and couldn't be restored: {e}"))
+            }
+        }
+    }
+
+    /// No more checks or loads: teardown is about to remove the table.
+    pub async fn close(&self) {
+        let _turn = self.turn.lock().await;
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Each chain of a table as `nft` writes it (and `table` does): its name and its lines,
 /// the `type …` line included, trimmed.
 fn chains(text: &str) -> Vec<(String, Vec<String>)> {
@@ -385,12 +564,137 @@ mod tests {
         // Every chain, whole, in the one table.
         let names: Vec<String> = super::chains(&batch).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["spoof", "forward", "input", "post"]);
-        // And setup loads it with one nft run, not rule by rule.
+        // And it is loaded with one nft run, not rule by rule.
         let src = include_str!("net.rs");
-        let setup = &src[src.find("pub async fn setup").unwrap()..];
-        let setup = &setup[..setup.find("\n}\n").unwrap()];
-        assert!(setup.contains("load(&batch(uplink, slots))"), "{setup}");
-        assert!(!setup.contains("for rule in"), "{setup}");
+        let apply = &src[src.find("async fn apply_locked").unwrap()..];
+        let apply = &apply[..apply.find("\n    }\n").unwrap()];
+        assert!(apply.contains("self.nft.load(&batch(&self.uplink, self.slots))"), "{apply}");
+        assert!(!src.contains(&["for rule in ", "rules("].concat()));
+    }
+
+    /// What nft 1.1.7 lists for `table("enp2s0", 2)` (starship, 2026-10-12): its own
+    /// spelling of priorities, set order and counters.
+    const LISTED: &str = "table inet lorehouse_sbx {
+\tchain spoof {
+\t\tiifname \"lhtap0\" ip saddr 172.30.0.2 return
+\t\tiifname \"lhtap1\" ip saddr 172.30.0.6 return
+\t\tcounter packets 0 bytes 0 drop
+\t}
+
+\tchain forward {
+\t\ttype filter hook forward priority filter - 1; policy accept;
+\t\tiifname \"lhtap*\" meta nfproto ipv6 drop
+\t\tiifname \"lhtap*\" jump spoof
+\t\tiifname \"lhtap*\" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
+\t\tiifname \"lhtap*\" oifname != \"enp2s0\" drop
+\t\tiifname \"lhtap*\" tcp dport { 25, 465, 587 } drop
+\t\toifname \"lhtap*\" ct state established,related accept
+\t\toifname \"lhtap*\" drop
+\t}
+
+\tchain input {
+\t\ttype filter hook input priority filter - 1; policy accept;
+\t\tiifname \"lhtap*\" jump spoof
+\t\tiifname \"lhtap*\" drop
+\t}
+
+\tchain post {
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t\tip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade
+\t}
+}
+";
+
+    #[test]
+    fn drift_is_a_change_in_rules_not_in_counters() {
+        use super::{drift, normalize, Drift};
+        let expected = normalize(LISTED);
+        assert_eq!(drift(&expected, Some(LISTED)), Drift::InSync);
+        // Counters count, indentation and blank lines vary: still the same table.
+        let counted = LISTED.replace("counter packets 0 bytes 0 drop", "counter packets 17 bytes 1428 drop").replace("\n\n", "\n").replace('\t', "  ");
+        assert_eq!(drift(&expected, Some(&counted)), Drift::InSync);
+        // Flushed, deleted: not there.
+        assert_eq!(drift(&expected, None), Drift::Missing);
+        // A chain flushed, a rule added in front, a rule changed: changed.
+        let flushed = LISTED.replace("\t\tiifname \"lhtap*\" jump spoof\n\t\tiifname \"lhtap*\" drop\n", "");
+        assert_eq!(drift(&expected, Some(&flushed)), Drift::Changed);
+        let opened = LISTED.replace("policy accept;\n\t\tiifname \"lhtap*\" meta nfproto ipv6 drop", "policy accept;\n\t\tiifname \"lhtap*\" accept\n\t\tiifname \"lhtap*\" meta nfproto ipv6 drop");
+        assert_eq!(drift(&expected, Some(&opened)), Drift::Changed);
+        assert_eq!(drift(&expected, Some(&LISTED.replace("172.30.0.2 return", "172.30.0.3 return"))), Drift::Changed);
+        assert_eq!(drift(&expected, Some(&LISTED.replace("{ 25, 465, 587 }", "{ 25 }"))), Drift::Changed);
+        // nft's listing has the shape of what was declared; a short one doesn't.
+        assert!(super::same_shape(&super::table("enp2s0", 2), LISTED));
+        assert!(!super::same_shape(&super::table("enp2s0", 2), &flushed));
+        assert!(!super::same_shape(&super::table("enp2s0", 3), LISTED));
+    }
+
+    /// nft as a table in memory: `load` keeps the declared table (as LISTED would show
+    /// it), `flush` and `tamper` change it behind the Firewall's back.
+    #[derive(Default)]
+    struct Fake {
+        live: std::sync::Mutex<Option<String>>,
+        loads: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    struct Shared(std::sync::Arc<Fake>);
+
+    impl super::Nft for Shared {
+        fn list(&self) -> super::Boxed<'_, Option<String>> {
+            let live = self.0.live.lock().unwrap().clone();
+            Box::pin(async move { live })
+        }
+        fn load<'a>(&'a self, text: &'a str) -> super::Boxed<'a, Result<(), String>> {
+            Box::pin(async move {
+                if self.0.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("netlink: Operation not permitted".into());
+                }
+                self.0.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let table = &text[text.find("table inet lorehouse_sbx {\n").unwrap()..];
+                *self.0.live.lock().unwrap() = Some(table.to_string());
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flushed_or_changed_table_is_loaded_again_or_boots_stop() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = std::sync::Arc::new(Fake::default());
+        let fw = super::Firewall::with("enp2s0", 2, Box::new(Shared(fake.clone())));
+        fw.apply().await.unwrap();
+        assert_eq!(fake.loads.load(SeqCst), 1);
+        // In place: nothing to do.
+        fw.ensure().await.unwrap();
+        assert_eq!(fake.loads.load(SeqCst), 1);
+        // `nft flush ruleset`: loaded again.
+        *fake.live.lock().unwrap() = None;
+        fw.ensure().await.unwrap();
+        assert_eq!(fake.loads.load(SeqCst), 2);
+        assert!(fake.live.lock().unwrap().as_deref().unwrap().contains("meta nfproto ipv6 drop"));
+        // A rule slipped in ahead of ours: loaded again, the rule gone.
+        let tampered = fake.live.lock().unwrap().clone().unwrap().replace("\tchain input {\n", "\tchain input {\n\t\tiifname \"lhtap0\" accept\n");
+        *fake.live.lock().unwrap() = Some(tampered);
+        fw.ensure().await.unwrap();
+        assert_eq!(fake.loads.load(SeqCst), 3);
+        assert!(!fake.live.lock().unwrap().as_deref().unwrap().contains("\"lhtap0\" accept"));
+        // Gone, and can't be loaded again: an error (no boots, VMs stopped), every time,
+        // even once the table looks right again by itself...
+        fake.fail.store(true, SeqCst);
+        *fake.live.lock().unwrap() = None;
+        assert!(fw.ensure().await.is_err());
+        *fake.live.lock().unwrap() = Some(super::table("enp2s0", 2));
+        assert!(fw.ensure().await.is_err());
+        // ...until a load succeeds.
+        fake.fail.store(false, SeqCst);
+        fw.ensure().await.unwrap();
+        fw.ensure().await.unwrap();
+        assert_eq!(fake.loads.load(SeqCst), 4);
+        // Shutting down: teardown removes it, and nothing puts it back.
+        fw.close().await;
+        *fake.live.lock().unwrap() = None;
+        fw.ensure().await.unwrap();
+        assert_eq!(fake.loads.load(SeqCst), 4);
     }
 
     #[test]

@@ -62,6 +62,7 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_DISK_MIBPS` `SANDBOXD_DISK_IOPS` | `200`, `5000` | per VM, its disk (0 = unlimited) |
 | `SANDBOXD_DISK_QUOTA_GIB` | `8` | what one sandbox may write to its disk. Unset: enforced where the state directory can (btrfs with quotas on), else a warning at start; set: enforced or sandboxd won't start; `0`: off. Either way, sandboxes made before quotas were on stay uncapped; `0` doesn't lift a limit already set |
 | `SANDBOXD_VM_MEM_HEADROOM_MIB` | `512` | a VM's cgroup memory limit is its RAM plus this (Firecracker itself, and the page cache its disk IO is charged with) |
+| `SANDBOXD_NET_CHECK_SECS` | `10` | how often the nftables table is checked against what sandboxd loaded (1–3600); see [Network rules](#network-rules) |
 | `SANDBOXD_LISTEN` | `127.0.0.1:8787` | serve mode: where the API listens; keep it on loopback |
 | `SANDBOXD_STATE` | `/var/lib/lorehouse-sandboxes` | one directory per sandbox |
 | `SANDBOXD_MAX_VMS` | `4` | running at once (1–64); more gets a 503 |
@@ -185,6 +186,30 @@ unit (jailed, above) and reach GitHub. Without the jail, the same unit's confine
 Firecracker had `CapEff` `CAP_NET_ADMIN` only, `NoNewPrivs` 1 and `Seccomp` 2. A file the
 guest wrote just before `systemctl stop` (not yet flushed) was there after the next boot;
 with `KillMode=control-group` it was lost.
+
+## Network rules
+
+One nftables table, `inet lorehouse_sbx` ([`net.rs`](src/net.rs)), so every rule covers
+IPv4 and IPv6:
+
+| chain | |
+|---|---|
+| `spoof` | from tap *n*, only slot *n*'s guest address gets through; anything else is counted and dropped |
+| `forward` (priority -1, before Docker's) | from a tap: IPv6 dropped (guests have none), then the source check, private destinations (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16), anything but the uplink, and mail ports dropped; to a tap: only replies (`ct state established,related`) |
+| `input` (priority -1) | nothing from a tap reaches the host, IPv4 or IPv6 (spoofed sources counted first) |
+| `post` | masquerade of 172.30.0.0/24 out of the uplink |
+
+The guest kernel boots with `ipv6.disable=1` too. The table is loaded as one `nft -f`
+transaction: the old one (or an older build's `ip lorehouse_sbx`) is deleted and the new
+one added together, or nothing changes.
+
+The host is shared, so the table is checked against what sandboxd loaded every
+`SANDBOXD_NET_CHECK_SECS` (10 s) and before every boot: an `nft flush ruleset`, a deleted
+table or a rule added to it is noticed, logged (`ALERT: nftables table inet lorehouse_sbx
+is gone …; loading it again`) and the table loaded again. If it can't be, sandboxd fails
+closed: no VM boots and every running one is stopped until a later check loads it. A
+flush can still leave running guests unfiltered until the next check, at most
+`SANDBOXD_NET_CHECK_SECS`.
 
 ## Limits
 

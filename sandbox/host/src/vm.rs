@@ -222,6 +222,8 @@ impl Drop for Use {
 pub struct Manager {
     cfg: Config,
     host: Arc<Host>,
+    /// The nftables table, checked before every boot.
+    fw: Arc<net::Firewall>,
     quota: Quota,
     sandboxes: Mutex<HashMap<String, Arc<Sandbox>>>,
     slots: Mutex<Vec<bool>>, // true = taken
@@ -236,9 +238,9 @@ pub struct Listing {
 }
 
 impl Manager {
-    pub fn new(cfg: Config, host: Arc<Host>, quota: Quota) -> Arc<Manager> {
+    pub fn new(cfg: Config, host: Arc<Host>, quota: Quota, fw: Arc<net::Firewall>) -> Arc<Manager> {
         let slots = vec![false; cfg.max_vms];
-        Arc::new(Manager { cfg, host, quota, sandboxes: Mutex::new(HashMap::new()), slots: Mutex::new(slots) })
+        Arc::new(Manager { cfg, host, fw, quota, sandboxes: Mutex::new(HashMap::new()), slots: Mutex::new(slots) })
     }
 
     fn jail<'a>(&'a self, sb: &'a Sandbox, slot: usize) -> Jail<'a> {
@@ -334,6 +336,12 @@ impl Manager {
     async fn boot(&self, sb: &Sandbox, slot_index: usize) -> Result<Vmm, BootError> {
         let t0 = Instant::now();
         let slot = Slot { index: slot_index };
+        // No VM boots unfiltered: the table is checked (and loaded again if it was flushed)
+        // first. If it can't be, the running VMs are stopped too (main's watch, woken here).
+        if let Err(e) = self.fw.ensure().await {
+            self.fw.alarm.notify_one();
+            return Err(e.into());
+        }
         quota::prepare_dir(&self.quota, &sb.dir).await?;
         let rootfs = sb.rootfs();
         if !rootfs.exists() {
@@ -578,6 +586,7 @@ mod tests {
             mirrors: crate::publish::Policy::default(),
             jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, mem_headroom_mib: 512 },
             limits: crate::config::Limits::default(),
+            net_check: Duration::from_secs(10),
         }
     }
 
