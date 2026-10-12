@@ -34,7 +34,11 @@ function parseStatus(runner: string, v: unknown): RunnerStatus | undefined {
   const ids = (v: unknown) => v as string[] | undefined;
   // The runner process: an id, and when it started (unix ms). Both, or neither.
   const session = typeof o.session === "string" && /^[\w.-]{1,64}$/.test(o.session) && Number.isSafeInteger(o.started) && o.started! >= 0 ? { session: o.session, started: o.started } : {};
-  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received), sandboxes: ids(o.sandboxes), ...session };
+  // The mirrors block is for operators to read: an object of at most 2 KB of JSON, else
+  // dropped (never the whole status: nothing acts on it).
+  const m = o.mirrors as unknown;
+  const mirrors = m && typeof m === "object" && !Array.isArray(m) && JSON.stringify(m).length <= 2048 ? { mirrors: m as Record<string, unknown> } : {};
+  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received), sandboxes: ids(o.sandboxes), ...session, ...mirrors };
 }
 
 function parseResult(v: unknown): JobResult | undefined {

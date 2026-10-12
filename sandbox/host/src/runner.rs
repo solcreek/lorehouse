@@ -436,7 +436,7 @@ impl Runner {
 
     async fn status_json(&self) -> serde_json::Value {
         let jobs = self.ledger().ids(Instant::now());
-        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "sandboxes": self.vms.running_ids().await, "version": VERSION, "jobs": jobs, "session": self.process, "started": self.started })
+        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "sandboxes": self.vms.running_ids().await, "version": VERSION, "jobs": jobs, "session": self.process, "started": self.started, "mirrors": self.publisher.status() })
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -806,6 +806,7 @@ mod tests {
             vcpus: 1,
             mem_mib: 128,
             github_url: format!("file://{}", dir.display()),
+            mirrors: crate::publish::Policy::default(),
         };
         (crate::vm::Manager::new(cfg), std::sync::Arc::new(crate::publish::Publisher::new(dir.join("mirrors"), format!("file://{}", dir.display()))))
     }
@@ -880,6 +881,16 @@ mod tests {
         let r = execute(&vms, &publisher, push(Some(B64.encode("{\"stage\":1}"))), Instant::now()).await;
         assert_eq!(r.status, 400);
         assert!(r.error.as_deref().unwrap_or("").starts_with("push request:"), "{:?}", r.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_status_carries_the_mirrors_block() {
+        let dir = scratch_dir("status-mirrors");
+        let (vms, publisher) = no_vms(&dir);
+        let runner = super::Runner::new(vms, publisher, "http://127.0.0.1:1".into(), "tok".into(), "box-1".into(), crate::config::Transport::Poll, dir.join("jobs"));
+        let status = runner.status_json().await;
+        assert_eq!((status["mirrors"]["count"].as_u64(), status["mirrors"]["perMirrorMaxBytes"].as_u64(), status["mirrors"]["maxBytes"].as_u64()), (Some(0), Some(4 << 30), Some(24 << 30)), "{status}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -39,6 +39,8 @@ use std::time::Duration;
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(15 * 60 + 30);
 /// How long requests in flight get after SIGTERM before the VMs are stopped anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// How often the mirrors' upkeep runs (retention, the daily gc, what heavy stages left).
+const MIRROR_UPKEEP_EVERY: Duration = Duration::from_secs(5 * 60);
 use subtle::ConstantTimeEq;
 use vm::Manager;
 
@@ -167,7 +169,21 @@ async fn main() {
 
     let vms = Manager::new(cfg.clone());
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
-    let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()));
+    let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()).with_policy(cfg.mirrors.clone()));
+
+    // Every mirror measured before any job is taken, so the quotas count them all.
+    let inventory = publisher.clone();
+    let _ = tokio::task::spawn_blocking(move || inventory.inventory()).await;
+    // The mirrors' upkeep (publish/upkeep.rs): at start, then every few minutes.
+    let upkeep = publisher.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MIRROR_UPKEEP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            upkeep.maintain().await;
+        }
+    });
 
     let reaper = vms.clone();
     tokio::spawn(async move {

@@ -25,7 +25,7 @@ import { createHmac } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { pollRunner, wsRunner } from "./fake-runner";
+import { MIRRORS, pollRunner, wsRunner } from "./fake-runner";
 import { parseArgs, selectScenarios, UsageError, type Args } from "./select";
 
 const ROOT = join(import.meta.dir, "..");
@@ -1267,8 +1267,9 @@ const scenarios: Scenario[] = [
         const a = await ask("[exec] echo hi");
         if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
         if (!/^slack_C1_\d+\.\d+$/.test(runner.jobs[0]?.sandbox ?? "")) return `the job's sandbox ${runner.jobs[0]?.sandbox}, want one per thread (slack_C1_<ts>)`;
-        const listed = (await status() as unknown as { runners?: { runner: string; transport: string; online: boolean }[] }).runners;
-        return listed?.some((r) => r.runner === "r-ws" && r.transport === "ws" && r.online) ? null : `/status runners ${JSON.stringify(listed)}`;
+        const listed = (await status() as unknown as { runners?: { runner: string; transport: string; online: boolean; mirrors?: unknown }[] }).runners;
+        // The runner's mirrors block, as it sent it.
+        return listed?.some((r) => r.runner === "r-ws" && r.transport === "ws" && r.online && JSON.stringify(r.mirrors) === JSON.stringify(MIRRORS)) ? null : `/status runners ${JSON.stringify(listed)}`;
       } finally {
         await runner.stop();
       }
@@ -1282,8 +1283,8 @@ const scenarios: Scenario[] = [
         await Bun.sleep(200); // the first poll registers the runner
         const a = await ask("[exec] echo hi");
         if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
-        const listed = (await status() as unknown as { runners?: { runner: string; transport: string }[] }).runners;
-        return listed?.some((r) => r.runner === "r-poll" && r.transport === "poll") ? null : `/status runners ${JSON.stringify(listed)}`;
+        const listed = (await status() as unknown as { runners?: { runner: string; transport: string; mirrors?: unknown }[] }).runners;
+        return listed?.some((r) => r.runner === "r-poll" && r.transport === "poll" && JSON.stringify(r.mirrors) === JSON.stringify(MIRRORS)) ? null : `/status runners ${JSON.stringify(listed)}`;
       } finally {
         await runner.stop();
       }

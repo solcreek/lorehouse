@@ -20,7 +20,10 @@ import { EXEC_TIMEOUT_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, type ExecOptions, t
 // `session` and `started` (unix ms) identify the runner process: of two with one name, the
 // later-started one is the runner, and the other's polls are ignored.
 // `sandboxes`: those whose VM is up (and counted in `running`).
-export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number; sandboxes?: string[] };
+// `mirrors`: the host's publish mirrors, as it last measured them (count, bytes, quotas,
+// free space, the last gc, evictions and refusals; sandbox/host/src/publish/upkeep.rs).
+// For operators only: passed through to /status, never acted on.
+export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number; sandboxes?: string[]; mirrors?: Record<string, unknown> };
 
 type JobBody =
   | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string }
@@ -194,7 +197,7 @@ export class RunnerHub {
   private touch(name: string, status: RunnerStatus): void {
     const r = this.runners.get(name);
     if (!r) return;
-    r.status = { runner: name, capacity: status.capacity, running: status.running, version: status.version };
+    r.status = { runner: name, capacity: status.capacity, running: status.running, version: status.version, mirrors: status.mirrors };
     r.lastSeen = this.now();
     if (status.session) {
       r.session = status.session;
@@ -346,6 +349,7 @@ export class RunnerHub {
       running: r.status.running,
       version: r.status.version,
       lastSeenSecs: Math.round((this.now() - r.lastSeen) / 1000),
+      ...(r.status.mirrors ? { mirrors: r.status.mirrors } : {}),
     }));
   }
 }

@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { openKnowledge } from "../src/knowledge";
 import { RunnerHub, type Job, type JobResult } from "../src/runners/hub";
+import { runnerRoutes } from "../src/runners/routes";
 import { EXEC_TIMEOUT_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS } from "../src/tools/workspace";
 
 const status = (runner: string, capacity = 4, running = 0) => ({ runner, capacity, running });
@@ -384,5 +385,31 @@ describe("results and failures", () => {
       { runner: "ws1", transport: "ws", online: true, capacity: 4, running: 1, version: undefined },
       { runner: "poll1", transport: "poll", online: true, capacity: 2, running: 0, version: "0.1.0" },
     ]);
+  });
+
+  test("/status passes on a runner's mirrors block, as last reported", async () => {
+    const hub = hubWith({ pollWaitMs: 1 });
+    await hub.poll({ runner: "poll1", capacity: 2, running: 0, mirrors: { count: 1, bytes: 10 } });
+    await hub.poll({ runner: "poll1", capacity: 2, running: 0, mirrors: { count: 2, bytes: 20 } });
+    await hub.poll({ runner: "poll2", capacity: 2, running: 0 });
+    const listed = hub.status();
+    expect(listed.find((r) => r.runner === "poll1")?.mirrors).toEqual({ count: 2, bytes: 20 });
+    expect("mirrors" in listed.find((r) => r.runner === "poll2")!).toBe(false);
+  });
+
+  test("a polled mirrors block that isn't an object, or is over 2 KB, is dropped, not the status", async () => {
+    const hub = hubWith({ pollWaitMs: 1 });
+    const { handle } = runnerRoutes(hub, "t".repeat(32));
+    const poll = (runner: string, mirrors: unknown) =>
+      handle(new Request("http://x/runners/poll", { method: "POST", headers: { authorization: `Bearer ${"t".repeat(32)}`, "x-lorehouse-runner": runner }, body: JSON.stringify({ capacity: 1, running: 0, mirrors }) }));
+    const cases: [string, unknown, Record<string, unknown> | undefined][] = [
+      ["ok", { count: 1 }, { count: 1 }],
+      ["list", [1, 2], undefined],
+      ["text", "big", undefined],
+      ["huge", { pad: "x".repeat(2100) }, undefined],
+    ];
+    for (const [runner, sent] of cases) expect((await poll(runner, sent))?.status).toBe(200);
+    const listed = hub.status();
+    for (const [runner, , want] of cases) expect(listed.find((r) => r.runner === runner)?.mirrors).toEqual(want);
   });
 });
