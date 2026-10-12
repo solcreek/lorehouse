@@ -220,9 +220,13 @@ async fn main() {
             if fw.ensure().await.is_err() && !fw.is_closed() {
                 // Cut off at once (taps down), then stopped (seconds each, after the guest's
                 // sync), in a task of its own so the checks go on meanwhile.
-                net::taps_down().await;
+                let down = net::taps_down().await;
+                if let Err(e) = &down {
+                    eprintln!("sandboxd: ALERT: {e}; those guests may still be unfiltered until their VMs stop");
+                }
                 if vms.running_count().await > 0 && !stopping.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    eprintln!("sandboxd: ALERT: every tap is down; stopping every running VM: their network rules are gone");
+                    let taps = if down.is_ok() { "every tap is down" } else { "not every tap could be taken down" };
+                    eprintln!("sandboxd: ALERT: {taps}; stopping every running VM: their network rules are gone");
                     let (vms, stopping) = (vms.clone(), stopping.clone());
                     tokio::spawn(async move {
                         vms.stop_all().await;
