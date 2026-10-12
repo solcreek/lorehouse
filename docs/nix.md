@@ -129,6 +129,42 @@ Every one of them is a single always-on instance (Lorehouse holds a SQLite file 
 to answer Slack within 3 s), with the secrets from the README as environment variables.
 Render and Railway set `PORT` themselves; Lorehouse listens on it.
 
+### Render
+
+The [`render.yaml`](../render.yaml) Blueprint (New → Blueprint, this repository) creates
+the service and its disk together, and asks for the secrets. The workspace needs a
+payment method first: `render blueprints validate render.yaml` says `need_payment_info`
+until it has one, because a disk needs a paid instance type.
+
+The same from the CLI and the API, for an install an agent drives:
+
+```bash
+render services create --name lorehouse --type web_service --runtime image \
+  --image ghcr.io/solcreek/lorehouse:latest --plan starter --region <region> \
+  --health-check-path /healthz --env-var SLACK_SIGNING_SECRET=… --env-var … -o json --confirm
+# once its first deploy is live (a disk can't be added while one is pending):
+curl -X POST https://api.render.com/v1/disks -H "Authorization: Bearer $RENDER_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"lorehouse-data","mountPath":"/data","sizeGB":1,"serviceId":"srv-…"}'
+```
+
+The CLI has no flag for a disk, and its login doesn't work as an API key: create one
+under Account Settings → API Keys.
+
+Proven on 2026-10-12, without Slack secrets (so in setup mode): a starter service in
+Singapore pulled `:latest`, listened on Render's `PORT` (10000) and passed `/healthz`, and
+a file written to `/data` was still there after a redeploy onto a new instance. Not yet
+proven: a full install answering Slack on Render.
+
+Two things that differ from Fly:
+
+- **Shell access**: `render ssh` works only in an interactive terminal. Plain `ssh
+  srv-…@ssh.<region>.render.com` works once your key is under Account Settings → SSH
+  Public Keys, but needs `-tt`, or a command runs and prints nothing.
+- **Start command**: on an image service, a Docker Command of `/bin/sh -c "…"` (or the
+  other quotings tried) ran with `$(…)` and `;` as literal text, not as shell syntax.
+  Leave it empty; the image's own command starts Lorehouse.
+
 ### Railway
 
 ```bash
