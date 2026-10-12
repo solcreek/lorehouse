@@ -15,6 +15,7 @@ impl Pidfd {
     /// The process now holding `pid`. For a child not yet waited for, that is certainly
     /// the child (an unreaped pid can't be reused); for any other process, check after
     /// opening that it is the one meant (/proc/<pid> then describes the same process).
+    /// Needs Linux 5.3+ and a tokio runtime (AsyncFd panics outside one).
     #[cfg(target_os = "linux")]
     pub fn open(pid: u32) -> io::Result<Pidfd> {
         // SAFETY: a plain syscall; the result is checked. pidfd_open sets O_CLOEXEC.
@@ -31,7 +32,8 @@ impl Pidfd {
         Err(io::Error::new(io::ErrorKind::Unsupported, "pidfds are Linux only"))
     }
 
-    /// SIGKILL to this process. ESRCH once it has exited: never anyone else.
+    /// SIGKILL to this process: a no-op while it is an unreaped zombie, ESRCH once it is
+    /// reaped. Never anyone else.
     #[cfg(target_os = "linux")]
     pub fn kill(&self) -> io::Result<()> {
         // SAFETY: a plain syscall on a pidfd we own; no siginfo.

@@ -161,6 +161,18 @@ impl Drop for Vmm {
     }
 }
 
+/// A boot that failed; `unstopped` is its VMM when that one's exit couldn't be confirmed.
+struct BootError {
+    msg: String,
+    unstopped: Option<Box<Vmm>>,
+}
+
+impl From<String> for BootError {
+    fn from(msg: String) -> BootError {
+        BootError { msg, unstopped: None }
+    }
+}
+
 /// Wait up to `grace` for the VMM to exit, then SIGKILL it and wait as long again. True
 /// only once its exit has been seen through its pidfd.
 async fn exited_or_killed(vmm: &mut Vmm, grace: Duration) -> bool {
@@ -288,10 +300,17 @@ impl Manager {
             };
             match self.boot(&sb, slot).await {
                 Ok(vmm) => *running = Some(Running { vmm, slot }),
-                Err(e) => {
+                Err(BootError { msg, unstopped: Some(vmm) }) => {
+                    // A VMM whose exit couldn't be confirmed keeps its slot, jail and disk
+                    // (as in stop_locked); the next request finds it and tries again.
+                    eprintln!("sandboxd: {}: its VMM's exit couldn't be confirmed after a failed boot; it keeps slot {slot} until it is", sb.id);
+                    *running = Some(Running { vmm: *vmm, slot });
+                    return Err((500, msg));
+                }
+                Err(BootError { msg, unstopped: None }) => {
                     self.release(&sb, slot).await;
                     self.forget_if_never_created(&sb).await;
-                    return Err((500, e));
+                    return Err((500, msg));
                 }
             }
         }
@@ -312,7 +331,7 @@ impl Manager {
         }
     }
 
-    async fn boot(&self, sb: &Sandbox, slot_index: usize) -> Result<Vmm, String> {
+    async fn boot(&self, sb: &Sandbox, slot_index: usize) -> Result<Vmm, BootError> {
         let t0 = Instant::now();
         let slot = Slot { index: slot_index };
         quota::prepare_dir(&self.quota, &sb.dir).await?;
@@ -320,7 +339,7 @@ impl Manager {
         if !rootfs.exists() {
             let out = Command::new("cp").arg("--reflink=always").arg(&self.cfg.golden).arg(&rootfs).output().await.map_err(|e| format!("cp: {e}"))?;
             if !out.status.success() {
-                return Err(format!("reflink golden: {}", String::from_utf8_lossy(&out.stderr).trim()));
+                return Err(format!("reflink golden: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
             }
         }
         // The jail, rebuilt from nothing (a few ms: the disk is a hard link, the kernel a
@@ -343,7 +362,7 @@ impl Manager {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             if vmm.exited() {
-                return Err(format!("the jailer or firecracker exited during boot; see {}/console.log", sb.dir.display()));
+                return Err(format!("the jailer or firecracker exited during boot; see {}/console.log", sb.dir.display()).into());
             }
             // Each probe is bounded, so a guest that accepts but never answers can't hold
             // the slot past the deadline.
@@ -353,8 +372,11 @@ impl Manager {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let _ = exited_or_killed(&mut vmm, Duration::from_secs(5)).await;
-        Err(format!("guestd never answered within 60 s; see {}/console.log", sb.dir.display()))
+        // A guest that never answered won't exit by itself: killed now, then waited for.
+        let _ = vmm.pidfd.kill();
+        let msg = format!("guestd never answered within 60 s; see {}/console.log", sb.dir.display());
+        let unstopped = (!vmm.wait(Duration::from_secs(5)).await).then(|| Box::new(vmm));
+        Err(BootError { msg, unstopped })
     }
 
     /// Flush the guest's disk cache, reboot it (reboot=k makes that exit the VMM), and
@@ -625,10 +647,12 @@ mod tests {
         let watch = super::Pidfd::open(alive.child.id().unwrap()).unwrap();
         drop(alive);
         assert!(watch.wait(Duration::from_secs(2)).await, "a dropped VMM is killed");
-        // Nothing in vm.rs signals a VMM by number any more.
+        // Outside its tests, vm.rs signals no process by number: no kill_on_drop(true)
+        // (tokio's kill by pid), no kill(1), no kill(2).
         let src = include_str!("vm.rs");
-        for by_number in [["kill_on_drop(", "true)"].concat(), ["Command::new(\"kill", "\")"].concat(), ["libc::kill(", "pid as"].concat()] {
-            assert!(!src.contains(&by_number), "{by_number}");
+        let code = &src[..src.find(&["#[cfg(", "test)]"].concat()).unwrap()];
+        for by_number in [["kill_on_drop(", "true)"].concat(), ["Command::new(\"kill", "\")"].concat(), ["libc::", "kill("].concat()] {
+            assert!(!code.contains(&by_number), "{by_number}");
         }
     }
 }
