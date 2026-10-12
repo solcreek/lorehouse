@@ -323,12 +323,8 @@ pub async fn prepare(cfg: &Config) -> Result<Host, String> {
         return Err(format!("SANDBOXD_JAIL_UID_BASE: the VMs' ids {taken:?} belong to existing users or groups; pick a free range of {}", cfg.max_vms));
     }
     let cgroup_parent = setup_cgroups().await?;
-    eprintln!(
-        "sandboxd: VMs run under the jailer ({}, Firecracker {fv}) as uids {}..{}, in cgroup {cgroup_parent}",
-        jailer.display(),
-        cfg.jail.uid_base,
-        cfg.jail.uid_base + cfg.max_vms as u32 - 1
-    );
+    // The uids themselves aren't logged: CodeQL reads a logged uid as private data.
+    eprintln!("sandboxd: VMs run under the jailer ({}, Firecracker {fv}), each as its slot's uid (SANDBOXD_JAIL_UID_BASE + slot), in cgroup {cgroup_parent}", jailer.display());
     Ok(Host { jailer, firecracker, exec_name, cgroup_parent, uid_base: cfg.jail.uid_base, mem_headroom_mib: cfg.jail.mem_headroom_mib })
 }
 
