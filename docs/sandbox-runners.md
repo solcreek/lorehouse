@@ -228,7 +228,8 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   - Quotas, failing closed: a mirror may use 4 GiB (`SANDBOXD_MIRROR_MAX_GIB`), all of them
     24 GiB (`SANDBOXD_MIRRORS_MAX_GIB`), and the filesystem keeps 10% or 20 GiB free,
     whichever is larger (`SANDBOXD_MIRRORS_FREE_PCT`, `SANDBOXD_MIRRORS_FREE_GIB`).
-    Checked before the refresh (a new mirror counts at its cap), after it, and after the
+    Checked before the refresh (a new mirror counts at its cap, against the total and the
+    free space over the floor), after it, and after the
     bundle fetch; a mirror over its cap is removed. Before refusing, mirrors idle for over
     24 h are dropped, least recently used first, down to 80% of the total.
   - It runs at start (which measures every mirror) and every 5 minutes, plus after every

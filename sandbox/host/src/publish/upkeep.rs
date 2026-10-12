@@ -12,7 +12,8 @@
 //! - **Quotas, fail closed (507).** One mirror may use `mirror_max`, all of them
 //!   `mirrors_max`, and the filesystem keeps `free_min_pct` or `free_min` free, whichever is
 //!   larger. Checked before the refresh (from the last measured size; a new mirror counts at
-//!   `mirror_max`), after it, and after the bundle fetch. A mirror over its cap is removed.
+//!   `mirror_max`, against the total and the free space over the floor), after it, and after
+//!   the bundle fetch. A mirror over its cap is removed.
 //!   Before refusing, mirrors idle for over `evict_idle` are dropped, least recently used
 //!   first, until the mirrors use at most 80% of `mirrors_max` and the floor holds.
 //! - **Status.** Sizes are measured after every job, gc and upkeep pass, and kept; the
@@ -220,6 +221,8 @@ enum Short {
     Total(u64),
     /// The filesystem has this much free, under this floor.
     Free(u64, u64),
+    /// The filesystem has this much free, over this floor, but not by the room asked for.
+    FreeFor(u64, u64),
 }
 
 impl Publisher {
@@ -315,7 +318,8 @@ impl Publisher {
         self.stats().mirrors.values().map(|m| m.bytes).sum()
     }
 
-    /// Whether the mirrors, with `extra` bytes more, fit, and the filesystem keeps its floor.
+    /// Whether the mirrors, with `extra` bytes more, fit, and the filesystem keeps its floor
+    /// with `extra` bytes less free.
     fn room(&self, extra: u64) -> Result<(), Short> {
         let total = self.total() + extra;
         if total > self.policy.mirrors_max {
@@ -323,6 +327,7 @@ impl Publisher {
         }
         match self.fs() {
             Some((free, size)) if free < self.policy.floor(size) => Err(Short::Free(free, self.policy.floor(size))),
+            Some((free, size)) if free - extra.min(free) < self.policy.floor(size) => Err(Short::FreeFor(free, self.policy.floor(size))),
             Some(_) => Ok(()),
             None => {
                 // Unknown: the quotas still hold; the floor can't be checked.
@@ -390,6 +395,12 @@ impl Publisher {
                 "the sandbox host is low on disk space ({} GiB free, under the {} GiB it keeps free), so it has no room for the mirror of {owner}/{name}: nothing was staged. Try again later, or ask an operator to free space on the host.",
                 gib(free),
                 gib(floor)
+            ),
+            Short::FreeFor(free, floor) => format!(
+                "the sandbox host is low on disk space for the mirror of {owner}/{name} ({} GiB free, and it keeps {} GiB free; this one would need up to {} GiB): nothing was staged. Try again later, or ask an operator to free space on the host.",
+                gib(free),
+                gib(floor),
+                gib(need)
             ),
         };
         Err((507, message))

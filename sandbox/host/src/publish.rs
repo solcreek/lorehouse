@@ -1906,6 +1906,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_mirror_needs_its_cap_free_above_the_floor() {
+        let s = scratch("floornew");
+        sh(&s.vm, "echo n > n && git add n && git commit -qm n");
+        // 23 GiB free, over the 20 GiB floor, but not with a new mirror's 4 GiB: refused.
+        *s.disk.fs.lock().unwrap() = Some((23 * GIB, 100 * GIB));
+        let err = s.stage_all(request("scout/n"), || {}).await.unwrap_err();
+        assert_eq!(err, (507, "the sandbox host is low on disk space for the mirror of acme/widgets (23 GiB free, and it keeps 20 GiB free; this one would need up to 4 GiB): nothing was staged. Try again later, or ask an operator to free space on the host.".to_string()));
+        assert!(!s.dir().exists());
+        *s.disk.fs.lock().unwrap() = Some((24 * GIB, 100 * GIB));
+        s.stage_all(request("scout/n"), || {}).await.unwrap();
+        // Once it exists, it needs only the floor.
+        *s.disk.fs.lock().unwrap() = Some((21 * GIB, 100 * GIB));
+        sh(&s.vm, "echo m > m && git add m && git commit -qm m");
+        s.stage_all(request("scout/n2"), || {}).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn the_status_reports_the_mirrors_as_last_measured() {
         let s = scratch("status");
         sh(&s.vm, "echo s > s && git add s && git commit -qm s");
