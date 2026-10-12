@@ -76,3 +76,25 @@ asked for the host to be hardened on 2026-10-12.
   jailer's privileges. Follow-ups: the same for the other children where they need no
   capability, and `ProtectControlGroups=private` (systemd 257+) once the jail's cgroup
   paths are checked under a cgroup namespace.
+
+## Addendum, 2026-10-12: the network rules
+
+Approved by the maintainer on 2026-10-12, after three analyses (firerunner's, the boxed
+red-team corpus, dew/creekd) all flagged IPv6: the `ip` table never saw IPv6, and a
+guest could reach starship's sshd over the tap's link-local address (shown from inside a
+guest on the 5811498 build). From then on:
+
+- The rules are one `inet` table, so every rule covers IPv4 and IPv6. Guests get no IPv6
+  (`ipv6.disable=1`), the host's taps no IPv6 address, and IPv6 from a tap is dropped.
+- A packet from a tap must carry that slot's guest address (anti-spoofing).
+- Mail is dropped on TCP 25, 465, 587 and 2525.
+- The table is loaded in one transaction, and checked against what was loaded
+  periodically and before every boot. A table that can't be put back fails closed (taps
+  down, VMs stopped, no boots).
+- Every process sandboxd starts gets a clean environment, and the tokens can come as
+  systemd credentials instead of environment variables.
+
+Not covered: ARP from a guest still gets answers about the host's other addresses (an
+information leak, no path); `PRIVATE` lacks a few special ranges (0/8, 192.0.0/24,
+198.18/15, multicast, 240/4) and the uplink's own public address (hairpin through the
+router); a flush leaves running guests unfiltered until the next check.
