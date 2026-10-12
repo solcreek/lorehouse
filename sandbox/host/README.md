@@ -16,7 +16,8 @@ thread). Rust. Work reaches it one of two ways:
 - **Stopping** always flushes the guest's disk cache first.
 - **Network**: a sandbox reaches the internet and nothing else. There is no route to
   private networks (LAN, tailnet, link-local, other sandboxes), no connection into the
-  host, and no mail out (TCP 25, 465, 587). No IPv6 either: the guest kernel boots with
+  host, and no mail out (TCP 25, 465, 587). A packet from a sandbox must carry its own
+  address: one forging another sandbox's, or any other, is dropped. No IPv6 either: the guest kernel boots with
   `ipv6.disable=1`, and the host's rules (one `inet` table, so IPv4 and IPv6 alike) drop
   any IPv6 from a tap, into the host or through it. The agent inside, guestd, is reached
   over vsock.

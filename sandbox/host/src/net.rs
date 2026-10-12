@@ -4,6 +4,8 @@
 //!   • no private destinations (LAN, tailnet, link-local, other sandboxes)
 //!   • no connections into the host (guestd is reached over vsock, never the network)
 //!   • nothing opens a connection into a sandbox; only replies to its own traffic get in
+//!   • no forged sources: a packet from a tap must carry that slot's guest address, so a
+//!     guest can't pass as another sandbox or as anything else
 //!   • no IPv6 at all: guests have no IPv6 route, so whatever IPv6 a tap carries (a
 //!     link-local address, the host's sshd over fe80::) is dropped, both into the host and
 //!     through it; the guest kernel also boots with `ipv6.disable=1` (vm.rs)
@@ -171,17 +173,29 @@ async fn check_forwarding() -> Result<(), String> {
 /// some providers, the server locked).
 pub const MAIL_PORTS: &str = "{ 25, 465, 587 }";
 
-/// The table's rules, in order, as `nft` commands. The table is `inet`, so a rule with no
-/// family match (`iifname "lhtap*" drop`) covers IPv4 and IPv6 alike.
-fn rules(uplink: &str) -> Vec<String> {
+/// The table's rules, in order, as `nft` commands, for slots `0..slots`. The table is
+/// `inet`, so a rule with no family match (`iifname "lhtap*" drop`) covers IPv4 and IPv6.
+fn rules(uplink: &str, slots: usize) -> Vec<String> {
     let t = format!("{FAMILY} {TABLE}");
-    vec![
+    let mut rules = vec![
         format!("add table {t}"),
+        // Anti-spoofing: from tap N only slot N's guest address gets past this chain; any
+        // other source (another guest's, the host's, the internet's) is counted and
+        // dropped. Masquerade then only ever rewrites a guest's own address.
+        format!("add chain {t} spoof"),
+    ];
+    for index in 0..slots {
+        let slot = Slot { index };
+        rules.push(format!("add rule {t} spoof iifname \"{}\" ip saddr {} return", slot.tap(), slot.guest_ip()));
+    }
+    rules.extend([
+        format!("add rule {t} spoof counter drop"),
         // Priority -1: before Docker's filter chains, so a drop here is final.
         format!("add chain {t} forward {{ type filter hook forward priority -1; }}"),
         // Guests have no IPv6 route (and no IPv6 at all with ipv6.disable=1): nothing of it
         // goes through the host, whatever the host's own IPv6 forwarding is.
         format!("add rule {t} forward iifname \"lhtap*\" meta nfproto ipv6 drop"),
+        format!("add rule {t} forward iifname \"lhtap*\" jump spoof"),
         format!("add rule {t} forward iifname \"lhtap*\" ip daddr {PRIVATE} drop"),
         format!("add rule {t} forward iifname \"lhtap*\" oifname != \"{uplink}\" drop"),
         format!("add rule {t} forward iifname \"lhtap*\" tcp dport {MAIL_PORTS} drop"),
@@ -191,17 +205,20 @@ fn rules(uplink: &str) -> Vec<String> {
         format!("add rule {t} forward oifname \"lhtap*\" drop"),
         // Into the host from a tap, IPv4 and IPv6: a tap has an IPv6 link-local address by
         // default, and the host's IPv6 firewall (ufw on starship) allows sshd from anywhere.
+        // Spoofed sources are counted first, then everything is dropped.
         format!("add chain {t} input {{ type filter hook input priority -1; }}"),
+        format!("add rule {t} input iifname \"lhtap*\" jump spoof"),
         format!("add rule {t} input iifname \"lhtap*\" drop"),
         format!("add chain {t} post {{ type nat hook postrouting priority srcnat; }}"),
         format!("add rule {t} post ip saddr 172.30.0.0/24 oifname \"{uplink}\" masquerade"),
-    ]
+    ]);
+    rules
 }
 
 /// The shared rules, set up once at start (after teardown_all).
-pub async fn setup(uplink: &str) -> Result<(), String> {
+pub async fn setup(uplink: &str, slots: usize) -> Result<(), String> {
     check_forwarding().await?;
-    for rule in rules(uplink) {
+    for rule in rules(uplink, slots) {
         nft(&rule).await?;
     }
     if docker_forward_exists().await {
@@ -236,7 +253,7 @@ pub async fn tap_down(slot: &Slot) {
 mod tests {
     #[test]
     fn a_sandbox_reaches_the_internet_but_not_mail_ports() {
-        let rules = super::rules("enp2s0");
+        let rules = super::rules("enp2s0", 4);
         let drop_mail = "add rule inet lorehouse_sbx forward iifname \"lhtap*\" tcp dport { 25, 465, 587 } drop";
         let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
         // Before anything in the chain could accept it.
@@ -250,7 +267,7 @@ mod tests {
 
     #[test]
     fn ipv6_from_a_sandbox_goes_nowhere() {
-        let rules = super::rules("enp2s0");
+        let rules = super::rules("enp2s0", 4);
         // One inet table: every rule sees IPv4 and IPv6. An `ip` table never sees IPv6, which
         // left the host's sshd reachable over a tap's link-local address.
         assert!(rules.iter().all(|r| r.contains(" inet lorehouse_sbx")), "{rules:#?}");
@@ -258,10 +275,38 @@ mod tests {
         let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
         // Through the host: dropped first, before any rule could accept it.
         let v6 = at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" meta nfproto ipv6 drop");
-        assert_eq!(v6, 2, "the first rule of the forward chain");
+        let forward = at("add chain inet lorehouse_sbx forward { type filter hook forward priority -1; }");
+        assert_eq!(v6, forward + 1, "the first rule of the forward chain");
         // Into the host: the input drop names no family, so it covers both.
         at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop");
         assert!(at("add chain inet lorehouse_sbx input { type filter hook input priority -1; }") < at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop"));
+    }
+
+    #[test]
+    fn a_guest_sends_only_from_its_own_address() {
+        let rules = super::rules("enp2s0", 3);
+        let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
+        // Each tap lets through its own guest's address, and nothing else.
+        let own: Vec<usize> = (0..3)
+            .map(|i| {
+                let slot = super::Slot { index: i };
+                at(&format!("add rule inet lorehouse_sbx spoof iifname \"lhtap{i}\" ip saddr {} return", slot.guest_ip()))
+            })
+            .collect();
+        assert_eq!(rules.iter().filter(|r| r.contains(" spoof iifname")).count(), 3, "one per slot");
+        let drop = at("add rule inet lorehouse_sbx spoof counter drop");
+        assert!(own.iter().all(|&i| i < drop), "the drop ends the chain");
+        assert!(at("add chain inet lorehouse_sbx spoof") < own[0]);
+        // Checked on the way through the host, before anything there accepts...
+        let jump = at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" jump spoof");
+        assert!(jump < at("add rule inet lorehouse_sbx forward oifname \"lhtap*\" ct state established,related accept"));
+        assert!(jump < at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop"));
+        // ...and into it.
+        assert!(at("add rule inet lorehouse_sbx input iifname \"lhtap*\" jump spoof") < at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop"));
+        // The addresses: slot 2's guest is 172.30.0.10, its tap lhtap2.
+        assert!(rules.contains(&"add rule inet lorehouse_sbx spoof iifname \"lhtap2\" ip saddr 172.30.0.10 return".to_string()));
+        // Masquerade is unchanged: only the sandboxes' range, only out of the uplink.
+        at("add rule inet lorehouse_sbx post ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade");
     }
 
     #[test]

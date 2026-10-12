@@ -191,7 +191,7 @@ async fn main() {
     // before their taps, and before any request can boot a disk one of them still holds.
     vm::stop_stale_vmms(&cfg.state_dir, &host).await;
     net::teardown_all().await;
-    if let Err(e) = net::setup(&cfg.uplink).await {
+    if let Err(e) = net::setup(&cfg.uplink, cfg.max_vms).await {
         eprintln!("sandboxd: network setup: {e}");
         net::teardown_all().await;
         std::process::exit(1);
