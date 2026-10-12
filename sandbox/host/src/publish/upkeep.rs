@@ -14,6 +14,11 @@
 //!   larger. Checked before the refresh (from the last measured size; a new mirror counts at
 //!   `mirror_max`, against the total and the free space over the floor), after it, and after
 //!   the bundle fetch. A mirror over its cap is removed, unless a live stage record names it.
+//!   New mirrors are made one at a time, host-wide (`new_mirrors`): admitted, fetched and
+//!   measured before the next is admitted, so two can't count on the same room; a stage of a
+//!   second new repo waits for the first's fetch. Stages of existing mirrors don't wait, and
+//!   run at once: those growing together can pass the total for as long as their stages run,
+//!   by what they bring (about 10 KB a stage, measured), until the check after the bundle.
 //!   Before refusing, mirrors idle for over `evict_idle` are dropped, least recently used
 //!   first, until the mirrors use at most 80% of `mirrors_max` and the floor holds.
 //! - **Status.** Sizes are measured after every job, gc and upkeep pass, and kept; the
@@ -418,8 +423,12 @@ impl Publisher {
     }
 
     /// Before a stage's refresh, under the mirror's lock: the mirror as last measured is
-    /// within its cap, and there is room for it (a new one counts at mirror_max).
-    pub(super) fn admit(&self, dir: &Path, owner: &str, name: &str) -> Result<(), Failure> {
+    /// within its cap, and there is room for it. A `new` one (never fetched into: is_new)
+    /// counts at mirror_max, and is admitted under `new_mirrors`.
+    pub(super) fn admit(&self, dir: &Path, owner: &str, name: &str, new: bool) -> Result<(), Failure> {
+        if new {
+            return self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max);
+        }
         let mut known = self.stats().mirrors.get(dir).map(|m| m.bytes);
         if known.is_none() && dir.join("HEAD").exists() {
             // On disk, not measured yet: put there after the start's inventory, not by a stage.

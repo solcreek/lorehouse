@@ -135,6 +135,10 @@ pub struct Publisher {
     /// REVIEW_CAP; smaller in tests.
     review_cap: usize,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held by a stage making a new mirror, from its admission to its first fetch measured
+    /// (upkeep.rs, Quotas): one new mirror at a time, host-wide. Taken after the mirror's
+    /// own lock.
+    new_mirrors: tokio::sync::Mutex<()>,
     /// The mirrors' quotas, retention and gc (upkeep.rs).
     policy: Policy,
     /// Where mirror and filesystem sizes come from; the disk outside tests.
@@ -573,6 +577,7 @@ impl Publisher {
             remote_base: remote_base.trim_end_matches('/').to_string(),
             review_cap: REVIEW_CAP,
             locks: Mutex::default(),
+            new_mirrors: tokio::sync::Mutex::new(()),
             policy: Policy::default(),
             disk: Arc::new(RealDisk),
             clock: Arc::new(unix_secs),
@@ -651,20 +656,23 @@ impl Publisher {
         let dir = self.mirror(&req.owner, &req.name);
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
-        self.admit(&dir, &req.owner, &req.name)?;
         let new = is_new(&dir).await;
+        // A new mirror is admitted, fetched and measured one at a time, so the next one is
+        // admitted against what the last one measured, not against the same room.
+        let first = if new { Some(self.new_mirrors.lock().await) } else { None };
+        self.admit(&dir, &req.owner, &req.name, new)?;
         if let Err(e) = self.update_mirror(&dir, &req.owner, &req.name, req.token.as_deref()).await {
             self.refresh_failed(&dir, &e);
             return Err((502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)));
         }
         if let Err(e) = self.check_size(&dir, &req.owner, &req.name) {
-            // A mirror just made for this stage doesn't stay to hold space it had no room for
-            // (two new mirrors admitted at once can't both keep theirs).
+            // A mirror just made for this stage doesn't stay to hold space it had no room for.
             if new {
                 self.drop_mirror(&dir);
             }
             return Err(e);
         }
+        drop(first);
         let id = new_stage_id_at(self.now()).map_err(|e| (500, e))?;
         // Removed however this ends, a deadline that drops this future included.
         let bundle = TempFile(dir.join(format!("stage-{id}.bundle")));
@@ -1920,6 +1928,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_new_mirrors_staged_at_once_are_admitted_one_after_the_other() {
+        let mut s = scratch("newatonce");
+        s.publisher.policy.mirrors_max = 6 * GIB;
+        sh(&s.vm, "echo a2 > a2 && git add a2 && git commit -qm a2");
+        s.size("acme/widgets", 3 * GIB);
+        s.size("acme/gadgets", GIB);
+        // Both start before either has fetched. The second is admitted only once the first
+        // is measured: 3 GiB used, and a new mirror counts at 4, over the 6.
+        let (first, second) = tokio::join!(s.stage_all(request("scout/a"), || {}), s.stage_all(on("gadgets", "main", "scout/a"), || {}));
+        first.unwrap();
+        let err = second.unwrap_err();
+        assert!(err.0 == 507 && err.1.contains("mirrors use 3 of 6 GiB"), "{err:?}");
+        assert!(!s.publisher.mirror("acme", "gadgets").exists(), "never fetched");
+    }
+
+    #[tokio::test]
+    async fn a_stage_of_an_existing_mirror_doesnt_wait_for_a_new_mirrors_first_fetch() {
+        let s = scratch("newwait");
+        sh(&s.vm, "echo e2 > e2 && git add e2 && git commit -qm e2");
+        s.stage_all(request("scout/e"), || {}).await.unwrap();
+        // A new mirror's first fetch is under way (it holds new_mirrors).
+        let fetching = s.publisher.new_mirrors.lock().await;
+        sh(&s.vm, "echo e3 > e3 && git add e3 && git commit -qm e3");
+        let staged = tokio::time::timeout(Duration::from_secs(60), s.stage_all(request("scout/e2"), || {})).await;
+        assert!(staged.expect("not blocked by the first fetch").is_ok());
+        // A new one waits for it.
+        let new = tokio::time::timeout(Duration::from_millis(500), s.stage_all(on("gadgets", "main", "scout/e"), || {})).await;
+        assert!(new.is_err(), "a second new mirror waits for the first's fetch");
+        drop(fetching);
+        s.stage_all(on("gadgets", "main", "scout/e"), || {}).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_restarted_host_counts_the_mirrors_on_disk_before_it_takes_a_stage() {
         let mut s = scratch("inventory");
         s.publisher.policy.mirrors_max = 6 * GIB;
@@ -1931,7 +1972,7 @@ mod tests {
         restarted.disk = s.disk.clone();
         restarted.inventory();
         // 3 GiB used, and a new mirror counts at 4: over the 6.
-        let err = restarted.admit(&restarted.mirror("acme", "widgets"), "acme", "widgets").unwrap_err();
+        let err = restarted.admit(&restarted.mirror("acme", "widgets"), "acme", "widgets", true).unwrap_err();
         assert!(err.0 == 507 && err.1.contains("mirrors use 3 of 6 GiB"), "{err:?}");
     }
 

@@ -234,6 +234,12 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
     is removed, unless a live stage record names it (its push needs it). Before refusing,
     mirrors idle for over 24 h are dropped, least recently used first, down to 80% of the
     total.
+  - New mirrors are made one at a time on a host: admitted, fetched and measured before
+    the next one is admitted, so two can't count on the same room. A stage of a second new
+    repo waits for the first's fetch (within its own deadline). Stages of existing mirrors
+    never wait for it and run at once, so mirrors growing together can pass the total
+    briefly, by what their stages bring (about 10 KB a stage, measured in #76), until the
+    check after each bundle.
   - Every mirror is measured at start, before any job is taken. The upkeep runs then and
     every 5 minutes, plus after every stage and push.
 - **Failures** come back as statuses with a reason:
