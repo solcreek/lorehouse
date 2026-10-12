@@ -1603,6 +1603,8 @@ mod tests {
         }
         let text = std::fs::read_to_string(&ids).unwrap();
         let [helper, group]: [libc::pid_t; 2] = text.split_whitespace().map(|n| n.parse().unwrap()).collect::<Vec<_>>().try_into().unwrap();
+        // SAFETY: getpgid() only reads.
+        assert_eq!(unsafe { libc::getpgid(helper) }, group, "the helper is in the command's group");
         // Whoever takes the lock next looks at once: is anything of that command left?
         let next = tokio::spawn({
             let lock = lock.clone();
