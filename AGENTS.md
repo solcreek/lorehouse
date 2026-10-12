@@ -79,11 +79,10 @@ to catch edits/deletes made while down, and re-indexes a thread live after it go
 (`INGEST_DEBOUNCE_MS`). One document per thread (`slack:<channel>:<root ts>`).
 `src/knowledge.ts` is SQLite FTS with CJK bigram indexing. Deleted messages must leave the
 index and `LOREHOUSE_DB`'s files, the `-wal` included (`checkpointSoon` after whatever
-removes text, `closeKnowledge` on SIGTERM or SIGINT). Known exceptions: usage's search
-queries for a thread (`agent_searches`) can stay until `pruneUsage` drops them after
-`USAGE_RETENTION_DAYS`, and June's `SESSIONS_DB` keeps what a conversation already
-quoted (#66).
-DMs are never indexed.
+removes text, `closeKnowledge` on SIGTERM or SIGINT). Two other copies can remain: usage
+records, until `USAGE_RETENTION_DAYS` at the latest (#98), and June's `SESSIONS_DB`, which
+keeps every turn's full tool results and answers until June supports redaction
+(junebuild/june#360). DMs are never indexed.
 
 **Policy.** `src/policy.ts` restricts every channel event to channels in
 `AGENT_CHANNELS` (empty means nowhere) and refuses private channels and group DMs where the
