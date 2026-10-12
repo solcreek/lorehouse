@@ -19,6 +19,12 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/sandboxd
 EnvironmentFile=/etc/lorehouse/sandboxd.env
+# The token as a systemd credential (README.md, "Tokens"): a root-only file systemd hands
+# to sandboxd alone, never in any process's environment. Read before SANDBOXD_RUNNER_TOKEN
+# (still accepted, with a warning). To switch: write the token to the file (root, 0600),
+# uncomment this line, remove SANDBOXD_RUNNER_TOKEN from sandboxd.env, restart. A line
+# naming a missing file fails the start. Serve mode: LoadCredential=api-token:<file>.
+#LoadCredential=runner-token:/etc/lorehouse/sandboxd-runner-token
 Restart=on-failure
 RestartSec=5
 # SIGTERM stops every VM cleanly (sync first, disks kept) and removes its network rules:

@@ -36,6 +36,11 @@ Every request carries:
 - `Authorization: Bearer <SANDBOX_RUNNER_TOKEN>`, compared in constant time;
 - `X-Lorehouse-Runner: <name>`, 1–64 characters of `[A-Za-z0-9_.-]`.
 
+On the runner's side, sandboxd reads the token from the systemd credential
+`runner-token` (`LoadCredential=runner-token:<file>`, a root-only file), falling back to
+`SANDBOXD_RUNNER_TOKEN` with a deprecation warning: a credential is never in any
+process's environment ([`sandbox/host/README.md`](../sandbox/host/README.md#tokens)).
+
 A second connection with the same name replaces the first, with two exceptions: a poll
 never displaces a live WebSocket, and a poll from an older runner process (by the status's
 `started`) never displaces a newer one's.

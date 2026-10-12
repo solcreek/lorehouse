@@ -48,10 +48,10 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 |---|---|---|
 | `SANDBOXD_APP_URL` | (none) | runner mode: Lorehouse's URL, e.g. `https://lorehouse.example.com`. Must be HTTPS: the runner token travels with every request |
 | `SANDBOXD_ALLOW_INSECURE_HTTP` | (off) | `1` allows an `http://` app URL, only for loopback or an already-encrypted private link (e.g. a WireGuard tailnet) in development |
-| `SANDBOXD_RUNNER_TOKEN` | (required with `SANDBOXD_APP_URL`) | Lorehouse's `SANDBOX_RUNNER_TOKEN` |
+| `SANDBOXD_RUNNER_TOKEN` | (required with `SANDBOXD_APP_URL`, unless the `runner-token` credential is set) | Lorehouse's `SANDBOX_RUNNER_TOKEN`. Deprecated here: pass it as a credential instead ([Tokens](#tokens)) |
 | `SANDBOXD_RUNNER_NAME` | the hostname | how Lorehouse knows this host (sandboxes stick to it) |
 | `SANDBOXD_TRANSPORT` | `auto` | `ws`, `poll`, or `auto`: WebSocket, falling back to long poll when an upgrade is refused |
-| `SANDBOXD_TOKEN` | (required without `SANDBOXD_APP_URL`) | serve mode: bearer token for every `/v1` request, 32+ characters |
+| `SANDBOXD_TOKEN` | (required without `SANDBOXD_APP_URL`, unless the `api-token` credential is set) | serve mode: bearer token for every `/v1` request, 32+ characters. Deprecated here, like the runner token |
 | `SANDBOXD_GOLDEN` | (required) | the prepared rootfs |
 | `SANDBOXD_KERNEL` | (required) | guest kernel image |
 | `SANDBOXD_UPLINK` | (required) | the host's internet-facing interface |
@@ -70,6 +70,34 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_MIRRORS_MAX_GIB` | `24` | the most all mirrors may use; idle ones (over 24 h) are dropped first. New mirrors are made one at a time (a second new repo's stage waits for the first's fetch); existing mirrors growing at once can pass it by what those stages fetch (about 10 KB for a typical stage); a refused stage's bundle is collected by the gc, its refresh stays with the mirror |
 | `SANDBOXD_MIRRORS_FREE_PCT` `SANDBOXD_MIRRORS_FREE_GIB` | `10`, `20` | stages are refused (507) while the state directory's filesystem has less free, whichever is larger. On a large shared disk 10% is a lot (93 GiB of 932): lower the percentage there |
 | `SANDBOXD_MIRROR_RETENTION_DAYS` | `14` | a mirror is dropped this long after its last stage or push |
+
+### Tokens
+
+The runner token (and serve mode's API token) are best passed as systemd credentials:
+a root-only file that systemd hands to sandboxd alone, in `$CREDENTIALS_DIRECTORY`, and
+that is never part of any process's environment. A variable in `sandboxd.env` ends up in
+sandboxd's environment, readable in `/proc/<pid>/environ` by root for as long as it runs
+(sandboxd starts every child with a clean environment, so they don't inherit it).
+
+| credential | file (suggested) | replaces |
+|---|---|---|
+| `runner-token` | `/etc/lorehouse/sandboxd-runner-token` | `SANDBOXD_RUNNER_TOKEN` |
+| `api-token` | `/etc/lorehouse/sandboxd-api-token` | `SANDBOXD_TOKEN` |
+
+sandboxd reads the credential first. The variable still works, with a deprecation
+warning at every start; with both set, the credential wins and the warning says the
+variable is ignored. To switch a host:
+
+```bash
+sudo install -m 0600 /dev/null /etc/lorehouse/sandboxd-runner-token
+# write the token into it (from where it is now, never through argv), then
+# uncomment LoadCredential=runner-token:/etc/lorehouse/sandboxd-runner-token in
+# the unit, remove SANDBOXD_RUNNER_TOKEN from sandboxd.env, and:
+sudo systemctl daemon-reload && sudo systemctl restart sandboxd
+```
+
+A token rotation then writes that file instead of `sandboxd.env`. The unit ships with
+the line commented out: `LoadCredential=` naming a missing file fails the start.
 
 Then install [`sandboxd.service`](sandboxd.service). It creates the default state
 directory itself (`StateDirectory=`); with another `SANDBOXD_STATE`, create it and add a
