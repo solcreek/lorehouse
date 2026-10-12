@@ -951,13 +951,21 @@ mod tests {
         fs: Mutex<Option<(u64, u64)>>,
         /// Once this mirror is measured, the filesystem becomes this.
         fs_on_measure: Mutex<Option<(String, (u64, u64))>>,
+        /// Run once this mirror is measured.
+        on_measure: Mutex<Option<(String, Hook)>>,
     }
+
+    type Hook = Box<dyn FnOnce() + Send>;
 
     impl Disk for FakeDisk {
         fn usage(&self, dir: &Path) -> (u64, u64) {
             let repo = format!("{}/{}", dir.parent().unwrap().file_name().unwrap().to_string_lossy(), dir.file_name().unwrap().to_string_lossy().trim_end_matches(".git"));
             if let Some((_, fs)) = self.fs_on_measure.lock().unwrap().as_ref().filter(|(r, _)| *r == repo) {
                 *self.fs.lock().unwrap() = Some(*fs);
+            }
+            let hook = self.on_measure.lock().unwrap().take_if(|(r, _)| *r == repo);
+            if let Some((_, run)) = hook {
+                run();
             }
             match self.sizes.lock().unwrap().get(&repo) {
                 Some(&bytes) => (bytes, 0),
@@ -1804,6 +1812,26 @@ mod tests {
         assert!(!s.dir().exists(), "15 days idle: dropped");
         assert!(s.publisher.mirror("acme", "gadgets").exists(), "used 2 days ago: kept");
         assert_eq!(s.publisher.status()["evicted"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_mirror_made_during_an_upkeep_pass_stays_counted() {
+        let s = scratch("passnew");
+        sh(&s.vm, "echo p > p && git add p && git commit -qm p");
+        s.size("acme/widgets", GIB);
+        s.size("acme/gadgets", 2 * GIB);
+        s.stage_all(request("scout/p"), || {}).await.unwrap();
+        s.stage_all(on("gadgets", "main", "scout/p"), || {}).await.unwrap();
+        // gadgets is made (here: put back) after the pass listed the mirrors, and measured
+        // by its stage.
+        let (gadgets, aside) = (s.publisher.mirror("acme", "gadgets"), s.root.join("aside.git"));
+        std::fs::rename(&gadgets, &aside).unwrap();
+        let back = gadgets.clone();
+        *s.disk.on_measure.lock().unwrap() = Some(("acme/widgets".into(), Box::new(move || std::fs::rename(&aside, &back).unwrap())));
+        s.publisher.maintain().await;
+        assert!(gadgets.exists());
+        let status = s.publisher.status();
+        assert_eq!((status["count"].as_u64(), status["bytes"].as_u64()), (Some(2), Some(3 * GIB)));
     }
 
     #[tokio::test]

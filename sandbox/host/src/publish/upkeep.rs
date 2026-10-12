@@ -549,12 +549,12 @@ impl Publisher {
             }
             self.measure(dir);
         }
-        // Mirrors no longer on disk (removed by hand) are forgotten.
-        let on_disk: HashSet<&PathBuf> = dirs.iter().collect();
+        // Mirrors no longer on disk (removed by hand) are forgotten; not by the list the pass
+        // started from, which a stage may have added a mirror to since.
         let fs_free = self.fs().map(|(free, _)| free);
         let records = self.count_records();
         let mut st = self.stats();
-        st.mirrors.retain(|d, _| on_disk.contains(d) && d.join("HEAD").exists());
+        st.mirrors.retain(|d, _| d.join("HEAD").exists());
         st.fs_free = fs_free;
         st.records = records;
     }
