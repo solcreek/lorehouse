@@ -1807,6 +1807,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_looks_for_a_live_stage_again_once_it_holds_the_mirrors_lock() {
+        let mut s = scratch("retentionlive");
+        sh(&s.vm, "echo q > q && git add q && git commit -qm q");
+        s.stage_all(request("scout/q"), || {}).await.unwrap();
+        // 15 days on. The pass reads the clock first for the records it starts from, then
+        // once it holds the mirror's lock: a stage of it records itself in between.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen, records) = (calls.clone(), s.publisher.records());
+        s.publisher.clock = Arc::new(move || {
+            let now = unix_secs() + 15 * 86_400;
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                let id = format!("{now}-{}", "c".repeat(32));
+                let record = StageRecord { id: id.clone(), sandbox: SANDBOX.into(), owner: "acme".into(), name: "widgets".into(), base: "main".into(), base_sha: String::new(), branch: "scout/q2".into(), sha: "c".repeat(40), diff_sha256: String::new(), created_at: now };
+                std::fs::write(records.join(format!("{id}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            now
+        });
+        s.publisher.maintain().await;
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "the record was written during the pass");
+        assert!(s.dir().exists(), "a live stage names it");
+    }
+
+    #[tokio::test]
     async fn a_mirror_over_its_cap_after_the_refresh_or_the_bundle_is_removed_with_a_507() {
         let s = scratch("overcap");
         sh(&s.vm, "echo o > o && git add o && git commit -qm o");

@@ -532,7 +532,9 @@ impl Publisher {
                 continue;
             };
             let idle = now.saturating_sub(state.last_used);
-            if idle > self.policy.retention.as_secs() && !live.contains(&repo_of(dir)) {
+            // Looked at again under its lock, as evict() does: a stage of it may have written
+            // its record since the pass began.
+            if idle > self.policy.retention.as_secs() && !live.contains(&repo_of(dir)) && !self.live_repos().contains(&repo_of(dir)) {
                 remove_mirror(dir);
                 self.forget(dir);
                 self.stats().evicted += 1;
