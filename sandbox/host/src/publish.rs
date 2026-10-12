@@ -873,12 +873,15 @@ impl Publisher {
         // The stage's ref is done with either way (its record is gone).
         let _ = git(&dir, &["update-ref", "-d", &format!("refs/stage/{}", record.id)], None, GIT_LOCAL).await;
         self.prune(&dir).await;
+        // gc before the mirror is measured, so the size kept is what the push left.
+        if pushed.is_ok() {
+            let _ = git(&dir, GC_AUTO, None, GIT_LOCAL).await;
+        }
         self.after_job(&dir, pushed.as_ref().ok().map(|_| record.id.as_str())).await;
         if let Err(e) = pushed {
             let status = if e.contains("non-fast-forward") || e.contains("[rejected]") || e.contains("fetch first") { 409 } else { 502 };
             return Err((status, format!("push to {}: {e}", record.branch)));
         }
-        let _ = git(&dir, GC_AUTO, None, GIT_LOCAL).await;
         Ok(Pushed { sha: record.sha, branch: record.branch })
     }
 
@@ -1606,6 +1609,30 @@ mod tests {
             let got = git(&s.dir(), &["config", "--get", key], None, GIT_LOCAL).await;
             assert_eq!(got.as_deref().map(str::trim), Ok(want), "{key}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_push_is_measured_after_its_gc() {
+        let s = scratch("gcmeasure");
+        sh(&s.vm, "echo m > m && git add m && git commit -qm m");
+        let staged = s.stage("scout/m").await.unwrap();
+        sh(&s.dir(), "for i in $(seq 1 55); do echo $i | git hash-object --stdin -w | git pack-objects -q objects/pack/pack >/dev/null; done");
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/m")).await.unwrap();
+        assert!(packs(&s.dir()) <= 2, "{}", packs(&s.dir()));
+        assert_eq!(s.publisher.status()["bytes"].as_u64().unwrap(), RealDisk.usage(&s.dir()).0, "the size kept is the size after gc");
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_measures_the_mirror_again() {
+        let s = scratch("refreshmeasure");
+        sh(&s.vm, "echo r > r && git add r && git commit -qm r");
+        s.size("acme/widgets", GIB);
+        s.stage_all(request("scout/r"), || {}).await.unwrap();
+        assert_eq!(s.publisher.status()["bytes"].as_u64().unwrap(), GIB);
+        s.size("acme/widgets", 2 * GIB);
+        std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
+        s.stage_all(request("scout/r2"), || {}).await.unwrap_err();
+        assert_eq!(s.publisher.status()["bytes"].as_u64().unwrap(), 2 * GIB, "measured again after the failed refresh");
     }
 
     #[tokio::test]
