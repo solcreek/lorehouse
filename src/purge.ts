@@ -11,9 +11,9 @@
 // A 👍/👎 (agent_feedback) stays until retention: it holds no text and no thread. An empty
 // list purges everything learned from Slack.
 //
-// Two other copies of the channel's text can remain:
+// Other copies of the channel's text can remain, among them:
 //   • usage records this doesn't match by channel (a search can repeat its words), until
-//     USAGE_RETENTION_DAYS at the latest (#98);
+//     pruneUsage drops them past USAGE_RETENTION_DAYS (#98);
 //   • June's saved conversations in SESSIONS_DB: every turn's full tool results (whole
 //     search results, not only what was quoted) and answers. They are the framework's
 //     tables, which Lorehouse code doesn't touch (AGENTS.md). The channel's own threads are

@@ -137,10 +137,10 @@ These are Lorehouse's position, not settings:
   ingested or seeded into it, and nothing is filtered at read time. So only public
   material may go into the index; what is indexed and when it leaves is the ingest's
   rule, not the DM's (#82). Leaving the index, and `LOREHOUSE_DB`'s files with it
-  (#65, #92), is not leaving every copy. Two can remain after a message is deleted or its
-  channel unlisted: usage records, until the 90-day usage retention at the latest (#98);
-  and June's saved conversations in `SESSIONS_DB`, which keep every turn's full tool
-  results (whole search results, not only what was quoted) and answers, so any
+  (#65, #92), is not leaving every copy. Others can remain after a message is deleted or
+  its channel unlisted, among them usage records, until usage's 90-day retention prunes
+  them (#98), and June's saved conversations in `SESSIONS_DB`, which keep every turn's
+  full tool results (whole search results, not only what was quoted) and answers, so any
   conversation can bring the text up again until June supports redaction
   (junebuild/june#360). Stopping the app and deleting `SESSIONS_DB` erases them now, with
   every thread's memory. It never has code tools (#58). A profile can't loosen that.
