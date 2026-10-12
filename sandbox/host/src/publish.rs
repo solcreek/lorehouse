@@ -1466,21 +1466,22 @@ mod tests {
         sh(&s.dir(), "git rev-parse --verify -q refs/heads/main");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_fetched_mirror_whose_refs_cant_be_read_is_kept_when_its_refresh_fails() {
-        use std::os::unix::fs::PermissionsExt;
         let s = scratch("unreadable");
         let dir = s.dir();
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
-        // for-each-ref fails (packed-refs can't be read), and so does the fetch.
+        // for-each-ref fails (git won't read a packed-refs with a line it doesn't know, as
+        // any user, root included), and so does the fetch.
         sh(&dir, "git pack-refs --all");
         let packed = dir.join("packed-refs");
-        std::fs::set_permissions(&packed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refs = std::fs::read(&packed).unwrap();
+        std::fs::write(&packed, [refs.as_slice(), b"not a ref\n"].concat()).unwrap();
+        assert!(git(&dir, &["for-each-ref"], None, GIT_LOCAL).await.is_err(), "for-each-ref fails");
         std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap_err();
         assert!(packed.exists(), "the mirror is still there");
-        std::fs::set_permissions(&packed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&packed, refs).unwrap();
         sh(&dir, "git rev-parse --verify -q refs/heads/main");
     }
 
