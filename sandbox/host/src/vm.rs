@@ -37,7 +37,7 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
         let Ok(cmdline) = tokio::fs::read(format!("/proc/{pid}/cmdline")).await else { continue };
         let args: Vec<String> = cmdline.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-        if !args.first().is_some_and(|a| a.ends_with("firecracker")) {
+        if !args.first().is_some_and(|a| jail::is_firecracker(a)) {
             continue;
         }
         let cgroup = tokio::fs::read_to_string(format!("/proc/{pid}/cgroup")).await.unwrap_or_default();

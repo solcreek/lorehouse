@@ -223,10 +223,17 @@ pub fn parse_cgroup(proc_cgroup: &str) -> Option<String> {
     proc_cgroup.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_string())
 }
 
+/// Whether a process's argv[0] is a Firecracker binary: its file name contains
+/// "firecracker", the same rule `prepare` (and the jailer) hold the binary to. A jailed one
+/// is `/<exec_name>`, e.g. `/firecracker-v1.10.1-x86_64` as release tarballs name it.
+pub fn is_firecracker(argv0: &str) -> bool {
+    Path::new(argv0).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("firecracker"))
+}
+
 /// The jail id of a Firecracker process from a previous run, if it is one of ours: its
 /// argv[0] names Firecracker and its cgroup sits under our VMs' parent.
 pub fn jailed_vmm(args: &[String], proc_cgroup: &str, cgroup_parent: &str) -> Option<String> {
-    if !args.first().is_some_and(|a| a.ends_with("firecracker")) {
+    if !args.first().is_some_and(|a| is_firecracker(a)) {
         return None;
     }
     let path = parse_cgroup(proc_cgroup)?;
@@ -479,6 +486,10 @@ pub mod tests {
         let parent = "system.slice/sandboxd.service/vms";
         let fc = args(&["/firecracker", "--id", "lorehouse-2", "--api-sock", "/api.sock"]);
         assert_eq!(jailed_vmm(&fc, "0::/system.slice/sandboxd.service/vms/lorehouse-2\n", parent).as_deref(), Some("lorehouse-2"));
+        // A release tarball's binary keeps its versioned name in the jail.
+        let versioned = args(&["/firecracker-v1.10.1-x86_64", "--id", "lorehouse-2"]);
+        assert_eq!(jailed_vmm(&versioned, "0::/system.slice/sandboxd.service/vms/lorehouse-2\n", parent).as_deref(), Some("lorehouse-2"));
+        assert!(!is_firecracker("/usr/local/bin/firecracker-wrapper/bash"));
         // Someone else's Firecracker (another cgroup), or not Firecracker at all: not ours.
         assert_eq!(jailed_vmm(&fc, "0::/system.slice/firerunner.service/vm-1\n", parent), None);
         assert_eq!(jailed_vmm(&fc, "0::/system.slice/sandboxd.service/vms-old/lorehouse-2\n", parent), None);
