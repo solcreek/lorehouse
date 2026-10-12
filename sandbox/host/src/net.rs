@@ -87,9 +87,80 @@ pub async fn teardown_all() {
     }
 }
 
+const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+
+/// Whether the host forwards IPv4, from the contents of IP_FORWARD.
+fn forwarding_on(ip_forward: &str) -> bool {
+    ip_forward.trim() == "1"
+}
+
+/// The value a sysctl config file's last assignment gives net.ipv4.ip_forward, if any.
+fn forwarding_value(conf: &str) -> Option<bool> {
+    conf.lines().rev().find_map(|line| {
+        let (k, v) = line.trim().trim_start_matches('-').split_once('=')?;
+        (k.trim().replace('/', ".") == "net.ipv4.ip_forward").then(|| v.trim() == "1")
+    })
+}
+
+/// Where systemd-sysctl reads its files at boot, highest precedence first.
+/// (/etc/sysctl.conf counts only through a link in one of them, as distributions ship it.)
+const SYSCTL_DIRS: [&str; 5] = ["/etc/sysctl.d", "/run/sysctl.d", "/usr/local/lib/sysctl.d", "/usr/lib/sysctl.d", "/lib/sysctl.d"];
+
+/// Whether forwarding is on once systemd-sysctl has applied `files` — (file name, contents)
+/// in SYSCTL_DIRS order — the way it does: only `*.conf`, a name in an earlier directory
+/// hides the same name in a later one (a link to /dev/null masks it), the rest applied in
+/// file name order, the last assignment winning.
+fn forwarding_after(files: Vec<(String, String)>) -> bool {
+    let mut by_name = std::collections::BTreeMap::new();
+    for (name, contents) in files {
+        if name.ends_with(".conf") {
+            by_name.entry(name).or_insert(contents);
+        }
+    }
+    by_name.values().rev().find_map(|c| forwarding_value(c)).unwrap_or(false)
+}
+
+/// Whether forwarding will still be on after a reboot, from what systemd-sysctl reads.
+async fn forwarding_set_at_boot() -> bool {
+    let mut files = Vec::new();
+    for dir in SYSCTL_DIRS {
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else { continue };
+        let mut names = Vec::new();
+        while let Ok(Some(e)) = entries.next_entry().await {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        for name in names {
+            if let Ok(contents) = tokio::fs::read_to_string(std::path::Path::new(dir).join(&name)).await {
+                files.push((name, contents));
+            }
+        }
+    }
+    forwarding_after(files)
+}
+
+/// sandboxd doesn't turn forwarding on itself: its unit makes /proc/sys read-only
+/// (ProtectKernelTunables=yes), so sandboxd.sysctl.conf sets it at boot and this checks it.
+async fn check_forwarding() -> Result<(), String> {
+    let value = tokio::fs::read_to_string(IP_FORWARD).await.map_err(|e| format!("{IP_FORWARD}: {e}"))?;
+    if forwarding_on(&value) {
+        // On now, possibly only because an older sandboxd (or Docker) set it at run time:
+        // say so before a reboot turns it off and this check refuses the start.
+        if !forwarding_set_at_boot().await {
+            eprintln!("sandboxd: WARNING: net.ipv4.ip_forward is on, but the sysctl.d files applied at boot leave it off, so after a reboot sandboxd won't start; install sandboxd.sysctl.conf as /etc/sysctl.d/90-lorehouse-sandboxd.conf, with no later-named file setting it to 0");
+        }
+        Ok(())
+    } else {
+        Err(format!(
+            "net.ipv4.ip_forward is {}, so sandboxes would have no internet. Install sandboxd.sysctl.conf as /etc/sysctl.d/90-lorehouse-sandboxd.conf and run `sysctl --system`; sandboxd doesn't set it itself (its unit makes kernel tunables read-only)",
+            value.trim()
+        ))
+    }
+}
+
 /// The shared rules, set up once at start (after teardown_all).
 pub async fn setup(uplink: &str) -> Result<(), String> {
-    run(&["sysctl", "-q", "-w", "net.ipv4.ip_forward=1"]).await?;
+    check_forwarding().await?;
     nft(&format!("add table ip {TABLE}")).await?;
     // Priority -1: before Docker's filter chains, so a drop here is final.
     nft(&format!("add chain ip {TABLE} forward {{ type filter hook forward priority -1; }}")).await?;
@@ -121,4 +192,46 @@ pub async fn tap_up(slot: &Slot) -> Result<(), String> {
 
 pub async fn tap_down(slot: &Slot) {
     let _ = run(&["ip", "link", "del", &slot.tap()]).await;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn forwarding_is_read_not_written() {
+        assert!(super::forwarding_on("1\n"));
+        assert!(!super::forwarding_on("0\n"));
+        assert!(!super::forwarding_on(""));
+        // Nothing in the daemon may write a sysctl: under ProtectKernelTunables=yes it
+        // can't, and the setting belongs to sandboxd.sysctl.conf.
+        let src = include_str!("net.rs");
+        let call = ["\"sys", "ctl\""].concat();
+        assert!(!src.contains(&call), "net.rs runs sysctl");
+        let conf = include_str!("../sandboxd.sysctl.conf");
+        assert_eq!(super::forwarding_value(conf), Some(true), "{conf}");
+        // What the boot-time check recognises, and what it doesn't.
+        assert_eq!(super::forwarding_value("net/ipv4/ip_forward=1\n"), Some(true));
+        assert_eq!(super::forwarding_value("-net.ipv4.ip_forward = 1\n"), Some(true));
+        assert_eq!(super::forwarding_value("# net.ipv4.ip_forward = 1\nnet.ipv4.ip_forward = 0\n"), Some(false));
+        assert_eq!(super::forwarding_value("net.ipv4.ip_forward = 1\nnet.ipv4.ip_forward = 0\n"), Some(false));
+        assert_eq!(super::forwarding_value("kernel.sysrq = 1\n"), None);
+    }
+
+    #[test]
+    fn boot_forwarding_follows_systemd_sysctl_order() {
+        let f = |files: &[(&str, &str)]| super::forwarding_after(files.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect());
+        let on = "net.ipv4.ip_forward = 1\n";
+        let off = "net.ipv4.ip_forward = 0\n";
+        assert!(f(&[("90-lorehouse-sandboxd.conf", on)]));
+        assert!(!f(&[]));
+        // A later file name turns it off again: a reboot would leave it off.
+        assert!(!f(&[("90-lorehouse-sandboxd.conf", on), ("99-local.conf", off)]));
+        assert!(f(&[("10-local.conf", off), ("90-lorehouse-sandboxd.conf", on)]));
+        // File name order, not directory order: /etc's 99 (read first) is applied after
+        // /usr/lib's 90.
+        assert!(!f(&[("99-local.conf", off), ("90-lorehouse-sandboxd.conf", on)]));
+        // An /etc file (listed first) hides /usr/lib's of the same name, e.g. a /dev/null mask.
+        assert!(!f(&[("90-lorehouse-sandboxd.conf", ""), ("90-lorehouse-sandboxd.conf", on)]));
+        // Only *.conf is read.
+        assert!(!f(&[("90-lorehouse-sandboxd.conf.bak", on)]));
+    }
 }

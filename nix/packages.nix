@@ -193,6 +193,10 @@ let
         ../sandbox/host/Cargo.toml
         ../sandbox/host/Cargo.lock
         ../sandbox/host/src
+        # The unit and the host settings: the tests check them (src/service_unit.rs).
+        ../sandbox/host/sandboxd.service
+        ../sandbox/host/sandboxd.sysctl.conf
+        ../sandbox/host/sandboxd.modules.conf
       ];
     };
     cargoLock.lockFile = ../sandbox/host/Cargo.lock;
