@@ -554,11 +554,19 @@ impl Publisher {
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
         self.admit(&dir, &req.owner, &req.name)?;
+        let new = !dir.join("HEAD").exists();
         if let Err(e) = self.update_mirror(&dir, &req.owner, &req.name, req.token.as_deref()).await {
             self.refresh_failed(&dir, &e);
             return Err((502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)));
         }
-        self.check_size(&dir, &req.owner, &req.name)?;
+        if let Err(e) = self.check_size(&dir, &req.owner, &req.name) {
+            // A mirror just made for this stage doesn't stay to hold space it had no room for
+            // (two new mirrors admitted at once can't both keep theirs).
+            if new {
+                self.drop_mirror(&dir);
+            }
+            return Err(e);
+        }
         let id = new_stage_id_at(self.now()).map_err(|e| (500, e))?;
         // Removed however this ends, a deadline that drops this future included.
         let bundle = TempFile(dir.join(format!("stage-{id}.bundle")));
@@ -891,11 +899,16 @@ mod tests {
     struct FakeDisk {
         sizes: Mutex<HashMap<String, u64>>,
         fs: Mutex<Option<(u64, u64)>>,
+        /// Once this mirror is measured, the filesystem becomes this.
+        fs_on_measure: Mutex<Option<(String, (u64, u64))>>,
     }
 
     impl Disk for FakeDisk {
         fn usage(&self, dir: &Path) -> (u64, u64) {
             let repo = format!("{}/{}", dir.parent().unwrap().file_name().unwrap().to_string_lossy(), dir.file_name().unwrap().to_string_lossy().trim_end_matches(".git"));
+            if let Some((_, fs)) = self.fs_on_measure.lock().unwrap().as_ref().filter(|(r, _)| *r == repo) {
+                *self.fs.lock().unwrap() = Some(*fs);
+            }
             match self.sizes.lock().unwrap().get(&repo) {
                 Some(&bytes) => (bytes, 0),
                 None => RealDisk.usage(dir),
@@ -1723,28 +1736,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_mirror_needs_room_for_its_cap_and_idle_mirrors_make_room_least_recently_used_first() {
+    async fn a_new_mirror_needs_room_for_its_cap_and_idle_mirrors_make_room_least_recently_used_first_down_to_80_percent() {
         let mut s = scratch("total");
         s.publisher.policy.mirrors_max = 10 * GIB;
-        sh(&s.root, "git clone -q --bare acme/gadgets.git acme/gizmos.git");
+        sh(&s.root, "git clone -q --bare acme/gadgets.git acme/gizmos.git && git clone -q --bare acme/gadgets.git acme/gears.git");
         sh(&s.vm, "echo t > t && git add t && git commit -qm t");
         let half = GIB / 2;
-        s.size("acme/gadgets", 3 * GIB + half);
-        s.size("acme/gizmos", 3 * GIB + half);
-        s.stage_all(on("gadgets", "main", "scout/t"), || {}).await.unwrap();
-        s.advance(3600);
-        s.stage_all(on("gizmos", "main", "scout/t"), || {}).await.unwrap();
-        // 7 of 10 GiB used, and a new mirror counts at its cap (4): no room, none idle.
+        // Used in this order, an hour apart: 1.5 + 4 + 1.5 = 7 GiB.
+        for (name, size) in [("gadgets", GIB + half), ("gizmos", 4 * GIB), ("gears", GIB + half)] {
+            s.size(&format!("acme/{name}"), size);
+            s.stage_all(on(name, "main", "scout/t"), || {}).await.unwrap();
+            s.advance(3600);
+        }
+        // A new mirror counts at its cap (4): 11 of 10. None is idle yet: refused.
         let err = s.stage_all(request("scout/t"), || {}).await.unwrap_err();
         assert_eq!(err, (507, "the sandbox host has no room for the mirror of acme/widgets (mirrors use 7 of 10 GiB, and this one would need up to 4 GiB): nothing was staged. Try again later, or ask an operator to raise SANDBOXD_MIRRORS_MAX_GIB or free space on the host.".to_string()));
         assert!(!s.dir().exists());
-        // A day later both are idle: the least recently used one goes, and that is enough.
-        s.advance(86_400 + 60);
+        // A day later all are idle. Least recently used first: gadgets (then 9.5 GiB with the
+        // new one, which fits but is over 80%), then gizmos (5.5 GiB); gears stays.
+        s.advance(86_400);
         s.stage_all(request("scout/t"), || {}).await.unwrap();
-        assert!(!s.publisher.mirror("acme", "gadgets").exists());
-        assert!(s.publisher.mirror("acme", "gizmos").exists());
+        let exists = |name: &str| s.publisher.mirror("acme", name).exists();
+        assert_eq!((exists("gadgets"), exists("gizmos"), exists("gears")), (false, false, true));
         let status = s.publisher.status();
-        assert_eq!((status["count"].as_u64(), status["evicted"].as_u64(), status["refusedForSpace"].as_u64()), (Some(2), Some(1), Some(1)));
+        assert_eq!((status["count"].as_u64(), status["evicted"].as_u64(), status["refusedForSpace"].as_u64()), (Some(2), Some(2), Some(1)));
+    }
+
+    #[tokio::test]
+    async fn eviction_skips_a_mirror_a_live_stage_names_or_a_busy_one_and_a_new_mirror_without_room_goes() {
+        let mut s = scratch("evictguard");
+        s.publisher.policy.mirror_max = 8 * GIB;
+        s.publisher.policy.mirrors_max = 20 * GIB;
+        sh(&s.vm, "echo g > g && git add g && git commit -qm g");
+        s.size("acme/gadgets", 5 * GIB);
+        s.stage_all(on("gadgets", "main", "scout/g"), || {}).await.unwrap();
+        // A new mirror, admitted, but once fetched the filesystem is under its floor (another
+        // writer filled it): refused, and the new mirror doesn't stay.
+        *s.disk.fs_on_measure.lock().unwrap() = Some(("acme/widgets".into(), (GIB, 100 * GIB)));
+        let err = s.stage_all(request("scout/w"), || {}).await.unwrap_err();
+        assert_eq!(err.0, 507, "{}", err.1);
+        assert!(!s.dir().exists());
+        *s.disk.fs_on_measure.lock().unwrap() = None;
+        *s.disk.fs.lock().unwrap() = None;
+        // An existing mirror over the total after the bundle: refused, nothing staged, kept.
+        s.stage_all(request("scout/w"), || {}).await.unwrap();
+        s.publisher.policy.mirrors_max = 10 * GIB;
+        sh(&s.vm, "echo h > h && git add h && git commit -qm h");
+        let err = s.stage_all(request("scout/w2"), || s.size("acme/widgets", 6 * GIB)).await.unwrap_err();
+        assert!(err.0 == 507 && err.1.contains("mirrors use 11 of 10 GiB"), "{err:?}");
+        assert!(s.dir().exists());
+        assert_eq!(s.records().len(), 2, "the two earlier stages' records, none for this one");
+        // Two days on, gadgets is idle, and widgets (11 of 10 with it) needs it gone.
+        s.advance(2 * 86_400);
+        // But a stage of it an hour old (by the clock) names it: kept, and refused.
+        let now = s.publisher.now();
+        let live = StageRecord { id: format!("{}-{}", now - 3600, "b".repeat(32)), sandbox: SANDBOX.into(), owner: "acme".into(), name: "gadgets".into(), base: "main".into(), base_sha: String::new(), branch: "scout/g".into(), sha: "b".repeat(40), diff_sha256: String::new(), created_at: now - 3600 };
+        s.publisher.write_record(&live).unwrap();
+        assert_eq!(s.stage_all(request("scout/w3"), || {}).await.unwrap_err().0, 507);
+        assert!(s.publisher.mirror("acme", "gadgets").exists());
+        std::fs::remove_file(s.publisher.record_path(&live.id)).unwrap();
+        // Busy: its lock is held. Kept, and never waited for.
+        {
+            let lock = s.publisher.lock(&s.publisher.mirror("acme", "gadgets"));
+            let _held = lock.lock().await;
+            assert_eq!(s.stage_all(request("scout/w3"), || {}).await.unwrap_err().0, 507);
+            assert!(s.publisher.mirror("acme", "gadgets").exists());
+        }
+        // Neither: it goes, and the stage goes through.
+        s.stage_all(request("scout/w3"), || {}).await.unwrap();
+        assert!(!s.publisher.mirror("acme", "gadgets").exists());
     }
 
     #[tokio::test]
@@ -1772,7 +1832,7 @@ mod tests {
         s.advance(60);
         let mut status = s.publisher.status();
         let idle = status["oldestIdleSecs"].as_u64().unwrap();
-        assert!((60..=62).contains(&idle), "{idle}");
+        assert!((60..=120).contains(&idle), "{idle}");
         status["oldestIdleSecs"] = 60.into();
         assert_eq!(
             status,

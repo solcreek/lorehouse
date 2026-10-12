@@ -33,6 +33,8 @@ const MIB: u64 = 1 << 20;
 const EVICT_TO_PCT: u64 = 80;
 /// Where a mirror keeps what its upkeep needs.
 const STATE: &str = "sandboxd.json";
+/// After a gc fails (or runs out of time), how long until the next try on that mirror.
+const GC_RETRY: u64 = 3600;
 
 /// What the mirrors may use, and when they are collected and dropped. The quotas and the
 /// retention come from sandboxd's configuration (config.rs); the rest is fixed outside tests.
@@ -142,6 +144,9 @@ pub(super) struct MirrorState {
     pub(super) last_used: u64,
     #[serde(rename = "lastGc", default)]
     pub(super) last_gc: u64,
+    /// When a gc last failed: none is tried again for GC_RETRY.
+    #[serde(rename = "gcFailedAt", default)]
+    pub(super) gc_failed_at: u64,
     /// Stages whose bundle was over heavy_bundle and that weren't pushed (yet).
     #[serde(default)]
     pub(super) heavy: Vec<String>,
@@ -203,6 +208,7 @@ pub(super) struct Stats {
     evicted: u64,
     refused_for_space: u64,
     refresh_timeouts: u64,
+    fs_unknown_logged: bool,
 }
 
 /// Why there is no room.
@@ -269,7 +275,16 @@ impl Publisher {
     /// Its size in bytes.
     fn measure(&self, dir: &Path) -> u64 {
         let (bytes, garbage) = self.disk.usage(dir);
-        let m = Measured { bytes, garbage, stage_refs: count_stage_refs(dir), last_used: read_state(dir).map_or(0, |s| s.last_used) };
+        let last_used = match read_state(dir) {
+            Some(s) => s.last_used,
+            None => {
+                // A mirror from before its upkeep was kept: counted as used now.
+                let now = self.now();
+                write_state(dir, &MirrorState { last_used: now, ..MirrorState::default() });
+                now
+            }
+        };
+        let m = Measured { bytes, garbage, stage_refs: count_stage_refs(dir), last_used };
         let fs_free = self.fs().map(|(free, _)| free);
         let records = self.count_records();
         let mut st = self.stats();
@@ -281,6 +296,12 @@ impl Publisher {
 
     fn count_records(&self) -> u64 {
         std::fs::read_dir(self.records()).map_or(0, |d| d.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".json")).count() as u64)
+    }
+
+    /// Remove a mirror (its lock held) and forget it.
+    pub(super) fn drop_mirror(&self, dir: &Path) {
+        remove_mirror(dir);
+        self.forget(dir);
     }
 
     fn forget(&self, dir: &Path) {
@@ -299,7 +320,15 @@ impl Publisher {
         }
         match self.fs() {
             Some((free, size)) if free < self.policy.floor(size) => Err(Short::Free(free, self.policy.floor(size))),
-            _ => Ok(()),
+            Some(_) => Ok(()),
+            None => {
+                // Unknown: the quotas still hold; the floor can't be checked.
+                if !self.stats().fs_unknown_logged {
+                    self.stats().fs_unknown_logged = true;
+                    eprintln!("sandboxd: can't read the free space of {}: the mirrors' free-space floor isn't checked", self.mirrors.display());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -322,6 +351,12 @@ impl Publisher {
             }
             let lock = self.lock(&dir);
             let Ok(_held) = lock.try_lock() else { continue };
+            // Looked at again under its lock: a stage of it may have ended since the list
+            // was made.
+            let used = read_state(&dir).map_or(last_used, |s| s.last_used);
+            if now.saturating_sub(used) <= self.policy.evict_idle.as_secs() || self.live_repos().contains(&repo_of(&dir)) {
+                continue;
+            }
             remove_mirror(&dir);
             self.forget(&dir);
             self.stats().evicted += 1;
@@ -444,6 +479,9 @@ impl Publisher {
     /// lock excludes every stage and push of this mirror, and nothing else writes to it.
     /// Objects of a live stage are kept by its refs/stage ref. Whether it succeeded.
     async fn gc(&self, dir: &Path, state: &mut MirrorState) -> bool {
+        if self.now().saturating_sub(state.gc_failed_at) < GC_RETRY {
+            return false;
+        }
         let before = self.disk.usage(dir).0;
         let started = Instant::now();
         let done = git(dir, &["gc", "--quiet", "--prune=now"], None, self.policy.gc_deadline).await;
@@ -451,6 +489,8 @@ impl Publisher {
         let reclaimed = before.saturating_sub(self.disk.usage(dir).0);
         if let Err(e) = &done {
             eprintln!("sandboxd: gc of the mirror of {}: {e}", repo_of(dir));
+            state.gc_failed_at = self.now();
+            write_state(dir, state);
             return false;
         }
         let now = self.now();
@@ -471,9 +511,7 @@ impl Publisher {
             let Ok(_held) = lock.try_lock() else { continue };
             let now = self.now();
             let Some(mut state) = read_state(dir) else {
-                // A mirror from before its upkeep was kept: counted as used now.
-                write_state(dir, &MirrorState { last_used: now, ..MirrorState::default() });
-                self.measure(dir);
+                self.measure(dir); // stamps it as used now
                 continue;
             };
             let idle = now.saturating_sub(state.last_used);

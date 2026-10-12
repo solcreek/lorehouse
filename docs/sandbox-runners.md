@@ -64,8 +64,8 @@ sandboxes on the runner with the most free room.
 - `mirrors` is the host's publish mirrors (see [Publishing](#publishing)) as it last
   measured them: `count`, `bytes`, `maxBytes`, `perMirrorMaxBytes`, `fsFreeBytes`,
   `garbageBytes`, `stageRefs`, `records`, `largest` (`repo`, `bytes`), `oldestIdleSecs`,
-  `lastGc` (`at`, `ms`, `reclaimedBytes`), and since the runner started `evicted`,
-  `refusedForSpace` and `refreshTimeouts`. Lorehouse only shows it in `/status`; an object
+  `lastGc` (`at`, `ms`, `reclaimedBytes`), and since the runner started `evicted` (mirrors
+  dropped, for retention or to make room), `refusedForSpace` and `refreshTimeouts`. Lorehouse only shows it in `/status`; an object
   over 2 KB of JSON is dropped (not the status).
 - All of these are optional. A runner that omits them loses the guarantees they give but
   still works. A list that is present must be an array of strings, or the whole status
@@ -216,7 +216,9 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   mirror's lock, a busy mirror skipped and never waited for:
   - `git gc --prune=now` after a stage whose bundle was over 8 MiB failed, was cut off, or
     expired unpushed; and once a day for a mirror used since its last gc, once it has had
-    no job for 10 minutes. Its own deadline: 600 s.
+    no job for 10 minutes. Its own deadline: 600 s; after a gc fails, that mirror's next
+    one waits an hour. The gc after a failed stage runs before the stage answers (under the
+    lock), so that answer can take as long as the gc (13 s measured at 2.7 GB).
   - A mirror is dropped 14 days after its last stage or push
     (`SANDBOXD_MIRROR_RETENTION_DAYS`), never while a stage record younger than 24 h
     names it.
