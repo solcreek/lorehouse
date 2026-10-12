@@ -1003,19 +1003,44 @@ mod tests {
     const SANDBOX: &str = "slack_C1_1790000001.000100";
 
     /// git and whatever it starts (here, a shell alias) run with no capabilities and
-    /// no_new_privs, so an exec can't hand root's capabilities back.
+    /// no_new_privs, so an exec can't hand root's capabilities back. Only meaningful from a
+    /// process that has capabilities: so git_runs_without_capabilities runs this inside a
+    /// user namespace, where the test is root with every capability.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn git_runs_without_capabilities() {
+    #[ignore = "run by git_runs_without_capabilities, in a user namespace"]
+    async fn git_without_capabilities_in_userns() {
+        let field = |status: &str, name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim).unwrap_or_else(|| panic!("no {name} in {status}")).to_string();
+        let own = std::fs::read_to_string("/proc/self/status").unwrap();
+        assert_ne!(field(&own, "CapEff:"), "0000000000000000", "the test itself has no capabilities to drop");
         let dir = std::env::temp_dir();
         let out = git_command(&dir, &["-c", "alias.status-of-proc=!cat /proc/self/status", "status-of-proc"], None).output().await.unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let status = String::from_utf8_lossy(&out.stdout);
-        let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim).unwrap_or_else(|| panic!("no {name} in {status}")).to_string();
-        assert_eq!(field("NoNewPrivs:"), "1");
+        assert_eq!(field(&status, "NoNewPrivs:"), "1");
         for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
-            assert_eq!(field(cap), "0000000000000000", "{cap}");
+            assert_eq!(field(&status, cap), "0000000000000000", "{cap}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_runs_without_capabilities() {
+        let me = std::env::current_exe().unwrap();
+        let inner = ["publish::tests::git_without_capabilities_in_userns", "--exact", "--ignored", "--nocapture"];
+        let Ok(out) = std::process::Command::new("unshare").arg("--user").arg("--map-root-user").arg(&me).args(inner).output() else {
+            eprintln!("skipped: no unshare(1)");
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Hosts that forbid unprivileged user namespaces (Ubuntu's AppArmor default): the
+        // inner test never started, so there is nothing to check here.
+        if stderr.starts_with("unshare:") {
+            eprintln!("skipped: {}", stderr.trim());
+            return;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
     }
 
     /// A scratch area: a bare "GitHub" remote with main, a clone standing in for the VM's
