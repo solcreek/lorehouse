@@ -48,7 +48,7 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 
 #[test]
 fn root_keeps_only_the_capabilities_it_uses() {
-    // Taps and nftables rules. Firecracker itself needs none.
+    // Taps and nftables rules; Firecracker, root here, needs it too, to attach to its tap.
     assert_eq!(words("CapabilityBoundingSet"), set(&["CAP_NET_ADMIN"]));
     assert_eq!(one("NoNewPrivileges"), "yes");
 }
