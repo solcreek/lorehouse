@@ -15,8 +15,8 @@ thread). Rust. Work reaches it one of two ways:
   comes back finds the same checkout.
 - **Stopping** always flushes the guest's disk cache first.
 - **Network**: a sandbox reaches the internet and nothing else. There is no route to
-  private networks (LAN, tailnet, link-local, other sandboxes) and no connection into the
-  host. The agent inside, guestd, is reached over vsock.
+  private networks (LAN, tailnet, link-local, other sandboxes), no connection into the
+  host, and no mail out (TCP 25, 465, 587). The agent inside, guestd, is reached over vsock.
 
 ## Needs
 
@@ -54,6 +54,9 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_UPLINK` | (required) | the host's internet-facing interface |
 | `SANDBOXD_JAILER` `SANDBOXD_FIRECRACKER` | `jailer`, `firecracker` | the binaries, as paths or names on `PATH`; they must be from the same release. Without a jailer sandboxd doesn't start: no setting runs a VM unjailed |
 | `SANDBOXD_JAIL_UID_BASE` | `1900000000` | the VM in slot *n* runs as uid and gid base + *n*; sandboxd refuses to start if any of them belongs to a user or group |
+| `SANDBOXD_NET_RX_MIBPS` `SANDBOXD_NET_TX_MIBPS` | `50`, `10` | per VM, into and out of the guest (MiB/s, 0 = unlimited); see [Limits](#limits) |
+| `SANDBOXD_DISK_MIBPS` `SANDBOXD_DISK_IOPS` | `200`, `5000` | per VM, its disk (0 = unlimited) |
+| `SANDBOXD_DISK_QUOTA_GIB` | `8` | what one sandbox may write to its disk. Unset: enforced where the state directory can (btrfs with quotas on), else a warning at start; set: enforced or sandboxd won't start; `0`: off. Either way, sandboxes made before quotas were on stay uncapped; `0` doesn't lift a limit already set |
 | `SANDBOXD_VM_MEM_HEADROOM_MIB` | `512` | a VM's cgroup memory limit is its RAM plus this (Firecracker itself, and the page cache its disk IO is charged with) |
 | `SANDBOXD_LISTEN` | `127.0.0.1:8787` | serve mode: where the API listens; keep it on loopback |
 | `SANDBOXD_STATE` | `/var/lib/lorehouse-sandboxes` | one directory per sandbox |
@@ -149,6 +152,58 @@ unit (jailed, above) and reach GitHub. Without the jail, the same unit's confine
 Firecracker had `CapEff` `CAP_NET_ADMIN` only, `NoNewPrivs` 1 and `Seccomp` 2. A file the
 guest wrote just before `systemctl stop` (not yet flushed) was there after the next boot;
 with `KillMode=control-group` it was lost.
+
+## Limits
+
+What one sandbox can take from the host and send to the internet, each per VM:
+
+- **Rates** (Firecracker's rate limiters, [`vm.rs`](src/vm.rs) `vm_config`): its network
+  at 50 MiB/s in and 10 MiB/s out, its disk at 200 MiB/s and 5000 operations/s, each with
+  a one-time burst of five seconds' worth for the boot and the start of a clone. 50 MiB/s
+  in is above what GitHub gave starship (4.5–22 MB/s), so a clone is no slower; 10 MiB/s
+  out bounds what a flood from a sandbox can send. Packets per second are not limited.
+- **Mail**: TCP 25, 465 and 587 out are dropped (the nftables table in
+  [`net.rs`](src/net.rs)). Spam from a sandbox would get the host's address blocklisted.
+  IPv4 only, like the rest of the table: guests get no IPv6 address. Other ports (2525)
+  stay open.
+- **Disk**: a sandbox's disk is a reflink of the golden, so it costs only what the guest
+  writes, and that is capped at `SANDBOXD_DISK_QUOTA_GIB` (8 GiB). A write past it fails:
+  the guest sees I/O errors on its disk, and ext4 may abort its journal and go read-only
+  until the next boot (in the run below, guestd kept answering and small writes still
+  worked). [`quota.rs`](src/quota.rs). Booting a sandbox that is already full wasn't
+  tried: the jail's kernel and Firecracker copies are reflinks when they sit on the same
+  filesystem as the state, so they shouldn't count, but `vm.json` and the console log do.
+  - **btrfs** (what sandboxd sets up): each new sandbox directory is a subvolume with a
+    limit on its exclusive bytes (`btrfs qgroup limit -e`), so what it shares with the
+    golden doesn't count. It needs quotas on for the state directory's filesystem,
+    once: `sudo btrfs quota enable --simple <mount>`. Only simple quotas (kernel 6.7+)
+    are used: they are cheap, and an extent counts against whoever wrote it for good.
+    Under full qgroups "exclusive" is recomputed as sharing changes, so replacing the
+    golden would put every sandbox over its limit at once; sandboxd treats full qgroups
+    like quotas off (`btrfs quota status` tells which). Note
+    that quotas are per filesystem: on a host whose state directory shares one btrfs with
+    everything else, that turns them on for all of it. A sandbox made before quotas were
+    on isn't a subvolume and stays uncapped (it says so when it boots).
+  - **XFS**: project quotas are the tool, and sandboxd doesn't set them up. As far as we
+    know XFS charges a reflinked file for every block it maps, shared or not, so the hard
+    limit has to be the golden's size plus the cap. By hand: mount with `prjquota`, then
+    per sandbox directory
+    `xfs_quota -x -c 'project -s -p <dir> <id>' -c 'limit -p bhard=<golden + cap> <id>' <mount>`
+    (not tried: no XFS host was at hand).
+  - Anywhere else, or with quotas off, sandboxd starts with a warning and no cap, unless
+    `SANDBOXD_DISK_QUOTA_GIB` was set explicitly: then it refuses to start.
+  The console log sits in the sandbox's directory, so it counts against the cap too.
+
+Verified on starship (2026-10-12; the disk quota on a scratch btrfs with simple quotas,
+since starship's own has quotas off):
+
+| | |
+|---|---|
+| default limits, `git clone expressjs/express` + `npm install` (304 packages) | 7.8 s + 47.9 s; with every rate limit off, 6.4 s + 49.3 s. `sveltejs/svelte` (129 MB) cloned in 34 s, at GitHub's pace that afternoon |
+| limits set to 2 / 1 / 5 MiB/s (rx / tx / disk), after the burst | downloads at 2.04 MB/s, uploads at 1.02 MB/s, disk writes at 5.0 MB/s |
+| mail | `smtp.gmail.com` 465 and 587 refused from the guest, open from the host |
+| still blocked | the LAN gateway, the Pi-hole, the host (LAN and tap addresses), two tailnet peers, 169.254.169.254; GitHub and npm reachable |
+| disk quota 2 GiB | a guest `dd` of 3000 MiB stopped at 2008 MiB with I/O errors on its disk; the host's qgroup read 2.00 GiB of 2.00 GiB; guestd still answered; `DELETE` removed the subvolume |
 
 ## Measured
 
