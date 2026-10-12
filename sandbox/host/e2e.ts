@@ -7,6 +7,8 @@
 //   bun sandbox/host/e2e.ts                       # prints the runner token and URL to use
 //   # on the KVM host, over an encrypted private link (plain HTTP must be opted into):
 //   SANDBOXD_APP_URL=http://<this host>:8850 SANDBOXD_ALLOW_INSECURE_HTTP=1 SANDBOXD_RUNNER_TOKEN=<token> sandboxd
+//   # sandboxd jails every VM in a cgroup of its own, so it needs a delegated one: its
+//   # unit has Delegate=yes; by hand, `sudo systemd-run --pty -p Delegate=yes -E … sandboxd`
 //
 // Env: E2E_TOKEN or E2E_TOKEN_FILE (default: random), E2E_TRANSPORT (expected transport,
 // ws|poll; default ws), E2E_NO_WS_PROXY=1 (runner via :8851, upgrades stripped),

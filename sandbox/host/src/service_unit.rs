@@ -48,9 +48,21 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 
 #[test]
 fn root_keeps_only_the_capabilities_it_uses() {
-    // Taps and nftables rules; Firecracker, root here, needs it too, to attach to its tap.
-    assert_eq!(words("CapabilityBoundingSet"), set(&["CAP_NET_ADMIN"]));
+    // Taps and nftables rules, and what the jailer needs to build a chroot and drop to
+    // the VM's uid. Firecracker itself ends with none.
+    assert_eq!(
+        words("CapabilityBoundingSet"),
+        set(&["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL"])
+    );
     assert_eq!(one("NoNewPrivileges"), "yes");
+}
+
+#[test]
+fn each_vm_gets_a_cgroup_under_the_units() {
+    // jail.rs refuses to start without a delegated cgroup, and a delegated cgroup must be
+    // writable: the two settings can't be on together.
+    assert_eq!(one("Delegate"), "yes");
+    assert!(all("ProtectControlGroups").is_empty());
 }
 
 #[test]
@@ -70,9 +82,14 @@ fn the_file_system_is_read_only_but_the_state_directory() {
 #[test]
 fn only_kvm_and_tun_are_reachable() {
     assert_eq!(one("DevicePolicy"), "closed");
-    assert_eq!(all("DeviceAllow").into_iter().collect::<BTreeSet<_>>(), set(&["/dev/kvm rw", "/dev/net/tun rw"]));
+    // "m": the jailer makes its own nodes of them in each jail.
+    assert_eq!(
+        all("DeviceAllow").into_iter().collect::<BTreeSet<_>>(),
+        set(&["/dev/kvm rwm", "/dev/net/tun rwm", "/dev/userfaultfd m", "/dev/urandom m"])
+    );
     assert_eq!(words("RestrictAddressFamilies"), set(&["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"]));
-    assert_eq!(one("RestrictNamespaces"), "yes");
+    // The jailer's mount namespace only.
+    assert_eq!(one("RestrictNamespaces"), "mnt");
 }
 
 #[test]
@@ -81,7 +98,6 @@ fn the_kernel_is_out_of_reach() {
         "ProtectKernelTunables",
         "ProtectKernelModules",
         "ProtectKernelLogs",
-        "ProtectControlGroups",
         "ProtectClock",
         "ProtectHostname",
         "LockPersonality",
@@ -92,7 +108,8 @@ fn the_kernel_is_out_of_reach() {
         assert_eq!(one(key), "yes", "{key}");
     }
     assert_eq!(one("SystemCallArchitectures"), "native");
-    assert_eq!(all("SystemCallFilter"), vec!["@system-service".to_string(), "~@privileged @resources".to_string()]);
+    // @mount for the jailer's pivot_root and chroot; nothing else beyond @system-service.
+    assert_eq!(all("SystemCallFilter"), vec!["@system-service @mount".to_string()]);
     // With ProtectKernelModules=yes nothing in the service loads a module: what the taps
     // and the rules use is loaded at boot.
     let modules: BTreeSet<&str> = MODULES.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();

@@ -16,7 +16,9 @@
 //! stopped sandbox boot it first; idle ones are stopped with their disk kept.
 
 mod config;
+mod jail;
 mod net;
+mod pidfd;
 mod publish;
 mod runner;
 #[cfg(test)]
@@ -167,9 +169,17 @@ async fn main() {
         std::process::exit(1);
     }
     let _ = tokio::fs::remove_file(&probe).await;
+    // No jailer, no cgroup of its own, or uids that belong to someone: no VMs at all.
+    let host = match jail::prepare(&cfg).await {
+        Ok(h) => Arc::new(h),
+        Err(e) => {
+            eprintln!("sandboxd: {e}");
+            std::process::exit(1);
+        }
+    };
     // Start clean: whatever a previous run left (a crash, a kill) is removed first, VMMs
     // before their taps, and before any request can boot a disk one of them still holds.
-    vm::stop_stale_vmms(&cfg.state_dir).await;
+    vm::stop_stale_vmms(&cfg.state_dir, &host).await;
     net::teardown_all().await;
     if let Err(e) = net::setup(&cfg.uplink).await {
         eprintln!("sandboxd: network setup: {e}");
@@ -177,7 +187,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let vms = Manager::new(cfg.clone());
+    let vms = Manager::new(cfg.clone(), host);
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
     let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()).with_policy(cfg.mirrors.clone()));
 

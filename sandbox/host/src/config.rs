@@ -39,7 +39,27 @@ pub struct Config {
     pub github_url: String,
     /// The publish mirrors' quotas and retention (publish/upkeep.rs).
     pub mirrors: Policy,
+    /// How each VM is jailed (jail.rs).
+    pub jail: JailConfig,
 }
+
+/// The jail's settings. Every VM runs under the jailer; there is no setting to turn it off.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JailConfig {
+    /// The jailer: a path, or a name looked up on PATH.
+    pub jailer: PathBuf,
+    /// Firecracker, likewise; it must be the jailer's own release.
+    pub firecracker: PathBuf,
+    /// The VM in slot n runs as uid and gid `uid_base + n`. These ids must belong to no
+    /// user or group; sandboxd checks at start.
+    pub uid_base: u32,
+    /// A VM's cgroup memory limit is its guest RAM plus this.
+    pub mem_headroom_mib: u32,
+}
+
+/// Above every regular and system user (and systemd's dynamic users), and below the
+/// ids some tools read as signed: 1_900_000_000 + 63 is still under 2^31.
+pub const DEFAULT_JAIL_UID_BASE: u64 = 1_900_000_000;
 
 /// Where sandboxes live unless SANDBOXD_STATE says otherwise; sandboxd.service's
 /// StateDirectory= creates this directory and makes it writable.
@@ -115,6 +135,8 @@ impl Config {
         let free_pct = num("SANDBOXD_MIRRORS_FREE_PCT", d.free_min_pct);
         let free_gib = num("SANDBOXD_MIRRORS_FREE_GIB", d.free_min / GIB);
         let retention_days = num("SANDBOXD_MIRROR_RETENTION_DAYS", d.retention.as_secs() / 86_400);
+        let uid_base = num("SANDBOXD_JAIL_UID_BASE", DEFAULT_JAIL_UID_BASE);
+        let headroom = num("SANDBOXD_VM_MEM_HEADROOM_MIB", 512);
         // Checked before the casts below, so an out-of-range value fails here instead of
         // wrapping (4294967297 as u32 is 1).
         if !(1..=32).contains(&vcpus) {
@@ -142,6 +164,18 @@ impl Config {
             problems.push("SANDBOXD_MIRROR_RETENTION_DAYS must be 1..=365".into());
         }
         let mirrors = Policy { mirror_max: mirror_max * GIB, mirrors_max: mirrors_max * GIB, free_min_pct: free_pct, free_min: free_gib * GIB, retention: Duration::from_secs(retention_days * 86_400), ..d };
+        if !(65_536..=2_000_000_000).contains(&uid_base) {
+            problems.push("SANDBOXD_JAIL_UID_BASE must be 65536..=2000000000 (above every real user, below 2^31 with room for 64 VMs)".into());
+        }
+        if !(64..=65_536).contains(&headroom) {
+            problems.push("SANDBOXD_VM_MEM_HEADROOM_MIB must be 64..=65536".into());
+        }
+        let jail = JailConfig {
+            jailer: var("SANDBOXD_JAILER").unwrap_or_else(|| "jailer".into()).into(),
+            firecracker: var("SANDBOXD_FIRECRACKER").unwrap_or_else(|| "firecracker".into()).into(),
+            uid_base: uid_base as u32,
+            mem_headroom_mib: headroom as u32,
+        };
         if !problems.is_empty() {
             return Err(format!("sandboxd: invalid configuration:\n  {}", problems.join("\n  ")));
         }
@@ -157,6 +191,7 @@ impl Config {
             mem_mib: mem as u32,
             github_url: var("SANDBOXD_GITHUB_URL").unwrap_or_else(|| "https://github.com".into()),
             mirrors,
+            jail,
         })
     }
 }
@@ -217,5 +252,22 @@ mod tests {
         for k in ["SANDBOXD_MIRROR_MAX_GIB", "SANDBOXD_MIRRORS_MAX_GIB", "SANDBOXD_MIRRORS_FREE_PCT", "SANDBOXD_MIRRORS_FREE_GIB", "SANDBOXD_MIRROR_RETENTION_DAYS"] {
             std::env::remove_var(k);
         }
+
+        // The jail: always on, its binaries from PATH, uids far above real users.
+        let jail = Config::from_env().unwrap().jail;
+        assert_eq!(jail, super::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, mem_headroom_mib: 512 });
+        std::env::set_var("SANDBOXD_JAILER", "/opt/fc/jailer");
+        std::env::set_var("SANDBOXD_JAIL_UID_BASE", "3000000");
+        let set = Config::from_env().unwrap().jail;
+        assert_eq!((set.jailer.to_str(), set.uid_base), (Some("/opt/fc/jailer"), 3_000_000));
+        for (k, v) in [("SANDBOXD_JAIL_UID_BASE", "1000"), ("SANDBOXD_JAIL_UID_BASE", "4294967200"), ("SANDBOXD_VM_MEM_HEADROOM_MIB", "0")] {
+            std::env::set_var(k, v);
+            assert!(Config::from_env().unwrap_err().contains(k), "{k}={v}");
+            std::env::remove_var(k);
+        }
+        // No value turns it off: "off" is just a jailer binary that jail::prepare won't find.
+        std::env::set_var("SANDBOXD_JAILER", "off");
+        assert_eq!(Config::from_env().unwrap().jail.jailer.to_str(), Some("off"));
+        std::env::remove_var("SANDBOXD_JAILER");
     }
 }
