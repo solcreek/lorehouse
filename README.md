@@ -17,9 +17,9 @@ You name it per install; it defaults to `scout`.
 - **Stays true to Slack.**
   - An edit is reflected, and a deleted message leaves the knowledge index, so no new
     search finds it, including a secret someone pasted and then removed. Its text leaves
-    `LOREHOUSE_DB`'s files too, the `-wal` included, with one exception: usage keeps the
-    queries the agent searched with in that thread, which can repeat its words, for up to
-    90 days. Deleting the thread's first message while Lorehouse runs takes them with it.
+    `LOREHOUSE_DB`'s files too, the `-wal` included, with one exception: the queries the
+    agent searched with in that thread, which can repeat its words, can stay in usage
+    until its 90-day retention prunes them.
   - Changes made while it was down are caught up on the next start.
   - A channel taken off `AGENT_CHANNELS` is forgotten on the next start: its threads
     leave the index, and it stops answering follow-ups in threads it was asked into there.
