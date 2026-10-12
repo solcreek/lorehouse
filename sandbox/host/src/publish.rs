@@ -1584,9 +1584,10 @@ mod tests {
         let dir = s.dir();
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
         // A git command whose helper ignores SIGTERM (as a stuck index-pack might not answer
-        // it): only SIGKILL stops it. It says its pid and its group's.
+        // it): only SIGKILL stops it. It says its pid and its group's: git's, the shell's
+        // parent (no `ps`, which a build sandbox may not have).
         let ids = s.root.join("helper.ids");
-        let alias = format!("alias.hang=!trap '' TERM; sleep 60 & echo $! $(ps -o pgid= -p $$) > {}.tmp; mv {0}.tmp {0}; wait", ids.display());
+        let alias = format!("alias.hang=!trap '' TERM; sleep 60 & echo $! $PPID > {}.tmp; mv {0}.tmp {0}; wait", ids.display());
         let lock = s.publisher.lock(&dir);
         let job = tokio::spawn({
             let (lock, dir) = (lock.clone(), dir.clone());
