@@ -17,7 +17,7 @@
 // pendingPurge counts the same rows without changing anything, for `lorehouse doctor`.
 
 import type { Database } from "bun:sqlite";
-import { deleteDocument } from "./knowledge";
+import { checkpointSoon, deleteDocument } from "./knowledge";
 
 export type ChannelPurge = { channel: string; documents: number; threads: number; cursors: number; asks: number; searches: number };
 
@@ -56,9 +56,10 @@ export function pendingPurge(db: Database, listed: ReadonlySet<string>): Channel
   return knownChannels(db).filter((c) => !listed.has(c)).map((c) => counts(db, c));
 }
 
-// Purge every channel not in `listed`; returns what went, per channel.
+// Purge every channel not in `listed`; returns what went, per channel. What went leaves
+// the WAL too, soon after (checkpointSoon; deleteDocument asks for it as well).
 export function purgeUnlistedChannels(db: Database, listed: ReadonlySet<string>): ChannelPurge[] {
-  return db.transaction(() =>
+  const purged = db.transaction(() =>
     knownChannels(db).filter((c) => !listed.has(c)).map((channel): ChannelPurge => {
       let documents = 0;
       for (const id of docIds(db, channel)) if (deleteDocument(db, id)) documents++;
@@ -72,6 +73,8 @@ export function purgeUnlistedChannels(db: Database, listed: ReadonlySet<string>)
       };
     }),
   )();
+  if (purged.length) checkpointSoon(db);
+  return purged;
 }
 
 // One log line per purged channel: counts only, never what was in them.

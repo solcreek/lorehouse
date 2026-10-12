@@ -187,9 +187,12 @@ export class SlackIngester {
   private error?: string;
   private reconciled = { refreshed: 0, removed: 0 };
   private pending = new Map<string, ReturnType<typeof setTimeout>>();
+  // Live re-reads under way (debounce elapsed, or flushed by stop()), for stop() to wait on.
+  private reading = new Set<Promise<void>>();
   // Channels found private or archived since the start, with why: never read again.
   private closed = new Map<string, string>();
   private rechecking?: Promise<string[]>;
+  private stopped = false;
 
   constructor(
     private readonly api: SlackApi,
@@ -401,14 +404,39 @@ export class SlackIngester {
   // Re-reads the thread once things settle.
   onRawEvent(ev: Record<string, unknown> | undefined): void {
     const t = threadOfEvent(ev);
-    if (!t || !this.opts.channels.has(t.channel) || this.closed.has(t.channel)) return;
+    if (this.stopped || !t || !this.opts.channels.has(t.channel) || this.closed.has(t.channel)) return;
     const key = `${t.channel}:${t.threadTs}`;
     clearTimeout(this.pending.get(key));
     this.pending.set(key, setTimeout(() => {
       this.pending.delete(key);
-      if (this.closed.has(t.channel)) return;
-      this.refreshThread(t.channel, t.threadTs).catch((err) => this.opts.log?.(`ingest: thread ${key}: ${err}`));
+      if (this.stopped) return;
+      this.readLive(t.channel, t.threadTs);
     }, this.opts.debounceMs));
+  }
+
+  private readLive(channel: string, threadTs: string): void {
+    if (this.closed.has(channel)) return;
+    const p: Promise<void> = this.refreshThread(channel, threadTs)
+      .then(() => {}, (err) => this.opts.log?.(`ingest: thread ${channel}:${threadTs}: ${err}`))
+      .finally(() => this.reading.delete(p));
+    this.reading.add(p);
+  }
+
+  // Shutting down: no new event arms a read. A thread still waiting out its debounce is
+  // read now, not dropped: the next start's reconcile only revisits threads inside
+  // INGEST_REFRESH_DAYS, so a deletion dropped here could stay quotable for good. Resolves
+  // once those reads, and live ones already under way, have settled; the caller bounds the
+  // wait (app.close). A start-up backfill or reconcile still running may also try to write;
+  // once the store is closed that write fails and is logged.
+  stop(): Promise<void> {
+    this.stopped = true;
+    for (const [key, timer] of this.pending) {
+      clearTimeout(timer);
+      const at = key.indexOf(":");
+      this.readLive(key.slice(0, at), key.slice(at + 1));
+    }
+    this.pending.clear();
+    return Promise.all([...this.reading]).then(() => {});
   }
 
   status(): IngestStatus {
