@@ -20,9 +20,11 @@ thread). Rust. Work reaches it one of two ways:
 
 ## Needs
 
-A Linux host with KVM, Firecracker on `PATH`, a guest kernel, and a btrfs or XFS
-filesystem for the state and golden files. It runs as root with only `CAP_NET_ADMIN`: it
-creates taps and nftables rules. systemd confines it (see [Hardening](#hardening)).
+A Linux host with KVM, cgroup v2 and systemd, Firecracker and its `jailer` from the same
+release on `PATH`, a guest kernel, and a btrfs or XFS filesystem for the state and golden
+files. It runs as root with a few capabilities: it creates taps and nftables rules, and
+the jailer builds each VM's chroot before dropping to the VM's own uid. systemd confines
+it (see [Hardening](#hardening)).
 
 ## Set up
 
@@ -50,6 +52,9 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_GOLDEN` | (required) | the prepared rootfs |
 | `SANDBOXD_KERNEL` | (required) | guest kernel image |
 | `SANDBOXD_UPLINK` | (required) | the host's internet-facing interface |
+| `SANDBOXD_JAILER` `SANDBOXD_FIRECRACKER` | `jailer`, `firecracker` | the binaries, as paths or names on `PATH`; they must be from the same release. Without a jailer sandboxd doesn't start: no setting runs a VM unjailed |
+| `SANDBOXD_JAIL_UID_BASE` | `1900000000` | the VM in slot *n* runs as uid and gid base + *n*; sandboxd refuses to start if any of them belongs to a user or group |
+| `SANDBOXD_VM_MEM_HEADROOM_MIB` | `512` | a VM's cgroup memory limit is its RAM plus this (Firecracker itself, and the page cache its disk IO is charged with) |
 | `SANDBOXD_LISTEN` | `127.0.0.1:8787` | serve mode: where the API listens; keep it on loopback |
 | `SANDBOXD_STATE` | `/var/lib/lorehouse-sandboxes` | one directory per sandbox |
 | `SANDBOXD_MAX_VMS` | `4` | running at once (1–64); more gets a 503 |
@@ -92,16 +97,38 @@ confirmed through Vercel's sandbox bounty on 2026-10-03, still unpatched a week 
 [The Register](https://www.theregister.com/offbeat/2026/10/06/security-researcher-claims-they-found-kvm-guest-host-escape-flaw/5301267)). So the host is set up assuming a guest may
 get out of its VM, and what it lands in should hold as little as possible.
 
-[`sandboxd.service`](sandboxd.service) confines sandboxd and every process it starts
-(Firecracker, `ip`, `nft`, `git`):
+Every VM runs under Firecracker's `jailer` ([ADR 0003](../../docs/adr/0003-sandbox-host-isolation.md),
+[`src/jail.rs`](src/jail.rs)):
 
 | | |
 |---|---|
-| capabilities | only `CAP_NET_ADMIN` (taps, nftables), which Firecracker, running as root, keeps too; `NoNewPrivileges=yes` |
+| user | its slot's own uid and gid (`SANDBOXD_JAIL_UID_BASE` + slot), no capabilities, `NoNewPrivs` |
+| files | chrooted into `<state>/<sandbox>/jail/firecracker/lorehouse-<slot>/root`: a hard link to its disk (owned by its uid while it runs, root's again after), a copy of the kernel, its config and sockets. Rebuilt from nothing at every boot, removed at every stop |
+| cgroup | `<sandboxd.service>/vms/lorehouse-<slot>`: `cpu.max` its vCPUs + 1, `memory.max` its RAM + `SANDBOXD_VM_MEM_HEADROOM_MIB`, `pids.max` 64, `io.weight` 50 |
+| system calls | Firecracker's default seccomp filter (`socket()` for `AF_UNIX` only), on top of the unit's |
+| network | its tap, owned by its uid, in the host's namespace with the nftables rules as before (no network namespace: the ADR says why) |
+
+Verified on starship (2026-10-12): the VM's Firecracker had `Uid`/`Gid` 1900000000,
+`CapEff` 0, `NoNewPrivs` 1, `Seccomp` 2; its `/proc/<pid>/root` was the jail directory
+(same device and inode) holding only `api.sock dev firecracker firecracker.pid rootfs.ext4
+run vm.json vmlinux vsock.sock`; its cgroup `…/vms/lorehouse-0` had `cpu.max 300000
+100000`, `memory.max 2684354560`, `pids.max 64` (5 in use), `io.weight 50`, and its tap
+`user 1900000000 group 1900000000`. Cold boot 4.0 s, as before; after an idle stop the
+jail, cgroup and tap were gone, the disk root's again, and the next request booted the
+same disk in 0.94 s. With sandboxd SIGKILLed, systemd killed the VM and restarted it in
+6 s, disk intact.
+
+[`sandboxd.service`](sandboxd.service) confines sandboxd and every process it starts
+(the jailer and Firecracker, `ip`, `nft`, `git`):
+
+| | |
+|---|---|
+| capabilities | `CAP_NET_ADMIN` (taps, nftables), and for the jailer `SYS_ADMIN`, `SYS_CHROOT`, `MKNOD`, `CHOWN`, `SETUID`, `SETGID`; `DAC_OVERRIDE` and `KILL` to reach into and stop a jailed VM; `NoNewPrivileges=yes` |
 | file system | read-only (`ProtectSystem=strict`) but the state directory; no `/home` or `/root`; private `/tmp` |
-| devices | `/dev/kvm` and `/dev/net/tun`, beyond the standard pseudo-devices (`DevicePolicy=closed`; `ProtectClock` adds read access to the RTC) |
+| devices | `/dev/kvm` and `/dev/net/tun`, beyond the standard pseudo-devices (`DevicePolicy=closed`; `ProtectClock` adds read access to the RTC), plus making nodes of those, `/dev/userfaultfd` and `/dev/urandom` in a jail |
 | sockets | `AF_UNIX` (vsock, API), `AF_INET`/`AF_INET6` (Lorehouse, GitHub), `AF_NETLINK` (ip, nft) |
-| kernel | tunables, modules, logs, clock, hostname and cgroups read-only or out of reach; `@system-service` system calls only, without `@privileged` and `@resources`; no W+X memory, no namespaces, no realtime, no set-uid files |
+| cgroups | delegated (`Delegate=yes`): sandboxd moves itself to `supervisor/` and each VM gets a cgroup under `vms/`. sandboxd refuses to start without the delegation. The whole cgroup tree is writable to it (no `ProtectControlGroups`), and with the jailer's `SYS_ADMIN` and `@mount` it could remount `/` in a namespace of its own: this confines sandboxd against mistakes, not against itself being compromised (ADR 0003) |
+| kernel | tunables, modules, logs, clock and hostname read-only or out of reach; `@system-service` and `@mount` system calls only; no W+X memory, no namespaces but mount, no realtime, no set-uid files |
 | stop | `KillMode=mixed`: only sandboxd gets the SIGTERM and stops each VM after the guest's sync. Firecracker dies on SIGTERM, so the default (`control-group`) killed every VM before its disk cache was flushed |
 
 Because of that, the host sets up two things sandboxd used to do itself:
@@ -109,16 +136,19 @@ Because of that, the host sets up two things sandboxd used to do itself:
 it at start and refuses to run without it) and the modules for taps and nftables
 ([`sandboxd.modules.conf`](sandboxd.modules.conf)).
 
-`systemd-analyze security --offline=yes sandboxd.service`: **9.4 UNSAFE before, 2.2 OK
-after** (systemd 261, 2026-10-12). What still counts against it is what the job needs:
-root, the host's network, `/dev/kvm`, internet and netlink sockets. Cargo tests parse the
-unit (`src/service_unit.rs`), so dropping one of the directives they check fails CI.
+`systemd-analyze security --offline=yes sandboxd.service` (systemd 261, 2026-10-12):
+**9.4 UNSAFE** for the unit before any of this, **2.2 OK** confined, **3.9 OK** with the
+jailer's privileges added. That score measures sandboxd; the VMs, which run the untrusted
+code, went from root with every capability to an unprivileged uid with none. What counts
+against it is what the job needs: root, the jailer's capabilities and `@mount`, a
+delegated cgroup, the host's network, `/dev/kvm`, internet and netlink sockets. Cargo
+tests parse the unit (`src/service_unit.rs`), so dropping one of the directives they check fails CI.
 
-Verified on starship (2026-10-12, Firecracker 1.10.1, systemd 261): a VM boots under the
-unit and reaches GitHub; Firecracker runs with `CapEff` `CAP_NET_ADMIN` only,
-`NoNewPrivs` 1 and `Seccomp` 2. A file the guest wrote just before `systemctl stop`
-(not yet flushed) was there after the next boot; with `KillMode=control-group` it was
-lost.
+Verified on starship (2026-10-12, Firecracker 1.10.1, systemd 261): VMs boot under the
+unit (jailed, above) and reach GitHub. Without the jail, the same unit's confined
+Firecracker had `CapEff` `CAP_NET_ADMIN` only, `NoNewPrivs` 1 and `Seccomp` 2. A file the
+guest wrote just before `systemctl stop` (not yet flushed) was there after the next boot;
+with `KillMode=control-group` it was lost.
 
 ## Measured
 
