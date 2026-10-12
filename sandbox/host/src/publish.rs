@@ -503,8 +503,10 @@ impl Publisher {
     /// it is gone (a stage ref to a missing object, a lock file a killed git left). A mirror
     /// with no refs yet (its first fetch didn't complete), failed or cut off, is removed.
     async fn update_mirror(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
-        let fetched = git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await.is_ok_and(|refs| !refs.trim().is_empty());
-        let mut new = NewMirror((!fetched).then_some(dir));
+        // New only when git said so: a for-each-ref that couldn't run or failed says nothing
+        // about the mirror, and a failed refresh mustn't remove one that has been fetched.
+        let new = !dir.join("HEAD").exists() || matches!(git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty());
+        let mut new = NewMirror(new.then_some(dir));
         let mut updated = self.refresh(dir, owner, name, token).await;
         if updated.is_err() && self.prune(dir).await {
             updated = self.refresh(dir, owner, name, token).await;
@@ -1462,6 +1464,24 @@ mod tests {
         std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
         s.publisher.update_mirror(&s.dir(), "acme", "widgets", None).await.unwrap_err();
         sh(&s.dir(), "git rev-parse --verify -q refs/heads/main");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fetched_mirror_whose_refs_cant_be_read_is_kept_when_its_refresh_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = scratch("unreadable");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        // for-each-ref fails (packed-refs can't be read), and so does the fetch.
+        sh(&dir, "git pack-refs --all");
+        let packed = dir.join("packed-refs");
+        std::fs::set_permissions(&packed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap_err();
+        assert!(packed.exists(), "the mirror is still there");
+        std::fs::set_permissions(&packed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        sh(&dir, "git rev-parse --verify -q refs/heads/main");
     }
 
     #[tokio::test]
