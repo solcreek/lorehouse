@@ -17,18 +17,22 @@ You name it per install; it defaults to `scout`.
 - **Stays true to Slack.**
   - An edit is reflected, and a deleted message leaves the knowledge index, so no new
     search finds it, including a secret someone pasted and then removed. Its text leaves
-    `LOREHOUSE_DB`'s files too, the `-wal` included, with one exception: the queries the
-    agent searched with in that thread, which can repeat its words, can stay in usage
-    until its 90-day retention prunes them.
+    `LOREHOUSE_DB`'s files too, the `-wal` included.
   - Changes made while it was down are caught up on the next start.
-  - A channel taken off `AGENT_CHANNELS` is forgotten on the next start: its threads
-    leave the index, and it stops answering follow-ups in threads it was asked into there.
-  - Not yet forgotten: what the agent already quoted. Its saved conversations
-    (`SESSIONS_DB`) keep what a search returned and what it answered. A thread where it
-    quoted a message that is then deleted can still quote it, and so can a thread in a
-    channel still listed that quoted a channel taken off the list. Its own reply in Slack
-    keeps the quote too. This lasts until June supports redaction
-    ([#66](https://github.com/solcreek/lorehouse/issues/66)).
+  - A channel taken off `AGENT_CHANNELS` is forgotten the same way on the next start: its
+    threads leave the index and `LOREHOUSE_DB`'s files, and it stops answering follow-ups
+    in threads it was asked into there.
+  - Two other copies can remain after a deletion or an unlisting, each until a set point:
+    - usage records (that a question was asked, and the agent's search queries, which can
+      repeat its words): until the 90-day usage retention at the latest, sooner in some
+      cases ([#98](https://github.com/solcreek/lorehouse/issues/98) tracks clearing them on every deletion);
+    - the agent's saved conversations (`SESSIONS_DB`): every turn's full tool results
+      (whole search results, not only what was quoted) and its answers, in any thread, so
+      a later turn there can bring the text up again, until June supports redaction
+      ([junebuild/june#360](https://github.com/junebuild/june/issues/360)). To erase them now, stop the app and delete `SESSIONS_DB`: every thread's
+      memory goes with it.
+
+    The agent's own replies in Slack keep what they quoted until they are deleted there.
 - **Works in your team's languages.** Chinese, Japanese and Korean are searchable word by
   word, not only in English. It replies in the language it was asked in.
 - **Knows people by name, and never pings them.**
@@ -181,13 +185,13 @@ To set up Slack:
 | env | default | |
 |---|---|---|
 | `AGENT_NAME` | `scout` | the agent's handle; must match the Slack app's display name |
-| `AGENT_CHANNELS` | (none) | the public channel ids it works in: answers mentions and follow-ups, counts reactions, and learns from. Empty means **nowhere**. Only public channels: on start, each one is looked up (`conversations.info`, needs `channels:read`) and the app **refuses to start** while any is private, archived, or can't be looked up, naming each; a channel that turns private or is archived while the app runs (Slack then answers that it's private, archived, or not visible to the bot) is found at the next recheck (`INGEST_CHANNEL_RECHECK_MS`), then no longer read and its mentions refused (best effort for work already running at that moment: a turn admitted before the close finishes, and may still read its own thread; a reconcile in progress may finish its reads); what was learned there goes once it is taken off this list. ⚠️ On each start, what was learned from a channel no longer listed is purged from `LOREHOUSE_DB`: its threads leave the index (and `LOREHOUSE_DB`'s files, the `-wal` included), with the threads it was asked into there, its ingest cursor, and usage's asks and searches there. Seeded documents stay, as do 👍/👎 counts (no text) and the agent's saved conversations in `SESSIONS_DB`, with what it quoted: a thread in a channel still listed that quoted the removed channel can still quote it, until June supports redaction ([#66](https://github.com/solcreek/lorehouse/issues/66)). **An empty list purges every thread learned from Slack.** `lorehouse doctor` shows what the next start would purge |
+| `AGENT_CHANNELS` | (none) | the public channel ids it works in: answers mentions and follow-ups, counts reactions, and learns from. Empty means **nowhere**. Only public channels: on start, each one is looked up (`conversations.info`, needs `channels:read`) and the app **refuses to start** while any is private, archived, or can't be looked up, naming each; a channel that turns private or is archived while the app runs (Slack then answers that it's private, archived, or not visible to the bot) is found at the next recheck (`INGEST_CHANNEL_RECHECK_MS`), then no longer read and its mentions refused (best effort for work already running at that moment: a turn admitted before the close finishes, and may still read its own thread; a reconcile in progress may finish its reads); what was learned there goes once it is taken off this list. ⚠️ On each start, what was learned from a channel no longer listed is purged from `LOREHOUSE_DB`: its threads leave the index (and `LOREHOUSE_DB`'s files, the `-wal` included), with the threads it was asked into there, its ingest cursor, and usage's asks and searches there. Seeded documents stay, as do 👍/👎 counts (no text). Two other copies of its text can remain: usage records, until the 90-day usage retention at the latest ([#98](https://github.com/solcreek/lorehouse/issues/98)), and the agent's saved conversations in `SESSIONS_DB` (below), until June supports redaction ([junebuild/june#360](https://github.com/junebuild/june/issues/360)). **An empty list purges every thread learned from Slack.** `lorehouse doctor` shows what the next start would purge |
 | `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call, nothing read), `ignore`, or `answer` (from the knowledge index, the same as a public answer, plus the DM conversation itself; not with the code tools). A DM is never indexed |
 | `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). `/healthz` is always open and says only `ok` |
 | `ADMIN_TOKEN` | (none) | bearer token for the read-only [admin API](docs/admin-api.md) under `/api/v1`: the indexed threads and their text, search, the agent's threads, the sandboxes. 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |
 | `USAGE_RECORD_PEOPLE` | (off) | `1` makes [usage](docs/admin-api.md#usage) record who asks the agent things; each channel is told, and turning it off erases them. Off, usage never says who asked |
 | `LOREHOUSE_DB` | `lorehouse.db` | Lorehouse's own data (knowledge index) |
-| `SESSIONS_DB` | `sessions.db` beside `LOREHOUSE_DB` | the agent framework's conversation state, including a turn waiting on an Approve, so it survives a restart. `:memory:` keeps it in memory (lost on every restart), as it is when `LOREHOUSE_DB` is `:memory:`. It keeps each turn whole, with what a search returned and what the agent answered: a message deleted in Slack, or from a channel taken off `AGENT_CHANNELS`, stays in every conversation that quoted it, and the agent can quote it again there, until June supports redaction ([#66](https://github.com/solcreek/lorehouse/issues/66)). To erase it now, stop the app and delete this file: every thread's memory goes, a turn waiting on an Approve too |
+| `SESSIONS_DB` | `sessions.db` beside `LOREHOUSE_DB` | the agent framework's conversation state, including a turn waiting on an Approve, so it survives a restart. `:memory:` keeps it in memory (lost on every restart), as it is when `LOREHOUSE_DB` is `:memory:`. It keeps every turn whole: its tools' full results (whole search results, not only what was quoted) and its answers, in every conversation. A message deleted in Slack, or from a channel taken off `AGENT_CHANNELS`, stays there, and a later turn in that conversation can bring it up again, until June supports redaction ([junebuild/june#360](https://github.com/junebuild/june/issues/360)). To erase it now, stop the app and delete this file: every thread's memory goes, a turn waiting on an Approve too |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |
 | `INGEST_BACKFILL_DAYS` | `90` | how far back to read each allowed channel's history on first start (`0` = live only) |
 | `INGEST_REFRESH_DAYS` | `14` | on each start, re-check threads this recent for replies, edits and deletions made while the app was down |
@@ -206,7 +210,7 @@ mocked Slack and a mocked model through the same HTTP interface any implementati
 serves. Examples:
 
 - a Chinese question finds a Chinese message
-- a deleted message stops being cited
+- a deleted message stops being cited, and its text leaves the database's files
 - a DM is never indexed
 - a restart catches up on what it missed
 
