@@ -379,6 +379,14 @@ fn remove_mirror(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Whether a mirror has never been fetched into: not there, or no refs (a first fetch that
+/// failed or was cut off, by a sandboxd that then stopped). New only when git said so: a
+/// for-each-ref that couldn't run or failed says nothing about the mirror, and a failed
+/// refresh mustn't remove one that has been fetched.
+async fn is_new(dir: &Path) -> bool {
+    !dir.join("HEAD").exists() || matches!(git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty())
+}
+
 /// A mirror whose first fetch hasn't completed, removed when this is dropped unless it was
 /// kept: a first fetch that fails, times out or is cut off by the job's deadline leaves no
 /// partial pack behind (one of next.js was 2.3 GB, #76). Dropped under the mirror's lock.
@@ -559,10 +567,7 @@ impl Publisher {
     /// it is gone (a stage ref to a missing object, a lock file a killed git left). A mirror
     /// with no refs yet (its first fetch didn't complete), failed or cut off, is removed.
     async fn update_mirror(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
-        // New only when git said so: a for-each-ref that couldn't run or failed says nothing
-        // about the mirror, and a failed refresh mustn't remove one that has been fetched.
-        let new = !dir.join("HEAD").exists() || matches!(git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty());
-        let mut new = NewMirror(new.then_some(dir));
+        let mut new = NewMirror(is_new(dir).await.then_some(dir));
         let mut updated = self.refresh(dir, owner, name, token).await;
         if updated.is_err() && self.prune(dir).await {
             updated = self.refresh(dir, owner, name, token).await;
@@ -594,7 +599,7 @@ impl Publisher {
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
         self.admit(&dir, &req.owner, &req.name)?;
-        let new = !dir.join("HEAD").exists();
+        let new = is_new(&dir).await;
         if let Err(e) = self.update_mirror(&dir, &req.owner, &req.name, req.token.as_deref()).await {
             self.refresh_failed(&dir, &e);
             return Err((502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)));
@@ -1903,6 +1908,23 @@ mod tests {
         assert_eq!(s.stage_all(request("scout/f"), || {}).await.unwrap_err(), low(40, 50));
         *s.disk.fs.lock().unwrap() = Some((60 * GIB, 500 * GIB));
         s.stage_all(request("scout/f"), || {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_mirror_with_no_refs_yet_is_new_and_goes_when_its_first_fetch_has_no_room() {
+        let s = scratch("norefs");
+        sh(&s.vm, "echo z > z && git add z && git commit -qm z");
+        s.stage_all(request("scout/z"), || {}).await.unwrap();
+        // What a first fetch cut off by a stopping sandboxd leaves: an empty mirror, which
+        // the quotas already know.
+        let dir = s.dir();
+        std::fs::remove_dir_all(&dir).unwrap();
+        sh(&s.root, &format!("git init -q --bare {}", dir.display()));
+        // Fetched, the filesystem is under its floor: refused, and the mirror doesn't stay.
+        *s.disk.fs_on_measure.lock().unwrap() = Some(("acme/widgets".into(), (GIB, 100 * GIB)));
+        let err = s.stage_all(request("scout/z2"), || {}).await.unwrap_err();
+        assert_eq!(err.0, 507, "{}", err.1);
+        assert!(!dir.exists(), "a mirror with no refs before this stage is new");
     }
 
     #[tokio::test]
