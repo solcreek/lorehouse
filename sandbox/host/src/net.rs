@@ -87,9 +87,61 @@ pub async fn teardown_all() {
     }
 }
 
+const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+
+/// Whether the host forwards IPv4, from the contents of IP_FORWARD.
+fn forwarding_on(ip_forward: &str) -> bool {
+    ip_forward.trim() == "1"
+}
+
+/// Whether a sysctl config file's contents turn IPv4 forwarding on.
+fn sets_forwarding(conf: &str) -> bool {
+    conf.lines().any(|line| {
+        let line = line.trim().trim_start_matches('-');
+        line.split_once('=').is_some_and(|(k, v)| k.trim().replace('/', ".") == "net.ipv4.ip_forward" && v.trim() == "1")
+    })
+}
+
+/// Whether any of the places systemd-sysctl reads at boot turns forwarding on.
+async fn forwarding_set_at_boot() -> bool {
+    let mut files = vec![std::path::PathBuf::from("/etc/sysctl.conf")];
+    for dir in ["/etc/sysctl.d", "/run/sysctl.d", "/usr/local/lib/sysctl.d", "/usr/lib/sysctl.d", "/lib/sysctl.d"] {
+        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(e)) = entries.next_entry().await {
+                files.push(e.path());
+            }
+        }
+    }
+    for f in files {
+        if tokio::fs::read_to_string(&f).await.is_ok_and(|c| sets_forwarding(&c)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// sandboxd doesn't turn forwarding on itself: its unit makes /proc/sys read-only
+/// (ProtectKernelTunables=yes), so sandboxd.sysctl.conf sets it at boot and this checks it.
+async fn check_forwarding() -> Result<(), String> {
+    let value = tokio::fs::read_to_string(IP_FORWARD).await.map_err(|e| format!("{IP_FORWARD}: {e}"))?;
+    if forwarding_on(&value) {
+        // On now, possibly only because an older sandboxd (or Docker) set it at run time:
+        // say so before a reboot turns it off and this check refuses the start.
+        if !forwarding_set_at_boot().await {
+            eprintln!("sandboxd: WARNING: net.ipv4.ip_forward is on, but no sysctl.d file turns it on at boot, so after a reboot sandboxd won't start; install sandboxd.sysctl.conf as /etc/sysctl.d/90-lorehouse-sandboxd.conf");
+        }
+        Ok(())
+    } else {
+        Err(format!(
+            "net.ipv4.ip_forward is {}, so sandboxes would have no internet. Install sandboxd.sysctl.conf as /etc/sysctl.d/90-lorehouse-sandboxd.conf and run `sysctl --system`; sandboxd doesn't set it itself (its unit makes kernel tunables read-only)",
+            value.trim()
+        ))
+    }
+}
+
 /// The shared rules, set up once at start (after teardown_all).
 pub async fn setup(uplink: &str) -> Result<(), String> {
-    run(&["sysctl", "-q", "-w", "net.ipv4.ip_forward=1"]).await?;
+    check_forwarding().await?;
     nft(&format!("add table ip {TABLE}")).await?;
     // Priority -1: before Docker's filter chains, so a drop here is final.
     nft(&format!("add chain ip {TABLE} forward {{ type filter hook forward priority -1; }}")).await?;
@@ -121,4 +173,25 @@ pub async fn tap_up(slot: &Slot) -> Result<(), String> {
 
 pub async fn tap_down(slot: &Slot) {
     let _ = run(&["ip", "link", "del", &slot.tap()]).await;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn forwarding_is_read_not_written() {
+        assert!(super::forwarding_on("1\n"));
+        assert!(!super::forwarding_on("0\n"));
+        assert!(!super::forwarding_on(""));
+        // Nothing in the daemon may write a sysctl: under ProtectKernelTunables=yes it
+        // can't, and the setting belongs to sandboxd.sysctl.conf.
+        let src = include_str!("net.rs");
+        let call = ["\"sys", "ctl\""].concat();
+        assert!(!src.contains(&call), "net.rs runs sysctl");
+        let conf = include_str!("../sandboxd.sysctl.conf");
+        assert!(super::sets_forwarding(conf), "{conf}");
+        // What the boot-time check recognises, and what it doesn't.
+        assert!(super::sets_forwarding("net/ipv4/ip_forward=1\n"));
+        assert!(super::sets_forwarding("-net.ipv4.ip_forward = 1\n"));
+        assert!(!super::sets_forwarding("# net.ipv4.ip_forward = 1\nnet.ipv4.ip_forward = 0\n"));
+    }
 }
