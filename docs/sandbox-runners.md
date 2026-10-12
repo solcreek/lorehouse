@@ -233,8 +233,8 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
     is removed, unless a live stage record names it (its push needs it). Before refusing,
     mirrors idle for over 24 h are dropped, least recently used first, down to 80% of the
     total.
-  - It runs at start (which measures every mirror) and every 5 minutes, plus after every
-    stage and push.
+  - Every mirror is measured at start, before any job is taken. The upkeep runs then and
+    every 5 minutes, plus after every stage and push.
 - **Failures** come back as statuses with a reason:
   - 409: nothing new to publish, or a branch that has moved on.
   - 404: the base isn't on GitHub, or the stage isn't there (never completed, already

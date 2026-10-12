@@ -422,7 +422,7 @@ impl Publisher {
     pub(super) fn admit(&self, dir: &Path, owner: &str, name: &str) -> Result<(), Failure> {
         let mut known = self.stats().mirrors.get(dir).map(|m| m.bytes);
         if known.is_none() && dir.join("HEAD").exists() {
-            // On disk, not measured yet (the first upkeep pass hasn't reached it).
+            // On disk, not measured yet: put there after the start's inventory, not by a stage.
             known = Some(self.measure(dir));
         }
         match known {
@@ -515,6 +515,16 @@ impl Publisher {
         write_state(dir, state);
         self.stats().last_gc = Some((now, ms, reclaimed));
         true
+    }
+
+    /// Every mirror on disk measured, for the quotas: run at start, before any job is taken
+    /// (the first upkeep pass may take minutes to reach them all, a gc at a time).
+    pub fn inventory(&self) {
+        for dir in self.mirror_dirs() {
+            if dir.join("HEAD").exists() {
+                self.measure(&dir);
+            }
+        }
     }
 
     /// The periodic pass (at start, then every few minutes), over every mirror whose lock is

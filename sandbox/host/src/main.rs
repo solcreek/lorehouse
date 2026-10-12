@@ -171,8 +171,10 @@ async fn main() {
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
     let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()).with_policy(cfg.mirrors.clone()));
 
-    // The mirrors' upkeep (publish/upkeep.rs): at start, which measures every mirror for the
-    // quotas and the status, then every few minutes.
+    // Every mirror measured before any job is taken, so the quotas count them all.
+    let inventory = publisher.clone();
+    let _ = tokio::task::spawn_blocking(move || inventory.inventory()).await;
+    // The mirrors' upkeep (publish/upkeep.rs): at start, then every few minutes.
     let upkeep = publisher.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(MIRROR_UPKEEP_EVERY);

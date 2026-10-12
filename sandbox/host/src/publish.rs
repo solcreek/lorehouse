@@ -1815,6 +1815,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restarted_host_counts_the_mirrors_on_disk_before_it_takes_a_stage() {
+        let mut s = scratch("inventory");
+        s.publisher.policy.mirrors_max = 6 * GIB;
+        sh(&s.vm, "echo i > i && git add i && git commit -qm i");
+        s.size("acme/gadgets", 3 * GIB);
+        s.stage_all(on("gadgets", "main", "scout/i"), || {}).await.unwrap();
+        // A new sandboxd over the same mirrors: until they are measured it knows of none.
+        let mut restarted = Publisher::new(s.root.join("mirrors"), format!("file://{}", s.root.display())).with_policy(s.publisher.policy.clone());
+        restarted.disk = s.disk.clone();
+        restarted.inventory();
+        // 3 GiB used, and a new mirror counts at 4: over the 6.
+        let err = restarted.admit(&restarted.mirror("acme", "widgets"), "acme", "widgets").unwrap_err();
+        assert!(err.0 == 507 && err.1.contains("mirrors use 3 of 6 GiB"), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn a_mirror_made_during_an_upkeep_pass_stays_counted() {
         let s = scratch("passnew");
         sh(&s.vm, "echo p > p && git add p && git commit -qm p");
