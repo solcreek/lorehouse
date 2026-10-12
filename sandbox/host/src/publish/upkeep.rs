@@ -13,7 +13,7 @@
 //!   `mirrors_max`, and the filesystem keeps `free_min_pct` or `free_min` free, whichever is
 //!   larger. Checked before the refresh (from the last measured size; a new mirror counts at
 //!   `mirror_max`, against the total and the free space over the floor), after it, and after
-//!   the bundle fetch. A mirror over its cap is removed.
+//!   the bundle fetch. A mirror over its cap is removed, unless a live stage record names it.
 //!   Before refusing, mirrors idle for over `evict_idle` are dropped, least recently used
 //!   first, until the mirrors use at most 80% of `mirrors_max` and the floor holds.
 //! - **Status.** Sizes are measured after every job, gc and upkeep pass, and kept; the
@@ -406,10 +406,13 @@ impl Publisher {
         Err((507, message))
     }
 
-    /// A mirror over its cap: removed, and a 507.
+    /// A mirror over its cap: a 507, and removed, unless a live stage record names it (its
+    /// push needs the mirror; the first stage after no record does, removes it).
     fn over_cap(&self, dir: &Path, owner: &str, name: &str, bytes: u64) -> Failure {
-        remove_mirror(dir);
-        self.forget(dir);
+        if !self.live_repos().contains(&repo_of(dir)) {
+            remove_mirror(dir);
+            self.forget(dir);
+        }
         self.stats().refused_for_space += 1;
         (507, format!("the mirror of {owner}/{name} is {} GiB, over the {} GiB a repo may use on this sandbox host: nothing was staged. An operator can raise SANDBOXD_MIRROR_MAX_GIB.", gib(bytes), gib(self.policy.mirror_max)))
     }

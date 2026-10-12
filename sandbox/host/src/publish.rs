@@ -1829,6 +1829,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mirror_over_its_cap_stays_while_a_live_stage_names_it() {
+        let s = scratch("overcaplive");
+        sh(&s.vm, "echo v > v && git add v && git commit -qm v");
+        let live = s.stage_all(request("scout/v"), || {}).await.unwrap();
+        // Over its cap, with that stage not pushed yet: refused, but its push still works.
+        s.size("acme/widgets", 5 * GIB);
+        sh(&s.vm, "echo w > w && git add w && git commit -qm w");
+        assert_eq!(s.stage_all(request("scout/v2"), || {}).await.unwrap_err().0, 507);
+        assert!(s.dir().exists(), "a live stage names it");
+        s.publisher.push(SANDBOX, s.push(&live, "scout/v")).await.unwrap();
+        assert_eq!(s.remote("scout/v"), Some(live.sha.clone()));
+        // No record names it now: the next stage removes it.
+        assert_eq!(s.stage_all(request("scout/v2"), || {}).await.unwrap_err().0, 507);
+        assert!(!s.dir().exists());
+    }
+
+    #[tokio::test]
     async fn a_new_mirror_needs_room_for_its_cap_and_idle_mirrors_make_room_least_recently_used_first_down_to_80_percent() {
         let mut s = scratch("total");
         s.publisher.policy.mirrors_max = 10 * GIB;
