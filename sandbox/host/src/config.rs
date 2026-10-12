@@ -41,6 +41,38 @@ pub struct Config {
     pub mirrors: Policy,
     /// How each VM is jailed (jail.rs).
     pub jail: JailConfig,
+    /// Each VM's network and disk rates and its disk quota.
+    pub limits: Limits,
+}
+
+/// Per VM. A rate of 0 means unlimited.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Limits {
+    /// Into the guest (downloads): above what GitHub gave starship (4.5–22 MB/s, 2026-10-11),
+    /// so a clone isn't slowed by it.
+    pub net_rx_mibps: u64,
+    /// Out of the guest: what abuse from a sandbox (a flood, a scan) can send.
+    pub net_tx_mibps: u64,
+    pub disk_mibps: u64,
+    pub disk_iops: u64,
+    pub disk_quota: DiskQuota,
+}
+
+/// SANDBOXD_DISK_QUOTA_GIB: unset is the default, enforced where the filesystem can and
+/// skipped with a warning where it can't; set, it must be enforced or sandboxd won't start.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DiskQuota {
+    Off,
+    Default(u64),
+    Set(u64),
+}
+
+pub const DEFAULT_DISK_QUOTA_GIB: u64 = 8;
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { net_rx_mibps: 50, net_tx_mibps: 10, disk_mibps: 200, disk_iops: 5000, disk_quota: DiskQuota::Default(DEFAULT_DISK_QUOTA_GIB) }
+    }
 }
 
 /// The jail's settings. Every VM runs under the jailer; there is no setting to turn it off.
@@ -137,6 +169,14 @@ impl Config {
         let retention_days = num("SANDBOXD_MIRROR_RETENTION_DAYS", d.retention.as_secs() / 86_400);
         let uid_base = num("SANDBOXD_JAIL_UID_BASE", DEFAULT_JAIL_UID_BASE);
         let headroom = num("SANDBOXD_VM_MEM_HEADROOM_MIB", 512);
+        let dl = Limits::default();
+        let rates = [
+            ("SANDBOXD_NET_RX_MIBPS", num("SANDBOXD_NET_RX_MIBPS", dl.net_rx_mibps)),
+            ("SANDBOXD_NET_TX_MIBPS", num("SANDBOXD_NET_TX_MIBPS", dl.net_tx_mibps)),
+            ("SANDBOXD_DISK_MIBPS", num("SANDBOXD_DISK_MIBPS", dl.disk_mibps)),
+            ("SANDBOXD_DISK_IOPS", num("SANDBOXD_DISK_IOPS", dl.disk_iops)),
+        ];
+        let quota_gib = var("SANDBOXD_DISK_QUOTA_GIB").map(|_| num("SANDBOXD_DISK_QUOTA_GIB", DEFAULT_DISK_QUOTA_GIB));
         // Checked before the casts below, so an out-of-range value fails here instead of
         // wrapping (4294967297 as u32 is 1).
         if !(1..=32).contains(&vcpus) {
@@ -170,6 +210,25 @@ impl Config {
         if !(64..=65_536).contains(&headroom) {
             problems.push("SANDBOXD_VM_MEM_HEADROOM_MIB must be 64..=65536".into());
         }
+        for (key, value) in rates {
+            if value > 100_000 {
+                problems.push(format!("{key} must be 0 (unlimited)..=100000"));
+            }
+        }
+        if quota_gib.is_some_and(|g| g > 65_536) {
+            problems.push("SANDBOXD_DISK_QUOTA_GIB must be 0 (off)..=65536".into());
+        }
+        let limits = Limits {
+            net_rx_mibps: rates[0].1,
+            net_tx_mibps: rates[1].1,
+            disk_mibps: rates[2].1,
+            disk_iops: rates[3].1,
+            disk_quota: match quota_gib {
+                None => DiskQuota::Default(DEFAULT_DISK_QUOTA_GIB),
+                Some(0) => DiskQuota::Off,
+                Some(g) => DiskQuota::Set(g),
+            },
+        };
         let jail = JailConfig {
             jailer: var("SANDBOXD_JAILER").unwrap_or_else(|| "jailer".into()).into(),
             firecracker: var("SANDBOXD_FIRECRACKER").unwrap_or_else(|| "firecracker".into()).into(),
@@ -192,6 +251,7 @@ impl Config {
             github_url: var("SANDBOXD_GITHUB_URL").unwrap_or_else(|| "https://github.com".into()),
             mirrors,
             jail,
+            limits,
         })
     }
 }
@@ -269,5 +329,21 @@ mod tests {
         std::env::set_var("SANDBOXD_JAILER", "off");
         assert_eq!(Config::from_env().unwrap().jail.jailer.to_str(), Some("off"));
         std::env::remove_var("SANDBOXD_JAILER");
+
+        // Rates and the disk quota: on by default, 0 turns each off, a set quota is explicit.
+        use super::{DiskQuota, Limits};
+        let limits = Config::from_env().unwrap().limits;
+        assert_eq!(limits, Limits { net_rx_mibps: 50, net_tx_mibps: 10, disk_mibps: 200, disk_iops: 5000, disk_quota: DiskQuota::Default(8) });
+        for (v, want) in [("0", DiskQuota::Off), ("8", DiskQuota::Set(8)), ("2", DiskQuota::Set(2))] {
+            std::env::set_var("SANDBOXD_DISK_QUOTA_GIB", v);
+            assert_eq!(Config::from_env().unwrap().limits.disk_quota, want, "{v}");
+        }
+        std::env::set_var("SANDBOXD_NET_TX_MIBPS", "0");
+        assert_eq!(Config::from_env().unwrap().limits.net_tx_mibps, 0);
+        for (k, v) in [("SANDBOXD_DISK_QUOTA_GIB", "70000"), ("SANDBOXD_NET_TX_MIBPS", "200000"), ("SANDBOXD_DISK_IOPS", "lots")] {
+            std::env::set_var(k, v);
+            assert!(Config::from_env().unwrap_err().contains(k), "{k}={v}");
+            std::env::remove_var(k);
+        }
     }
 }

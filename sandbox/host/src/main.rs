@@ -19,6 +19,7 @@ mod config;
 mod jail;
 mod net;
 mod publish;
+mod quota;
 mod runner;
 #[cfg(test)]
 mod service_unit;
@@ -176,6 +177,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // A disk quota set explicitly but not enforceable here refuses the start too.
+    let quota = match quota::detect(&cfg.state_dir, &cfg.limits.disk_quota).await {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("sandboxd: {e}");
+            std::process::exit(1);
+        }
+    };
     // Start clean: whatever a previous run left (a crash, a kill) is removed first, VMMs
     // before their taps, and before any request can boot a disk one of them still holds.
     vm::stop_stale_vmms(&cfg.state_dir, &host).await;
@@ -186,7 +195,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let vms = Manager::new(cfg.clone(), host);
+    let vms = Manager::new(cfg.clone(), host, quota);
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
     let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()).with_policy(cfg.mirrors.clone()));
 

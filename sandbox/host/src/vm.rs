@@ -12,6 +12,7 @@
 use crate::config::Config;
 use crate::jail::{self, Host, Jail};
 use crate::net::{self, Slot};
+use crate::quota::{self, Quota};
 use crate::vsock;
 use bytes::Bytes;
 use hyper::Method;
@@ -139,6 +140,7 @@ impl Drop for Use {
 pub struct Manager {
     cfg: Config,
     host: Arc<Host>,
+    quota: Quota,
     sandboxes: Mutex<HashMap<String, Arc<Sandbox>>>,
     slots: Mutex<Vec<bool>>, // true = taken
 }
@@ -152,9 +154,9 @@ pub struct Listing {
 }
 
 impl Manager {
-    pub fn new(cfg: Config, host: Arc<Host>) -> Arc<Manager> {
+    pub fn new(cfg: Config, host: Arc<Host>, quota: Quota) -> Arc<Manager> {
         let slots = vec![false; cfg.max_vms];
-        Arc::new(Manager { cfg, host, sandboxes: Mutex::new(HashMap::new()), slots: Mutex::new(slots) })
+        Arc::new(Manager { cfg, host, quota, sandboxes: Mutex::new(HashMap::new()), slots: Mutex::new(slots) })
     }
 
     fn jail<'a>(&'a self, sb: &'a Sandbox, slot: usize) -> Jail<'a> {
@@ -243,7 +245,7 @@ impl Manager {
     async fn boot(&self, sb: &Sandbox, slot_index: usize) -> Result<Child, String> {
         let t0 = Instant::now();
         let slot = Slot { index: slot_index };
-        tokio::fs::create_dir_all(&sb.dir).await.map_err(|e| format!("state dir: {e}"))?;
+        quota::prepare_dir(&self.quota, &sb.dir).await?;
         let rootfs = sb.rootfs();
         if !rootfs.exists() {
             let out = Command::new("cp").arg("--reflink=always").arg(&self.cfg.golden).arg(&rootfs).output().await.map_err(|e| format!("cp: {e}"))?;
@@ -319,11 +321,13 @@ impl Manager {
             self.stop_locked(&sb, &mut running).await;
         }
         self.sandboxes.lock().await.remove(id);
-        match tokio::fs::remove_dir_all(&sb.dir).await {
+        let removed = match tokio::fs::remove_dir_all(&sb.dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("remove {}: {e}", sb.dir.display())),
-        }
+        };
+        quota::after_destroy(&self.quota, &self.cfg.state_dir).await;
+        removed
     }
 
     /// Stop every running VM that has been idle longer than the configured idle time.
@@ -409,19 +413,46 @@ impl Manager {
 /// there): Firecracker runs chrooted and can't see the host's.
 fn vm_config(cfg: &Config, slot_index: usize) -> serde_json::Value {
     let slot = Slot { index: slot_index };
+    let l = &cfg.limits;
+    let mut drive = serde_json::json!({ "drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": true, "is_read_only": false });
+    if let Some(limiter) = rate_limiter(l.disk_mibps << 20, l.disk_iops) {
+        drive["rate_limiter"] = limiter;
+    }
+    let mut nic = serde_json::json!({ "iface_id": "eth0", "host_dev_name": slot.tap(), "guest_mac": slot.guest_mac() });
+    if let Some(limiter) = rate_limiter(l.net_rx_mibps << 20, 0) {
+        nic["rx_rate_limiter"] = limiter;
+    }
+    if let Some(limiter) = rate_limiter(l.net_tx_mibps << 20, 0) {
+        nic["tx_rate_limiter"] = limiter;
+    }
     serde_json::json!({
         "boot-source": {
             "kernel_image_path": "/vmlinux",
             "boot_args": format!("console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw {}", slot.kernel_ip_arg()),
         },
-        "drives": [{ "drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": true, "is_read_only": false }],
+        "drives": [drive],
         "machine-config": { "vcpu_count": cfg.vcpus, "mem_size_mib": cfg.mem_mib },
-        "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": slot.tap(), "guest_mac": slot.guest_mac() }],
+        "network-interfaces": [nic],
         // Firecracker's vsock is a host-side Unix socket per VM, so CIDs never meet on the
         // host and the same one works for every VM (two ran at once in the acceptance run).
         // A distinct CID per slot costs nothing and keeps that true under vhost-vsock too.
         "vsock": { "guest_cid": 3 + slot_index, "uds_path": "/vsock.sock" },
     })
+}
+
+/// A Firecracker rate limiter: token buckets refilled every second with one second's
+/// worth, plus a one-time burst of five seconds' worth for a boot or the start of a
+/// clone. 0 leaves that bucket out (unlimited); both 0, no limiter.
+fn rate_limiter(bytes_per_sec: u64, ops_per_sec: u64) -> Option<serde_json::Value> {
+    let bucket = |per_sec: u64| serde_json::json!({ "size": per_sec, "one_time_burst": per_sec * 5, "refill_time": 1000 });
+    let mut limiter = serde_json::json!({});
+    if bytes_per_sec > 0 {
+        limiter["bandwidth"] = bucket(bytes_per_sec);
+    }
+    if ops_per_sec > 0 {
+        limiter["ops"] = bucket(ops_per_sec);
+    }
+    (bytes_per_sec > 0 || ops_per_sec > 0).then_some(limiter)
 }
 
 #[cfg(test)]
@@ -443,6 +474,7 @@ mod tests {
             github_url: "https://github.com".into(),
             mirrors: crate::publish::Policy::default(),
             jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, mem_headroom_mib: 512 },
+            limits: crate::config::Limits::default(),
         }
     }
 
@@ -458,5 +490,22 @@ mod tests {
         for host_path in ["/var/lib", "/usr/local"] {
             assert!(!text.contains(host_path), "{host_path} in {text}");
         }
+    }
+
+    #[test]
+    fn every_vm_has_its_network_and_disk_rates_capped() {
+        let mut cfg = config(std::path::Path::new("/s"));
+        let vm = super::vm_config(&cfg, 0);
+        let mib = 1u64 << 20;
+        let bucket = |per_sec: u64| serde_json::json!({ "size": per_sec, "one_time_burst": per_sec * 5, "refill_time": 1000 });
+        assert_eq!(vm["network-interfaces"][0]["rx_rate_limiter"], serde_json::json!({ "bandwidth": bucket(50 * mib) }));
+        assert_eq!(vm["network-interfaces"][0]["tx_rate_limiter"], serde_json::json!({ "bandwidth": bucket(10 * mib) }));
+        assert_eq!(vm["drives"][0]["rate_limiter"], serde_json::json!({ "bandwidth": bucket(200 * mib), "ops": bucket(5000) }));
+        // 0 is unlimited: the limiter, or its bucket, is left out.
+        cfg.limits.net_rx_mibps = 0;
+        cfg.limits.disk_iops = 0;
+        let vm = super::vm_config(&cfg, 0);
+        assert!(vm["network-interfaces"][0].get("rx_rate_limiter").is_none());
+        assert_eq!(vm["drives"][0]["rate_limiter"], serde_json::json!({ "bandwidth": bucket(200 * mib) }));
     }
 }
