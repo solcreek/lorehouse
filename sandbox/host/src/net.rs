@@ -163,10 +163,18 @@ pub async fn setup(uplink: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn tap_up(slot: &Slot) -> Result<(), String> {
+/// `ip tuntap add` for a slot's tap, owned by the uid its jailed Firecracker runs as:
+/// without that, attaching to the tap would need CAP_NET_ADMIN, which the VM never has.
+fn tap_add(tap: &str, owner: u32) -> Vec<String> {
+    let owner = owner.to_string();
+    ["ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", &owner, "group", &owner].map(String::from).to_vec()
+}
+
+pub async fn tap_up(slot: &Slot, owner: u32) -> Result<(), String> {
     let tap = slot.tap();
     let _ = run(&["ip", "link", "del", &tap]).await; // a leftover from a crash
-    run(&["ip", "tuntap", "add", "dev", &tap, "mode", "tap"]).await?;
+    let add = tap_add(&tap, owner);
+    run(&add.iter().map(String::as_str).collect::<Vec<_>>()).await?;
     run(&["ip", "addr", "add", &format!("{}/30", slot.host_ip()), "dev", &tap]).await?;
     run(&["ip", "link", "set", &tap, "up"]).await
 }
@@ -177,6 +185,11 @@ pub async fn tap_down(slot: &Slot) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tap_belongs_to_its_vms_uid() {
+        assert_eq!(super::tap_add("lhtap3", 1_900_000_003).join(" "), "ip tuntap add dev lhtap3 mode tap user 1900000003 group 1900000003");
+    }
+
     #[test]
     fn forwarding_is_read_not_written() {
         assert!(super::forwarding_on("1\n"));

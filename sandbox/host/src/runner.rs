@@ -807,8 +807,9 @@ mod tests {
             mem_mib: 128,
             github_url: format!("file://{}", dir.display()),
             mirrors: crate::publish::Policy::default(),
+            jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, mem_headroom_mib: 512 },
         };
-        (crate::vm::Manager::new(cfg), std::sync::Arc::new(crate::publish::Publisher::new(dir.join("mirrors"), format!("file://{}", dir.display()))))
+        (crate::vm::Manager::new(cfg, std::sync::Arc::new(crate::jail::tests::host())), std::sync::Arc::new(crate::publish::Publisher::new(dir.join("mirrors"), format!("file://{}", dir.display()))))
     }
 
     #[tokio::test]

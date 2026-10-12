@@ -31,10 +31,19 @@ KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=120
 
-# Root, but only for what it does: taps and nftables rules (CAP_NET_ADMIN). Firecracker,
-# its child, runs as root with the same single capability (it attaches to the tap).
-CapabilityBoundingSet=CAP_NET_ADMIN
+# Root, but only for what it does: taps and nftables rules (CAP_NET_ADMIN), and the
+# jailer, which builds each VM's chroot (SYS_ADMIN for its mount namespace and
+# pivot_root, SYS_CHROOT, MKNOD for /dev/kvm and /dev/net/tun in it, CHOWN), then drops
+# to the VM's uid (SETUID, SETGID). sandboxd reaches into a jail, owned by that uid, for
+# the vsock and to clean up (DAC_OVERRIDE), and signals the jailed VMM (KILL). The VMM
+# itself ends with no capability at all.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_KILL
+# The jailer drops privileges with setuid(2), which NoNewPrivileges doesn't stop.
 NoNewPrivileges=yes
+# Each VM gets its own cgroup (CPU, memory, pids, IO limits) under this unit's, and
+# systemd's stop reaches the VMs too. Hence no ProtectControlGroups=: delegated cgroups
+# must be writable.
+Delegate=yes
 # Read-only everywhere but the state directory (sandbox disks, mirrors, runner ledger),
 # which systemd creates (0700) and makes writable. For a different SANDBOXD_STATE add
 # ReadWritePaths=<it> (it must exist): sandboxd refuses to start when its state
@@ -47,21 +56,25 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateIPC=yes
 UMask=0077
-# /dev/kvm for the VMs and /dev/net/tun for their taps; beyond those, only the standard
-# pseudo-devices (null, zero, random, …) DevicePolicy=closed keeps.
+# /dev/kvm for the VMs and /dev/net/tun for their taps; beyond those, only the
+# standard pseudo-devices (null, zero, random, …) DevicePolicy=closed keeps. "m": the
+# jailer makes its own nodes of them (and of /dev/userfaultfd and /dev/urandom, when
+# the host has them; it fails without /dev/userfaultfd's) inside each jail.
 DevicePolicy=closed
-DeviceAllow=/dev/kvm rw
-DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/kvm rwm
+DeviceAllow=/dev/net/tun rwm
+DeviceAllow=/dev/userfaultfd m
+DeviceAllow=/dev/urandom m
 # AF_INET/AF_INET6: Lorehouse and GitHub. AF_UNIX: each VM's vsock and API sockets.
 # AF_NETLINK: ip and nft.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-RestrictNamespaces=yes
+# The jailer's mount namespace, and no other.
+RestrictNamespaces=mnt
 # net.ipv4.ip_forward comes from sandboxd.sysctl.conf at boot (sandboxd checks it is on
 # and refuses to start otherwise), and nft's modules from sandboxd.modules.conf.
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
-ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 LockPersonality=yes
@@ -69,8 +82,9 @@ MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+# @mount: the jailer's mount, pivot_root and chroot. Firecracker installs its own, much
+# narrower filter on top of this one.
+SystemCallFilter=@system-service @mount
 SystemCallErrorNumber=EPERM
 
 [Install]
