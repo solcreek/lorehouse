@@ -57,6 +57,13 @@ pub fn quota_mode(status: &str) -> BtrfsQuotas {
     }
 }
 
+/// statfs's f_type, whatever its width and sign on this target, as the u32 the magic
+/// numbers are: a 32-bit signed f_type holds btrfs's magic as a negative number, which
+/// widening sign-extends, and only its low 32 bits are the magic.
+fn magic(f_type: i64) -> u32 {
+    f_type as u32
+}
+
 fn fs_kind(f_type: u32) -> Option<bool> {
     match f_type {
         BTRFS_SUPER_MAGIC => Some(true),
@@ -101,7 +108,7 @@ async fn probe(state_dir: &Path) -> Result<Fs, String> {
         return Err(format!("statfs {}: {}", state_dir.display(), std::io::Error::last_os_error()));
     }
     #[allow(clippy::unnecessary_cast)] // f_type's type differs by target
-    Ok(match fs_kind(buf.f_type as u32) {
+    Ok(match fs_kind(magic(buf.f_type as i64)) {
         Some(true) => Fs::Btrfs(match Command::new("btrfs").args(["quota", "status"]).arg(state_dir).output().await {
             Ok(out) if out.status.success() => quota_mode(&String::from_utf8_lossy(&out.stdout)),
             _ => BtrfsQuotas::NoTool,
@@ -202,8 +209,10 @@ mod tests {
         assert_eq!(fs_kind(BTRFS_SUPER_MAGIC), Some(true));
         assert_eq!(fs_kind(XFS_SUPER_MAGIC), Some(false));
         assert_eq!(fs_kind(0xEF53), None); // ext4
-        // A 32-bit target's signed f_type, sign-extended, still reads as btrfs.
-        assert_eq!(fs_kind(0x9123_683Eu32 as i32 as i64 as u32), Some(true));
+        // A 32-bit target's signed f_type (btrfs's magic is negative there), widened as
+        // probe does, still reads as btrfs; so does a 64-bit target's positive one.
+        assert_eq!(fs_kind(magic(0x9123_683Eu32 as i32 as i64)), Some(true));
+        assert_eq!(fs_kind(magic(0x9123_683E_i64)), Some(true));
     }
 
     #[test]
