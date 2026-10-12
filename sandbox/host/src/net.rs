@@ -226,8 +226,9 @@ mod tests {
         // A later file name turns it off again: a reboot would leave it off.
         assert!(!f(&[("90-lorehouse-sandboxd.conf", on), ("99-local.conf", off)]));
         assert!(f(&[("10-local.conf", off), ("90-lorehouse-sandboxd.conf", on)]));
-        // File name order, not directory order: /usr/lib's 99 comes after /etc's 90.
-        assert!(!f(&[("90-lorehouse-sandboxd.conf", on), ("99-vendor.conf", off)]));
+        // File name order, not directory order: /etc's 99 (read first) is applied after
+        // /usr/lib's 90.
+        assert!(!f(&[("99-local.conf", off), ("90-lorehouse-sandboxd.conf", on)]));
         // An /etc file (listed first) hides /usr/lib's of the same name, e.g. a /dev/null mask.
         assert!(!f(&[("90-lorehouse-sandboxd.conf", ""), ("90-lorehouse-sandboxd.conf", on)]));
         // Only *.conf is read.
