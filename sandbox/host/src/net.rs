@@ -161,41 +161,64 @@ pub async fn teardown_all() {
     }
 }
 
+/// What taps_down could confirm: the taps seen to go down, and what went wrong with the
+/// rest. A tap not in `down` (it failed, it hung, or the taps couldn't even be listed) may
+/// still carry its guest's traffic.
+#[derive(Debug, Default, PartialEq)]
+pub struct TapsDown {
+    pub down: std::collections::HashSet<String>,
+    pub errors: Vec<String>,
+}
+
+impl TapsDown {
+    /// Whether `tap` was seen to go down.
+    pub fn confirmed(&self, tap: &str) -> bool {
+        self.down.contains(tap)
+    }
+}
+
 /// Every sandbox's tap down at once: no packet in or out of any VM from here on, before
-/// they are stopped (which takes seconds each). For when the table is gone for good.
-/// How many went down; an error names what couldn't be listed or taken down, so the
-/// caller never reports a tap down that may still carry a guest's traffic.
-pub async fn taps_down() -> Result<usize, String> {
+/// they are stopped. For when the table is gone for good. A tap it can't confirm down is
+/// named in `errors`, and its VM is killed rather than stopped gracefully (vm.rs fail_closed).
+pub async fn taps_down() -> TapsDown {
     all_down(list_taps().await, |tap| async move { run(&["ip", "link", "set", "dev", &tap, "down"]).await }).await
 }
 
 /// `down` for every tap in `taps`, all at once: one `ip` that hangs (up to TOOL_DEADLINE)
-/// doesn't hold back the others. Ok(count) only when every one succeeded.
-async fn all_down<F, Fut>(taps: Result<Vec<String>, String>, down: F) -> Result<usize, String>
+/// doesn't hold back the others.
+pub(crate) async fn all_down<F, Fut>(taps: Result<Vec<String>, String>, down: F) -> TapsDown
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
-    let taps = taps.map_err(|e| format!("the taps couldn't be listed ({e})"))?;
+    let mut result = TapsDown::default();
+    let taps = match taps {
+        Ok(t) => t,
+        Err(e) => {
+            result.errors.push(format!("the taps couldn't be listed ({e}), so none is confirmed down"));
+            return result;
+        }
+    };
     let mut set = tokio::task::JoinSet::new();
     for tap in &taps {
         let (fut, tap) = (down(tap.clone()), tap.clone());
-        set.spawn(async move { fut.await.map_err(|e| format!("{tap}: {e}")) });
+        set.spawn(async move { (fut.await, tap) });
     }
-    let mut failed = Vec::new();
     while let Some(done) = set.join_next().await {
         match done {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => failed.push(e),
-            Err(e) => failed.push(e.to_string()),
+            Ok((Ok(()), tap)) => {
+                result.down.insert(tap);
+            }
+            Ok((Err(e), tap)) => result.errors.push(format!("{tap}: {e}")),
+            Err(e) => result.errors.push(e.to_string()),
         }
     }
-    if failed.is_empty() {
-        Ok(taps.len())
-    } else {
-        failed.sort();
-        Err(format!("{} of {} taps not confirmed down: {}", failed.len(), taps.len(), failed.join("; ")))
+    if !result.errors.is_empty() {
+        result.errors.sort();
+        let n = result.errors.len();
+        result.errors.insert(0, format!("{n} of {} taps not confirmed down", taps.len()));
     }
+    result
 }
 
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -898,15 +921,18 @@ mod tests {
                 Ok(())
             }
         };
-        let together = tokio::time::timeout(std::time::Duration::from_secs(5), super::all_down(taps(3), down)).await;
-        assert_eq!(together.expect("taps went down one after another"), Ok(3));
-        // One that fails is named, and the result is no success.
-        let err = super::all_down(taps(3), |tap: String| async move { if tap == "lhtap1" { Err("ip: no answer within 10 s".to_string()) } else { Ok(()) } }).await.unwrap_err();
-        assert!(err.contains("1 of 3") && err.contains("lhtap1: ip: no answer"), "{err}");
-        // Not listed: not reported as down.
-        let err = super::all_down(Err("ip: no answer within 10 s".into()), |_: String| async { Ok(()) }).await.unwrap_err();
-        assert!(err.contains("couldn't be listed"), "{err}");
-        assert_eq!(super::all_down(taps(0), |_: String| async { Ok(()) }).await, Ok(0));
+        let together = tokio::time::timeout(std::time::Duration::from_secs(5), super::all_down(taps(3), down)).await.expect("taps went down one after another");
+        assert_eq!(together.down.len(), 3);
+        assert!(together.errors.is_empty(), "{:?}", together.errors);
+        // One that fails is named, and is not confirmed; the others are.
+        let r = super::all_down(taps(3), |tap: String| async move { if tap == "lhtap1" { Err("ip: no answer within 10 s".to_string()) } else { Ok(()) } }).await;
+        assert!(r.confirmed("lhtap0") && r.confirmed("lhtap2") && !r.confirmed("lhtap1"));
+        let errors = r.errors.join("; ");
+        assert!(errors.contains("1 of 3") && errors.contains("lhtap1: ip: no answer"), "{errors}");
+        // Not listed: none is confirmed down.
+        let r = super::all_down(Err("ip: no answer within 10 s".into()), |_: String| async { Ok(()) }).await;
+        assert!(r.down.is_empty() && r.errors.join("").contains("couldn't be listed"), "{r:?}");
+        assert_eq!(super::all_down(taps(0), |_: String| async { Ok(()) }).await, super::TapsDown::default());
     }
 
     #[test]

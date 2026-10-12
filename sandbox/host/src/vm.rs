@@ -119,7 +119,8 @@ async fn jailed_uds(state_dir: &Path, exec_name: &str, jail_id: &str) -> Vec<Pat
 /// sent through the pidfd only, so neither can ever reach a reused pid: not after a failed
 /// wait, not when it is dropped (at shutdown, or with a boot that was given up on).
 pub(crate) struct Vmm {
-    pidfd: Pidfd,
+    /// Shared with Manager::vmms, so fail_closed can kill it without its sandbox's lock.
+    pidfd: Arc<Pidfd>,
     /// Kept only to be reaped (no kill_on_drop: a dropped Child is reaped by tokio).
     child: Child,
 }
@@ -129,7 +130,7 @@ impl Vmm {
         let mut child = cmd.kill_on_drop(false).spawn().map_err(|e| format!("jailer: {e}"))?;
         let opened = child.id().ok_or_else(|| "jailer: no pid".to_string()).and_then(|pid| Pidfd::open(pid).map_err(|e| format!("pidfd: {e}")));
         match opened {
-            Ok(pidfd) => Ok(Vmm { pidfd, child }),
+            Ok(pidfd) => Ok(Vmm { pidfd: Arc::new(pidfd), child }),
             Err(e) => {
                 // Not waited for yet, so the pid is still this child's: safe to signal.
                 let _ = child.start_kill();
@@ -227,6 +228,10 @@ pub struct Manager {
     quota: Quota,
     sandboxes: Mutex<HashMap<String, Arc<Sandbox>>>,
     slots: Mutex<Vec<bool>>, // true = taken
+    /// Each running VMM's pidfd by slot, from the moment it runs until its slot is
+    /// released: fail_closed kills through it at once, even while a stop or a request
+    /// holds that sandbox's lock.
+    vmms: std::sync::Mutex<HashMap<usize, Arc<Pidfd>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -240,7 +245,7 @@ pub struct Listing {
 impl Manager {
     pub fn new(cfg: Config, host: Arc<Host>, quota: Quota, fw: Arc<net::Firewall>) -> Arc<Manager> {
         let slots = vec![false; cfg.max_vms];
-        Arc::new(Manager { cfg, host, fw, quota, sandboxes: Mutex::new(HashMap::new()), slots: Mutex::new(slots) })
+        Arc::new(Manager { cfg, host, fw, quota, sandboxes: Mutex::new(HashMap::new()), slots: Mutex::new(slots), vmms: std::sync::Mutex::new(HashMap::new()) })
     }
 
     fn jail<'a>(&'a self, sb: &'a Sandbox, slot: usize) -> Jail<'a> {
@@ -250,6 +255,7 @@ impl Manager {
     /// Everything a VM in `slot` held, given back once its process is gone: its tap, its
     /// jail (the disk root's again) and the slot.
     async fn release(&self, sb: &Sandbox, slot: usize) {
+        self.vmms.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
         net::tap_down(&Slot { index: slot }).await;
         self.jail(sb, slot).release(&sb.rootfs()).await;
         self.free_slot(slot).await;
@@ -301,12 +307,12 @@ impl Manager {
                 return Err((503, format!("all {} sandboxes are busy; try again later", self.cfg.max_vms)));
             };
             match self.boot(&sb, slot).await {
-                Ok(vmm) => *running = Some(Running { vmm, slot }),
+                Ok(vmm) => *running = Some(self.track(vmm, slot)),
                 Err(BootError { msg, unstopped: Some(vmm) }) => {
                     // A VMM whose exit couldn't be confirmed keeps its slot, jail and disk
                     // (as in stop_locked); the next request finds it and tries again.
                     eprintln!("sandboxd: {}: its VMM's exit couldn't be confirmed after a failed boot; it keeps slot {slot} until it is", sb.id);
-                    *running = Some(Running { vmm: *vmm, slot });
+                    *running = Some(self.track(*vmm, slot));
                     return Err((500, msg));
                 }
                 Err(BootError { msg, unstopped: None }) => {
@@ -444,6 +450,39 @@ impl Manager {
                 let _ = self.stop_locked(&sb, &mut running).await;
             }
         }
+    }
+
+    /// A VMM now running in `slot`, its pidfd recorded for fail_closed.
+    fn track(&self, vmm: Vmm, slot: usize) -> Running {
+        self.vmms.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, vmm.pidfd.clone());
+        Running { vmm, slot }
+    }
+
+    /// The network rules are gone for good and every tap was told to go down (`taps`).
+    /// Isolation comes before the disk only where the cut isn't confirmed: a VM whose tap
+    /// is confirmed down is stopped gracefully (its guest syncs first), one whose tap isn't
+    /// is SIGKILLed through its pidfd at once, without a sync, and reported. Then every VM
+    /// is stopped and released as usual (a killed one only reaped). Which VMs it killed.
+    pub async fn fail_closed(self: &Arc<Self>, taps: &net::TapsDown) -> Vec<usize> {
+        let unconfirmed: Vec<(usize, Arc<Pidfd>)> = {
+            let vmms = self.vmms.lock().unwrap_or_else(|e| e.into_inner());
+            let mut v: Vec<_> = vmms.iter().filter(|(slot, _)| !taps.confirmed(&Slot { index: **slot }.tap())).map(|(s, p)| (*s, p.clone())).collect();
+            v.sort_by_key(|(s, _)| *s);
+            v
+        };
+        let mut killed = Vec::new();
+        for (slot, pidfd) in unconfirmed {
+            match pidfd.kill() {
+                Ok(()) => {
+                    eprintln!("sandboxd: ALERT: slot {slot}'s VMM killed (SIGKILL, no sync): its tap {} couldn't be confirmed down", Slot { index: slot }.tap());
+                    killed.push(slot);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {} // already gone
+                Err(e) => eprintln!("sandboxd: ALERT: slot {slot}'s VMM couldn't be killed ({e}); its tap isn't confirmed down"),
+            }
+        }
+        self.stop_all().await;
+        killed
     }
 
     /// Stop every VM at once, not one after another, so shutdown takes about as long as
@@ -642,6 +681,40 @@ mod tests {
         assert!(!dir.join("state/t1").exists(), "a disk was made");
         assert_eq!(vms.running_count().await, 0, "the slot was given back");
         tokio::time::timeout(Duration::from_secs(1), fw.alarm.notified()).await.expect("the watch was woken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_vm_whose_tap_isnt_confirmed_down_is_killed_the_others_stopped_gracefully() {
+        let dir = std::env::temp_dir().join(format!("sandboxd-fail-closed-{}", std::process::id()));
+        let vms = super::Manager::new(config(&dir), std::sync::Arc::new(crate::jail::tests::host()), crate::quota::Quota::Off, crate::net::Firewall::new("lo", 2));
+        // Two running VMMs (stand-ins that ignore everything but a kill), slots 0 and 1.
+        let mut watch = Vec::new();
+        for (id, slot) in [("a", 0), ("b", 1)] {
+            let sb = vms.get(id).await;
+            let vmm = super::Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
+            watch.push(super::Pidfd::open(vmm.child.id().unwrap()).unwrap());
+            vms.slots.lock().await[slot] = true;
+            *sb.running.lock().await = Some(vms.track(vmm, slot));
+        }
+        // The fake: lhtap0 went down, lhtap1 couldn't be confirmed.
+        let taps = crate::net::all_down(Ok(vec!["lhtap0".into(), "lhtap1".into()]), |tap: String| async move {
+            if tap == "lhtap1" {
+                Err("ip: no answer within 10 s".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        let run = { let vms = vms.clone(); tokio::spawn(async move { vms.fail_closed(&taps).await }) };
+        // Slot 1 is killed at once; slot 0 is on the graceful path (asked to sync, then
+        // given 5 s to exit), so it is still there a second later.
+        assert!(watch[1].wait(Duration::from_secs(1)).await, "the VM on an unconfirmed tap wasn't killed at once");
+        assert!(!watch[0].exited(), "the VM on a confirmed tap didn't get the graceful stop");
+        assert_eq!(run.await.unwrap(), vec![1]);
+        assert!(watch[0].exited(), "the graceful stop still ends in a stopped VM");
+        assert_eq!(vms.running_count().await, 0);
+        assert!(vms.vmms.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

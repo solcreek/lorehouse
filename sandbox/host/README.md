@@ -212,7 +212,10 @@ table or a rule added to it is noticed, logged (`ALERT: nftables table inet lore
 is gone …; loading it again`) and the table loaded again, along with sandboxd's accepts in
 Docker's FORWARD chain if those went too. If it can't be loaded, sandboxd fails closed:
 every tap goes down at once, every running VM is stopped, and none boots until a later
-check loads it. Between a flush and the next check (up to `SANDBOXD_NET_CHECK_SECS`)
+check loads it. A VM whose tap is confirmed down is stopped gracefully (its guest syncs
+first); one whose tap can't be confirmed down is killed at once through its pidfd, without
+a sync, and logged: isolation comes before its disk only there. sandboxd keeps running,
+refusing boots, so the runner reports the state. Between a flush and the next check (up to `SANDBOXD_NET_CHECK_SECS`)
 running guests are unfiltered; a smaller value narrows that, at one `nft list` per check.
 Every `nft` and `ip` run is cut off after 10 s, so a hung one can't stall the checks. An
 nft upgrade that lists the same rules differently shows up as one ALERT and one reload,

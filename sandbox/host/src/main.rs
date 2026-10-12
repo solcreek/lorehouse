@@ -204,7 +204,6 @@ async fn main() {
     // every tap down and stops every VM, and none boots until it is back (fail closed).
     let watch = (fw.clone(), vms.clone());
     let every = cfg.net_check;
-    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     tokio::spawn(async move {
         let (fw, vms) = watch;
         let mut tick = tokio::time::interval(every);
@@ -218,20 +217,21 @@ async fn main() {
                 break;
             }
             if fw.ensure().await.is_err() && !fw.is_closed() {
-                // Cut off at once (taps down), then stopped (seconds each, after the guest's
-                // sync), in a task of its own so the checks go on meanwhile.
+                // Cut off at once (taps down), then stopped in a task of its own so the checks
+                // go on meanwhile: gracefully (the guest's sync, seconds each) where its tap is
+                // confirmed down, killed at once where it isn't. sandboxd keeps running, and
+                // refusing boots, so the runner can report the state.
                 let down = net::taps_down().await;
-                if let Err(e) = &down {
-                    eprintln!("sandboxd: ALERT: {e}; those guests may still be unfiltered until their VMs stop");
+                if !down.errors.is_empty() {
+                    eprintln!("sandboxd: ALERT: {}; their VMs are killed now, without a sync", down.errors.join("; "));
                 }
-                if vms.running_count().await > 0 && !stopping.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    let taps = if down.is_ok() { "every tap is down" } else { "not every tap could be taken down" };
-                    eprintln!("sandboxd: ALERT: {taps}; stopping every running VM: their network rules are gone");
-                    let (vms, stopping) = (vms.clone(), stopping.clone());
-                    tokio::spawn(async move {
-                        vms.stop_all().await;
-                        stopping.store(false, std::sync::atomic::Ordering::SeqCst);
-                    });
+                // On every failed check, not only the first: a tap that fails to go down later
+                // is still acted on (its kill needs no lock), and a VM a stop is already
+                // under way for is found stopped once that stop is done.
+                if vms.running_count().await > 0 {
+                    eprintln!("sandboxd: ALERT: the network rules are gone; stopping every running VM (killed where its tap isn't confirmed down)");
+                    let vms = vms.clone();
+                    tokio::spawn(async move { vms.fail_closed(&down).await });
                 }
             }
         }
