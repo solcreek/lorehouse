@@ -632,7 +632,12 @@ impl Publisher {
     /// so it can be tested without a VM.
     async fn stage_and_record(&self, dir: &Path, bundle: &Path, sandbox: &str, req: &StageRequest, id: &str) -> Result<Staged, Failure> {
         let mut staged = self.stage_bundle(dir, bundle, &req.base, id).await?;
-        // The bundle is in the mirror now: it must still fit (upkeep.rs).
+        // The bundle is in the mirror now: it must still fit (upkeep.rs). Measured without the
+        // bundle's file, which would count twice: a stage's own file (stage_with), in the
+        // mirror, is removed here, as soon as its objects are in.
+        if bundle.starts_with(dir) {
+            let _ = std::fs::remove_file(bundle);
+        }
         if let Err(e) = self.check_size(dir, &req.owner, &req.name) {
             let _ = git(dir, &["update-ref", "-d", &format!("refs/stage/{id}")], None, GIT_LOCAL).await;
             return Err(e);
@@ -1908,6 +1913,18 @@ mod tests {
         assert_eq!(s.stage_all(request("scout/f"), || {}).await.unwrap_err(), low(40, 50));
         *s.disk.fs.lock().unwrap() = Some((60 * GIB, 500 * GIB));
         s.stage_all(request("scout/f"), || {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stage_is_measured_without_its_bundle_file() {
+        let mut s = scratch("bundlesize");
+        heavy_commit(&s, "big.bin");
+        s.stage_all(request("scout/b"), || {}).await.unwrap();
+        // The same commits again: they are in the mirror already, so it grows by the ref and
+        // the bundle file (64 KiB) only. A cap with half the bundle to spare holds.
+        let size = RealDisk.usage(&s.dir()).0;
+        s.publisher.policy.mirror_max = size + (32 << 10);
+        s.stage_all(request("scout/b2"), || {}).await.unwrap();
     }
 
     #[tokio::test]
