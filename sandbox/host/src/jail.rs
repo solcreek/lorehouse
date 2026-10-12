@@ -317,13 +317,13 @@ enum Lookup {
     Failed,
 }
 
-/// getpwuid_r/getgrgid_r's result: 0 with a record (taken) or without one (free); "not
-/// found" as some implementations spell it (ENOENT, ESRCH); ERANGE (a bigger buffer);
-/// anything else a failed lookup.
+/// getpwuid_r/getgrgid_r's result: 0 with a record (taken) or without one (free, which
+/// is how glibc and musl say "not found"); ERANGE (a bigger buffer); anything else a
+/// failed lookup. That includes ENOENT: glibc returns a backend's errno when it couldn't
+/// answer, e.g. ENOENT for a missing /etc/passwd or an sssd socket that isn't there.
 fn lookup_outcome(rc: i32, found: bool) -> Lookup {
     match rc {
         0 => Lookup::Done(found),
-        libc::ENOENT | libc::ESRCH => Lookup::Done(false),
         libc::ERANGE => Lookup::Grow,
         _ => Lookup::Failed,
     }
@@ -481,7 +481,8 @@ pub mod tests {
     fn a_failed_user_lookup_refuses_rather_than_reads_as_free() {
         assert_eq!(lookup_outcome(0, true), Lookup::Done(true));
         assert_eq!(lookup_outcome(0, false), Lookup::Done(false));
-        assert_eq!(lookup_outcome(libc::ENOENT, false), Lookup::Done(false));
+        // A backend that couldn't be reached (a missing file, an sssd socket): not "free".
+        assert_eq!(lookup_outcome(libc::ENOENT, false), Lookup::Failed);
         assert_eq!(lookup_outcome(libc::ERANGE, false), Lookup::Grow);
         // An NSS backend that can't answer: not "free".
         assert_eq!(lookup_outcome(libc::EIO, false), Lookup::Failed);
