@@ -727,7 +727,13 @@ mod tests {
         assert!(vms.vmms.lock().unwrap().is_empty());
 
         // A VM still booting (spawned, not yet answering: its sandbox's lock is held by the
-        // boot, and it isn't Running yet) is reached too, and killed.
+        // boot, and it isn't Running yet) is reached too, and killed. boot() can't run here
+        // (a jail and a tap need root), so its spawn is pinned to spawn_tracked in the
+        // source, and spawn_tracked is exercised below.
+        let src = include_str!("vm.rs");
+        let boot = &src[src.find("    async fn boot(").unwrap()..];
+        let boot = &boot[..boot.find("\n    }\n").unwrap()];
+        assert!(boot.contains("self.spawn_tracked(") && !boot.contains(&["Vmm::", "spawn("].concat()), "boot() spawns its VMM untracked");
         let booting = vms.spawn_tracked(tokio::process::Command::new("sleep").arg("60"), 1).unwrap();
         let held = vms.get("c").await;
         let lock = held.running.lock().await;
