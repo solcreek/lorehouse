@@ -121,6 +121,25 @@ describe("live edits and deletions", () => {
     expect(searcher(db)("wombat")[0]?.id).toBe(`slack:C1:${THREAD}`);
   });
 
+  test("a stop reads every thread still waiting out its debounce: a deletion just before shutdown isn't lost", async () => {
+    // The start-up reconcile only revisits threads inside INGEST_REFRESH_DAYS, so an event a
+    // stop dropped could leave a deleted message quotable for good.
+    const slack = fakeSlack(baseHistory());
+    const db = openKnowledge(":memory:");
+    const ing = new SlackIngester(slack.api, db, { channels: new Set(["C1"]), backfillDays: 30, refreshDays: 14, debounceMs: 60_000, now: NOW });
+    await ing.start();
+    slack.remove("C1", "1790000010.000100");
+    ing.onRawEvent({ type: "message", subtype: "message_deleted", channel: "C1", deleted_ts: "1790000010.000100", previous_message: { ts: "1790000010.000100" } });
+    expect(searcher(db)("hunter2")).toHaveLength(1); // still debouncing
+    await ing.stop();
+    expect(searcher(db)("hunter2")).toEqual([]);
+    // Stopped: a later event arms nothing.
+    slack.remove("C1", "1790000002.000100");
+    ing.onRawEvent({ type: "message", subtype: "message_deleted", channel: "C1", deleted_ts: "1790000002.000100", previous_message: { ts: "1790000002.000100", thread_ts: THREAD } });
+    await ing.stop();
+    expect(searcher(db)("which room")).toHaveLength(1);
+  });
+
   test("a deleted root with replies keeps the thread, minus the root", async () => {
     const slack = fakeSlack(baseHistory());
     const { db, ing } = ingester(slack.api);

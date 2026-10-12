@@ -16,11 +16,13 @@
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
 // 404 when STATUS_TOKEN is unset). The admin API under /api/v1 (docs/admin-api.md) answers
-// only to ADMIN_TOKEN, the same way.
+// only to ADMIN_TOKEN, the same way. On SIGTERM it must exit 0 within 5 s (one during
+// start-up: once the start is through, without serving), and a deleted message's text
+// must not stay in LOREHOUSE_DB's files (the -wal included).
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { MIRRORS, pollRunner, wsRunner } from "./fake-runner";
@@ -682,6 +684,115 @@ const scenarios: Scenario[] = [
         if (results.some((x) => x.id === doc)) return `${doc} is still found by "${q}"`;
       }
       return null;
+    },
+  },
+  {
+    // #89: secure_delete (#65) clears the database file, but the WAL's earlier frames held
+    // the text until a checkpoint truncated it, and a stop never ran one. A backup of the
+    // directory carried what was deleted.
+    name: "a deleted message leaves LOREHOUSE_DB's files, its -wal too; a stop (SIGTERM) exits 0 within 5 s and leaves none",
+    run: async () => {
+      const db = freshDb();
+      const wal = `${db}-wal`;
+      const copies = (file: string, word: string) => (existsSync(file) ? readFileSync(file).toString("latin1").split(word).length - 1 : 0);
+      const inFiles = (word: string) => copies(db, word) + copies(wal, word);
+      const until = async (ok: () => boolean | Promise<boolean>, ms = 5000) => {
+        const t0 = Date.now();
+        while (!(await ok())) {
+          if (Date.now() - t0 > ms) return false;
+          await Bun.sleep(50);
+        }
+        return true;
+      };
+      return inMode({ LOREHOUSE_DB: db }, async () => {
+        // A message alone (its document is deleted), and a reply in a thread that stays (its
+        // document is rewritten without it).
+        const alone = `okapiwalone${++seq}`;
+        const reply = `okapiwalreply${++seq}`;
+        const aloneTs = await liveMessage(ALLOWED, "channel", `the okapi vault code is ${alone}, keep it here`);
+        const root = await liveMessage(ALLOWED, "channel", "where is the okapi vault runbook?");
+        const replyTs = `${1980000000 + ++seq}.000100`;
+        const replyText = `the okapi runbook password is ${reply}`;
+        await post("/fixtures/messages", { channel: ALLOWED, message: { ts: replyTs, thread_ts: root, user: "U7", text: replyText } });
+        await sendEvent({ type: "message", channel: ALLOWED, channel_type: "channel", user: "U7", text: replyText, ts: replyTs, thread_ts: root, event_ts: replyTs });
+        const found = async (word: string) => (await admin<{ results: { id: string }[] }>(`/api/v1/search?q=${word}`)).results.length > 0;
+        if (!(await until(async () => (await found(alone)) && (await found(reply))))) return "the messages were never indexed";
+        // What this checks is there to begin with: the files hold both words.
+        if (!inFiles(alone) || !inFiles(reply)) return `before deleting, LOREHOUSE_DB's files hold ${inFiles(alone)}/${inFiles(reply)} copies; want some of each (the check below would prove nothing)`;
+        await deleteMessage(ALLOWED, aloneTs);
+        // A reply's deletion names its thread, as Slack's does.
+        await post("/fixtures/delete", { channel: ALLOWED, ts: replyTs });
+        const now = `${1990000000 + ++seq}.000100`;
+        await sendEvent({ type: "message", subtype: "message_deleted", hidden: true, channel: ALLOWED, channel_type: "channel", ts: now, event_ts: now, deleted_ts: replyTs, previous_message: { ts: replyTs, thread_ts: root } });
+        if (!(await until(async () => !(await found(alone)) && !(await found(reply))))) return "the deleted messages are still found";
+        // Removed from the index; out of both files within seconds, while the app runs.
+        if (!(await until(() => inFiles(alone) + inFiles(reply) === 0))) {
+          return `while running, the deleted text is still in LOREHOUSE_DB's files: file ${copies(db, alone)}+${copies(db, reply)}, -wal ${copies(wal, alone)}+${copies(wal, reply)}`;
+        }
+        // Delete one more and stop straight away, before the checkpoint it asked for has run:
+        // the stop must do it.
+        const last = `okapiwallast${++seq}`;
+        const lastTs = await liveMessage(ALLOWED, "channel", `the okapi door code is ${last}`);
+        if (!(await until(() => found(last)))) return "the last message was never indexed";
+        await deleteMessage(ALLOWED, lastTs);
+        await deleteMessage(ALLOWED, root); // nothing of this scenario stays in Slack's history
+        if (!(await until(async () => !(await found(last))))) return "the last deleted message is still found";
+        const proc = app!;
+        const t0 = Date.now();
+        proc.kill("SIGTERM");
+        const code = await Promise.race([proc.exited, Bun.sleep(5000).then(() => "timeout" as const)]);
+        if (code === "timeout") {
+          proc.kill("SIGKILL");
+          await proc.exited;
+          app = undefined;
+          return "still running 5 s after SIGTERM (the length of Fly's default kill_timeout)";
+        }
+        app = undefined;
+        const t0Free = Date.now();
+        while ((await listenerPids(APP_PORT)).length && Date.now() - t0Free < 5000) await Bun.sleep(20);
+        if (code !== 0) return `exited ${code} (signal ${proc.signalCode}) on SIGTERM, want 0`;
+        const left = [alone, reply, last].map((w) => `${copies(db, w)}/${copies(wal, w)}`);
+        return [alone, reply, last].every((w) => inFiles(w) === 0) ? null : `after the stop (${Date.now() - t0} ms), copies in file/-wal: ${left.join(", ")}; want 0`;
+      }).finally(() => removeDb(db));
+    },
+  },
+  {
+    // A stop that comes while the app is still starting (here: held on its channel check,
+    // before the database is opened and purged) waits for the start, then shuts down as
+    // any stop does: it never serves, and it exits 0 with LOREHOUSE_DB's WAL emptied.
+    name: "a stop (SIGTERM) during start-up waits for it, then exits 0 with LOREHOUSE_DB's -wal empty, never serving",
+    run: async () => {
+      const db = freshDb();
+      const hold = async (on: boolean) => ((await (await post("/fixtures/hold", { method: "conversations.info", hold: on })).json()) as { waiting: number }).waiting;
+      await stopApp();
+      await hold(true);
+      const proc = Bun.spawn(APP_CMD, { cwd: ARGS.app ? dirname(APP_CMD[0]!) : ROOT, env: appEnv({ LOREHOUSE_DB: db }), stdout: "pipe", stderr: "pipe" });
+      const stdout = new Response(proc.stdout as ReadableStream).text();
+      const stderr = new Response(proc.stderr as ReadableStream).text();
+      try {
+        const t0 = Date.now();
+        while (!(await hold(true))) {
+          if (Date.now() - t0 > 15000) return "the app never looked its channels up";
+          await Bun.sleep(20);
+        }
+        proc.kill("SIGTERM");
+        await Bun.sleep(300);
+        await hold(false);
+        const code = await Promise.race([proc.exited, Bun.sleep(5000).then(() => "timeout" as const)]);
+        if (code === "timeout") return "still running 5 s after its start-up was let through";
+        if (code !== 0) return `exited ${code} (signal ${proc.signalCode}) on a SIGTERM during start-up, want 0: ${(await stderr).slice(0, 300)}`;
+        const wal = `${db}-wal`;
+        if (existsSync(wal) && readFileSync(wal).length) return `LOREHOUSE_DB's -wal holds ${readFileSync(wal).length} bytes after the stop, want 0`;
+        return / on :\d+/.test(await stdout) ? "it started serving after the stop" : null;
+      } finally {
+        await hold(false);
+        if (proc.exitCode === null && proc.signalCode === null) {
+          proc.kill("SIGKILL");
+          await proc.exited;
+        }
+        removeDb(db);
+        await startApp();
+      }
     },
   },
   {
@@ -1458,7 +1569,13 @@ async function refusedStart(extraEnv: Record<string, string>): Promise<{ code: n
 async function stopApp(): Promise<void> {
   if (!app) return;
   app.kill();
-  await app.exited;
+  // A shutdown that wedges is killed after 8 s instead of hanging the run (the SIGTERM
+  // scenario is what fails one that takes over 5 s).
+  if ((await Promise.race([app.exited, Bun.sleep(8000).then(() => "timeout" as const)])) === "timeout") {
+    console.log(`  (the app was still running 8 s after SIGTERM: killed)`);
+    app.kill("SIGKILL");
+    await app.exited;
+  }
   app = undefined;
   // wait until the port is free, so the next start can't be answered by a dying process
   const t0 = Date.now();

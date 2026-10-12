@@ -13,10 +13,12 @@
 //
 // Only public collaboration is counted: app.ts records nothing from a DM. Rows are kept
 // USAGE_RETENTION_DAYS, the longest window the API reports, and a deleted question takes
-// its ask with it (forgetAsk), as a deleted message leaves the knowledge index.
+// its ask with it (forgetAsk), as a deleted message leaves the knowledge index. What is
+// erased or forgotten here leaves the WAL too, as a deleted document does (checkpointSoon).
 
 import type { Database } from "bun:sqlite";
 import { createHmac } from "node:crypto";
+import { checkpointSoon } from "./knowledge";
 
 // A message that started a turn. Slack redelivers an event it thinks went unanswered,
 // and after a restart nothing remembers having seen it: the (channel, ts) key keeps
@@ -28,7 +30,9 @@ export function recordAsk(db: Database, ask: { channel: string; ts: string; thre
 
 // Opted out (again): forget every asker kept while it was on. Returns how many asks lost one.
 export function eraseAskers(db: Database): number {
-  return db.query("UPDATE agent_asks SET user_id = NULL WHERE user_id IS NOT NULL").run().changes;
+  const n = db.query("UPDATE agent_asks SET user_id = NULL WHERE user_id IS NOT NULL").run().changes;
+  if (n) checkpointSoon(db);
+  return n;
 }
 
 // Which channels still need telling that askers are recorded (on), or that they no longer
@@ -78,10 +82,11 @@ export function recordSearch(db: Database, search: { channel: string; threadTs: 
 // A question deleted in Slack is forgotten here too. When it was a thread's root, the
 // thread's searches go with it: they were run for it and hold its words.
 export function forgetAsk(db: Database, channel: string, ts: string): void {
-  db.transaction(() => {
-    db.query("DELETE FROM agent_asks WHERE channel = ? AND ts = ?").run(channel, ts);
-    db.query("DELETE FROM agent_searches WHERE channel = ? AND thread_ts = ?").run(channel, ts);
-  })();
+  const n = db.transaction(() =>
+    db.query("DELETE FROM agent_asks WHERE channel = ? AND ts = ?").run(channel, ts).changes +
+    db.query("DELETE FROM agent_searches WHERE channel = ? AND thread_ts = ?").run(channel, ts).changes,
+  )();
+  if (n) checkpointSoon(db);
 }
 
 export const USAGE_RETENTION_DAYS = 90;
@@ -89,11 +94,13 @@ export const USAGE_RETENTION_DAYS = 90;
 // Drop every usage row older than the retention window. Returns how many went.
 export function pruneUsage(db: Database, now = new Date()): number {
   const before = new Date(now.getTime() - USAGE_RETENTION_DAYS * 86_400_000).toISOString();
-  return db.transaction(() =>
+  const n = db.transaction(() =>
     db.query("DELETE FROM agent_asks WHERE asked_at < ?").run(before).changes +
     db.query("DELETE FROM agent_searches WHERE searched_at < ?").run(before).changes +
     db.query("DELETE FROM agent_feedback WHERE reacted_at < ?").run(before).changes,
   )();
+  if (n) checkpointSoon(db);
+  return n;
 }
 
 // Tells one person's reactions from another's without saying who: an HMAC of their Slack
