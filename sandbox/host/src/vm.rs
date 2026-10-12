@@ -228,7 +228,7 @@ pub struct Manager {
     quota: Quota,
     sandboxes: Mutex<HashMap<String, Arc<Sandbox>>>,
     slots: Mutex<Vec<bool>>, // true = taken
-    /// Each running VMM's pidfd by slot, from the moment it runs until its slot is
+    /// Each VMM's pidfd by slot, from its spawn (boot included) until its slot is
     /// released: fail_closed kills through it at once, even while a stop or a request
     /// holds that sandbox's lock.
     vmms: std::sync::Mutex<HashMap<usize, Arc<Pidfd>>>,
@@ -365,7 +365,8 @@ impl Manager {
         let jail = self.jail(sb, slot_index);
         net::tap_up(&slot, jail.uid()).await?;
         let console = std::fs::File::create(sb.dir.join("console.log")).map_err(|e| format!("console.log: {e}"))?;
-        let mut vmm = Vmm::spawn(&mut vmm_command(&self.host.jailer, &jail.args(self.cfg.vcpus, self.cfg.mem_mib), console)?)?;
+        // Tracked from its spawn, not only once it answers: the rules can go during the boot.
+        let mut vmm = self.spawn_tracked(&mut vmm_command(&self.host.jailer, &jail.args(self.cfg.vcpus, self.cfg.mem_mib), console)?, slot_index)?;
         let uds = jail.uds();
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
@@ -456,6 +457,15 @@ impl Manager {
     fn track(&self, vmm: Vmm, slot: usize) -> Running {
         self.vmms.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, vmm.pidfd.clone());
         Running { vmm, slot }
+    }
+
+    /// Vmm::spawn for a boot into `slot`, its pidfd recorded at once: a boot holds its
+    /// sandbox's lock for up to a minute, and fail_closed must reach that VMM meanwhile.
+    /// Every way out of a failed boot releases the slot, which forgets it again.
+    fn spawn_tracked(&self, cmd: &mut Command, slot: usize) -> Result<Vmm, String> {
+        let vmm = Vmm::spawn(cmd)?;
+        self.vmms.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, vmm.pidfd.clone());
+        Ok(vmm)
     }
 
     /// The network rules are gone for good and every tap was told to go down (`taps`).
@@ -715,6 +725,19 @@ mod tests {
         assert!(watch[0].exited(), "the graceful stop still ends in a stopped VM");
         assert_eq!(vms.running_count().await, 0);
         assert!(vms.vmms.lock().unwrap().is_empty());
+
+        // A VM still booting (spawned, not yet answering: its sandbox's lock is held by the
+        // boot, and it isn't Running yet) is reached too, and killed.
+        let booting = vms.spawn_tracked(tokio::process::Command::new("sleep").arg("60"), 1).unwrap();
+        let held = vms.get("c").await;
+        let lock = held.running.lock().await;
+        let none_down = crate::net::all_down(Err("ip: no answer within 10 s".into()), |_: String| async { Ok(()) }).await;
+        let run = { let vms = vms.clone(); tokio::spawn(async move { vms.fail_closed(&none_down).await }) };
+        // Killed while the boot still holds the lock...
+        assert!(booting.pidfd.wait(Duration::from_secs(1)).await, "the booting VMM wasn't killed");
+        // ...and the rest (stop_all) goes on once the boot lets go.
+        drop(lock);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), run).await.expect("fail_closed hung").unwrap(), vec![1]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
