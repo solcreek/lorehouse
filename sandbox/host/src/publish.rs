@@ -57,8 +57,8 @@ const CLOCK_SLACK: u64 = 300;
 const GIT_LOCAL: Duration = Duration::from_secs(120);
 const GIT_NETWORK: Duration = Duration::from_secs(600);
 /// How old a temporary file in a mirror (git's partial packs, a stage's bundle) must be
-/// before prune() removes it. Nothing else writes to a mirror while its lock is held; this
-/// is a margin, for a git process a cut-off job left behind that hasn't died yet.
+/// before prune() removes it. Nothing else writes to a mirror while its lock is held (a git
+/// command that is cut off is killed with its helpers, Group); this is a margin.
 const GARBAGE_AGE: Duration = Duration::from_secs(10 * 60);
 /// `gc --auto` as push runs it: git's own thresholds (6700 loose objects, 50 packs), which
 /// the guarded environment turns off for every other command (gc.auto=0). In the foreground
@@ -199,6 +199,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
     let mut cmd = git_command(dir, args, token);
     let work = async {
         let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+        let mut group = Group(child.id());
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
@@ -212,6 +213,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
         let mut out = Vec::new();
         stdout.take(cap as u64 + 1).read_to_end(&mut out).await.map_err(|e| format!("git {}: {e}", args[0]))?;
         if out.len() > cap {
+            group.kill();
             let _ = child.kill().await;
             errors.abort();
             let mut cut = cap;
@@ -222,6 +224,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
             return Ok((String::from_utf8_lossy(&out).into_owned(), true));
         }
         let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+        group.0 = None;
         let err = errors.await.unwrap_or_default();
         if !status.success() {
             return Err(format!("git {}: {}", args[0], tail(&err)));
@@ -240,8 +243,12 @@ async fn git_says(dir: &Path, args: &[&str]) -> Option<bool> {
     let mut cmd = git_command(dir, args, None);
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().ok()?;
+    let mut group = Group(child.id());
     match tokio::time::timeout(GIT_LOCAL, child.wait()).await {
-        Ok(Ok(status)) => Some(status.success()),
+        Ok(Ok(status)) => {
+            group.0 = None;
+            Some(status.success())
+        }
         _ => None,
     }
 }
@@ -254,6 +261,7 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
     let mut cmd = git_command(dir, args, None);
     let work = async {
         let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+        let mut group = Group(child.id());
         let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
@@ -272,6 +280,7 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
             hash.update(&buf[..n]);
         }
         let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+        group.0 = None;
         let err = errors.await.unwrap_or_default();
         if !status.success() {
             return Err(format!("git {}: {}", args[0], tail(&err)));
@@ -320,8 +329,33 @@ fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
     for (i, (k, v)) in config.iter().enumerate() {
         cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // In a process group of its own, so a command that is cut off is stopped with all of
+    // its helpers (Group).
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     cmd
+}
+
+/// A git command's process group (git_command gives each its own; the id is the command's
+/// pid), killed whole if this is dropped before the command was waited for: a command that
+/// timed out, or whose job was cut off. Killing the command alone would leave its helpers
+/// running (a fetch's git-remote-https and index-pack, a gc's repack), still writing to the
+/// mirror after its lock is released. Cleared once the command has been waited for: its id
+/// may then be reused.
+struct Group(Option<u32>);
+
+impl Group {
+    fn kill(&mut self) {
+        use std::process::Stdio;
+        if let Some(id) = self.0.take() {
+            let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{id}")]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 
@@ -361,20 +395,24 @@ impl Drop for NewMirror<'_> {
 /// Remove what a git process that died or was killed leaves in a mirror, once it is older
 /// than GARBAGE_AGE: its partial packs (`objects/pack/tmp_pack_*`, `tmp_idx_*`, up to the
 /// size of what it was fetching), its lock files (`*.lock`: a `refs/heads/<b>.lock` or
-/// `packed-refs.lock` fails every later fetch), and stage bundles a crash left. Whether it
-/// removed a lock file.
+/// `packed-refs.lock` fails every later fetch), and stage bundles a crash left. Each name is
+/// matched only where that file lives: a branch may be called `tmp_pack_x` or
+/// `stage-x.bundle`, but no ref name ends in `.lock`. Whether it removed a lock file.
 fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
-    fn walk(place: &Path, top: bool, now: SystemTime, unlocked: &mut bool) {
+    fn walk(top: &Path, place: &Path, now: SystemTime, unlocked: &mut bool) {
+        let packs = place == top.join("objects").join("pack");
         for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
             let Ok(kind) = entry.file_type() else { continue };
             if kind.is_dir() {
-                walk(&entry.path(), false, now, unlocked);
+                walk(top, &entry.path(), now, unlocked);
                 continue;
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let lock = name.ends_with(".lock");
-            let garbage = lock || name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_") || (top && name.starts_with("stage-") && name.ends_with(".bundle"));
+            let garbage = lock
+                || (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_")))
+                || (place == top && name.starts_with("stage-") && name.ends_with(".bundle"));
             let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > GARBAGE_AGE));
             if garbage && kind.is_file() && old() && std::fs::remove_file(entry.path()).is_ok() {
                 *unlocked |= lock;
@@ -382,7 +420,7 @@ fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
         }
     }
     let mut unlocked = false;
-    walk(dir, true, now, &mut unlocked);
+    walk(dir, dir, now, &mut unlocked);
     unlocked
 }
 
@@ -521,8 +559,10 @@ impl Publisher {
     /// it is gone (a stage ref to a missing object, a lock file a killed git left). A mirror
     /// with no refs yet (its first fetch didn't complete), failed or cut off, is removed.
     async fn update_mirror(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
-        let fetched = git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await.is_ok_and(|refs| !refs.trim().is_empty());
-        let mut new = NewMirror((!fetched).then_some(dir));
+        // New only when git said so: a for-each-ref that couldn't run or failed says nothing
+        // about the mirror, and a failed refresh mustn't remove one that has been fetched.
+        let new = !dir.join("HEAD").exists() || matches!(git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty());
+        let mut new = NewMirror(new.then_some(dir));
         let mut updated = self.refresh(dir, owner, name, token).await;
         if updated.is_err() && self.prune(dir).await {
             updated = self.refresh(dir, owner, name, token).await;
@@ -1574,6 +1614,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fetched_mirror_whose_refs_cant_be_read_is_kept_when_its_refresh_fails() {
+        let s = scratch("unreadable");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        // for-each-ref fails (git won't read a packed-refs with a line it doesn't know, as
+        // any user, root included), and so does the fetch.
+        sh(&dir, "git pack-refs --all");
+        let packed = dir.join("packed-refs");
+        let refs = std::fs::read(&packed).unwrap();
+        std::fs::write(&packed, [refs.as_slice(), b"not a ref\n"].concat()).unwrap();
+        assert!(git(&dir, &["for-each-ref"], None, GIT_LOCAL).await.is_err(), "for-each-ref fails");
+        std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap_err();
+        assert!(packed.exists(), "the mirror is still there");
+        std::fs::write(&packed, refs).unwrap();
+        sh(&dir, "git rev-parse --verify -q refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_is_cut_off_is_stopped_with_its_helpers() {
+        // The connection to the server is held by git-remote-http, a child of the fetch:
+        // it closes only when that helper is gone too.
+        let s = scratch("helpers");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hanging = Publisher::new(s.root.join("mirrors"), format!("http://{addr}"));
+        let dir = hanging.mirror("acme", "slow");
+        let fetch = tokio::spawn(async move { hanging.update_mirror(&dir, "acme", "slow", None).await });
+        // Cut off once it has connected: the job's future is dropped.
+        let accepted = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await;
+        fetch.abort();
+        let (mut conn, _) = accepted.expect("the fetch connects").unwrap();
+        assert!(fetch.await.unwrap_err().is_cancelled(), "the fetch was cut off");
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 4096];
+            while conn.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        })
+        .await;
+        assert!(closed.is_ok(), "a helper of the fetch still holds the connection");
+    }
+
+    #[tokio::test]
     async fn a_lock_file_a_killed_git_left_is_cleared_and_the_refresh_retried() {
         let s = scratch("lockfile");
         let dir = s.dir();
@@ -1842,6 +1925,26 @@ mod tests {
                 "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn branches_named_like_git_garbage_are_kept_however_old() {
+        // GitHub allows a branch called tmp_pack_x or stage-x.bundle; only where git and a
+        // stage put such files are they garbage.
+        let s = scratch("garbagenames");
+        let dir = s.dir();
+        sh(&s.vm, "for b in tmp_pack_release tmp_idx_release stage-1.bundle; do git push -q origin HEAD:refs/heads/$b; done");
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        let refs = ["refs/heads/tmp_pack_release", "refs/heads/tmp_idx_release", "refs/heads/stage-1.bundle"];
+        for r in refs {
+            let loose = dir.join(r);
+            assert!(loose.is_file(), "{r} is a loose ref");
+            age(&loose, GARBAGE_AGE.as_secs() + 60);
+        }
+        s.publisher.prune(&dir).await;
+        for r in refs {
+            assert!(dir.join(r).is_file(), "{r}");
+        }
     }
 
     #[test]
