@@ -178,10 +178,11 @@ async fn check_forwarding() -> Result<(), String> {
     }
 }
 
-/// The ports mail goes out on: SMTP, SMTPS and submission. A sandbox has no business
-/// sending mail, and spam from it would get the host's address blocklisted (and, at
-/// some providers, the server locked).
-pub const MAIL_PORTS: &str = "{ 25, 465, 587 }";
+/// The ports mail goes out on: SMTP, SMTPS, submission, and 2525, the alternative
+/// submission port mail services (SendGrid, Mailgun, Postmark, …) offer where 587 is
+/// blocked. A sandbox has no business sending mail, and spam from it would get the host's
+/// address blocklisted (and, at some providers, the server locked).
+pub const MAIL_PORTS: &str = "{ 25, 465, 587, 2525 }";
 
 /// The table, as `nft -f` reads it, for slots `0..slots`. It is `inet`, so a rule with no
 /// family match (`iifname "lhtap*" drop`) covers IPv4 and IPv6 alike.
@@ -495,7 +496,7 @@ mod tests {
     #[test]
     fn a_sandbox_reaches_the_internet_but_not_mail_ports() {
         let forward = chain("enp2s0", 4, "forward");
-        let drop_mail = at(&forward, "iifname \"lhtap*\" tcp dport { 25, 465, 587 } drop");
+        let drop_mail = at(&forward, "iifname \"lhtap*\" tcp dport { 25, 465, 587, 2525 } drop");
         // Before anything in the chain could accept it.
         assert!(drop_mail < at(&forward, "oifname \"lhtap*\" ct state established,related accept"));
         // The rules from before are all still there.
@@ -587,7 +588,7 @@ mod tests {
 \t\tiifname \"lhtap*\" jump spoof
 \t\tiifname \"lhtap*\" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop
 \t\tiifname \"lhtap*\" oifname != \"enp2s0\" drop
-\t\tiifname \"lhtap*\" tcp dport { 25, 465, 587 } drop
+\t\tiifname \"lhtap*\" tcp dport { 25, 465, 587, 2525 } drop
 \t\toifname \"lhtap*\" ct state established,related accept
 \t\toifname \"lhtap*\" drop
 \t}
@@ -621,7 +622,7 @@ mod tests {
         let opened = LISTED.replace("policy accept;\n\t\tiifname \"lhtap*\" meta nfproto ipv6 drop", "policy accept;\n\t\tiifname \"lhtap*\" accept\n\t\tiifname \"lhtap*\" meta nfproto ipv6 drop");
         assert_eq!(drift(&expected, Some(&opened)), Drift::Changed);
         assert_eq!(drift(&expected, Some(&LISTED.replace("172.30.0.2 return", "172.30.0.3 return"))), Drift::Changed);
-        assert_eq!(drift(&expected, Some(&LISTED.replace("{ 25, 465, 587 }", "{ 25 }"))), Drift::Changed);
+        assert_eq!(drift(&expected, Some(&LISTED.replace("{ 25, 465, 587, 2525 }", "{ 25, 465, 587 }"))), Drift::Changed);
         // nft's listing has the shape of what was declared; a short one doesn't.
         assert!(super::same_shape(&super::table("enp2s0", 2), LISTED));
         assert!(!super::same_shape(&super::table("enp2s0", 2), &flushed));

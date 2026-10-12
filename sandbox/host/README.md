@@ -16,7 +16,7 @@ thread). Rust. Work reaches it one of two ways:
 - **Stopping** always flushes the guest's disk cache first.
 - **Network**: a sandbox reaches the internet and nothing else. There is no route to
   private networks (LAN, tailnet, link-local, other sandboxes), no connection into the
-  host, and no mail out (TCP 25, 465, 587). A packet from a sandbox must carry its own
+  host, and no mail out (TCP 25, 465, 587, 2525). A packet from a sandbox must carry its own
   address: one forging another sandbox's, or any other, is dropped. No IPv6 either: the guest kernel boots with
   `ipv6.disable=1`, and the host's rules (one `inet` table, so IPv4 and IPv6 alike) drop
   any IPv6 from a tap, into the host or through it. The agent inside, guestd, is reached
@@ -195,7 +195,7 @@ IPv4 and IPv6:
 | chain | |
 |---|---|
 | `spoof` | from tap *n*, only slot *n*'s guest address gets through; anything else is counted and dropped |
-| `forward` (priority -1, before Docker's) | from a tap: IPv6 dropped (guests have none), then the source check, private destinations (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16), anything but the uplink, and mail ports dropped; to a tap: only replies (`ct state established,related`) |
+| `forward` (priority -1, before Docker's) | from a tap: IPv6 dropped (guests have none), then the source check, private destinations (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16), anything but the uplink, and mail ports (TCP 25, 465, 587, 2525) dropped; to a tap: only replies (`ct state established,related`) |
 | `input` (priority -1) | nothing from a tap reaches the host, IPv4 or IPv6 (spoofed sources counted first) |
 | `post` | masquerade of 172.30.0.0/24 out of the uplink |
 
@@ -220,10 +220,10 @@ What one sandbox can take from the host and send to the internet, each per VM:
   a one-time burst of five seconds' worth for the boot and the start of a clone. 50 MiB/s
   in is above what GitHub gave starship (4.5–22 MB/s), so a clone is no slower; 10 MiB/s
   out bounds what a flood from a sandbox can send. Packets per second are not limited.
-- **Mail**: TCP 25, 465 and 587 out are dropped (the nftables table in
-  [`net.rs`](src/net.rs)). Spam from a sandbox would get the host's address blocklisted.
-  The table is `inet`, so this holds for IPv6 too, though a guest has none. Other ports
-  (2525) stay open.
+- **Mail**: TCP 25, 465, 587 and 2525 (the alternative submission port mail services
+  offer) out are dropped (the nftables table in [`net.rs`](src/net.rs)). Spam from a
+  sandbox would get the host's address blocklisted. The table is `inet`, so this holds for
+  IPv6 too, though a guest has none.
 - **Disk**: a sandbox's disk is a reflink of the golden, so it costs only what the guest
   writes, and that is capped at `SANDBOXD_DISK_QUOTA_GIB` (8 GiB). A write past it fails:
   the guest sees I/O errors on its disk, and ext4 may abort its journal and go read-only
