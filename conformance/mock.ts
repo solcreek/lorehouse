@@ -16,6 +16,9 @@
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
 //   POST /fixtures/channel     {channel, info} — what conversations.info says of it now
 //                              (info null: no such channel)
+//   POST /fixtures/hold        {method, hold} — hold: true, Slack calls to that method wait
+//                              (unanswered) until a hold: false releases them; answers
+//                              {waiting}: how many are waiting now
 //   POST /reset                clear recorded calls (fixtures stay)
 //
 // The scripted model: turn 1 → a search_knowledge tool_use whose query is the user's
@@ -58,6 +61,8 @@ const TOKENS = Number(process.env.TOKENS ?? 80);
 const TOKEN_DELAY_MS = Number(process.env.TOKEN_DELAY_MS ?? 15);
 
 type SlackCall = { t: number; method: string; body: Record<string, unknown> };
+// Slack methods whose calls are held unanswered (POST /fixtures/hold), and how many wait.
+const holds = new Map<string, { waiting: number; released: Promise<void>; release: () => void }>();
 let calls: SlackCall[] = [];
 let modelCalls = 0;
 let githubCalls: { method: string; path: string; body?: unknown }[] = [];
@@ -342,7 +347,14 @@ Bun.serve({
       // reads come as GET query params, writes as JSON/form bodies; accept both
       const params = { ...Object.fromEntries(url.searchParams), ...(await parseBody(req)) };
       const token = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
-      return slack(url.pathname.slice("/slack/api/".length), params, token);
+      const method = url.pathname.slice("/slack/api/".length);
+      const hold = holds.get(method);
+      if (hold) {
+        hold.waiting++;
+        await hold.released;
+        hold.waiting--;
+      }
+      return slack(method, params, token);
     }
     // An interaction's response_url (a scenario puts this one in its click): what is posted
     // here (an ephemeral reply to the clicker) is recorded like a Slack call.
@@ -360,6 +372,20 @@ Bun.serve({
       if (info) channelInfo[channel] = info;
       else delete channelInfo[channel];
       return Response.json({ ok: true });
+    }
+    if (url.pathname === "/fixtures/hold" && req.method === "POST") {
+      const { method, hold } = (await req.json()) as { method: string; hold: boolean };
+      let h = holds.get(method);
+      if (hold && !h) {
+        let release = () => {};
+        const released = new Promise<void>((r) => { release = r; });
+        holds.set(method, (h = { waiting: 0, released, release }));
+      }
+      if (!hold && h) {
+        holds.delete(method);
+        h.release();
+      }
+      return Response.json({ ok: true, waiting: h?.waiting ?? 0 });
     }
     if (url.pathname === "/fixtures/edit" && req.method === "POST") {
       const { channel, ts, text, editedTs } = (await req.json()) as { channel: string; ts: string; text: string; editedTs: string };

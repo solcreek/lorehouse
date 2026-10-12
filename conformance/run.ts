@@ -16,8 +16,9 @@
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
 // 404 when STATUS_TOKEN is unset). The admin API under /api/v1 (docs/admin-api.md) answers
-// only to ADMIN_TOKEN, the same way. On SIGTERM it must exit 0 within 5 s, and a
-// deleted message's text must not stay in LOREHOUSE_DB's files (the -wal included).
+// only to ADMIN_TOKEN, the same way. On SIGTERM it must exit 0 within 5 s (one during
+// start-up: once the start is through, without serving), and a deleted message's text
+// must not stay in LOREHOUSE_DB's files (the -wal included).
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
@@ -744,7 +745,7 @@ const scenarios: Scenario[] = [
           proc.kill("SIGKILL");
           await proc.exited;
           app = undefined;
-          return "still running 5 s after SIGTERM (Fly's default kill_timeout)";
+          return "still running 5 s after SIGTERM (the length of Fly's default kill_timeout)";
         }
         app = undefined;
         const t0Free = Date.now();
@@ -753,6 +754,45 @@ const scenarios: Scenario[] = [
         const left = [alone, reply, last].map((w) => `${copies(db, w)}/${copies(wal, w)}`);
         return [alone, reply, last].every((w) => inFiles(w) === 0) ? null : `after the stop (${Date.now() - t0} ms), copies in file/-wal: ${left.join(", ")}; want 0`;
       }).finally(() => removeDb(db));
+    },
+  },
+  {
+    // A stop that comes while the app is still starting (here: held on its channel check,
+    // before the database is opened and purged) waits for the start, then shuts down as
+    // any stop does: it never serves, and it exits 0 with LOREHOUSE_DB's WAL emptied.
+    name: "a stop (SIGTERM) during start-up waits for it, then exits 0 with LOREHOUSE_DB's -wal empty, never serving",
+    run: async () => {
+      const db = freshDb();
+      const hold = async (on: boolean) => ((await (await post("/fixtures/hold", { method: "conversations.info", hold: on })).json()) as { waiting: number }).waiting;
+      await stopApp();
+      await hold(true);
+      const proc = Bun.spawn(APP_CMD, { cwd: ARGS.app ? dirname(APP_CMD[0]!) : ROOT, env: appEnv({ LOREHOUSE_DB: db }), stdout: "pipe", stderr: "pipe" });
+      const stdout = new Response(proc.stdout as ReadableStream).text();
+      const stderr = new Response(proc.stderr as ReadableStream).text();
+      try {
+        const t0 = Date.now();
+        while (!(await hold(true))) {
+          if (Date.now() - t0 > 15000) return "the app never looked its channels up";
+          await Bun.sleep(20);
+        }
+        proc.kill("SIGTERM");
+        await Bun.sleep(300);
+        await hold(false);
+        const code = await Promise.race([proc.exited, Bun.sleep(5000).then(() => "timeout" as const)]);
+        if (code === "timeout") return "still running 5 s after its start-up was let through";
+        if (code !== 0) return `exited ${code} (signal ${proc.signalCode}) on a SIGTERM during start-up, want 0: ${(await stderr).slice(0, 300)}`;
+        const wal = `${db}-wal`;
+        if (existsSync(wal) && readFileSync(wal).length) return `LOREHOUSE_DB's -wal holds ${readFileSync(wal).length} bytes after the stop, want 0`;
+        return / on :\d+/.test(await stdout) ? "it started serving after the stop" : null;
+      } finally {
+        await hold(false);
+        if (proc.exitCode === null && proc.signalCode === null) {
+          proc.kill("SIGKILL");
+          await proc.exited;
+        }
+        removeDb(db);
+        await startApp();
+      }
     },
   },
   {
@@ -1528,7 +1568,8 @@ async function refusedStart(extraEnv: Record<string, string>): Promise<{ code: n
 async function stopApp(): Promise<void> {
   if (!app) return;
   app.kill();
-  // A shutdown that wedges fails the run instead of hanging it.
+  // A shutdown that wedges is killed after 8 s instead of hanging the run (the SIGTERM
+  // scenario is what fails one that takes over 5 s).
   if ((await Promise.race([app.exited, Bun.sleep(8000).then(() => "timeout" as const)])) === "timeout") {
     console.log(`  (the app was still running 8 s after SIGTERM: killed)`);
     app.kill("SIGKILL");
