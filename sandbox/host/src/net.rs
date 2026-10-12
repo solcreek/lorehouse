@@ -173,60 +173,113 @@ async fn check_forwarding() -> Result<(), String> {
 /// some providers, the server locked).
 pub const MAIL_PORTS: &str = "{ 25, 465, 587 }";
 
-/// The table's rules, in order, as `nft` commands, for slots `0..slots`. The table is
-/// `inet`, so a rule with no family match (`iifname "lhtap*" drop`) covers IPv4 and IPv6.
-fn rules(uplink: &str, slots: usize) -> Vec<String> {
-    let t = format!("{FAMILY} {TABLE}");
-    let mut rules = vec![
-        format!("add table {t}"),
-        // Anti-spoofing: from tap N only slot N's guest address gets past this chain; any
-        // other source (another guest's, the host's, the internet's) is counted and
-        // dropped. Masquerade then only ever rewrites a guest's own address.
-        format!("add chain {t} spoof"),
-    ];
-    for index in 0..slots {
-        let slot = Slot { index };
-        rules.push(format!("add rule {t} spoof iifname \"{}\" ip saddr {} return", slot.tap(), slot.guest_ip()));
+/// The table, as `nft -f` reads it, for slots `0..slots`. It is `inet`, so a rule with no
+/// family match (`iifname "lhtap*" drop`) covers IPv4 and IPv6 alike.
+///
+/// - `spoof`: anti-spoofing. From tap N only slot N's guest address gets past it; any
+///   other source (another guest's, the host's, the internet's) is counted and dropped, so
+///   masquerade only ever rewrites a guest's own address.
+/// - `forward` (priority -1: before Docker's filter chains, so a drop here is final):
+///   IPv6 first (guests have no IPv6 route, nor any IPv6 with ipv6.disable=1), then the
+///   source check, private destinations, anything but the uplink, mail. Into a sandbox only
+///   replies to what it started: nothing may open a connection to a guest, whatever the
+///   host's own FORWARD policy is (Docker's drop is not assumed).
+/// - `input`: nothing from a tap reaches the host, IPv4 or IPv6 (a tap has an IPv6
+///   link-local address by default, and starship's ufw allows sshd over IPv6 from
+///   anywhere). Spoofed sources are counted on the way.
+/// - `post`: masquerade, only the sandboxes' range and only out of the uplink.
+fn table(uplink: &str, slots: usize) -> String {
+    let own: String = (0..slots)
+        .map(|index| {
+            let slot = Slot { index };
+            format!("\t\tiifname \"{}\" ip saddr {} return\n", slot.tap(), slot.guest_ip())
+        })
+        .collect();
+    format!(
+        "table {FAMILY} {TABLE} {{
+\tchain spoof {{
+{own}\t\tcounter drop
+\t}}
+\tchain forward {{
+\t\ttype filter hook forward priority -1; policy accept;
+\t\tiifname \"lhtap*\" meta nfproto ipv6 drop
+\t\tiifname \"lhtap*\" jump spoof
+\t\tiifname \"lhtap*\" ip daddr {PRIVATE} drop
+\t\tiifname \"lhtap*\" oifname != \"{uplink}\" drop
+\t\tiifname \"lhtap*\" tcp dport {MAIL_PORTS} drop
+\t\toifname \"lhtap*\" ct state established,related accept
+\t\toifname \"lhtap*\" drop
+\t}}
+\tchain input {{
+\t\ttype filter hook input priority -1; policy accept;
+\t\tiifname \"lhtap*\" jump spoof
+\t\tiifname \"lhtap*\" drop
+\t}}
+\tchain post {{
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t\tip saddr 172.30.0.0/24 oifname \"{uplink}\" masquerade
+\t}}
+}}
+"
+    )
+}
+
+/// What `nft -f -` loads, as one transaction: whatever table is there (this build's, or an
+/// older build's `ip` one) is deleted and the new one added, or, if any of it fails, none
+/// of it happens. There is never a moment with the old table gone and the new one not yet
+/// whole. (Adding an empty table first makes the delete succeed when there is none.)
+fn batch(uplink: &str, slots: usize) -> String {
+    format!("table ip {TABLE} {{}}\ndelete table ip {TABLE}\ntable {FAMILY} {TABLE} {{}}\ndelete table {FAMILY} {TABLE}\n{}", table(uplink, slots))
+}
+
+/// `nft -f -` with `text` on its stdin: one atomic transaction.
+async fn load(text: &str) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = command("nft").args(["-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("nft: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("nft: no stdin")?;
+    stdin.write_all(text.as_bytes()).await.map_err(|e| format!("nft -f -: {e}"))?;
+    drop(stdin);
+    let out = child.wait_with_output().await.map_err(|e| format!("nft: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("nft -f -: {}", String::from_utf8_lossy(&out.stderr).trim()))
     }
-    rules.extend([
-        format!("add rule {t} spoof counter drop"),
-        // Priority -1: before Docker's filter chains, so a drop here is final.
-        format!("add chain {t} forward {{ type filter hook forward priority -1; }}"),
-        // Guests have no IPv6 route (and no IPv6 at all with ipv6.disable=1): nothing of it
-        // goes through the host, whatever the host's own IPv6 forwarding is.
-        format!("add rule {t} forward iifname \"lhtap*\" meta nfproto ipv6 drop"),
-        format!("add rule {t} forward iifname \"lhtap*\" jump spoof"),
-        format!("add rule {t} forward iifname \"lhtap*\" ip daddr {PRIVATE} drop"),
-        format!("add rule {t} forward iifname \"lhtap*\" oifname != \"{uplink}\" drop"),
-        format!("add rule {t} forward iifname \"lhtap*\" tcp dport {MAIL_PORTS} drop"),
-        // Into a sandbox: only replies to what it started. Nothing may open a connection to
-        // a guest, whatever the host's own FORWARD policy is (Docker's drop is not assumed).
-        format!("add rule {t} forward oifname \"lhtap*\" ct state established,related accept"),
-        format!("add rule {t} forward oifname \"lhtap*\" drop"),
-        // Into the host from a tap, IPv4 and IPv6: a tap has an IPv6 link-local address by
-        // default, and the host's IPv6 firewall (ufw on starship) allows sshd from anywhere.
-        // Spoofed sources are counted first, then everything is dropped.
-        format!("add chain {t} input {{ type filter hook input priority -1; }}"),
-        format!("add rule {t} input iifname \"lhtap*\" jump spoof"),
-        format!("add rule {t} input iifname \"lhtap*\" drop"),
-        format!("add chain {t} post {{ type nat hook postrouting priority srcnat; }}"),
-        format!("add rule {t} post ip saddr 172.30.0.0/24 oifname \"{uplink}\" masquerade"),
-    ]);
-    rules
 }
 
 /// The shared rules, set up once at start (after teardown_all).
 pub async fn setup(uplink: &str, slots: usize) -> Result<(), String> {
     check_forwarding().await?;
-    for rule in rules(uplink, slots) {
-        nft(&rule).await?;
-    }
+    load(&batch(uplink, slots)).await?;
     if docker_forward_exists().await {
         // Docker's FORWARD policy is drop; our accepts must live in that chain.
         nft(&format!("insert rule ip filter FORWARD iifname \"{uplink}\" oifname \"lhtap*\" ct state established,related accept comment \"{TAG}\"")).await?;
         nft(&format!("insert rule ip filter FORWARD iifname \"lhtap*\" oifname \"{uplink}\" accept comment \"{TAG}\"")).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+/// Each chain of a table as `nft` writes it (and `table` does): its name and its lines,
+/// the `type …` line included, trimmed.
+fn chains(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix("chain ").and_then(|l| l.strip_suffix(" {")) {
+            current = Some((name.to_string(), Vec::new()));
+        } else if line == "}" {
+            if let Some(chain) = current.take() {
+                out.push(chain);
+            }
+        } else if let Some((_, lines)) = current.as_mut() {
+            if !line.is_empty() {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// `ip tuntap add` for a slot's tap, owned by the uid its jailed Firecracker runs as:
@@ -251,62 +304,93 @@ pub async fn tap_down(slot: &Slot) {
 
 #[cfg(test)]
 mod tests {
+    /// The lines of one chain of `table`.
+    fn chain(uplink: &str, slots: usize, name: &str) -> Vec<String> {
+        super::chains(&super::table(uplink, slots)).into_iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("no chain {name}")).1
+    }
+
+    fn at(lines: &[String], line: &str) -> usize {
+        lines.iter().position(|x| x == line).unwrap_or_else(|| panic!("missing: {line}\n{lines:#?}"))
+    }
+
     #[test]
     fn a_sandbox_reaches_the_internet_but_not_mail_ports() {
-        let rules = super::rules("enp2s0", 4);
-        let drop_mail = "add rule inet lorehouse_sbx forward iifname \"lhtap*\" tcp dport { 25, 465, 587 } drop";
-        let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
+        let forward = chain("enp2s0", 4, "forward");
+        let drop_mail = at(&forward, "iifname \"lhtap*\" tcp dport { 25, 465, 587 } drop");
         // Before anything in the chain could accept it.
-        assert!(at(drop_mail) < at("add rule inet lorehouse_sbx forward oifname \"lhtap*\" ct state established,related accept"));
+        assert!(drop_mail < at(&forward, "oifname \"lhtap*\" ct state established,related accept"));
         // The rules from before are all still there.
-        at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop");
-        at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" oifname != \"enp2s0\" drop");
-        at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop");
-        at("add rule inet lorehouse_sbx post ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade");
+        at(&forward, "iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop");
+        at(&forward, "iifname \"lhtap*\" oifname != \"enp2s0\" drop");
+        at(&forward, "oifname \"lhtap*\" drop");
+        at(&chain("enp2s0", 4, "input"), "iifname \"lhtap*\" drop");
+        at(&chain("enp2s0", 4, "post"), "ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade");
     }
 
     #[test]
     fn ipv6_from_a_sandbox_goes_nowhere() {
-        let rules = super::rules("enp2s0", 4);
         // One inet table: every rule sees IPv4 and IPv6. An `ip` table never sees IPv6, which
         // left the host's sshd reachable over a tap's link-local address.
-        assert!(rules.iter().all(|r| r.contains(" inet lorehouse_sbx")), "{rules:#?}");
-        assert!(!rules.iter().any(|r| r.contains(" ip lorehouse_sbx")));
-        let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
+        let table = super::table("enp2s0", 4);
+        assert!(table.starts_with("table inet lorehouse_sbx {\n"), "{table}");
+        assert_eq!(table.matches("table ").count(), 1);
+        let forward = chain("enp2s0", 4, "forward");
         // Through the host: dropped first, before any rule could accept it.
-        let v6 = at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" meta nfproto ipv6 drop");
-        let forward = at("add chain inet lorehouse_sbx forward { type filter hook forward priority -1; }");
-        assert_eq!(v6, forward + 1, "the first rule of the forward chain");
+        assert_eq!(forward[0], "type filter hook forward priority -1; policy accept;");
+        assert_eq!(forward[1], "iifname \"lhtap*\" meta nfproto ipv6 drop");
         // Into the host: the input drop names no family, so it covers both.
-        at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop");
-        assert!(at("add chain inet lorehouse_sbx input { type filter hook input priority -1; }") < at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop"));
+        let input = chain("enp2s0", 4, "input");
+        assert_eq!(input[0], "type filter hook input priority -1; policy accept;");
+        assert_eq!(input.last().unwrap(), "iifname \"lhtap*\" drop");
     }
 
     #[test]
     fn a_guest_sends_only_from_its_own_address() {
-        let rules = super::rules("enp2s0", 3);
-        let at = |r: &str| rules.iter().position(|x| x == r).unwrap_or_else(|| panic!("missing: {r}\n{rules:#?}"));
+        let spoof = chain("enp2s0", 3, "spoof");
         // Each tap lets through its own guest's address, and nothing else.
         let own: Vec<usize> = (0..3)
             .map(|i| {
                 let slot = super::Slot { index: i };
-                at(&format!("add rule inet lorehouse_sbx spoof iifname \"lhtap{i}\" ip saddr {} return", slot.guest_ip()))
+                at(&spoof, &format!("iifname \"lhtap{i}\" ip saddr {} return", slot.guest_ip()))
             })
             .collect();
-        assert_eq!(rules.iter().filter(|r| r.contains(" spoof iifname")).count(), 3, "one per slot");
-        let drop = at("add rule inet lorehouse_sbx spoof counter drop");
-        assert!(own.iter().all(|&i| i < drop), "the drop ends the chain");
-        assert!(at("add chain inet lorehouse_sbx spoof") < own[0]);
-        // Checked on the way through the host, before anything there accepts...
-        let jump = at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" jump spoof");
-        assert!(jump < at("add rule inet lorehouse_sbx forward oifname \"lhtap*\" ct state established,related accept"));
-        assert!(jump < at("add rule inet lorehouse_sbx forward iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop"));
-        // ...and into it.
-        assert!(at("add rule inet lorehouse_sbx input iifname \"lhtap*\" jump spoof") < at("add rule inet lorehouse_sbx input iifname \"lhtap*\" drop"));
+        assert_eq!(spoof.len(), 4, "one per slot, then the drop: {spoof:#?}");
+        assert_eq!(spoof.last().unwrap(), "counter drop", "the drop ends the chain");
+        assert!(own.iter().all(|&i| i < 3));
         // The addresses: slot 2's guest is 172.30.0.10, its tap lhtap2.
-        assert!(rules.contains(&"add rule inet lorehouse_sbx spoof iifname \"lhtap2\" ip saddr 172.30.0.10 return".to_string()));
+        at(&spoof, "iifname \"lhtap2\" ip saddr 172.30.0.10 return");
+        // Checked on the way through the host, before anything there accepts...
+        let forward = chain("enp2s0", 3, "forward");
+        let jump = at(&forward, "iifname \"lhtap*\" jump spoof");
+        assert!(jump < at(&forward, "oifname \"lhtap*\" ct state established,related accept"));
+        assert!(jump < at(&forward, "iifname \"lhtap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop"));
+        // ...and into it.
+        let input = chain("enp2s0", 3, "input");
+        assert!(at(&input, "iifname \"lhtap*\" jump spoof") < at(&input, "iifname \"lhtap*\" drop"));
         // Masquerade is unchanged: only the sandboxes' range, only out of the uplink.
-        at("add rule inet lorehouse_sbx post ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade");
+        assert_eq!(chain("enp2s0", 3, "post")[1..], ["ip saddr 172.30.0.0/24 oifname \"enp2s0\" masquerade".to_string()]);
+    }
+
+    #[test]
+    fn the_table_is_replaced_in_one_transaction() {
+        let batch = super::batch("enp2s0", 2);
+        // Old table out (this build's and an older build's ip one), new one in: one
+        // `nft -f` batch, so a failure anywhere changes nothing.
+        let prelude = "table ip lorehouse_sbx {}\ndelete table ip lorehouse_sbx\ntable inet lorehouse_sbx {}\ndelete table inet lorehouse_sbx\n";
+        assert_eq!(batch, format!("{prelude}{}", super::table("enp2s0", 2)));
+        // Declarations only: no flush, no rule added after the fact.
+        for word in ["flush", "add rule", "insert", "nft "] {
+            assert!(!batch.contains(word), "{word} in {batch}");
+        }
+        // Every chain, whole, in the one table.
+        let names: Vec<String> = super::chains(&batch).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["spoof", "forward", "input", "post"]);
+        // And setup loads it with one nft run, not rule by rule.
+        let src = include_str!("net.rs");
+        let setup = &src[src.find("pub async fn setup").unwrap()..];
+        let setup = &setup[..setup.find("\n}\n").unwrap()];
+        assert!(setup.contains("load(&batch(uplink, slots))"), "{setup}");
+        assert!(!setup.contains("for rule in"), "{setup}");
     }
 
     #[test]
