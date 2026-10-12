@@ -118,10 +118,13 @@ async fn jailed_uds(state_dir: &Path, exec_name: &str, jail_id: &str) -> Vec<Pat
 
 /// Wait up to `grace` for the child to exit, then SIGKILL it and wait as long again.
 /// True only once its exit has been seen: an error from wait() or kill() (the process
-/// can't be waited for) is not proof it's gone.
+/// can't be waited for) is not proof it's gone. A wait() that fails isn't followed by a
+/// kill: a pid that can't be waited for may already belong to another process.
 async fn exited_or_killed(child: &mut Child, grace: Duration) -> bool {
-    if let Ok(Ok(_)) = tokio::time::timeout(grace, child.wait()).await {
-        return true;
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(Ok(_)) => return true,
+        Ok(Err(_)) => return false,
+        Err(_) => {}
     }
     if child.start_kill().is_err() {
         return false;
@@ -517,8 +520,9 @@ mod tests {
         assert!(super::exited_or_killed(&mut quick, grace).await);
         let mut hung = tokio::process::Command::new("sleep").arg("60").spawn().unwrap();
         assert!(super::exited_or_killed(&mut hung, grace).await, "a hung child is killed");
-        // Reaped behind tokio's back: wait() fails (ECHILD) and kill() can't reach it. Not
-        // proof of anything, so not "stopped".
+        // Reaped behind tokio's back: wait() fails (ECHILD). Not proof of anything, so not
+        // "stopped". (That its pid, free again, isn't signalled can't be seen from here
+        // without the pid being reused.)
         let mut lost = tokio::process::Command::new("sleep").arg("60").spawn().unwrap();
         let pid = lost.id().unwrap() as libc::pid_t;
         // SAFETY: plain syscalls on our own child.
