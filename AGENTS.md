@@ -80,8 +80,10 @@ to catch edits/deletes made while down, and re-indexes a thread live after it go
 `src/knowledge.ts` is SQLite FTS with CJK bigram indexing. Deleted messages must leave the
 index and `LOREHOUSE_DB`'s files, the `-wal` included (`checkpointSoon` after whatever
 removes text, `closeKnowledge` on SIGTERM or SIGINT). Known exceptions: usage's search
-queries for a thread stay `USAGE_RETENTION_DAYS` unless its root is deleted
-(`forgetAsk`), and June's `SESSIONS_DB` keeps what a conversation already quoted (#66).
+queries for a thread stay up to `USAGE_RETENTION_DAYS`; only deleting its root live
+(`forgetAsk`), or while down when the root was itself an ask inside the refresh window
+(`reconcileAsks`), takes them sooner. And June's `SESSIONS_DB` keeps what a conversation
+already quoted (#66).
 DMs are never indexed.
 
 **Policy.** `src/policy.ts` restricts every channel event to channels in
