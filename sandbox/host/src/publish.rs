@@ -349,20 +349,24 @@ impl Drop for NewMirror<'_> {
 /// Remove what a git process that died or was killed leaves in a mirror, once it is older
 /// than GARBAGE_AGE: its partial packs (`objects/pack/tmp_pack_*`, `tmp_idx_*`, up to the
 /// size of what it was fetching), its lock files (`*.lock`: a `refs/heads/<b>.lock` or
-/// `packed-refs.lock` fails every later fetch), and stage bundles a crash left. Whether it
-/// removed a lock file.
+/// `packed-refs.lock` fails every later fetch), and stage bundles a crash left. Each name is
+/// matched only where that file lives: a branch may be called `tmp_pack_x` or
+/// `stage-x.bundle`, but no ref name ends in `.lock`. Whether it removed a lock file.
 fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
-    fn walk(place: &Path, top: bool, now: SystemTime, unlocked: &mut bool) {
+    fn walk(top: &Path, place: &Path, now: SystemTime, unlocked: &mut bool) {
+        let packs = place == top.join("objects").join("pack");
         for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
             let Ok(kind) = entry.file_type() else { continue };
             if kind.is_dir() {
-                walk(&entry.path(), false, now, unlocked);
+                walk(top, &entry.path(), now, unlocked);
                 continue;
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let lock = name.ends_with(".lock");
-            let garbage = lock || name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_") || (top && name.starts_with("stage-") && name.ends_with(".bundle"));
+            let garbage = lock
+                || (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_")))
+                || (place == top && name.starts_with("stage-") && name.ends_with(".bundle"));
             let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > GARBAGE_AGE));
             if garbage && kind.is_file() && old() && std::fs::remove_file(entry.path()).is_ok() {
                 *unlocked |= lock;
@@ -370,7 +374,7 @@ fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
         }
     }
     let mut unlocked = false;
-    walk(dir, true, now, &mut unlocked);
+    walk(dir, dir, now, &mut unlocked);
     unlocked
 }
 
@@ -1477,6 +1481,26 @@ mod tests {
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
         assert!(!lock.exists());
         assert_eq!(sh(&dir, "git rev-parse refs/heads/main"), head);
+    }
+
+    #[tokio::test]
+    async fn branches_named_like_git_garbage_are_kept_however_old() {
+        // GitHub allows a branch called tmp_pack_x or stage-x.bundle; only where git and a
+        // stage put such files are they garbage.
+        let s = scratch("garbagenames");
+        let dir = s.dir();
+        sh(&s.vm, "for b in tmp_pack_release tmp_idx_release stage-1.bundle; do git push -q origin HEAD:refs/heads/$b; done");
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        let refs = ["refs/heads/tmp_pack_release", "refs/heads/tmp_idx_release", "refs/heads/stage-1.bundle"];
+        for r in refs {
+            let loose = dir.join(r);
+            assert!(loose.is_file(), "{r} is a loose ref");
+            age(&loose, GARBAGE_AGE.as_secs() + 60);
+        }
+        s.publisher.prune(&dir).await;
+        for r in refs {
+            assert!(dir.join(r).is_file(), "{r}");
+        }
     }
 
     #[test]
