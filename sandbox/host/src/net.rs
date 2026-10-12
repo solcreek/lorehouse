@@ -81,10 +81,23 @@ async fn nft(rule: &str) -> Result<(), String> {
     run(&["nft", rule]).await
 }
 
-/// Docker's `ip filter FORWARD`, listed with handles; None when there is no such chain.
-async fn docker_forward() -> Option<String> {
-    let out = output(command("nft").args(["-a", "list", "chain", "ip", "filter", "FORWARD"])).await.ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// Docker's `ip filter FORWARD`, listed with handles; None when there is no such chain,
+/// an error when nft couldn't tell (a failure or a timeout is not an absent chain).
+async fn docker_forward() -> Result<Option<String>, String> {
+    let out = output(command("nft").args(["-a", "list", "chain", "ip", "filter", "FORWARD"])).await?;
+    forward_listing(out.status.success(), &String::from_utf8_lossy(&out.stdout), &String::from_utf8_lossy(&out.stderr))
+}
+
+/// What `nft -a list chain ip filter FORWARD` said: the listing, None when the chain (or
+/// its table) isn't there, else nft's error.
+fn forward_listing(success: bool, stdout: &str, stderr: &str) -> Result<Option<String>, String> {
+    if success {
+        Ok(Some(stdout.to_string()))
+    } else if stderr.contains("No such file or directory") {
+        Ok(None)
+    } else {
+        Err(format!("nft list chain ip filter FORWARD: {}", stderr.trim()))
+    }
 }
 
 /// Handles of the tagged rules in a listing of Docker's FORWARD.
@@ -94,14 +107,14 @@ fn tagged_handles(listing: &str) -> Vec<String> {
 
 /// Handles of the tagged rules in Docker's `ip filter FORWARD`, if that chain exists.
 async fn tagged_forward_handles() -> Vec<String> {
-    docker_forward().await.map(|l| tagged_handles(&l)).unwrap_or_default()
+    docker_forward().await.ok().flatten().map(|l| tagged_handles(&l)).unwrap_or_default()
 }
 
 /// Our two accepts in Docker's FORWARD (policy drop), where that chain exists: without
 /// them sandboxes have no internet. Put back when either is missing, e.g. after a flush
 /// and a Docker restart. Whether they had to be.
 async fn ensure_forward_accepts(uplink: &str) -> Result<bool, String> {
-    let Some(listing) = docker_forward().await else { return Ok(false) };
+    let Some(listing) = docker_forward().await? else { return Ok(false) };
     let handles = tagged_handles(&listing);
     if handles.len() == 2 {
         return Ok(false);
@@ -831,6 +844,17 @@ mod tests {
         for rule in ["meta nfproto ipv6 drop", "jump spoof", "iifname \"lhtap3\" ip saddr 172.30.0.14 return", "tcp dport { 25, 465, 587, 2525 } drop"] {
             assert!(listing.contains(rule), "{rule} not in {listing}");
         }
+    }
+
+    #[test]
+    fn a_failed_forward_listing_is_not_an_absent_chain() {
+        use super::forward_listing;
+        assert_eq!(forward_listing(true, "table ip filter {", ""), Ok(Some("table ip filter {".to_string())));
+        // No Docker (no such table or chain): nothing to keep, nothing wrong.
+        assert_eq!(forward_listing(false, "", "Error: No such file or directory\nlist chain ip filter FORWARD\n"), Ok(None));
+        // Anything else is an error, so keep_forward_accepts warns instead of passing it.
+        let err = forward_listing(false, "", "netlink: Error: cache initialization failed: Operation not permitted\n").unwrap_err();
+        assert!(err.contains("Operation not permitted"), "{err}");
     }
 
     #[test]
