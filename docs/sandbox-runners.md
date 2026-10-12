@@ -65,8 +65,9 @@ sandboxes on the runner with the most free room.
   measured them: `count`, `bytes`, `maxBytes`, `perMirrorMaxBytes`, `fsFreeBytes`,
   `garbageBytes`, `stageRefs`, `records`, `largest` (`repo`, `bytes`), `oldestIdleSecs`,
   `lastGc` (`at`, `ms`, `reclaimedBytes`), and since the runner started `evicted` (mirrors
-  dropped, for retention or to make room), `refusedForSpace` and `refreshTimeouts`. Lorehouse only shows it in `/status`; an object
-  over 2 KB of JSON is dropped (not the status).
+  dropped, for retention or to make room), `refusedForSpace` and `refreshTimeouts`.
+  Lorehouse only shows it, in `/status` and `/api/v1/runners`; an object over 2 KB of JSON
+  is dropped (not the status).
 - All of these are optional. A runner that omits them loses the guarantees they give but
   still works. A list that is present must be an array of strings, or the whole status
   is refused.
