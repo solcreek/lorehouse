@@ -183,7 +183,12 @@ What one sandbox can take from the host and send to the internet, each per VM:
     like quotas off (`btrfs quota status` tells which). Note
     that quotas are per filesystem: on a host whose state directory shares one btrfs with
     everything else, that turns them on for all of it. A sandbox made before quotas were
-    on isn't a subvolume and stays uncapped (it says so when it boots).
+    on isn't a subvolume and stays uncapped (it says so when it boots). When `btrfs quota
+    status` says `Inconsistent: yes` (accounting awaiting a rescan), the default limit is
+    still set, with a warning, and an explicit `SANDBOXD_DISK_QUOTA_GIB` refuses the
+    start. What the kernel does with a limit while simple-quota accounting is
+    inconsistent is not verified. Quotas are not enabled on starship: its state shares the
+    root btrfs, and enabling them there was decided against (2026-10-12).
   - **XFS**: project quotas are the tool, and sandboxd doesn't set them up. As far as we
     know XFS charges a reflinked file for every block it maps, shared or not, so the hard
     limit has to be the golden's size plus the cap. By hand: mount with `prjquota`, then

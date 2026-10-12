@@ -31,8 +31,10 @@ pub enum Quota {
 #[derive(Debug, PartialEq)]
 pub enum BtrfsQuotas {
     Off,
-    /// Simple quotas: an extent counts against whoever wrote it, for good.
-    Simple,
+    /// Simple quotas: an extent counts against whoever wrote it, for good. `inconsistent`:
+    /// the kernel says its accounting needs a rescan, so usage (and what the limit checks
+    /// against) may be off.
+    Simple { inconsistent: bool },
     /// Full qgroups: "exclusive" is recomputed as sharing changes, so replacing the golden
     /// would turn every sandbox's shared extents exclusive and put each over its limit.
     Full,
@@ -51,7 +53,7 @@ pub enum Fs {
 pub fn quota_mode(status: &str) -> BtrfsQuotas {
     let field = |name: &str| status.lines().find_map(|l| l.trim().strip_prefix(name).map(|v| v.trim().to_string()));
     match (field("Enabled:").as_deref(), field("Mode:")) {
-        (Some("yes"), Some(mode)) if mode.starts_with("squota") => BtrfsQuotas::Simple,
+        (Some("yes"), Some(mode)) if mode.starts_with("squota") => BtrfsQuotas::Simple { inconsistent: field("Inconsistent:").as_deref() == Some("yes") },
         (Some("yes"), _) => BtrfsQuotas::Full,
         _ => BtrfsQuotas::Off,
     }
@@ -74,6 +76,11 @@ fn fs_kind(f_type: u32) -> Option<bool> {
 
 /// What to enforce, given the filesystem and the setting. An explicit limit that can't be
 /// enforced is an error (fail closed); the default one is skipped, with the reason.
+///
+/// Simple quotas whose accounting is inconsistent: the default limit is still set (writes
+/// stay bounded, if by imprecise numbers) with a warning; an explicit one refuses the start,
+/// since it can't be confirmed. What the kernel does with a limit while squota accounting
+/// is inconsistent is not verified (no such filesystem was at hand).
 pub fn decide(fs: &Fs, setting: &DiskQuota, mount_hint: &Path) -> Result<(Quota, Option<String>), String> {
     let (gib, explicit) = match *setting {
         DiskQuota::Off => return Ok((Quota::Off, None)),
@@ -81,7 +88,15 @@ pub fn decide(fs: &Fs, setting: &DiskQuota, mount_hint: &Path) -> Result<(Quota,
         DiskQuota::Set(g) => (g, true),
     };
     let why = match fs {
-        Fs::Btrfs(BtrfsQuotas::Simple) => return Ok((Quota::Btrfs { bytes: gib << 30 }, None)),
+        Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: false }) => return Ok((Quota::Btrfs { bytes: gib << 30 }, None)),
+        Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: true }) if !explicit => {
+            let warning = format!(
+                "btrfs reports its quota accounting inconsistent (`btrfs quota status {}`); the {gib} GiB limit is set anyway, but usage may be counted wrong until a rescan",
+                mount_hint.display()
+            );
+            return Ok((Quota::Btrfs { bytes: gib << 30 }, Some(warning)));
+        }
+        Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: true }) => "btrfs reports its quota accounting inconsistent, so the limit can't be relied on until a rescan".into(),
         Fs::Btrfs(BtrfsQuotas::Off) => {
             format!("quotas are off on this btrfs; turn them on with `btrfs quota enable --simple {}`", mount_hint.display())
         }
@@ -123,7 +138,12 @@ pub async fn detect(state_dir: &Path, setting: &DiskQuota) -> Result<Quota, Stri
     let fs = if *setting == DiskQuota::Off { Fs::Other } else { probe(state_dir).await? };
     let (quota, warning) = decide(&fs, setting, state_dir)?;
     match (&quota, warning) {
-        (Quota::Btrfs { bytes }, _) => eprintln!("sandboxd: each sandbox's disk is capped at {} GiB of its own writes (btrfs qgroup)", bytes >> 30),
+        (Quota::Btrfs { bytes }, warning) => {
+            eprintln!("sandboxd: each sandbox's disk is capped at {} GiB of its own writes (btrfs qgroup)", bytes >> 30);
+            if let Some(w) = warning {
+                eprintln!("sandboxd: WARNING: {w}");
+            }
+        }
         (_, Some(w)) => eprintln!("sandboxd: WARNING: {w}"),
         _ => eprintln!("sandboxd: sandbox disks are not capped (SANDBOXD_DISK_QUOTA_GIB=0)"),
     }
@@ -185,7 +205,7 @@ mod tests {
     #[test]
     fn an_explicit_quota_that_cant_be_enforced_refuses_the_start() {
         let at = Path::new("/var/lib/lorehouse-sandboxes");
-        let on = Fs::Btrfs(BtrfsQuotas::Simple);
+        let on = Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: false });
         assert_eq!(decide(&on, &DiskQuota::Default(8), at).unwrap(), (Quota::Btrfs { bytes: 8 << 30 }, None));
         assert_eq!(decide(&on, &DiskQuota::Set(2), at).unwrap().0, Quota::Btrfs { bytes: 2 << 30 });
         for fs in [Fs::Btrfs(BtrfsQuotas::Off), Fs::Btrfs(BtrfsQuotas::Full), Fs::Btrfs(BtrfsQuotas::NoTool), Fs::Xfs, Fs::Other] {
@@ -219,8 +239,24 @@ mod tests {
     fn only_simple_quotas_are_trusted() {
         // btrfs-progs 7.1's `btrfs quota status`, as seen on starship (2026-10-12).
         let simple = "Quotas on /x:\n  Enabled:                 yes\n  Mode:                    squota (simplified accounting)\n  Inconsistent:            no\n";
-        assert_eq!(quota_mode(simple), BtrfsQuotas::Simple);
+        assert_eq!(quota_mode(simple), BtrfsQuotas::Simple { inconsistent: false });
         assert_eq!(quota_mode("Quotas on /x:\n  Enabled:                 yes\n  Mode:                    qgroup (full accounting)\n"), BtrfsQuotas::Full);
         assert_eq!(quota_mode("Quotas on /var/lib/lorehouse-sandboxes:\n  Enabled: no\n"), BtrfsQuotas::Off);
+    }
+
+    #[test]
+    fn inconsistent_accounting_keeps_the_default_limit_and_refuses_an_explicit_one() {
+        let status = "Quotas on /x:\n  Enabled:                 yes\n  Mode:                    squota (simplified accounting)\n  Inconsistent:            yes\n";
+        let fs = Fs::Btrfs(quota_mode(status));
+        assert_eq!(fs, Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: true }));
+        let at = Path::new("/var/lib/lorehouse-sandboxes");
+        // The default: still capped, with a warning.
+        let (q, warning) = decide(&fs, &DiskQuota::Default(8), at).unwrap();
+        assert_eq!(q, Quota::Btrfs { bytes: 8 << 30 });
+        assert!(warning.is_some_and(|w| w.contains("inconsistent")));
+        // Asked for explicitly: can't be confirmed, so the start is refused.
+        assert!(decide(&fs, &DiskQuota::Set(8), at).unwrap_err().contains("inconsistent"));
+        // An older btrfs-progs without the field isn't read as inconsistent.
+        assert_eq!(quota_mode("Quotas on /x:\n  Enabled: yes\n  Mode: squota (simplified accounting)\n"), BtrfsQuotas::Simple { inconsistent: false });
     }
 }
