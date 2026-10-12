@@ -322,13 +322,13 @@ const STOP_LOG_AFTER: Duration = Duration::from_secs(5);
 
 /// A running git command, the leader of a process group of its own (git_command). Dropped
 /// before it was waited for (it timed out, or its job was cut off) or stopped, the whole
-/// group is stopped: SIGTERM, SIGKILL after STOP_GRACE, and drop() returns only once no
-/// process of the group is left, however long that takes. Killing the command alone would
-/// leave its helpers (a fetch's git-remote-https and index-pack, a gc's repack) writing to
-/// the mirror. A job's future holds the mirror's lock longer than the command it is running
+/// group is stopped: SIGTERM, SIGKILL once the leader exits or after STOP_GRACE, and drop()
+/// returns only once no process of the group is left, however long that takes. Killing the
+/// command alone would leave its helpers (a fetch's git-remote-https and index-pack, a gc's
+/// repack) writing to the mirror. A job's future holds the mirror's lock longer than the command it is running
 /// (the lock is taken first, so it is dropped last), so the lock is never released with one
-/// of them alive. drop() blocks its thread for that while, two seconds at most unless a
-/// process ignores SIGTERM and then can't die.
+/// of them alive. drop() blocks its thread for that while: until the leader exits, two
+/// seconds at most, unless a process then can't die even of SIGKILL.
 struct Running {
     child: Child,
     /// None once the command has been waited for (its id may then be reused) or stopped.
@@ -348,40 +348,49 @@ impl Running {
         Ok(status)
     }
 
-    /// Stop the whole group, and wait until it is gone.
+    /// Stop the whole group, and wait until it is gone. The leader is reaped only once both
+    /// signals are sent: until then it holds the group's id (as a zombie, if it has exited),
+    /// so neither signal can reach a group that reused the id.
     fn stop(&mut self) {
         let Some(group) = self.group.take() else { return };
-        let child = &mut self.child;
-        let mut gone = || {
-            // Reap the leader as soon as it exits: a zombie still counts in its group.
-            let _ = child.try_wait();
+        let sleep = || std::thread::sleep(Duration::from_millis(10));
+        // SAFETY: killpg() signals the group this command leads, whose id its unreaped leader
+        // holds.
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+        // STOP_GRACE to stop on SIGTERM; cut short when the leader has exited, as git does at
+        // once (its helpers got the same signal at the same moment).
+        let start = std::time::Instant::now();
+        while !exited(group) && start.elapsed() < STOP_GRACE {
+            sleep();
+        }
+        // SAFETY: as above; the leader is still unreaped.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        let start = std::time::Instant::now();
+        let mut logged = false;
+        loop {
+            // Reap the leader: a zombie still counts in its group.
+            let _ = self.child.try_wait();
             // SAFETY: kill() with signal 0 only checks whether the group has a process left.
             let left = unsafe { libc::kill(-group, 0) };
-            left != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        };
-        let until = |gone: &mut dyn FnMut() -> bool, limit: Option<Duration>| {
-            let start = std::time::Instant::now();
-            while !gone() {
-                if limit.is_some_and(|l| start.elapsed() >= l) {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            if left != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
             }
-            true
-        };
-        // SAFETY: killpg() sends a signal to the group this command leads; while any of the
-        // group is left (the leader is reaped only above), its id can't be reused.
-        unsafe { libc::killpg(group, libc::SIGTERM) };
-        if until(&mut gone, Some(STOP_GRACE)) {
-            return;
+            if !logged && start.elapsed() >= STOP_LOG_AFTER {
+                logged = true;
+                eprintln!("sandboxd: git process group {group} is still there {} s after SIGKILL; its mirror stays locked until it is gone", STOP_LOG_AFTER.as_secs());
+            }
+            sleep();
         }
-        // SAFETY: as above.
-        unsafe { libc::killpg(group, libc::SIGKILL) };
-        if until(&mut gone, Some(STOP_LOG_AFTER)) {
-            return;
-        }
-        eprintln!("sandboxd: git process group {group} is still there {} s after SIGKILL; its mirror stays locked until it is gone", STOP_LOG_AFTER.as_secs());
-        until(&mut gone, None);
+    }
+}
+
+/// Whether process `pid`, a child of this one, has exited, without reaping it.
+fn exited(pid: libc::pid_t) -> bool {
+    // SAFETY: waitid() writes into the zeroed struct it is given; WNOWAIT leaves the child
+    // unreaped.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) == 0 && info.si_pid() != 0
     }
 }
 

@@ -201,7 +201,7 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   is off (`maintenance.auto=false`, `gc.auto=0`): it runs detached, after the lock is
   released, and a gc from outside the lock was seen to wedge a mirror (#76). A git command
   that times out or whose job is cut off is stopped with its helpers (its process group:
-  SIGTERM, then SIGKILL after 2 s), and the lock is held until none of them is left, so
+  SIGTERM, then SIGKILL within 2 s), and the lock is held until none of them is left, so
   none writes to the mirror after the lock is released. After a stage
   or push that runs to its end, and after a failed refresh, the housekeeping also removes
   what a git process that died or was killed left once it is older than 10 minutes (partial
