@@ -91,12 +91,12 @@ pub fn decide(fs: &Fs, setting: &DiskQuota, mount_hint: &Path) -> Result<(Quota,
         Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: false }) => return Ok((Quota::Btrfs { bytes: gib << 30 }, None)),
         Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: true }) if !explicit => {
             let warning = format!(
-                "btrfs reports its quota accounting inconsistent (`btrfs quota status {}`); the {gib} GiB limit is set anyway, but usage may be counted wrong until a rescan",
+                "btrfs reports its quota accounting inconsistent (`btrfs quota status {}`); the {gib} GiB limit is set anyway, but usage may be counted wrong until the accounting is consistent again (for simple quotas that may take disabling and re-enabling them; unverified)",
                 mount_hint.display()
             );
             return Ok((Quota::Btrfs { bytes: gib << 30 }, Some(warning)));
         }
-        Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: true }) => "btrfs reports its quota accounting inconsistent, so the limit can't be relied on until a rescan".into(),
+        Fs::Btrfs(BtrfsQuotas::Simple { inconsistent: true }) => "btrfs reports its quota accounting inconsistent, so the limit can't be relied on; make the accounting consistent again (for simple quotas that may take disabling and re-enabling them; unverified), or leave SANDBOXD_DISK_QUOTA_GIB unset to run with the limit and a warning".into(),
         Fs::Btrfs(BtrfsQuotas::Off) => {
             format!("quotas are off on this btrfs; turn them on with `btrfs quota enable --simple {}`", mount_hint.display())
         }

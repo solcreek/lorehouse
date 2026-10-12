@@ -184,7 +184,7 @@ What one sandbox can take from the host and send to the internet, each per VM:
     that quotas are per filesystem: on a host whose state directory shares one btrfs with
     everything else, that turns them on for all of it. A sandbox made before quotas were
     on isn't a subvolume and stays uncapped (it says so when it boots). When `btrfs quota
-    status` says `Inconsistent: yes` (accounting awaiting a rescan), the default limit is
+    status` says `Inconsistent: yes` (the accounting is off; for simple quotas a rescan may not be possible, only disabling and re-enabling them; unverified), the default limit is
     still set, with a warning, and an explicit `SANDBOXD_DISK_QUOTA_GIB` refuses the
     start. What the kernel does with a limit while simple-quota accounting is
     inconsistent is not verified. Quotas are not enabled on starship: its state shares the
