@@ -130,6 +130,7 @@ same disk in 0.94 s. With sandboxd SIGKILLed, systemd killed the VM and restarte
 | | |
 |---|---|
 | capabilities | `CAP_NET_ADMIN` (taps, nftables), and for the jailer `SYS_ADMIN`, `SYS_CHROOT`, `MKNOD`, `CHOWN`, `SETUID`, `SETGID`; `DAC_OVERRIDE` and `KILL` to reach into and stop a jailed VM; `NoNewPrivileges=yes`. `git`, which reads what a VM hands over, runs with none of them (dropped between fork and exec) |
+| environment | every process sandboxd starts gets `PATH` and `LC_ALL=C` and nothing else ([`src/child.rs`](src/child.rs)), so none of them, the jailer and Firecracker above all, inherits `SANDBOXD_RUNNER_TOKEN` or `SANDBOXD_TOKEN`; a test fails a spawn that bypasses it |
 | file system | read-only (`ProtectSystem=strict`) but the state directory; no `/home` or `/root`; private `/tmp` |
 | devices | `/dev/kvm` and `/dev/net/tun`, beyond the standard pseudo-devices (`DevicePolicy=closed`; `ProtectClock` adds read access to the RTC), plus making nodes of those, `/dev/userfaultfd` and `/dev/urandom` in a jail |
 | sockets | `AF_UNIX` (vsock, API), `AF_INET`/`AF_INET6` (Lorehouse, GitHub), `AF_NETLINK` (ip, nft) |

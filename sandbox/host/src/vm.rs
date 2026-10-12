@@ -337,7 +337,7 @@ impl Manager {
         quota::prepare_dir(&self.quota, &sb.dir).await?;
         let rootfs = sb.rootfs();
         if !rootfs.exists() {
-            let out = Command::new("cp").arg("--reflink=always").arg(&self.cfg.golden).arg(&rootfs).output().await.map_err(|e| format!("cp: {e}"))?;
+            let out = crate::child::command("cp").arg("--reflink=always").arg(&self.cfg.golden).arg(&rootfs).output().await.map_err(|e| format!("cp: {e}"))?;
             if !out.status.success() {
                 return Err(format!("reflink golden: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
             }
@@ -351,13 +351,7 @@ impl Manager {
         let jail = self.jail(sb, slot_index);
         net::tap_up(&slot, jail.uid()).await?;
         let console = std::fs::File::create(sb.dir.join("console.log")).map_err(|e| format!("console.log: {e}"))?;
-        let mut vmm = Vmm::spawn(
-            Command::new(&self.host.jailer)
-                .args(jail.args(self.cfg.vcpus, self.cfg.mem_mib))
-                .stdin(std::process::Stdio::null())
-                .stdout(console.try_clone().map_err(|e| e.to_string())?)
-                .stderr(console),
-        )?;
+        let mut vmm = Vmm::spawn(&mut vmm_command(&self.host.jailer, &jail.args(self.cfg.vcpus, self.cfg.mem_mib), console)?)?;
         let uds = jail.uds();
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
@@ -508,6 +502,14 @@ impl Manager {
     }
 }
 
+/// The jailer's command line, which execs Firecracker in place: both run with a clean
+/// environment (child::command), so neither ever holds sandboxd's tokens.
+fn vmm_command(jailer: &Path, args: &[String], console: std::fs::File) -> Result<Command, String> {
+    let mut cmd = crate::child::command(jailer);
+    cmd.args(args).stdin(std::process::Stdio::null()).stdout(console.try_clone().map_err(|e| e.to_string())?).stderr(console);
+    Ok(cmd)
+}
+
 /// The VM's Firecracker config. Every path is inside its jail (jail.rs puts the files
 /// there): Firecracker runs chrooted and can't see the host's.
 fn vm_config(cfg: &Config, slot_index: usize) -> serde_json::Value {
@@ -594,6 +596,25 @@ mod tests {
         for host_path in ["/var/lib", "/usr/local"] {
             assert!(!text.contains(host_path), "{host_path} in {text}");
         }
+    }
+
+    #[test]
+    fn the_vmm_never_sees_sandboxds_tokens() {
+        // sandboxd's environment holds them (EnvironmentFile=); the jailer, and the
+        // Firecracker it execs, must not. A name no other test touches stands in for them.
+        std::env::set_var("SANDBOXD_VMM_ENV_PROBE", "secret");
+        let dir = std::env::temp_dir().join(format!("sandboxd-vmm-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let console = dir.join("console.log");
+        // `env` in the jailer's place, no arguments: it prints what the jailer would get.
+        let cmd = super::vmm_command(std::path::Path::new("env"), &[], std::fs::File::create(&console).unwrap()).unwrap();
+        let _ = crate::child::names_seen_by_a_child(cmd);
+        let printed = std::fs::read_to_string(&console).unwrap();
+        let names: Vec<&str> = printed.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k)).collect();
+        assert!(!names.is_empty(), "env printed nothing");
+        assert!(!names.iter().any(|n| n.starts_with("SANDBOXD_")), "{names:?}");
+        assert!(names.iter().all(|n| crate::child::ALLOWED.contains(n)), "{names:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

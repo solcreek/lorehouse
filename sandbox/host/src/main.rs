@@ -15,6 +15,7 @@
 //! Every /v1 request needs `Authorization: Bearer <SANDBOXD_TOKEN>`. Requests for a
 //! stopped sandbox boot it first; idle ones are stopped with their disk kept.
 
+mod child;
 mod config;
 mod jail;
 mod net;

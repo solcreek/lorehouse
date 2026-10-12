@@ -257,7 +257,7 @@ pub fn version_of(output: &str) -> Option<String> {
 }
 
 async fn version(bin: &Path) -> Result<String, String> {
-    let out = tokio::process::Command::new(bin).arg("--version").output().await.map_err(|e| format!("{}: {e}", bin.display()))?;
+    let out = crate::child::command(bin).arg("--version").output().await.map_err(|e| format!("{}: {e}", bin.display()))?;
     version_of(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| format!("{} --version: no version in its output", bin.display()))
 }
 

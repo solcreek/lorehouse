@@ -11,7 +11,7 @@
 //! the rules; accepts that Docker's FORWARD chain (policy drop) needs are tagged so they
 //! can be removed exactly.
 
-use tokio::process::Command;
+use crate::child::command;
 
 pub const TABLE: &str = "lorehouse_sbx";
 /// `inet`: one table for both IPv4 and IPv6. Builds up to 5811498 used an `ip` table,
@@ -44,7 +44,7 @@ impl Slot {
 }
 
 async fn run(args: &[&str]) -> Result<(), String> {
-    let out = Command::new(args[0]).args(&args[1..]).output().await.map_err(|e| format!("{}: {e}", args[0]))?;
+    let out = command(args[0]).args(&args[1..]).output().await.map_err(|e| format!("{}: {e}", args[0]))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -58,7 +58,7 @@ async fn nft(rule: &str) -> Result<(), String> {
 
 /// Handles of the tagged rules in Docker's `ip filter FORWARD`, if that chain exists.
 async fn tagged_forward_handles() -> Vec<String> {
-    let Ok(out) = Command::new("nft").args(["-a", "list", "chain", "ip", "filter", "FORWARD"]).output().await else { return vec![] };
+    let Ok(out) = command("nft").args(["-a", "list", "chain", "ip", "filter", "FORWARD"]).output().await else { return vec![] };
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| l.contains(TAG))
@@ -67,12 +67,12 @@ async fn tagged_forward_handles() -> Vec<String> {
 }
 
 async fn docker_forward_exists() -> bool {
-    Command::new("nft").args(["list", "chain", "ip", "filter", "FORWARD"]).output().await.map(|o| o.status.success()).unwrap_or(false)
+    command("nft").args(["list", "chain", "ip", "filter", "FORWARD"]).output().await.map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// Every lhtapN interface on the host, whatever SANDBOXD_MAX_VMS was when it was made.
 async fn existing_taps() -> Vec<String> {
-    let Ok(out) = Command::new("ip").args(["-o", "link", "show"]).output().await else { return vec![] };
+    let Ok(out) = command("ip").args(["-o", "link", "show"]).output().await else { return vec![] };
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split(": ").nth(1))
