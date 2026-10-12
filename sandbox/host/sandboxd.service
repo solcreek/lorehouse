@@ -22,7 +22,7 @@ EnvironmentFile=/etc/lorehouse/sandboxd.env
 Restart=on-failure
 RestartSec=5
 # SIGTERM stops every VM cleanly (sync first, disks kept) and removes its network rules:
-# requests in flight get 30 s, then all VMs stop at once (≤ 15 s each), well under this.
+# requests in flight get 30 s, then all VMs stop at once (≤ 20 s each), well under this.
 KillSignal=SIGTERM
 # Only sandboxd gets the SIGTERM; it stops each VM itself, after the guest's sync.
 # KillMode=control-group (the default) would also send it to every Firecracker at once,
