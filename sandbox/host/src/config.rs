@@ -123,6 +123,9 @@ fn credential(name: &str) -> Result<Option<String>, String> {
             let v = v.trim_end_matches(['\n', '\r']).to_string();
             if v.is_empty() {
                 Err(format!("credential {name} ({}) is empty", path.display()))
+            } else if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                // A token never has them; one that does would only fail later, at the app.
+                Err(format!("credential {name} ({}) holds whitespace or control characters: one line, the token alone", path.display()))
             } else {
                 Ok(Some(v))
             }
@@ -375,6 +378,10 @@ mod tests {
         assert!(Config::from_env().is_ok(), "the credential alone is enough");
         std::fs::write(creds.join("runner-token"), "\n").unwrap();
         assert!(Config::from_env().unwrap_err().contains("is empty"));
+        for bad in [format!("{from_file} \n"), format!("{from_file}\nsecond line\n"), format!("{from_file}\t")] {
+            std::fs::write(creds.join("runner-token"), bad).unwrap();
+            assert!(Config::from_env().unwrap_err().contains("whitespace or control"));
+        }
         std::fs::remove_file(creds.join("runner-token")).unwrap();
         assert!(Config::from_env().unwrap_err().contains("runner token is required"), "neither");
         std::env::set_var("SANDBOXD_RUNNER_TOKEN", &token);
