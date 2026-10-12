@@ -203,7 +203,8 @@ The table is loaded as one `nft -f`
 transaction: the old one (or an older build's `ip lorehouse_sbx`) is deleted and the new
 one added together, or nothing changes.
 
-The guest kernel boots with `ipv6.disable=1` too.
+The guest kernel boots with `ipv6.disable=1`, and the host's side of each tap gets no
+IPv6 address either (`addrgenmode none`).
 
 The host is shared, so the table is checked against what sandboxd loaded every
 `SANDBOXD_NET_CHECK_SECS` (10 s) and before every boot: an `nft flush ruleset`, a deleted

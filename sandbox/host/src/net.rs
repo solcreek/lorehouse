@@ -548,6 +548,9 @@ pub async fn tap_up(slot: &Slot, owner: u32) -> Result<(), String> {
     let add = tap_add(&tap, owner);
     run(&add.iter().map(String::as_str).collect::<Vec<_>>()).await?;
     run(&["ip", "addr", "add", &format!("{}/30", slot.host_ip()), "dev", &tap]).await?;
+    // No IPv6 link-local address on the host's side either: nothing for a guest to reach
+    // over IPv6 even if the rules were gone. (Fails where the host has no IPv6: ignored.)
+    let _ = run(&["ip", "link", "set", "dev", &tap, "addrgenmode", "none"]).await;
     run(&["ip", "link", "set", &tap, "up"]).await
 }
 
