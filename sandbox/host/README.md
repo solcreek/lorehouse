@@ -199,17 +199,23 @@ IPv4 and IPv6:
 | `input` (priority -1) | nothing from a tap reaches the host, IPv4 or IPv6 (spoofed sources counted first) |
 | `post` | masquerade of 172.30.0.0/24 out of the uplink |
 
-The guest kernel boots with `ipv6.disable=1` too. The table is loaded as one `nft -f`
+The table is loaded as one `nft -f`
 transaction: the old one (or an older build's `ip lorehouse_sbx`) is deleted and the new
 one added together, or nothing changes.
+
+The guest kernel boots with `ipv6.disable=1` too.
 
 The host is shared, so the table is checked against what sandboxd loaded every
 `SANDBOXD_NET_CHECK_SECS` (10 s) and before every boot: an `nft flush ruleset`, a deleted
 table or a rule added to it is noticed, logged (`ALERT: nftables table inet lorehouse_sbx
-is gone …; loading it again`) and the table loaded again. If it can't be, sandboxd fails
-closed: no VM boots and every running one is stopped until a later check loads it. A
-flush can still leave running guests unfiltered until the next check, at most
-`SANDBOXD_NET_CHECK_SECS`.
+is gone …; loading it again`) and the table loaded again, along with sandboxd's accepts in
+Docker's FORWARD chain if those went too. If it can't be loaded, sandboxd fails closed:
+every tap goes down at once, every running VM is stopped, and none boots until a later
+check loads it. Between a flush and the next check (up to `SANDBOXD_NET_CHECK_SECS`)
+running guests are unfiltered; a smaller value narrows that, at one `nft list` per check.
+Every `nft` and `ip` run is cut off after 10 s, so a hung one can't stall the checks. An
+nft upgrade that lists the same rules differently shows up as one ALERT and one reload,
+not as a loop.
 
 ## Limits
 

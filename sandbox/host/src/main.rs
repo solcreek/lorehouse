@@ -200,10 +200,11 @@ async fn main() {
 
     let vms = Manager::new(cfg.clone(), host, quota, fw.clone());
     // The table, kept as loaded: checked every SANDBOXD_NET_CHECK_SECS (and before every
-    // boot, in vm.rs). One that is gone or changed is loaded again; one that can't be stops
-    // every VM, and none boots until it is back (fail closed).
+    // boot, in vm.rs). One that is gone or changed is loaded again; one that can't be takes
+    // every tap down and stops every VM, and none boots until it is back (fail closed).
     let watch = (fw.clone(), vms.clone());
     let every = cfg.net_check;
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     tokio::spawn(async move {
         let (fw, vms) = watch;
         let mut tick = tokio::time::interval(every);
@@ -213,9 +214,21 @@ async fn main() {
                 _ = tick.tick() => {}
                 _ = fw.alarm.notified() => {}
             }
-            if fw.ensure().await.is_err() && vms.running_count().await > 0 {
-                eprintln!("sandboxd: ALERT: stopping every running VM: their network rules are gone");
-                vms.stop_all().await;
+            if fw.is_closed() {
+                break;
+            }
+            if fw.ensure().await.is_err() && !fw.is_closed() {
+                // Cut off at once (taps down), then stopped (seconds each, after the guest's
+                // sync), in a task of its own so the checks go on meanwhile.
+                net::taps_down().await;
+                if vms.running_count().await > 0 && !stopping.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("sandboxd: ALERT: every tap is down; stopping every running VM: their network rules are gone");
+                    let (vms, stopping) = (vms.clone(), stopping.clone());
+                    tokio::spawn(async move {
+                        vms.stop_all().await;
+                        stopping.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
             }
         }
     });

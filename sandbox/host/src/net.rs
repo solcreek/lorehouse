@@ -55,8 +55,21 @@ impl Slot {
     }
 }
 
+/// The most any `ip` or `nft` run may take: one that hangs (a netlink lock, a stuck
+/// kernel) must not hold the table's checks, and with them every boot, forever.
+const TOOL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A command's output, killed past TOOL_DEADLINE.
+async fn output(cmd: &mut tokio::process::Command) -> Result<std::process::Output, String> {
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    match tokio::time::timeout(TOOL_DEADLINE, cmd.kill_on_drop(true).output()).await {
+        Ok(r) => r.map_err(|e| format!("{program}: {e}")),
+        Err(_) => Err(format!("{program}: no answer within {} s", TOOL_DEADLINE.as_secs())),
+    }
+}
+
 async fn run(args: &[&str]) -> Result<(), String> {
-    let out = command(args[0]).args(&args[1..]).output().await.map_err(|e| format!("{}: {e}", args[0]))?;
+    let out = output(command(args[0]).args(&args[1..])).await?;
     if out.status.success() {
         Ok(())
     } else {
@@ -68,23 +81,42 @@ async fn nft(rule: &str) -> Result<(), String> {
     run(&["nft", rule]).await
 }
 
-/// Handles of the tagged rules in Docker's `ip filter FORWARD`, if that chain exists.
-async fn tagged_forward_handles() -> Vec<String> {
-    let Ok(out) = command("nft").args(["-a", "list", "chain", "ip", "filter", "FORWARD"]).output().await else { return vec![] };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains(TAG))
-        .filter_map(|l| l.rsplit("handle ").next().map(|h| h.trim().to_string()))
-        .collect()
+/// Docker's `ip filter FORWARD`, listed with handles; None when there is no such chain.
+async fn docker_forward() -> Option<String> {
+    let out = output(command("nft").args(["-a", "list", "chain", "ip", "filter", "FORWARD"])).await.ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-async fn docker_forward_exists() -> bool {
-    command("nft").args(["list", "chain", "ip", "filter", "FORWARD"]).output().await.map(|o| o.status.success()).unwrap_or(false)
+/// Handles of the tagged rules in a listing of Docker's FORWARD.
+fn tagged_handles(listing: &str) -> Vec<String> {
+    listing.lines().filter(|l| l.contains(TAG)).filter_map(|l| l.rsplit("handle ").next().map(|h| h.trim().to_string())).collect()
+}
+
+/// Handles of the tagged rules in Docker's `ip filter FORWARD`, if that chain exists.
+async fn tagged_forward_handles() -> Vec<String> {
+    docker_forward().await.map(|l| tagged_handles(&l)).unwrap_or_default()
+}
+
+/// Our two accepts in Docker's FORWARD (policy drop), where that chain exists: without
+/// them sandboxes have no internet. Put back when either is missing, e.g. after a flush
+/// and a Docker restart. Whether they had to be.
+async fn ensure_forward_accepts(uplink: &str) -> Result<bool, String> {
+    let Some(listing) = docker_forward().await else { return Ok(false) };
+    let handles = tagged_handles(&listing);
+    if handles.len() == 2 {
+        return Ok(false);
+    }
+    for h in handles {
+        let _ = run(&["nft", "delete", "rule", "ip", "filter", "FORWARD", "handle", &h]).await;
+    }
+    nft(&format!("insert rule ip filter FORWARD iifname \"{uplink}\" oifname \"lhtap*\" ct state established,related accept comment \"{TAG}\"")).await?;
+    nft(&format!("insert rule ip filter FORWARD iifname \"lhtap*\" oifname \"{uplink}\" accept comment \"{TAG}\"")).await?;
+    Ok(true)
 }
 
 /// Every lhtapN interface on the host, whatever SANDBOXD_MAX_VMS was when it was made.
 async fn existing_taps() -> Vec<String> {
-    let Ok(out) = command("ip").args(["-o", "link", "show"]).output().await else { return vec![] };
+    let Ok(out) = output(command("ip").args(["-o", "link", "show"])).await else { return vec![] };
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split(": ").nth(1))
@@ -104,6 +136,14 @@ pub async fn teardown_all() {
     let _ = run(&["nft", "delete", "table", "ip", TABLE]).await; // from an older build
     for tap in existing_taps().await {
         let _ = run(&["ip", "link", "del", &tap]).await;
+    }
+}
+
+/// Every sandbox's tap down at once: no packet in or out of any VM from here on, before
+/// they are stopped (which takes seconds each). For when the table is gone for good.
+pub async fn taps_down() {
+    for tap in existing_taps().await {
+        let _ = run(&["ip", "link", "set", "dev", &tap, "down"]).await;
     }
 }
 
@@ -247,11 +287,15 @@ fn batch(uplink: &str, slots: usize) -> String {
 async fn load(text: &str) -> Result<(), String> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
-    let mut child = command("nft").args(["-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("nft: {e}"))?;
+    let mut child =
+        command("nft").args(["-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().map_err(|e| format!("nft: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("nft: no stdin")?;
-    stdin.write_all(text.as_bytes()).await.map_err(|e| format!("nft -f -: {e}"))?;
-    drop(stdin);
-    let out = child.wait_with_output().await.map_err(|e| format!("nft: {e}"))?;
+    let run = async {
+        stdin.write_all(text.as_bytes()).await.map_err(|e| format!("nft -f -: {e}"))?;
+        drop(stdin);
+        child.wait_with_output().await.map_err(|e| format!("nft: {e}"))
+    };
+    let out = tokio::time::timeout(TOOL_DEADLINE, run).await.map_err(|_| format!("nft -f -: no answer within {} s", TOOL_DEADLINE.as_secs()))??;
     if out.status.success() {
         Ok(())
     } else {
@@ -263,36 +307,44 @@ async fn load(text: &str) -> Result<(), String> {
 pub async fn setup(fw: &Firewall) -> Result<(), String> {
     check_forwarding().await?;
     fw.apply().await?;
-    if docker_forward_exists().await {
-        // Docker's FORWARD policy is drop; our accepts must live in that chain.
-        let uplink = &fw.uplink;
-        nft(&format!("insert rule ip filter FORWARD iifname \"{uplink}\" oifname \"lhtap*\" ct state established,related accept comment \"{TAG}\"")).await?;
-        nft(&format!("insert rule ip filter FORWARD iifname \"lhtap*\" oifname \"{uplink}\" accept comment \"{TAG}\"")).await?;
-    }
-    Ok(())
+    // Docker's FORWARD policy is drop; our accepts must live in that chain.
+    fw.nft.forward_accepts(&fw.uplink).await.map(|_| ())
 }
 
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// How the Firewall reads and loads the table: nft, or a stand-in in tests.
 pub trait Nft: Send + Sync {
-    /// `nft list table inet lorehouse_sbx`; None when it can't be listed (it isn't there).
-    fn list(&self) -> Boxed<'_, Option<String>>;
+    /// `nft list table inet lorehouse_sbx`: Ok(None) when it isn't there, an error when
+    /// nft couldn't tell.
+    fn list(&self) -> Boxed<'_, Result<Option<String>, String>>;
     /// `nft -f -`.
     fn load<'a>(&'a self, text: &'a str) -> Boxed<'a, Result<(), String>>;
+    /// ensure_forward_accepts.
+    fn forward_accepts<'a>(&'a self, uplink: &'a str) -> Boxed<'a, Result<bool, String>>;
 }
 
 struct System;
 
 impl Nft for System {
-    fn list(&self) -> Boxed<'_, Option<String>> {
+    fn list(&self) -> Boxed<'_, Result<Option<String>, String>> {
         Box::pin(async {
-            let out = command("nft").args(["list", "table", FAMILY, TABLE]).output().await.ok()?;
-            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+            let out = output(command("nft").args(["list", "table", FAMILY, TABLE])).await?;
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() {
+                Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+            } else if stderr.contains("No such file or directory") {
+                Ok(None)
+            } else {
+                Err(format!("nft list table: {}", stderr.trim()))
+            }
         })
     }
     fn load<'a>(&'a self, text: &'a str) -> Boxed<'a, Result<(), String>> {
         Box::pin(load(text))
+    }
+    fn forward_accepts<'a>(&'a self, uplink: &'a str) -> Boxed<'a, Result<bool, String>> {
+        Box::pin(ensure_forward_accepts(uplink))
     }
 }
 
@@ -350,10 +402,9 @@ pub struct Firewall {
     uplink: String,
     slots: usize,
     nft: Box<dyn Nft>,
-    /// The live table, normalized, right after sandboxd loaded it.
+    /// The live table, normalized, right after sandboxd loaded it; None until a load has
+    /// succeeded, and again after one failed: no VM may boot until a load succeeds.
     expected: std::sync::Mutex<Option<String>>,
-    /// The table couldn't be loaded again: no VM may boot until it is.
-    broken: AtomicBool,
     /// Shutting down: teardown removes the table, and nothing may put it back.
     closed: AtomicBool,
     /// One check or load at a time.
@@ -373,7 +424,6 @@ impl Firewall {
             slots,
             nft,
             expected: std::sync::Mutex::new(None),
-            broken: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             turn: tokio::sync::Mutex::new(()),
             alarm: tokio::sync::Notify::new(),
@@ -388,7 +438,7 @@ impl Firewall {
 
     async fn apply_locked(&self) -> Result<(), String> {
         self.nft.load(&batch(&self.uplink, self.slots)).await?;
-        let listing = self.nft.list().await.ok_or_else(|| format!("{FAMILY} {TABLE} isn't there right after it was loaded"))?;
+        let listing = self.list().await?.ok_or_else(|| format!("{FAMILY} {TABLE} isn't there right after it was loaded"))?;
         if !same_shape(&table(&self.uplink, self.slots), &listing) {
             return Err(format!("{FAMILY} {TABLE} as listed isn't the table loaded:\n{listing}"));
         }
@@ -396,48 +446,71 @@ impl Firewall {
         Ok(())
     }
 
+    /// The live table; a failure to list it is tried once more before it counts.
+    async fn list(&self) -> Result<Option<String>, String> {
+        match self.nft.list().await {
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                self.nft.list().await
+            }
+            done => done,
+        }
+    }
+
     /// Check the live table against what was loaded; load it again if it differs (and log
-    /// it loudly). An error means it couldn't be: the caller must not boot a VM, and the
-    /// running ones must stop.
+    /// it loudly). An error means it couldn't be, or sandboxd is shutting down: the caller
+    /// must not boot a VM, and (unless shutting down) the running ones must stop.
     pub async fn ensure(&self) -> Result<(), String> {
         let _turn = self.turn.lock().await;
-        if self.closed.load(Ordering::SeqCst) {
-            return Ok(());
+        if self.is_closed() {
+            return Err("sandboxd is shutting down".into());
         }
         let expected = self.expected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let live = self.nft.list().await;
-        let found = match &expected {
-            Some(e) => drift(e, live.as_deref()),
-            None => Drift::Missing, // never loaded, or the last load failed
-        };
-        if found == Drift::InSync && !self.broken.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        let what = match found {
-            Drift::InSync => "not yet loaded again after a failure",
-            Drift::Missing => "gone (flushed or deleted)",
-            Drift::Changed => "not what sandboxd loaded (rules added, removed or changed)",
+        let what = match (expected, self.list().await) {
+            (None, _) => "not loaded (the last load failed)".to_string(),
+            (Some(_), Err(e)) => format!("unreadable ({e})"),
+            (Some(e), Ok(live)) => match drift(&e, live.as_deref()) {
+                Drift::InSync => {
+                    self.keep_forward_accepts().await;
+                    return Ok(());
+                }
+                Drift::Missing => "gone (flushed or deleted)".into(),
+                Drift::Changed => "not what sandboxd loaded (rules added, removed or changed)".into(),
+            },
         };
         eprintln!("sandboxd: ALERT: nftables table {FAMILY} {TABLE} is {what}; loading it again");
         match self.apply_locked().await {
             Ok(()) => {
-                self.broken.store(false, Ordering::SeqCst);
                 eprintln!("sandboxd: nftables table {FAMILY} {TABLE} loaded again; sandboxes are filtered");
+                self.keep_forward_accepts().await;
                 Ok(())
             }
             Err(e) => {
-                self.broken.store(true, Ordering::SeqCst);
                 *self.expected.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                eprintln!("sandboxd: ALERT: nftables table {FAMILY} {TABLE} couldn't be loaded again ({e}): no VM boots, and every running one is stopped, until it is");
+                eprintln!("sandboxd: ALERT: nftables table {FAMILY} {TABLE} couldn't be loaded again ({e}): every tap goes down, every running VM is stopped, and none boots until it is");
                 Err(format!("the sandboxes' network rules are missing and couldn't be restored: {e}"))
             }
         }
     }
 
+    /// Docker's FORWARD accepts, put back if they went (sandboxes would have no internet:
+    /// that fails closed, so it is only logged).
+    async fn keep_forward_accepts(&self) {
+        match self.nft.forward_accepts(&self.uplink).await {
+            Ok(true) => eprintln!("sandboxd: WARNING: sandboxd's accepts in Docker's FORWARD chain were gone; added again"),
+            Ok(false) => {}
+            Err(e) => eprintln!("sandboxd: WARNING: sandboxd's accepts in Docker's FORWARD chain: {e}; sandboxes may have no internet"),
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     /// No more checks or loads: teardown is about to remove the table.
     pub async fn close(&self) {
-        let _turn = self.turn.lock().await;
         self.closed.store(true, Ordering::SeqCst);
+        let _turn = self.turn.lock().await; // a check under way finishes first
     }
 }
 
@@ -480,6 +553,51 @@ pub async fn tap_up(slot: &Slot, owner: u32) -> Result<(), String> {
 
 pub async fn tap_down(slot: &Slot) {
     let _ = run(&["ip", "link", "del", &slot.tap()]).await;
+}
+
+/// nft as a table in memory, for tests: `load` keeps the declared table, and a test
+/// changes `live` behind the Firewall's back, makes loads fail, or listing fail.
+#[cfg(test)]
+pub mod fake {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    pub struct Fake {
+        pub live: Mutex<Option<String>>,
+        pub loads: AtomicUsize,
+        pub fail: AtomicBool,
+        /// This many lists fail before one works.
+        pub unreadable: AtomicUsize,
+    }
+
+    pub struct Shared(pub Arc<Fake>);
+
+    impl super::Nft for Shared {
+        fn list(&self) -> super::Boxed<'_, Result<Option<String>, String>> {
+            let unreadable = self.0.unreadable.load(SeqCst);
+            if unreadable > 0 {
+                self.0.unreadable.store(unreadable - 1, SeqCst);
+                return Box::pin(async { Err("netlink: Device or resource busy".to_string()) });
+            }
+            let live = self.0.live.lock().unwrap().clone();
+            Box::pin(async move { Ok(live) })
+        }
+        fn load<'a>(&'a self, text: &'a str) -> super::Boxed<'a, Result<(), String>> {
+            Box::pin(async move {
+                if self.0.fail.load(SeqCst) {
+                    return Err("netlink: Operation not permitted".into());
+                }
+                self.0.loads.fetch_add(1, SeqCst);
+                let table = &text[text.find("table inet lorehouse_sbx {\n").unwrap()..];
+                *self.0.live.lock().unwrap() = Some(table.to_string());
+                Ok(())
+            })
+        }
+        fn forward_accepts<'a>(&'a self, _: &'a str) -> super::Boxed<'a, Result<bool, String>> {
+            Box::pin(async { Ok(false) })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -629,37 +747,9 @@ mod tests {
         assert!(!super::same_shape(&super::table("enp2s0", 3), LISTED));
     }
 
-    /// nft as a table in memory: `load` keeps the declared table (as LISTED would show
-    /// it), `flush` and `tamper` change it behind the Firewall's back.
-    #[derive(Default)]
-    struct Fake {
-        live: std::sync::Mutex<Option<String>>,
-        loads: std::sync::atomic::AtomicUsize,
-        fail: std::sync::atomic::AtomicBool,
-    }
-
-    struct Shared(std::sync::Arc<Fake>);
-
-    impl super::Nft for Shared {
-        fn list(&self) -> super::Boxed<'_, Option<String>> {
-            let live = self.0.live.lock().unwrap().clone();
-            Box::pin(async move { live })
-        }
-        fn load<'a>(&'a self, text: &'a str) -> super::Boxed<'a, Result<(), String>> {
-            Box::pin(async move {
-                if self.0.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err("netlink: Operation not permitted".into());
-                }
-                self.0.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let table = &text[text.find("table inet lorehouse_sbx {\n").unwrap()..];
-                *self.0.live.lock().unwrap() = Some(table.to_string());
-                Ok(())
-            })
-        }
-    }
-
     #[tokio::test]
     async fn a_flushed_or_changed_table_is_loaded_again_or_boots_stop() {
+        use super::fake::{Fake, Shared};
         use std::sync::atomic::Ordering::SeqCst;
         let fake = std::sync::Arc::new(Fake::default());
         let fw = super::Firewall::with("enp2s0", 2, Box::new(Shared(fake.clone())));
@@ -691,11 +781,19 @@ mod tests {
         fw.ensure().await.unwrap();
         fw.ensure().await.unwrap();
         assert_eq!(fake.loads.load(SeqCst), 4);
-        // Shutting down: teardown removes it, and nothing puts it back.
-        fw.close().await;
-        *fake.live.lock().unwrap() = None;
+        // nft failing to list it once: tried again, and in place, nothing to do.
+        fake.unreadable.store(1, SeqCst);
         fw.ensure().await.unwrap();
         assert_eq!(fake.loads.load(SeqCst), 4);
+        // Failing on and on: not assumed fine, loaded again.
+        fake.unreadable.store(3, SeqCst);
+        fw.ensure().await.unwrap();
+        assert_eq!(fake.loads.load(SeqCst), 5);
+        // Shutting down: teardown removes it, nothing puts it back, and no boot passes.
+        fw.close().await;
+        *fake.live.lock().unwrap() = None;
+        assert!(fw.ensure().await.unwrap_err().contains("shutting down"));
+        assert_eq!(fake.loads.load(SeqCst), 5);
     }
 
     #[test]

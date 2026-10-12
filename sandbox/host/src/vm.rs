@@ -626,6 +626,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn no_vm_boots_while_the_network_rules_are_gone() {
+        use crate::net::fake::{Fake, Shared};
+        let dir = std::env::temp_dir().join(format!("sandboxd-fw-boot-{}", std::process::id()));
+        let fake = std::sync::Arc::new(Fake::default());
+        // The table was never loaded and can't be: every boot is refused before anything
+        // (disk, jail, tap, VMM) is made, and main's watch is woken to stop the rest.
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let fw = crate::net::Firewall::with("lo", 2, Box::new(Shared(fake.clone())));
+        let vms = super::Manager::new(config(&dir), std::sync::Arc::new(crate::jail::tests::host()), crate::quota::Quota::Off, fw.clone());
+        let Err((status, msg)) = vms.acquire("t1").await else { panic!("booted without rules") };
+        assert_eq!(status, 500);
+        assert!(msg.contains("network rules"), "{msg}");
+        assert!(!dir.join("state/t1").exists(), "a disk was made");
+        assert_eq!(vms.running_count().await, 0, "the slot was given back");
+        tokio::time::timeout(Duration::from_secs(1), fw.alarm.notified()).await.expect("the watch was woken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_vm_has_its_network_and_disk_rates_capped() {
         let mut cfg = config(std::path::Path::new("/s"));
