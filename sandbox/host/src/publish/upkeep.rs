@@ -24,8 +24,12 @@
 //!   evicted or dropped.
 //!   Before refusing, mirrors idle for over `evict_idle` are dropped, least recently used
 //!   first, until the mirrors use at most 80% of `mirrors_max` and the floor holds.
-//! - **Status.** Sizes are measured after every job, gc and upkeep pass, and kept; the
-//!   status reads what was kept, never the disk.
+//! - **Status.** Sizes are measured after every job (a failed refresh and a push's gc
+//!   included), gc and upkeep pass, and kept; the status reads what was kept, never the disk.
+//!   The kept sizes are a cache, by design: anything else that changes a mirror (git on its
+//!   own, an operator) shows at the next measurement, at the latest the next upkeep pass
+//!   (every 5 minutes). The quotas are enforced against it at admission and again after
+//!   each fetch, so a lag of one pass can't let a mirror grow without bound.
 //!
 //! What a mirror was last used for is kept in it, in `sandboxd.json` (git ignores the file).
 
@@ -454,12 +458,15 @@ impl Publisher {
         self.make_room(dir, owner, name, 0, bytes)
     }
 
-    /// A refresh failed: counted if it ran out of time, and forgotten if the mirror is gone.
+    /// A refresh failed: counted if it ran out of time, forgotten if the mirror is gone, and
+    /// measured again if not (what the failed fetch left counts at once, not at the next pass).
     pub(super) fn refresh_failed(&self, dir: &Path, error: &str) {
         if error.contains(" took over ") {
             self.stats().refresh_timeouts += 1;
         }
-        if !dir.join("HEAD").exists() {
+        if dir.join("HEAD").exists() {
+            self.measure(dir);
+        } else {
             self.forget(dir);
         }
     }
