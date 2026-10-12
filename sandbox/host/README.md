@@ -102,6 +102,8 @@ get out of its VM, and what it lands in should hold as little as possible.
 | devices | `/dev/kvm` and `/dev/net/tun`, beyond the standard pseudo-devices (`DevicePolicy=closed`; `ProtectClock` adds read access to the RTC) |
 | sockets | `AF_UNIX` (vsock, API), `AF_INET`/`AF_INET6` (Lorehouse, GitHub), `AF_NETLINK` (ip, nft) |
 | kernel | tunables, modules, logs, clock, hostname and cgroups read-only or out of reach; `@system-service` system calls only, without `@privileged` and `@resources`; no W+X memory, no namespaces, no realtime, no set-uid files |
+| stop | `KillMode=mixed`: only sandboxd gets the SIGTERM and stops each VM after the guest's sync. Firecracker dies on SIGTERM, so the default (`control-group`) killed every VM before its disk cache was flushed |
+
 Because of that, the host sets up two things sandboxd used to do itself:
 `net.ipv4.ip_forward=1` ([`sandboxd.sysctl.conf`](sandboxd.sysctl.conf); sandboxd checks
 it at start and refuses to run without it) and the modules for taps and nftables
@@ -111,6 +113,12 @@ it at start and refuses to run without it) and the modules for taps and nftables
 after** (systemd 261, 2026-10-12). What still counts against it is what the job needs:
 root, the host's network, `/dev/kvm`, internet and netlink sockets. Cargo tests parse the
 unit (`src/service_unit.rs`), so dropping one of the directives they check fails CI.
+
+Verified on starship (2026-10-12, Firecracker 1.10.1, systemd 261): a VM boots under the
+unit and reaches GitHub; Firecracker runs with `CapEff` `CAP_NET_ADMIN` only,
+`NoNewPrivs` 1 and `Seccomp` 2. A file the guest wrote just before `systemctl stop`
+(not yet flushed) was there after the next boot; with `KillMode=control-group` it was
+lost.
 
 ## Measured
 

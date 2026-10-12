@@ -105,3 +105,11 @@ fn the_kernel_is_out_of_reach() {
         assert!(after.contains(unit), "After= lacks {unit}");
     }
 }
+
+#[test]
+fn a_stop_reaches_sandboxd_before_the_vms() {
+    // control-group (the default) would SIGTERM every Firecracker too, and Firecracker
+    // dies on SIGTERM, before the guest's sync.
+    assert_eq!(one("KillMode"), "mixed");
+    assert_eq!(one("KillSignal"), "SIGTERM");
+}
