@@ -52,8 +52,8 @@ const CLOCK_SLACK: u64 = 300;
 const GIT_LOCAL: Duration = Duration::from_secs(120);
 const GIT_NETWORK: Duration = Duration::from_secs(600);
 /// How old a temporary file in a mirror (git's partial packs, a stage's bundle) must be
-/// before prune() removes it. Nothing else writes to a mirror while its lock is held; this
-/// is a margin, for a git process a cut-off job left behind that hasn't died yet.
+/// before prune() removes it. Nothing else writes to a mirror while its lock is held (a git
+/// command that is cut off is killed with its helpers, Group); this is a margin.
 const GARBAGE_AGE: Duration = Duration::from_secs(10 * 60);
 /// `gc --auto` as push runs it: git's own thresholds (6700 loose objects, 50 packs), which
 /// the guarded environment turns off for every other command (gc.auto=0). In the foreground
@@ -187,6 +187,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
     let mut cmd = git_command(dir, args, token);
     let work = async {
         let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+        let mut group = Group(child.id());
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
@@ -200,6 +201,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
         let mut out = Vec::new();
         stdout.take(cap as u64 + 1).read_to_end(&mut out).await.map_err(|e| format!("git {}: {e}", args[0]))?;
         if out.len() > cap {
+            group.kill();
             let _ = child.kill().await;
             errors.abort();
             let mut cut = cap;
@@ -210,6 +212,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
             return Ok((String::from_utf8_lossy(&out).into_owned(), true));
         }
         let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+        group.0 = None;
         let err = errors.await.unwrap_or_default();
         if !status.success() {
             return Err(format!("git {}: {}", args[0], tail(&err)));
@@ -228,8 +231,12 @@ async fn git_says(dir: &Path, args: &[&str]) -> Option<bool> {
     let mut cmd = git_command(dir, args, None);
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().ok()?;
+    let mut group = Group(child.id());
     match tokio::time::timeout(GIT_LOCAL, child.wait()).await {
-        Ok(Ok(status)) => Some(status.success()),
+        Ok(Ok(status)) => {
+            group.0 = None;
+            Some(status.success())
+        }
         _ => None,
     }
 }
@@ -242,6 +249,7 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
     let mut cmd = git_command(dir, args, None);
     let work = async {
         let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+        let mut group = Group(child.id());
         let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
@@ -260,6 +268,7 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
             hash.update(&buf[..n]);
         }
         let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+        group.0 = None;
         let err = errors.await.unwrap_or_default();
         if !status.success() {
             return Err(format!("git {}: {}", args[0], tail(&err)));
@@ -308,8 +317,33 @@ fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
     for (i, (k, v)) in config.iter().enumerate() {
         cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // In a process group of its own, so a command that is cut off is stopped with all of
+    // its helpers (Group).
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     cmd
+}
+
+/// A git command's process group (git_command gives each its own; the id is the command's
+/// pid), killed whole if this is dropped before the command was waited for: a command that
+/// timed out, or whose job was cut off. Killing the command alone would leave its helpers
+/// running (a fetch's git-remote-https and index-pack, a gc's repack), still writing to the
+/// mirror after its lock is released. Cleared once the command has been waited for: its id
+/// may then be reused.
+struct Group(Option<u32>);
+
+impl Group {
+    fn kill(&mut self) {
+        use std::process::Stdio;
+        if let Some(id) = self.0.take() {
+            let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{id}")]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 
@@ -1483,6 +1517,30 @@ mod tests {
         assert!(packed.exists(), "the mirror is still there");
         std::fs::write(&packed, refs).unwrap();
         sh(&dir, "git rev-parse --verify -q refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_is_cut_off_is_stopped_with_its_helpers() {
+        // The connection to the server is held by git-remote-http, a child of the fetch:
+        // it closes only when that helper is gone too.
+        let s = scratch("helpers");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hanging = Publisher::new(s.root.join("mirrors"), format!("http://{addr}"));
+        let dir = hanging.mirror("acme", "slow");
+        let fetch = tokio::spawn(async move {
+            let cut = tokio::time::timeout(Duration::from_millis(1500), hanging.update_mirror(&dir, "acme", "slow", None)).await;
+            assert!(cut.is_err(), "the fetch was cut off: {cut:?}");
+        });
+        let (mut conn, _) = listener.accept().await.unwrap();
+        fetch.await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 4096];
+            while conn.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        })
+        .await;
+        assert!(closed.is_ok(), "a helper of the fetch still holds the connection");
     }
 
     #[tokio::test]
