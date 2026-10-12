@@ -1528,12 +1528,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let hanging = Publisher::new(s.root.join("mirrors"), format!("http://{addr}"));
         let dir = hanging.mirror("acme", "slow");
-        let fetch = tokio::spawn(async move {
-            let cut = tokio::time::timeout(Duration::from_millis(1500), hanging.update_mirror(&dir, "acme", "slow", None)).await;
-            assert!(cut.is_err(), "the fetch was cut off: {cut:?}");
-        });
-        let (mut conn, _) = listener.accept().await.unwrap();
-        fetch.await.unwrap();
+        let fetch = tokio::spawn(async move { hanging.update_mirror(&dir, "acme", "slow", None).await });
+        // Cut off once it has connected: the job's future is dropped.
+        let accepted = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await;
+        fetch.abort();
+        let (mut conn, _) = accepted.expect("the fetch connects").unwrap();
+        assert!(fetch.await.unwrap_err().is_cancelled(), "the fetch was cut off");
         let closed = tokio::time::timeout(Duration::from_secs(10), async {
             use tokio::io::AsyncReadExt;
             let mut buf = [0u8; 4096];
