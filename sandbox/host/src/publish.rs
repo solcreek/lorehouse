@@ -1947,6 +1947,19 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn garbage_is_counted_only_where_git_and_a_stage_leave_it() {
+        let s = scratch("garbagebytes");
+        let dir = s.dir();
+        sh(&s.vm, "git push -q origin HEAD:refs/heads/tmp_pack_release");
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        assert!(dir.join("refs/heads/tmp_pack_release").is_file());
+        assert_eq!(RealDisk.usage(&dir).1, 0, "a branch is not garbage");
+        std::fs::write(dir.join("objects/pack/tmp_pack_x"), [0u8; 100]).unwrap();
+        std::fs::write(dir.join("stage-x.bundle"), [0u8; 10]).unwrap();
+        assert_eq!(RealDisk.usage(&dir).1, 110);
+    }
+
     #[test]
     fn a_temp_file_is_removed_when_dropped() {
         let path = std::env::temp_dir().join(format!("publish-tempfile-{}", std::process::id()));

@@ -101,24 +101,27 @@ pub struct RealDisk;
 
 impl Disk for RealDisk {
     fn usage(&self, dir: &Path) -> (u64, u64) {
-        fn walk(dir: &Path, top: bool, sum: &mut (u64, u64)) {
-            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        // Garbage by the names remove_garbage() goes by, each only where that file lives (a
+        // branch may be called tmp_pack_x).
+        fn walk(top: &Path, place: &Path, sum: &mut (u64, u64)) {
+            let packs = place == top.join("objects").join("pack");
+            for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
                 // DirEntry::metadata doesn't follow a symlink.
                 let Ok(meta) = entry.metadata() else { continue };
                 if meta.is_dir() {
-                    walk(&entry.path(), false, sum);
+                    walk(top, &entry.path(), sum);
                     continue;
                 }
                 sum.0 += meta.len();
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_") || (top && name.starts_with("stage-") && name.ends_with(".bundle")) {
+                if (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_"))) || (place == top && name.starts_with("stage-") && name.ends_with(".bundle")) {
                     sum.1 += meta.len();
                 }
             }
         }
         let mut sum = (0, 0);
-        walk(dir, true, &mut sum);
+        walk(dir, dir, &mut sum);
         sum
     }
 
