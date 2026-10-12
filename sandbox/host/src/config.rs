@@ -42,7 +42,7 @@ pub struct Config {
 }
 
 /// Where sandboxes live unless SANDBOXD_STATE says otherwise; sandboxd.service's
-/// ReadWritePaths= names the same directory.
+/// StateDirectory= creates this directory and makes it writable.
 pub const DEFAULT_STATE: &str = "/var/lib/lorehouse-sandboxes";
 
 fn var(key: &str) -> Option<String> {
