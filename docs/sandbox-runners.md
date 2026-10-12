@@ -240,7 +240,8 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
     never wait for it and run at once, so mirrors growing together can pass the total by
     what those stages fetch (their refresh and their bundle: about 10 KB for a typical
     stage, measured in #76, more for an artifact-sized one). A check that finds it over
-    refuses the stage, but what it brought stays until the gc or an eviction.
+    refuses the stage: its bundle is collected by the gc (at once if artifact-sized), and
+    its refresh stays with the mirror until it is evicted or dropped.
   - Every mirror is measured at start, before any job is taken. The upkeep runs then and
     every 5 minutes, plus after every stage and push.
 - **Failures** come back as statuses with a reason:

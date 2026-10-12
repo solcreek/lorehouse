@@ -19,8 +19,9 @@
 //!   second new repo waits for the first's fetch. Stages of existing mirrors don't wait, and
 //!   run at once: those growing together can pass the total by what those stages fetch (the
 //!   refresh and the bundle: about 10 KB for a typical stage, measured; more for an
-//!   artifact-sized one). A check that finds it over refuses the stage; what it brought stays
-//!   until the gc or an eviction.
+//!   artifact-sized one). A check that finds it over refuses the stage: its bundle is
+//!   collected by the gc (at once if heavy), its refresh stays with the mirror until it is
+//!   evicted or dropped.
 //!   Before refusing, mirrors idle for over `evict_idle` are dropped, least recently used
 //!   first, until the mirrors use at most 80% of `mirrors_max` and the floor holds.
 //! - **Status.** Sizes are measured after every job, gc and upkeep pass, and kept; the
