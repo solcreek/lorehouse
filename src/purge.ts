@@ -1,8 +1,9 @@
 // purge.ts — a channel taken off AGENT_CHANNELS leaves Lorehouse (#82). On start, before
 // the app listens, everything kept for a Slack channel no longer listed goes:
 //   • its threads in the knowledge index (`slack:<channel>:…`, kind slack_thread), through
-//     deleteDocument, the path a deleted message takes, so the text leaves the database
-//     file too (migrations/0010_fts_secure_delete.sql); seeds are not Slack and stay
+//     deleteDocument, the path a deleted message takes, so the text leaves LOREHOUSE_DB's
+//     files too, the -wal included (secure_delete, migrations/0010_fts_secure_delete.sql;
+//     checkpointSoon); seeds are not Slack and stay
 //   • the threads the agent was asked into there (agent_threads), so follow-ups stop
 //   • its ingest cursor, so listing it again reads its history afresh
 //   • usage's asks and searches there, as for a deleted question (usage.ts, forgetAsk):
@@ -10,9 +11,16 @@
 // A 👍/👎 (agent_feedback) stays until retention: it holds no text and no thread. An empty
 // list purges everything learned from Slack.
 //
-// Not here: June's saved conversations in SESSIONS_DB (the agent's turns in those
-// threads, with what it quoted). They are the framework's tables, which Lorehouse code
-// doesn't touch (AGENTS.md); they are no longer reachable once the channel is unlisted.
+// Other copies of the channel's text can remain, among them:
+//   • usage records this doesn't match by channel (a search can repeat its words), until
+//     pruneUsage drops them past USAGE_RETENTION_DAYS (#98);
+//   • June's saved conversations in SESSIONS_DB: every turn's full tool results (whole
+//     search results, not only what was quoted) and answers. They are the framework's
+//     tables, which Lorehouse code doesn't touch (AGENTS.md). The channel's own threads are
+//     no longer answered once it is unlisted, but any conversation whose search returned
+//     its text sends that text to the model again on every later turn (#66 POC: 3 copies in
+//     each request of a follow-up in a listed channel's thread), until June supports
+//     redaction (junebuild/june#360). Deleting SESSIONS_DB with the app stopped erases them.
 //
 // pendingPurge counts the same rows without changing anything, for `lorehouse doctor`.
 
