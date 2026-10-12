@@ -197,6 +197,18 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
 - **Every git command** on the host runs with no user or system config, no prompts, no
   replace objects and no hooks. A token travels as an HTTP header in the command's
   environment, never in argv. Tokens are in jobs only, never logged or recorded.
+- **A mirror is written by one job at a time**, under its lock. Git's automatic maintenance
+  is off (`maintenance.auto=false`, `gc.auto=0`): it runs detached, after the lock is
+  released, and a gc from outside the lock was seen to wedge a mirror (#76). A git command
+  that times out or whose job is cut off is stopped with its helpers (its process group:
+  SIGTERM, then SIGKILL within 2 s), and the lock is held until none of them is left, so
+  none writes to the mirror after the lock is released. After a stage
+  or push that runs to its end, and after a failed refresh, the housekeeping also removes
+  what a git process that died or was killed left once it is older than 10 minutes (partial
+  packs `tmp_pack_*` and `tmp_idx_*`, lock files `*.lock`, stage bundles), and any
+  `refs/stage/` ref whose object is missing. A lock file or such a ref fails every fetch
+  until it is gone, so a failed refresh that removed one is retried once. A mirror with no
+  refs yet (its first fetch failed or was cut off) is removed.
 - **Failures** come back as statuses with a reason:
   - 409: nothing new to publish, or a branch that has moved on.
   - 404: the base isn't on GitHub, or the stage isn't there (never completed, already

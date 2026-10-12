@@ -14,9 +14,15 @@
 //! The mirror's refs/stage/<id> refs exist for git's sake (they keep a stage's objects from
 //! being collected); they authorize nothing.
 //!
-//! Every git command here runs with no user or system config, no prompts, no replace objects
-//! and no hooks. A token travels as an HTTP header in the command's environment, never in
-//! argv or a file.
+//! Every git command here runs with no user or system config, no prompts, no replace objects,
+//! no hooks and no maintenance of git's own. A token travels as an HTTP header in the
+//! command's environment, never in argv or a file.
+//!
+//! A mirror is only ever written by one job at a time, under its lock: a stage, a push, and
+//! the housekeeping after either (prune). Git's automatic maintenance is off, because it runs
+//! detached, after the lock is released: a `gc --prune=now` from outside the lock was seen to
+//! leave a `refs/stage/<id>` pointing at a pack it had removed, after which every fetch into
+//! the mirror failed (#76).
 
 use crate::vm::{self, Manager};
 use crate::vsock;
@@ -29,7 +35,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 /// The bundle comes out of the VM in parts, each under guestd's 16 MiB file limit.
 const PART: u64 = 12 << 20;
@@ -45,6 +51,15 @@ const STAGE_TTL: Duration = Duration::from_secs(24 * 3600);
 const CLOCK_SLACK: u64 = 300;
 const GIT_LOCAL: Duration = Duration::from_secs(120);
 const GIT_NETWORK: Duration = Duration::from_secs(600);
+/// How old a temporary file in a mirror (git's partial packs, a stage's bundle) must be
+/// before prune() removes it. Nothing else writes to a mirror while its lock is held (a git
+/// command that is cut off is stopped with its helpers before the lock is released,
+/// Running); this is a margin.
+const GARBAGE_AGE: Duration = Duration::from_secs(10 * 60);
+/// `gc --auto` as push runs it: git's own thresholds (6700 loose objects, 50 packs), which
+/// the guarded environment turns off for every other command (gc.auto=0). In the foreground
+/// (gc.autoDetach=false, also from the environment), so it finishes under the lock.
+const GC_AUTO: &[&str] = &["-c", "gc.auto=6700", "gc", "--auto", "-q"];
 /// Where the checkout lives in every VM (Lorehouse's WORKDIR).
 const WORKDIR: &str = "/workspace/repo";
 
@@ -172,8 +187,8 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
     use tokio::io::AsyncReadExt;
     let mut cmd = git_command(dir, args, token);
     let work = async {
-        let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
-        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let mut child = Running::spawn(&mut cmd).map_err(|e| format!("git: {e}"))?;
+        let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
         // stderr on its own task, so a command stopped for too much stdout isn't left
@@ -186,7 +201,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
         let mut out = Vec::new();
         stdout.take(cap as u64 + 1).read_to_end(&mut out).await.map_err(|e| format!("git {}: {e}", args[0]))?;
         if out.len() > cap {
-            let _ = child.kill().await;
+            child.stop();
             errors.abort();
             let mut cut = cap;
             while cut > 0 && (out[cut] & 0xC0) == 0x80 {
@@ -208,6 +223,18 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
     }
 }
 
+/// One git command, in `dir`, in the guarded environment, for its answer alone: whether it
+/// succeeded, or None if it couldn't run or didn't finish within GIT_LOCAL.
+async fn git_says(dir: &Path, args: &[&str]) -> Option<bool> {
+    let mut cmd = git_command(dir, args, None);
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut child = Running::spawn(&mut cmd).ok()?;
+    match tokio::time::timeout(GIT_LOCAL, child.wait()).await {
+        Ok(Ok(status)) => Some(status.success()),
+        _ => None,
+    }
+}
+
 /// One git command, in `dir`, in the guarded environment: the SHA-256 (hex) of all of its
 /// stdout, however long, read as it comes and never kept.
 async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
@@ -215,8 +242,8 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
     use tokio::io::AsyncReadExt;
     let mut cmd = git_command(dir, args, None);
     let work = async {
-        let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
-        let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let mut child = Running::spawn(&mut cmd).map_err(|e| format!("git: {e}"))?;
+        let (Some(mut stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
         let errors = tokio::spawn(async move {
@@ -247,7 +274,8 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
 }
 
 /// git, in `dir`, with no user or system config, no prompts, no replace objects, no hooks,
-/// fsck on fetch, and the token (if any) as an HTTP header; stdout and stderr piped.
+/// fsck on fetch, no automatic maintenance, and the token (if any) as an HTTP header; stdout
+/// and stderr piped.
 fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
     use std::process::Stdio;
     let mut cmd = Command::new("git");
@@ -265,6 +293,14 @@ fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
         ("fetch.fsckObjects", "true".into()),
         ("transfer.fsckObjects", "true".into()),
         ("credential.helper", String::new()),
+        // No maintenance git starts on its own: a fetch ends with a detached `git
+        // maintenance run --auto` (traced on git 2.55 in #76), which would write to the
+        // mirror after the lock is released. A gc sandboxd asks for runs in the foreground,
+        // so under the lock.
+        ("maintenance.auto", "false".into()),
+        ("gc.auto", "0".into()),
+        ("gc.autoDetach", "false".into()),
+        ("maintenance.autoDetach", "false".into()),
     ];
     if let Some(t) = token {
         config.push(("http.extraHeader", format!("Authorization: Basic {}", B64.encode(format!("x-access-token:{t}")))));
@@ -273,10 +309,96 @@ fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
     for (i, (k, v)) in config.iter().enumerate() {
         cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // In a process group of its own, so a command that is cut off is stopped with all of
+    // its helpers (Running).
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     cmd
 }
 
+/// How long a cut-off git command's process group has after SIGTERM before it gets SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+/// After SIGKILL, how long before a group still not gone is logged (it is waited for anyway).
+const STOP_LOG_AFTER: Duration = Duration::from_secs(5);
+
+/// A running git command, the leader of a process group of its own (git_command). Dropped
+/// before it was waited for (it timed out, or its job was cut off) or stopped, the whole
+/// group is stopped: SIGTERM, SIGKILL once the leader exits or after STOP_GRACE, and drop()
+/// returns only once no process of the group is left, however long that takes. Killing the
+/// command alone would leave its helpers (a fetch's git-remote-https and index-pack, a gc's
+/// repack) writing to the mirror. A job's future holds the mirror's lock longer than the command it is running
+/// (the lock is taken first, so it is dropped last), so the lock is never released with one
+/// of them alive. drop() blocks its thread for that while: until the leader exits, two
+/// seconds at most, unless a process then can't die even of SIGKILL.
+struct Running {
+    child: Child,
+    /// None once the command has been waited for (its id may then be reused) or stopped.
+    group: Option<libc::pid_t>,
+}
+
+impl Running {
+    fn spawn(cmd: &mut Command) -> std::io::Result<Running> {
+        let child = cmd.spawn()?;
+        let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+        Ok(Running { child, group })
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        self.group = None;
+        Ok(status)
+    }
+
+    /// Stop the whole group, and wait until it is gone. The leader is reaped only once both
+    /// signals are sent: until then it holds the group's id (as a zombie, if it has exited),
+    /// so neither signal can reach a group that reused the id.
+    fn stop(&mut self) {
+        let Some(group) = self.group.take() else { return };
+        let sleep = || std::thread::sleep(Duration::from_millis(10));
+        // SAFETY: killpg() signals the group this command leads, whose id its unreaped leader
+        // holds.
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+        // STOP_GRACE to stop on SIGTERM; cut short when the leader has exited, as git does at
+        // once (its helpers got the same signal at the same moment).
+        let start = std::time::Instant::now();
+        while !exited(group) && start.elapsed() < STOP_GRACE {
+            sleep();
+        }
+        // SAFETY: as above; the leader is still unreaped.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        let start = std::time::Instant::now();
+        let mut logged = false;
+        loop {
+            // Reap the leader: a zombie still counts in its group.
+            let _ = self.child.try_wait();
+            // SAFETY: kill() with signal 0 only checks whether the group has a process left.
+            let left = unsafe { libc::kill(-group, 0) };
+            if left != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            if !logged && start.elapsed() >= STOP_LOG_AFTER {
+                logged = true;
+                eprintln!("sandboxd: git process group {group} is still there {} s after SIGKILL; its mirror stays locked until it is gone", STOP_LOG_AFTER.as_secs());
+            }
+            sleep();
+        }
+    }
+}
+
+/// Whether process `pid`, a child of this one, has exited, without reaping it.
+fn exited(pid: libc::pid_t) -> bool {
+    // SAFETY: waitid() writes into the zeroed struct it is given; WNOWAIT leaves the child
+    // unreaped.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) == 0 && info.si_pid() != 0
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 /// A file removed when this is dropped.
 struct TempFile(PathBuf);
@@ -290,6 +412,57 @@ impl Drop for TempFile {
 /// Sync a directory, so the entries just created, renamed or removed in it survive a crash.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// Remove a mirror. Its owner's directory stays: another repo of the same owner may be
+/// creating its mirror in it, under its own lock.
+fn remove_mirror(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A mirror whose first fetch hasn't completed, removed when this is dropped unless it was
+/// kept: a first fetch that fails, times out or is cut off by the job's deadline leaves no
+/// partial pack behind (one of next.js was 2.3 GB, #76). Dropped under the mirror's lock.
+struct NewMirror<'a>(Option<&'a Path>);
+
+impl Drop for NewMirror<'_> {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0 {
+            remove_mirror(dir);
+        }
+    }
+}
+
+/// Remove what a git process that died or was killed leaves in a mirror, once it is older
+/// than GARBAGE_AGE: its partial packs (`objects/pack/tmp_pack_*`, `tmp_idx_*`, up to the
+/// size of what it was fetching), its lock files (`*.lock`: a `refs/heads/<b>.lock` or
+/// `packed-refs.lock` fails every later fetch), and stage bundles a crash left. Each name is
+/// matched only where that file lives: a branch may be called `tmp_pack_x` or
+/// `stage-x.bundle`, but no ref name ends in `.lock`. Whether it removed a lock file.
+fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
+    fn walk(top: &Path, place: &Path, now: SystemTime, unlocked: &mut bool) {
+        let packs = place == top.join("objects").join("pack");
+        for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                walk(top, &entry.path(), now, unlocked);
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let lock = name.ends_with(".lock");
+            let garbage = lock
+                || (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_")))
+                || (place == top && name.starts_with("stage-") && name.ends_with(".bundle"));
+            let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > GARBAGE_AGE));
+            if garbage && kind.is_file() && old() && std::fs::remove_file(entry.path()).is_ok() {
+                *unlocked |= lock;
+            }
+        }
+    }
+    let mut unlocked = false;
+    walk(dir, dir, now, &mut unlocked);
+    unlocked
 }
 
 fn unix_secs() -> u64 {
@@ -412,6 +585,25 @@ impl Publisher {
         Ok(())
     }
 
+    /// refresh(), and what a failed one needs, under the mirror's lock: the housekeeping
+    /// (prune), and once more if that removed what fails every fetch into the mirror until
+    /// it is gone (a stage ref to a missing object, a lock file a killed git left). A mirror
+    /// with no refs yet (its first fetch didn't complete), failed or cut off, is removed.
+    async fn update_mirror(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
+        // New only when git said so: a for-each-ref that couldn't run or failed says nothing
+        // about the mirror, and a failed refresh mustn't remove one that has been fetched.
+        let new = !dir.join("HEAD").exists() || matches!(git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty());
+        let mut new = NewMirror(new.then_some(dir));
+        let mut updated = self.refresh(dir, owner, name, token).await;
+        if updated.is_err() && self.prune(dir).await {
+            updated = self.refresh(dir, owner, name, token).await;
+        }
+        if updated.is_ok() {
+            new.0 = None;
+        }
+        updated
+    }
+
     /// Stage the commits the sandbox has that GitHub doesn't: read, verify, describe, and
     /// record the stage.
     pub async fn stage(&self, vms: &Manager, sandbox: &str, req: StageRequest) -> Result<Staged, Failure> {
@@ -421,7 +613,7 @@ impl Publisher {
         let dir = self.mirror(&req.owner, &req.name);
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
-        self.refresh(&dir, &req.owner, &req.name, req.token.as_deref()).await.map_err(|e| (502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)))?;
+        self.update_mirror(&dir, &req.owner, &req.name, req.token.as_deref()).await.map_err(|e| (502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)))?;
         let id = new_stage_id().map_err(|e| (500, e))?;
         // Removed however this ends, a deadline that drops this future included.
         let bundle = TempFile(dir.join(format!("stage-{id}.bundle")));
@@ -613,16 +805,20 @@ impl Publisher {
             let status = if e.contains("non-fast-forward") || e.contains("[rejected]") || e.contains("fetch first") { 409 } else { 502 };
             return Err((status, format!("push to {}: {e}", record.branch)));
         }
-        let _ = git(&dir, &["gc", "--auto", "-q"], None, GIT_LOCAL).await;
+        let _ = git(&dir, GC_AUTO, None, GIT_LOCAL).await;
         Ok(Pushed { sha: record.sha, branch: record.branch })
     }
 
-    /// Housekeeping, never authorization: drop expired records (all repos'), and this
-    /// mirror's stage refs that are expired or have no record (a stage that failed, was cut
-    /// off, or was pushed). Runs under the mirror's lock, so no stage of this mirror is
-    /// between its ref and its record. Any failure here only leaves garbage behind.
-    async fn prune(&self, dir: &Path) {
+    /// Housekeeping, never authorization: drop expired records (all repos'), this mirror's
+    /// stage refs that are expired, have no record (a stage that failed, was cut off, or was
+    /// pushed) or name a missing object, and what dead git processes left (remove_garbage).
+    /// Runs under the mirror's lock, so no stage of this mirror is between its ref and its
+    /// record, and no git command is running in it. Any failure here only leaves garbage
+    /// behind. Whether it removed something that fails every fetch (a ref to a missing
+    /// object, a lock file).
+    async fn prune(&self, dir: &Path) -> bool {
         let now = unix_secs();
+        let mut repaired = remove_garbage(dir, SystemTime::now());
         if let Ok(entries) = std::fs::read_dir(self.records()) {
             for entry in entries.flatten() {
                 let file = entry.file_name();
@@ -633,16 +829,22 @@ impl Publisher {
                 }
             }
         }
-        for name in git(dir, &["for-each-ref", "--format=%(refname)", "refs/stage/"], None, GIT_LOCAL).await.unwrap_or_default().lines() {
+        // for-each-ref lists a ref whose object is missing too, with the id it names.
+        for line in git(dir, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/stage/"], None, GIT_LOCAL).await.unwrap_or_default().lines() {
+            let Some((name, oid)) = line.split_once(' ') else { continue };
             let id = name.trim_start_matches("refs/stage/");
             let stale = match stage_secs(id) {
                 Some(t) => expired(t, now) || matches!(std::fs::metadata(self.record_path(id)), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
                 None => true,
             };
-            if stale {
-                let _ = git(dir, &["update-ref", "-d", name], None, GIT_LOCAL).await;
+            // Missing only when git ran and said so; a git that couldn't run or timed out
+            // says nothing about the ref.
+            let missing = git_says(dir, &["cat-file", "-e", oid]).await == Some(false);
+            if (stale || missing) && git(dir, &["update-ref", "-d", name], None, GIT_LOCAL).await.is_ok() {
+                repaired |= missing;
             }
         }
+        repaired
     }
 }
 
@@ -1243,6 +1445,246 @@ mod tests {
         let mut files = staged.files.clone();
         files.sort();
         assert_eq!(files, vec![".github/workflows/ci.yml", "docs/CODEOWNERS", "old/CODEOWNERS", "old/ci.yml", "we\tird\n\"é"]);
+    }
+
+    /// Set a file's modification time `secs` seconds back.
+    fn age(path: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs)).unwrap();
+    }
+
+    fn packs(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("objects/pack")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".pack")).count()
+    }
+
+    #[tokio::test]
+    async fn no_git_command_starts_maintenance_of_its_own() {
+        // A fetch ends with a detached `git maintenance run --auto` (gc --auto on older
+        // gits) unless the config says not to; detached, it outlives the mirror's lock.
+        let s = scratch("maintenance");
+        s.publisher.refresh(&s.dir(), "acme", "widgets", None).await.unwrap();
+        for (key, want) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false"), ("maintenance.autoDetach", "false")] {
+            let got = git(&s.dir(), &["config", "--get", key], None, GIT_LOCAL).await;
+            assert_eq!(got.as_deref().map(str::trim), Ok(want), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_still_collects_a_mirror_with_many_packs_before_it_answers() {
+        // gc.auto=0 everywhere else; push's own `gc --auto` keeps git's thresholds, and runs
+        // in the foreground, under the lock.
+        let s = scratch("gcauto");
+        sh(&s.vm, "echo g > g && git add g && git commit -qm g");
+        let staged = s.stage("scout/g").await.unwrap();
+        sh(&s.dir(), "for i in $(seq 1 55); do echo $i | git hash-object --stdin -w | git pack-objects -q objects/pack/pack >/dev/null; done");
+        assert!(packs(&s.dir()) > 50, "{}", packs(&s.dir()));
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/g")).await.unwrap();
+        assert!(packs(&s.dir()) <= 2, "{}", packs(&s.dir()));
+    }
+
+    #[tokio::test]
+    async fn a_stage_ref_to_a_missing_object_and_stale_garbage_are_cleared_by_the_next_stage() {
+        // What an out-of-lock gc left in #76: a refs/stage ref whose pack was removed, which
+        // fails every fetch into the mirror. With it, git's partial packs and a bundle a crash
+        // left behind.
+        let s = scratch("dangling");
+        sh(&s.vm, "echo d > d && git add d && git commit -qm d");
+        let live = s.stage("scout/d").await.unwrap();
+        let dir = s.dir();
+        // A live-looking stage (a record, a fresh id), whose ref names a missing object.
+        let id = new_stage_id().unwrap();
+        std::fs::write(s.publisher.record_path(&id), b"{}").unwrap();
+        std::fs::write(dir.join(format!("refs/stage/{id}")), format!("{}\n", "1".repeat(40))).unwrap();
+        let err = s.publisher.refresh(&dir, "acme", "widgets", None).await.unwrap_err();
+        assert!(err.contains("refs/stage/"), "the mirror is wedged: {err}");
+        let pack = dir.join("objects/pack");
+        let garbage = [pack.join("tmp_pack_old"), pack.join("tmp_idx_old"), dir.join(format!("stage-{}.bundle", new_stage_id().unwrap())), dir.join("packed-refs.lock")];
+        for g in &garbage {
+            std::fs::write(g, b"x").unwrap();
+            age(g, GARBAGE_AGE.as_secs() + 60);
+        }
+        let fresh = pack.join("tmp_pack_fresh");
+        std::fs::write(&fresh, b"x").unwrap();
+        age(&fresh, 60);
+        // The next stage's refresh: it fails, the housekeeping drops the ref, and it is retried.
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        assert_eq!(s.stage_refs(), vec![format!("refs/stage/{}", live.stage)], "the live stage's ref is kept");
+        for g in &garbage {
+            assert!(!g.exists(), "{}", g.display());
+        }
+        assert!(fresh.exists(), "younger than GARBAGE_AGE: kept");
+        // The housekeeping after every job drops such a ref too, before any fetch trips on it.
+        std::fs::write(dir.join(format!("refs/stage/{id}")), format!("{}\n", "1".repeat(40))).unwrap();
+        s.publisher.prune(&dir).await;
+        assert_eq!(s.stage_refs(), vec![format!("refs/stage/{}", live.stage)]);
+        // And the stage goes on.
+        sh(&s.vm, "echo e > e && git add e && git commit -qm e");
+        s.stage("scout/d").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_first_fetch_that_fails_or_is_cut_off_leaves_no_mirror_and_a_later_one_keeps_it() {
+        let s = scratch("firstfetch");
+        let missing = s.publisher.mirror("acme", "missing");
+        // No such repo: the fetch fails.
+        s.publisher.update_mirror(&missing, "acme", "missing", None).await.unwrap_err();
+        assert!(!missing.exists());
+        // A fetch that hangs (a server that never answers), cut off by the job's deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok((c, _)) = listener.accept().await {
+                conns.push(c);
+            }
+        });
+        let hanging = Publisher::new(s.root.join("mirrors"), format!("http://{addr}"));
+        let dir = hanging.mirror("acme", "slow");
+        let cut = tokio::time::timeout(Duration::from_millis(1500), hanging.update_mirror(&dir, "acme", "slow", None)).await;
+        assert!(cut.is_err(), "the fetch was cut off: {cut:?}");
+        assert!(!dir.exists());
+        held.abort();
+        // A mirror that has been fetched once stays when a later fetch fails, packed or not
+        // (a fetch of under 100 objects leaves them loose).
+        s.publisher.update_mirror(&s.dir(), "acme", "widgets", None).await.unwrap();
+        sh(&s.dir(), "for p in objects/pack/*.pack; do mv $p unpack.tmp && rm -f ${p%.pack}.* && git unpack-objects -q < unpack.tmp && rm unpack.tmp; done");
+        std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
+        s.publisher.update_mirror(&s.dir(), "acme", "widgets", None).await.unwrap_err();
+        sh(&s.dir(), "git rev-parse --verify -q refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn a_fetched_mirror_whose_refs_cant_be_read_is_kept_when_its_refresh_fails() {
+        let s = scratch("unreadable");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        // for-each-ref fails (git won't read a packed-refs with a line it doesn't know, as
+        // any user, root included), and so does the fetch.
+        sh(&dir, "git pack-refs --all");
+        let packed = dir.join("packed-refs");
+        let refs = std::fs::read(&packed).unwrap();
+        std::fs::write(&packed, [refs.as_slice(), b"not a ref\n"].concat()).unwrap();
+        assert!(git(&dir, &["for-each-ref"], None, GIT_LOCAL).await.is_err(), "for-each-ref fails");
+        std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap_err();
+        assert!(packed.exists(), "the mirror is still there");
+        std::fs::write(&packed, refs).unwrap();
+        sh(&dir, "git rev-parse --verify -q refs/heads/main");
+    }
+
+    /// Whether any process of a group is left (a zombie included).
+    fn group_left(group: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks.
+        unsafe { libc::kill(-group, 0) == 0 }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_off_command_is_gone_with_its_helpers_before_the_mirror_lock_is_released() {
+        let s = scratch("stopgroup");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        // A git command whose helper ignores SIGTERM (as a stuck index-pack might not answer
+        // it): only SIGKILL stops it. It says its pid and its group's: git's, the shell's
+        // parent (no `ps`, which a build sandbox may not have).
+        let ids = s.root.join("helper.ids");
+        let alias = format!("alias.hang=!trap '' TERM; sleep 60 & echo $! $PPID > {}.tmp; mv {0}.tmp {0}; wait", ids.display());
+        let lock = s.publisher.lock(&dir);
+        let job = tokio::spawn({
+            let (lock, dir) = (lock.clone(), dir.clone());
+            async move {
+                let _held = lock.lock().await;
+                git(&dir, &["-c", &alias, "hang"], None, Duration::from_secs(120)).await
+            }
+        });
+        let started = std::time::Instant::now();
+        while !ids.exists() {
+            assert!(started.elapsed() < Duration::from_secs(20), "the helper started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let text = std::fs::read_to_string(&ids).unwrap();
+        let [helper, group]: [libc::pid_t; 2] = text.split_whitespace().map(|n| n.parse().unwrap()).collect::<Vec<_>>().try_into().unwrap();
+        // SAFETY: getpgid() only reads.
+        assert_eq!(unsafe { libc::getpgid(helper) }, group, "the helper is in the command's group");
+        // Whoever takes the lock next looks at once: is anything of that command left?
+        let next = tokio::spawn({
+            let lock = lock.clone();
+            async move {
+                let _held = lock.lock().await;
+                group_left(group)
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The job is cut off (its deadline drops it).
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        assert!(!next.await.unwrap(), "a process of the cut-off command was alive when the lock was released");
+        // SAFETY: signal 0 only checks.
+        assert_ne!(unsafe { libc::kill(helper, 0) }, 0, "the helper that ignored SIGTERM is gone");
+        // And the housekeeping right after has nothing live to step around.
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_is_cut_off_is_stopped_with_its_helpers() {
+        // The connection to the server is held by git-remote-http, a child of the fetch:
+        // it closes only when that helper is gone too.
+        let s = scratch("helpers");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hanging = Publisher::new(s.root.join("mirrors"), format!("http://{addr}"));
+        let dir = hanging.mirror("acme", "slow");
+        let fetch = tokio::spawn(async move { hanging.update_mirror(&dir, "acme", "slow", None).await });
+        // Cut off once it has connected: the job's future is dropped.
+        let accepted = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await;
+        fetch.abort();
+        let (mut conn, _) = accepted.expect("the fetch connects").unwrap();
+        assert!(fetch.await.unwrap_err().is_cancelled(), "the fetch was cut off");
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 4096];
+            while conn.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        })
+        .await;
+        assert!(closed.is_ok(), "a helper of the fetch still holds the connection");
+    }
+
+    #[tokio::test]
+    async fn a_lock_file_a_killed_git_left_is_cleared_and_the_refresh_retried() {
+        let s = scratch("lockfile");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        // GitHub's main moves on, and a killed git left the mirror's main locked.
+        let head = sh(&s.vm, "echo l > l && git add l && git commit -qm l && git push -q origin main && git rev-parse HEAD");
+        let lock = dir.join("refs/heads/main.lock");
+        std::fs::write(&lock, b"").unwrap();
+        // A young lock may be a git still running: left alone, and the refresh fails.
+        age(&lock, 60);
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap_err();
+        assert!(lock.exists());
+        age(&lock, GARBAGE_AGE.as_secs() + 60);
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        assert!(!lock.exists());
+        assert_eq!(sh(&dir, "git rev-parse refs/heads/main"), head);
+    }
+
+    #[tokio::test]
+    async fn branches_named_like_git_garbage_are_kept_however_old() {
+        // GitHub allows a branch called tmp_pack_x or stage-x.bundle; only where git and a
+        // stage put such files are they garbage.
+        let s = scratch("garbagenames");
+        let dir = s.dir();
+        sh(&s.vm, "for b in tmp_pack_release tmp_idx_release stage-1.bundle; do git push -q origin HEAD:refs/heads/$b; done");
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        let refs = ["refs/heads/tmp_pack_release", "refs/heads/tmp_idx_release", "refs/heads/stage-1.bundle"];
+        for r in refs {
+            let loose = dir.join(r);
+            assert!(loose.is_file(), "{r} is a loose ref");
+            age(&loose, GARBAGE_AGE.as_secs() + 60);
+        }
+        s.publisher.prune(&dir).await;
+        for r in refs {
+            assert!(dir.join(r).is_file(), "{r}");
+        }
     }
 
     #[test]
