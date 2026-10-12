@@ -18,6 +18,7 @@
 mod config;
 mod jail;
 mod net;
+mod pidfd;
 mod publish;
 mod runner;
 #[cfg(test)]
