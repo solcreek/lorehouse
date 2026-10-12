@@ -532,7 +532,7 @@ pub mod tests {
              --resource-limit no-file=2048 -- --api-sock /api.sock --config-file /vm.json"
         );
         // Firecracker's default seccomp filter stays on; it stays attached to sandboxd's
-        // process tree (no daemonizing, which would also hide it from kill_on_drop).
+        // process tree (no daemonizing: the pid sandboxd holds a pidfd for must be the VMM itself).
         for flag in ["--no-seccomp", "--seccomp-filter", "--daemonize", "--new-pid-ns"] {
             assert!(!args.iter().any(|a| a == flag), "{flag}");
         }

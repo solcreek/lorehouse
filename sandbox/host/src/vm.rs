@@ -21,11 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::pidfd::Pidfd;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-/// Firecracker processes a previous run left behind (a crash or SIGKILL gives
-/// kill_on_drop no chance). Under sandboxd.service this is a backstop: when sandboxd dies,
+/// Firecracker processes a previous run left behind (a crash or SIGKILL gives the
+/// VMMs' kill-on-drop no chance). Under sandboxd.service this is a backstop: when sandboxd dies,
 /// systemd SIGKILLs what is left in its cgroup before the restart (KillMode=mixed; seen on
 /// starship, 2026-10-12), and won't start it again while a VMM remains there. Ours are the
 /// jailed ones in our VMs' cgroup, and, from builds before the jail, unjailed ones with an
@@ -52,6 +53,13 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
             }
             vec![api.parent().unwrap_or(state_dir).join("vsock.sock")]
         };
+        // Held by a pidfd from here on, and checked again through it: if the process the
+        // scan saw is gone and its number reused, the check reads the newcomer and skips it.
+        let Ok(pidfd) = Pidfd::open(pid) else { continue };
+        let still_it = tokio::fs::read(format!("/proc/{pid}/cmdline")).await.is_ok_and(|c| c == cmdline);
+        if !still_it || pidfd.exited() {
+            continue;
+        }
         eprintln!("sandboxd: stopping a VMM left by a previous run (pid {pid}; {} socket(s) that may be its)", candidates.len());
         // Several sandboxes can hold a leftover jail for the same slot; only the live VM's
         // socket answers, so each is tried until one does.
@@ -61,20 +69,9 @@ pub async fn stop_stale_vmms(state_dir: &Path, host: &Host) {
                 break;
             }
         }
-        for _ in 0..50 {
-            if tokio::fs::metadata(format!("/proc/{pid}")).await.is_err() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if tokio::fs::metadata(format!("/proc/{pid}")).await.is_ok() {
-            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status().await;
-            for _ in 0..20 {
-                if tokio::fs::metadata(format!("/proc/{pid}")).await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+        if !pidfd.wait(Duration::from_secs(5)).await {
+            let _ = pidfd.kill();
+            let _ = pidfd.wait(Duration::from_secs(1)).await;
         }
     }
     // Their cgroups, once empty.
@@ -117,20 +114,61 @@ async fn jailed_uds(state_dir: &Path, exec_name: &str, jail_id: &str) -> Vec<Pat
     found
 }
 
-/// Wait up to `grace` for the child to exit, then SIGKILL it and wait as long again.
-/// True only once its exit has been seen: an error from wait() or kill() (the process
-/// can't be waited for) is not proof it's gone. A wait() that fails isn't followed by a
-/// kill: a pid that can't be waited for may already belong to another process.
-async fn exited_or_killed(child: &mut Child, grace: Duration) -> bool {
-    match tokio::time::timeout(grace, child.wait()).await {
-        Ok(Ok(_)) => return true,
-        Ok(Err(_)) => return false,
-        Err(_) => {}
+/// A running VMM (the jailer, which execs Firecracker in place), held by a pidfd opened
+/// right after the spawn, before anything could reap it. Its exit is seen and its kill is
+/// sent through the pidfd only, so neither can ever reach a reused pid: not after a failed
+/// wait, not when it is dropped (at shutdown, or with a boot that was given up on).
+pub(crate) struct Vmm {
+    pidfd: Pidfd,
+    /// Kept only to be reaped (no kill_on_drop: a dropped Child is reaped by tokio).
+    child: Child,
+}
+
+impl Vmm {
+    fn spawn(cmd: &mut Command) -> Result<Vmm, String> {
+        let mut child = cmd.kill_on_drop(false).spawn().map_err(|e| format!("jailer: {e}"))?;
+        let opened = child.id().ok_or_else(|| "jailer: no pid".to_string()).and_then(|pid| Pidfd::open(pid).map_err(|e| format!("pidfd: {e}")));
+        match opened {
+            Ok(pidfd) => Ok(Vmm { pidfd, child }),
+            Err(e) => {
+                // Not waited for yet, so the pid is still this child's: safe to signal.
+                let _ = child.start_kill();
+                Err(e)
+            }
+        }
     }
-    if child.start_kill().is_err() {
-        return false;
+
+    fn exited(&mut self) -> bool {
+        let gone = self.pidfd.exited();
+        if gone {
+            let _ = self.child.try_wait(); // reap; an error just means someone else did
+        }
+        gone
     }
-    matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)))
+
+    async fn wait(&mut self, grace: Duration) -> bool {
+        let gone = self.pidfd.wait(grace).await;
+        if gone {
+            let _ = self.child.try_wait();
+        }
+        gone
+    }
+}
+
+impl Drop for Vmm {
+    fn drop(&mut self) {
+        let _ = self.pidfd.kill(); // ESRCH if it has exited: the pidfd names nothing else
+    }
+}
+
+/// Wait up to `grace` for the VMM to exit, then SIGKILL it and wait as long again. True
+/// only once its exit has been seen through its pidfd.
+async fn exited_or_killed(vmm: &mut Vmm, grace: Duration) -> bool {
+    if vmm.wait(grace).await {
+        return true;
+    }
+    let _ = vmm.pidfd.kill();
+    vmm.wait(grace).await
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -142,7 +180,7 @@ fn now_secs() -> u64 {
 }
 
 struct Running {
-    child: Child,
+    vmm: Vmm,
     slot: usize,
 }
 
@@ -237,7 +275,7 @@ impl Manager {
         let mut running = sb.running.lock().await;
         let alive = match running.as_mut() {
             // An error reading its state is not proof it's gone: treat it as alive.
-            Some(r) => !matches!(r.child.try_wait(), Ok(Some(_))),
+            Some(r) => !r.vmm.exited(),
             None => false,
         };
         if !alive {
@@ -249,7 +287,7 @@ impl Manager {
                 return Err((503, format!("all {} sandboxes are busy; try again later", self.cfg.max_vms)));
             };
             match self.boot(&sb, slot).await {
-                Ok(child) => *running = Some(Running { child, slot }),
+                Ok(vmm) => *running = Some(Running { vmm, slot }),
                 Err(e) => {
                     self.release(&sb, slot).await;
                     self.forget_if_never_created(&sb).await;
@@ -274,7 +312,7 @@ impl Manager {
         }
     }
 
-    async fn boot(&self, sb: &Sandbox, slot_index: usize) -> Result<Child, String> {
+    async fn boot(&self, sb: &Sandbox, slot_index: usize) -> Result<Vmm, String> {
         let t0 = Instant::now();
         let slot = Slot { index: slot_index };
         quota::prepare_dir(&self.quota, &sb.dir).await?;
@@ -294,29 +332,28 @@ impl Manager {
         let jail = self.jail(sb, slot_index);
         net::tap_up(&slot, jail.uid()).await?;
         let console = std::fs::File::create(sb.dir.join("console.log")).map_err(|e| format!("console.log: {e}"))?;
-        let mut child = Command::new(&self.host.jailer)
-            .args(jail.args(self.cfg.vcpus, self.cfg.mem_mib))
-            .stdin(std::process::Stdio::null())
-            .stdout(console.try_clone().map_err(|e| e.to_string())?)
-            .stderr(console)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("jailer: {e}"))?;
+        let mut vmm = Vmm::spawn(
+            Command::new(&self.host.jailer)
+                .args(jail.args(self.cfg.vcpus, self.cfg.mem_mib))
+                .stdin(std::process::Stdio::null())
+                .stdout(console.try_clone().map_err(|e| e.to_string())?)
+                .stderr(console),
+        )?;
         let uds = jail.uds();
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(format!("the jailer or firecracker exited during boot ({status}); see {}/console.log", sb.dir.display()));
+            if vmm.exited() {
+                return Err(format!("the jailer or firecracker exited during boot; see {}/console.log", sb.dir.display()));
             }
             // Each probe is bounded, so a guest that accepts but never answers can't hold
             // the slot past the deadline.
             if uds.exists() && tokio::time::timeout(Duration::from_secs(2), vsock::healthy(&uds)).await.unwrap_or(false) {
                 eprintln!("sandboxd: {} booted in slot {} in {} ms", sb.id, slot_index, t0.elapsed().as_millis());
-                return Ok(child);
+                return Ok(vmm);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let _ = child.kill().await;
+        let _ = exited_or_killed(&mut vmm, Duration::from_secs(5)).await;
         Err(format!("guestd never answered within 60 s; see {}/console.log", sb.dir.display()))
     }
 
@@ -335,7 +372,7 @@ impl Manager {
         let body = Bytes::from_static(br#"{"command":"sync && (sleep 0.2; reboot -f) &","timeoutMs":10000}"#);
         // Bounded too: a hung guest still gets killed below.
         let _ = tokio::time::timeout(Duration::from_secs(10), vsock::request(&self.jail(sb, r.slot).uds(), Method::POST, "/exec", body)).await;
-        if !exited_or_killed(&mut r.child, Duration::from_secs(5)).await {
+        if !exited_or_killed(&mut r.vmm, Duration::from_secs(5)).await {
             // Releasing now would re-own the disk, delete the jail and give the slot (and
             // its uid) to the next VM while this VMM may still run. Kept for the next try.
             eprintln!("sandboxd: {}: its VMM's exit couldn't be confirmed; it keeps slot {} until it is", sb.id, r.slot);
@@ -562,23 +599,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn a_vmm_counts_as_stopped_only_once_its_exit_is_seen() {
+    async fn a_vmm_is_seen_and_signalled_through_its_pidfd_only() {
+        use super::Vmm;
         let grace = Duration::from_millis(500);
-        let mut quick = tokio::process::Command::new("true").spawn().unwrap();
+        let mut quick = Vmm::spawn(&mut tokio::process::Command::new("true")).unwrap();
         assert!(super::exited_or_killed(&mut quick, grace).await);
-        let mut hung = tokio::process::Command::new("sleep").arg("60").spawn().unwrap();
-        assert!(super::exited_or_killed(&mut hung, grace).await, "a hung child is killed");
-        // Reaped behind tokio's back: wait() fails (ECHILD). Not proof of anything, so not
-        // "stopped". (That its pid, free again, isn't signalled can't be seen from here
-        // without the pid being reused.)
-        let mut lost = tokio::process::Command::new("sleep").arg("60").spawn().unwrap();
-        let pid = lost.id().unwrap() as libc::pid_t;
+        let mut hung = Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
+        assert!(!hung.exited());
+        assert!(super::exited_or_killed(&mut hung, grace).await, "a hung VMM is killed");
+        // Reaped behind tokio's back, so its pid is free for anyone. Its exit is still seen,
+        // and the kill after it (and the one when it's dropped) reaches nothing: ESRCH.
+        let mut lost = Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
+        let pid = lost.child.id().unwrap() as libc::pid_t;
         // SAFETY: plain syscalls on our own child.
         unsafe {
             libc::kill(pid, libc::SIGKILL);
             libc::waitpid(pid, std::ptr::null_mut(), 0);
         }
-        assert!(!super::exited_or_killed(&mut lost, grace).await);
+        assert!(super::exited_or_killed(&mut lost, grace).await, "its exit is seen through the pidfd");
+        assert_eq!(lost.pidfd.kill().unwrap_err().raw_os_error(), Some(libc::ESRCH));
+        // Dropped while running: killed, as kill_on_drop did, but through the pidfd.
+        let alive = Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
+        let watch = super::Pidfd::open(alive.child.id().unwrap()).unwrap();
+        drop(alive);
+        assert!(watch.wait(Duration::from_secs(2)).await, "a dropped VMM is killed");
+        // Nothing in vm.rs signals a VMM by number any more.
+        let src = include_str!("vm.rs");
+        for by_number in [["kill_on_drop(", "true)"].concat(), ["Command::new(\"kill", "\")"].concat(), ["libc::kill(", "pid as"].concat()] {
+            assert!(!src.contains(&by_number), "{by_number}");
+        }
     }
 }
