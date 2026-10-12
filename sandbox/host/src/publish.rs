@@ -40,7 +40,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 /// The bundle comes out of the VM in parts, each under guestd's 16 MiB file limit.
 const PART: u64 = 12 << 20;
@@ -58,7 +58,8 @@ const GIT_LOCAL: Duration = Duration::from_secs(120);
 const GIT_NETWORK: Duration = Duration::from_secs(600);
 /// How old a temporary file in a mirror (git's partial packs, a stage's bundle) must be
 /// before prune() removes it. Nothing else writes to a mirror while its lock is held (a git
-/// command that is cut off is killed with its helpers, Group); this is a margin.
+/// command that is cut off is stopped with its helpers before the lock is released,
+/// Running); this is a margin.
 const GARBAGE_AGE: Duration = Duration::from_secs(10 * 60);
 /// `gc --auto` as push runs it: git's own thresholds (6700 loose objects, 50 packs), which
 /// the guarded environment turns off for every other command (gc.auto=0). In the foreground
@@ -198,9 +199,8 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
     use tokio::io::AsyncReadExt;
     let mut cmd = git_command(dir, args, token);
     let work = async {
-        let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
-        let mut group = Group(child.id());
-        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let mut child = Running::spawn(&mut cmd).map_err(|e| format!("git: {e}"))?;
+        let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
         // stderr on its own task, so a command stopped for too much stdout isn't left
@@ -213,8 +213,7 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
         let mut out = Vec::new();
         stdout.take(cap as u64 + 1).read_to_end(&mut out).await.map_err(|e| format!("git {}: {e}", args[0]))?;
         if out.len() > cap {
-            group.kill();
-            let _ = child.kill().await;
+            child.stop();
             errors.abort();
             let mut cut = cap;
             while cut > 0 && (out[cut] & 0xC0) == 0x80 {
@@ -224,7 +223,6 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
             return Ok((String::from_utf8_lossy(&out).into_owned(), true));
         }
         let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
-        group.0 = None;
         let err = errors.await.unwrap_or_default();
         if !status.success() {
             return Err(format!("git {}: {}", args[0], tail(&err)));
@@ -242,13 +240,9 @@ async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Durat
 async fn git_says(dir: &Path, args: &[&str]) -> Option<bool> {
     let mut cmd = git_command(dir, args, None);
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    let mut group = Group(child.id());
+    let mut child = Running::spawn(&mut cmd).ok()?;
     match tokio::time::timeout(GIT_LOCAL, child.wait()).await {
-        Ok(Ok(status)) => {
-            group.0 = None;
-            Some(status.success())
-        }
+        Ok(Ok(status)) => Some(status.success()),
         _ => None,
     }
 }
@@ -260,9 +254,8 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
     use tokio::io::AsyncReadExt;
     let mut cmd = git_command(dir, args, None);
     let work = async {
-        let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
-        let mut group = Group(child.id());
-        let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let mut child = Running::spawn(&mut cmd).map_err(|e| format!("git: {e}"))?;
+        let (Some(mut stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
             return Err("git: no pipes".to_string());
         };
         let errors = tokio::spawn(async move {
@@ -280,7 +273,6 @@ async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String
             hash.update(&buf[..n]);
         }
         let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
-        group.0 = None;
         let err = errors.await.unwrap_or_default();
         if !status.success() {
             return Err(format!("git {}: {}", args[0], tail(&err)));
@@ -330,34 +322,95 @@ fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
         cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
     }
     // In a process group of its own, so a command that is cut off is stopped with all of
-    // its helpers (Group).
+    // its helpers (Running).
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
     cmd
 }
 
-/// A git command's process group (git_command gives each its own; the id is the command's
-/// pid), killed whole if this is dropped before the command was waited for: a command that
-/// timed out, or whose job was cut off. Killing the command alone would leave its helpers
-/// running (a fetch's git-remote-https and index-pack, a gc's repack), still writing to the
-/// mirror after its lock is released. Cleared once the command has been waited for: its id
-/// may then be reused.
-struct Group(Option<u32>);
+/// How long a cut-off git command's process group has after SIGTERM before it gets SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+/// After SIGKILL, how long before a group still not gone is logged (it is waited for anyway).
+const STOP_LOG_AFTER: Duration = Duration::from_secs(5);
 
-impl Group {
-    fn kill(&mut self) {
-        use std::process::Stdio;
-        if let Some(id) = self.0.take() {
-            let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{id}")]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+/// A running git command, the leader of a process group of its own (git_command). Dropped
+/// before it was waited for (it timed out, or its job was cut off) or stopped, the whole
+/// group is stopped: SIGTERM, SIGKILL once the leader exits or after STOP_GRACE, and drop()
+/// returns only once no process of the group is left, however long that takes. Killing the
+/// command alone would leave its helpers (a fetch's git-remote-https and index-pack, a gc's
+/// repack) writing to the mirror. A job's future holds the mirror's lock longer than the command it is running
+/// (the lock is taken first, so it is dropped last), so the lock is never released with one
+/// of them alive. drop() blocks its thread for that while: until the leader exits, two
+/// seconds at most, unless a process then can't die even of SIGKILL.
+struct Running {
+    child: Child,
+    /// None once the command has been waited for (its id may then be reused) or stopped.
+    group: Option<libc::pid_t>,
+}
+
+impl Running {
+    fn spawn(cmd: &mut Command) -> std::io::Result<Running> {
+        let child = cmd.spawn()?;
+        let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+        Ok(Running { child, group })
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        self.group = None;
+        Ok(status)
+    }
+
+    /// Stop the whole group, and wait until it is gone. The leader is reaped only once both
+    /// signals are sent: until then it holds the group's id (as a zombie, if it has exited),
+    /// so neither signal can reach a group that reused the id.
+    fn stop(&mut self) {
+        let Some(group) = self.group.take() else { return };
+        let sleep = || std::thread::sleep(Duration::from_millis(10));
+        // SAFETY: killpg() signals the group this command leads, whose id its unreaped leader
+        // holds.
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+        // STOP_GRACE to stop on SIGTERM; cut short when the leader has exited, as git does at
+        // once (its helpers got the same signal at the same moment).
+        let start = std::time::Instant::now();
+        while !exited(group) && start.elapsed() < STOP_GRACE {
+            sleep();
+        }
+        // SAFETY: as above; the leader is still unreaped.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        let start = std::time::Instant::now();
+        let mut logged = false;
+        loop {
+            // Reap the leader: a zombie still counts in its group.
+            let _ = self.child.try_wait();
+            // SAFETY: kill() with signal 0 only checks whether the group has a process left.
+            let left = unsafe { libc::kill(-group, 0) };
+            if left != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            if !logged && start.elapsed() >= STOP_LOG_AFTER {
+                logged = true;
+                eprintln!("sandboxd: git process group {group} is still there {} s after SIGKILL; its mirror stays locked until it is gone", STOP_LOG_AFTER.as_secs());
+            }
+            sleep();
         }
     }
 }
 
-impl Drop for Group {
-    fn drop(&mut self) {
-        self.kill();
+/// Whether process `pid`, a child of this one, has exited, without reaping it.
+fn exited(pid: libc::pid_t) -> bool {
+    // SAFETY: waitid() writes into the zeroed struct it is given; WNOWAIT leaves the child
+    // unreaped.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) == 0 && info.si_pid() != 0
     }
 }
 
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 /// A file removed when this is dropped.
 struct TempFile(PathBuf);
@@ -1648,6 +1701,58 @@ mod tests {
         assert!(packed.exists(), "the mirror is still there");
         std::fs::write(&packed, refs).unwrap();
         sh(&dir, "git rev-parse --verify -q refs/heads/main");
+    }
+
+    /// Whether any process of a group is left (a zombie included).
+    fn group_left(group: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks.
+        unsafe { libc::kill(-group, 0) == 0 }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_off_command_is_gone_with_its_helpers_before_the_mirror_lock_is_released() {
+        let s = scratch("stopgroup");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        // A git command whose helper ignores SIGTERM (as a stuck index-pack might not answer
+        // it): only SIGKILL stops it. It says its pid and its group's: git's, the shell's
+        // parent (no `ps`, which a build sandbox may not have).
+        let ids = s.root.join("helper.ids");
+        let alias = format!("alias.hang=!trap '' TERM; sleep 60 & echo $! $PPID > {}.tmp; mv {0}.tmp {0}; wait", ids.display());
+        let lock = s.publisher.lock(&dir);
+        let job = tokio::spawn({
+            let (lock, dir) = (lock.clone(), dir.clone());
+            async move {
+                let _held = lock.lock().await;
+                git(&dir, &["-c", &alias, "hang"], None, Duration::from_secs(120)).await
+            }
+        });
+        let started = std::time::Instant::now();
+        while !ids.exists() {
+            assert!(started.elapsed() < Duration::from_secs(20), "the helper started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let text = std::fs::read_to_string(&ids).unwrap();
+        let [helper, group]: [libc::pid_t; 2] = text.split_whitespace().map(|n| n.parse().unwrap()).collect::<Vec<_>>().try_into().unwrap();
+        // SAFETY: getpgid() only reads.
+        assert_eq!(unsafe { libc::getpgid(helper) }, group, "the helper is in the command's group");
+        // Whoever takes the lock next looks at once: is anything of that command left?
+        let next = tokio::spawn({
+            let lock = lock.clone();
+            async move {
+                let _held = lock.lock().await;
+                group_left(group)
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The job is cut off (its deadline drops it).
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        assert!(!next.await.unwrap(), "a process of the cut-off command was alive when the lock was released");
+        // SAFETY: signal 0 only checks.
+        assert_ne!(unsafe { libc::kill(helper, 0) }, 0, "the helper that ignored SIGTERM is gone");
+        // And the housekeeping right after has nothing live to step around.
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
     }
 
     #[tokio::test]
