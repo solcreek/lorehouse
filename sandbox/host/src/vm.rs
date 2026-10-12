@@ -379,7 +379,7 @@ impl Manager {
     }
 
     /// Stop every VM at once, not one after another, so shutdown takes about as long as
-    /// the slowest stop (≤ 15 s) however many are running.
+    /// the slowest stop (≤ 20 s: the sync request, the exit, a kill) however many are running.
     pub async fn stop_all(self: &Arc<Self>) {
         let list: Vec<Arc<Sandbox>> = self.sandboxes.lock().await.values().cloned().collect();
         let mut stops = tokio::task::JoinSet::new();
