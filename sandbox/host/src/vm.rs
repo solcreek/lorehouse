@@ -117,6 +117,19 @@ async fn jailed_uds(state_dir: &Path, exec_name: &str, jail_id: &str) -> Vec<Pat
     found
 }
 
+/// Wait up to `grace` for the child to exit, then SIGKILL it and wait as long again.
+/// True only once its exit has been seen: an error from wait() or kill() (the process
+/// can't be waited for) is not proof it's gone.
+async fn exited_or_killed(child: &mut Child, grace: Duration) -> bool {
+    if let Ok(Ok(_)) = tokio::time::timeout(grace, child.wait()).await {
+        return true;
+    }
+    if child.start_kill().is_err() {
+        return false;
+    }
+    matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)))
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') && !id.starts_with('.')
 }
@@ -308,21 +321,27 @@ impl Manager {
     /// fall back to a kill if it doesn't go.
     async fn stop(&self, sb: &Sandbox) {
         let mut running = sb.running.lock().await;
-        self.stop_locked(sb, &mut running).await;
+        let _ = self.stop_locked(sb, &mut running).await;
     }
 
     /// `stop` for a caller already holding the sandbox's `running` lock. Every request
     /// takes that lock to reach the VM, so while it's held nothing new can start using it.
-    async fn stop_locked(&self, sb: &Sandbox, running: &mut Option<Running>) {
-        let Some(mut r) = running.take() else { return };
+    /// Whether the VM is gone: false leaves it running, in its slot, with its jail.
+    async fn stop_locked(&self, sb: &Sandbox, running: &mut Option<Running>) -> bool {
+        let Some(mut r) = running.take() else { return true };
         let body = Bytes::from_static(br#"{"command":"sync && (sleep 0.2; reboot -f) &","timeoutMs":10000}"#);
         // Bounded too: a hung guest still gets killed below.
         let _ = tokio::time::timeout(Duration::from_secs(10), vsock::request(&self.jail(sb, r.slot).uds(), Method::POST, "/exec", body)).await;
-        if tokio::time::timeout(Duration::from_secs(5), r.child.wait()).await.is_err() {
-            let _ = r.child.kill().await;
+        if !exited_or_killed(&mut r.child, Duration::from_secs(5)).await {
+            // Releasing now would re-own the disk, delete the jail and give the slot (and
+            // its uid) to the next VM while this VMM may still run. Kept for the next try.
+            eprintln!("sandboxd: {}: its VMM's exit couldn't be confirmed; it keeps slot {} until it is", sb.id, r.slot);
+            *running = Some(r);
+            return false;
         }
         self.release(sb, r.slot).await;
         eprintln!("sandboxd: {} stopped (disk kept)", sb.id);
+        true
     }
 
     /// Stop the VM and delete its disk.
@@ -334,7 +353,9 @@ impl Manager {
             if sb.in_flight.load(Ordering::SeqCst) > 0 {
                 return Err("sandbox is busy".into());
             }
-            self.stop_locked(&sb, &mut running).await;
+            if !self.stop_locked(&sb, &mut running).await {
+                return Err("sandbox's VM could not be stopped".into());
+            }
         }
         self.sandboxes.lock().await.remove(id);
         let removed = match tokio::fs::remove_dir_all(&sb.dir).await {
@@ -356,7 +377,7 @@ impl Manager {
             let mut running = sb.running.lock().await;
             let idle = now.saturating_sub(sb.last_used.load(Ordering::SeqCst));
             if running.is_some() && sb.in_flight.load(Ordering::SeqCst) == 0 && idle >= self.cfg.idle.as_secs() {
-                self.stop_locked(&sb, &mut running).await;
+                let _ = self.stop_locked(&sb, &mut running).await;
             }
         }
     }
@@ -536,5 +557,24 @@ mod tests {
         assert!(mirror.exists(), "a mirror owner named jail was removed");
         assert!(!dir.join("slack_C1_1.2/jail").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_vmm_counts_as_stopped_only_once_its_exit_is_seen() {
+        let grace = Duration::from_millis(500);
+        let mut quick = tokio::process::Command::new("true").spawn().unwrap();
+        assert!(super::exited_or_killed(&mut quick, grace).await);
+        let mut hung = tokio::process::Command::new("sleep").arg("60").spawn().unwrap();
+        assert!(super::exited_or_killed(&mut hung, grace).await, "a hung child is killed");
+        // Reaped behind tokio's back: wait() fails (ECHILD) and kill() can't reach it. Not
+        // proof of anything, so not "stopped".
+        let mut lost = tokio::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = lost.id().unwrap() as libc::pid_t;
+        // SAFETY: plain syscalls on our own child.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        assert!(!super::exited_or_killed(&mut lost, grace).await);
     }
 }
