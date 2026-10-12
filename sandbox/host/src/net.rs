@@ -796,6 +796,40 @@ mod tests {
         assert_eq!(fake.loads.load(SeqCst), 5);
     }
 
+    /// The batch loaded by the real nft, in a network namespace of its own (as root in a
+    /// user namespace, no privileges needed): nft takes it, lists the shape declared, and
+    /// a second listing reads as no drift. Skipped where nft or user namespaces aren't
+    /// available (it ran on starship, nft 1.1.7).
+    #[test]
+    fn nft_itself_takes_the_batch() {
+        use std::io::Write;
+        let script = "nft -f - && nft list table inet lorehouse_sbx";
+        let spawned = std::process::Command::new("unshare")
+            .args(["-rn", "sh", "-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            eprintln!("skipped: no unshare");
+            return;
+        };
+        child.stdin.take().unwrap().write_all(super::batch("enp2s0", 4).as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() && (stderr.contains("not found") || stderr.contains("Operation not permitted") || stderr.contains("unshare failed")) {
+            eprintln!("skipped: {stderr}");
+            return;
+        }
+        assert!(out.status.success(), "nft refused the batch: {stderr}");
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(super::same_shape(&super::table("enp2s0", 4), &listing), "{listing}");
+        assert_eq!(super::drift(&super::normalize(&listing), Some(&listing)), super::Drift::InSync);
+        for rule in ["meta nfproto ipv6 drop", "jump spoof", "iifname \"lhtap3\" ip saddr 172.30.0.14 return", "tcp dport { 25, 465, 587, 2525 } drop"] {
+            assert!(listing.contains(rule), "{rule} not in {listing}");
+        }
+    }
+
     #[test]
     fn a_tap_belongs_to_its_vms_uid() {
         assert_eq!(super::tap_add("lhtap3", 1_900_000_003).join(" "), "ip tuntap add dev lhtap3 mode tap user 1900000003 group 1900000003");
