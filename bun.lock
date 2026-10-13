@@ -6,8 +6,10 @@
       "name": "lorehouse",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.131.0",
-        "@junejs/core": "0.2.0-dev.65",
-        "@junejs/server": "1.0.0-dev.45",
+        "@junejs/core": "0.2.0-dev.66",
+        "@junejs/pdf": "0.1.0-dev.1",
+        "@junejs/pdf-typst-wasm": "0.1.0-dev.0",
+        "@junejs/server": "1.0.0-dev.47",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -20,11 +22,15 @@
 
     "@babel/runtime": ["@babel/runtime@7.29.7", "", {}, "sha512-Nq8OhGWiZIZGV6hLHoyAKLLcJihP/xFeBMGJoUrxTX2psI8dCifzLhZISFb+VWS3wFMRDmCGw5R+dOySCqPLhw=="],
 
-    "@junejs/core": ["@junejs/core@0.2.0-dev.65", "", { "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "react": "^19.2.0", "react-dom": "^19.2.0" }, "optionalPeers": ["@anthropic-ai/sdk", "react"] }, "sha512-qNtACcQ2evFXK8NNEXVqZrPZv6bDVG1cSVWcNKco1hF8wOZlNpc7xYEeSmbvbQtmiqz6XwofHtRBly+SPXOreQ=="],
+    "@junejs/core": ["@junejs/core@0.2.0-dev.66", "", { "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "react": "^19.2.0", "react-dom": "^19.2.0" }, "optionalPeers": ["@anthropic-ai/sdk", "react"] }, "sha512-QqqFRYDfutSfKHyMUu6IaEQCIS+PvXOjznXcs3hGmQWCbefQDbP5tX3oU4rW7RbSMHRRZA/CBqihph05hUzVew=="],
 
     "@junejs/db": ["@junejs/db@0.1.0-dev.2", "", { "dependencies": { "@junejs/core": ">=0.2.0-dev.26" } }, "sha512-N/MMYEsS46TkrSgeZzeGO7NArvysN/kEFJPYBPxA0pg4D1LwKVROKX1yFAzhZRbJJRfKeIA4EHZw+Uz1xO+c7w=="],
 
-    "@junejs/server": ["@junejs/server@1.0.0-dev.45", "", { "dependencies": { "@junejs/db": ">=0.1.0-dev.2", "@momiji-rs/sparkdown": "^0.0.4", "@resvg/resvg-wasm": "^2.6.2", "lightningcss": "^1.27.0", "oxc-parser": "^0.152.0", "rolldown": "^1.1.0" }, "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "@junejs/core": ">=0.2.0-dev.65", "@libsql/client": "^0.14.0 || ^0.15.0 || ^0.16.0 || ^0.17.0", "mysql2": "^3.0.0", "pg": "^8.0.0", "react": "^19.2.0", "react-dom": "^19.2.0", "react-server-dom-webpack": "19.3.0" }, "optionalPeers": ["@anthropic-ai/sdk", "@libsql/client", "mysql2", "pg", "react-server-dom-webpack"] }, "sha512-N90eQB14MSSPkxBlMqDpjhwbV2tz20DZC5l3NU+jvLkDAS21398Ce+SmVZwG91BEKacyq3wDKkUQjbS2ACHbDQ=="],
+    "@junejs/pdf": ["@junejs/pdf@0.1.0-dev.1", "", { "dependencies": { "@junejs/core": ">=0.2.0-dev.66", "marked": "^18.0.14" }, "peerDependencies": { "@myriaddreamin/typst-ts-web-compiler": "^0.7.0", "@myriaddreamin/typst.ts": "^0.7.0" }, "optionalPeers": ["@myriaddreamin/typst-ts-web-compiler", "@myriaddreamin/typst.ts"] }, "sha512-Q+pUgNMzT5y2nTO0J73T4asJXx+QdJPvVvDeU6hN6uU75BPmiU+uBlqgMiF+5xG9Ms4gn49u3gK4Sr6FXbEaiQ=="],
+
+    "@junejs/pdf-typst-wasm": ["@junejs/pdf-typst-wasm@0.1.0-dev.0", "", { "dependencies": { "@junejs/pdf": ">=0.1.0-dev.1" } }, "sha512-iwOO+wREj+bXnCNn/gZlDo6I7RvBqdzeCmFBzqiGLilnxClWdWPuwLUPtcgr7bP5sWU7mmibnuj8FghcPoiriQ=="],
+
+    "@junejs/server": ["@junejs/server@1.0.0-dev.47", "", { "dependencies": { "@junejs/db": ">=0.1.0-dev.2", "@momiji-rs/sparkdown": "^0.0.4", "@resvg/resvg-wasm": "^2.6.2", "lightningcss": "^1.27.0", "oxc-parser": "^0.152.0", "rolldown": "^1.1.0" }, "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "@junejs/core": ">=0.2.0-dev.66", "@libsql/client": "^0.14.0 || ^0.15.0 || ^0.16.0 || ^0.17.0", "mysql2": "^3.0.0", "pg": "^8.0.0", "react": "^19.2.0", "react-dom": "^19.2.0", "react-server-dom-webpack": "19.3.0" }, "optionalPeers": ["@anthropic-ai/sdk", "@libsql/client", "mysql2", "pg", "react-server-dom-webpack"] }, "sha512-u8b/5suOZrhRtQ9dytRISmRYRXmFmq3X+g2sMNW3eMTel7xupMdM0HlCu1sY2j5bzCQJsJV939Q/oQUVnXJyTA=="],
 
     "@momiji-rs/sparkdown": ["@momiji-rs/sparkdown@0.0.4", "", {}, "sha512-AVy2A/D623xI+wG1HFpNymrJz6onDQlw3HnkaqyLXSgTEA13LVeFgXNGWBaAl4kR1105I3k/YSOWrihpnF+IXA=="],
 
@@ -179,6 +185,8 @@
     "lightningcss-win32-arm64-msvc": ["lightningcss-win32-arm64-msvc@1.33.0", "", { "os": "win32", "cpu": "arm64" }, "sha512-1K+MPfLSFVpphzpdbfkhlWk6wBrTObBzS2T6db10PNOZgR9GoVsAWzwNyuhUYYbTp23j+4RrncfujZ4uAzXvwA=="],
 
     "lightningcss-win32-x64-msvc": ["lightningcss-win32-x64-msvc@1.33.0", "", { "os": "win32", "cpu": "x64" }, "sha512-OlEICDx/Xl0FqSp4bry8zFnCvGpig3Gl4gCquvYwHuqJKEC1+n9NgDniFvqHGmMv1ZkqDJrDqKKSykTDX+ehuA=="],
+
+    "marked": ["marked@18.1.1", "", { "bin": { "marked": "bin/marked.js" } }, "sha512-zEGgrtUG8crk+TrMacJSVABU4DYDDkS8uqgU3ohrn/2fW9C2AEfUrO3m6IhpIpQpl7YcVpiXXC9cSMWDANT3dg=="],
 
     "oxc-parser": ["oxc-parser@0.152.0", "", { "dependencies": { "@oxc-project/types": "^0.152.0" }, "optionalDependencies": { "@oxc-parser/binding-android-arm-eabi": "0.152.0", "@oxc-parser/binding-android-arm64": "0.152.0", "@oxc-parser/binding-darwin-arm64": "0.152.0", "@oxc-parser/binding-darwin-x64": "0.152.0", "@oxc-parser/binding-freebsd-x64": "0.152.0", "@oxc-parser/binding-linux-arm-gnueabihf": "0.152.0", "@oxc-parser/binding-linux-arm-musleabihf": "0.152.0", "@oxc-parser/binding-linux-arm64-gnu": "0.152.0", "@oxc-parser/binding-linux-arm64-musl": "0.152.0", "@oxc-parser/binding-linux-ppc64-gnu": "0.152.0", "@oxc-parser/binding-linux-riscv64-gnu": "0.152.0", "@oxc-parser/binding-linux-riscv64-musl": "0.152.0", "@oxc-parser/binding-linux-s390x-gnu": "0.152.0", "@oxc-parser/binding-linux-x64-gnu": "0.152.0", "@oxc-parser/binding-linux-x64-musl": "0.152.0", "@oxc-parser/binding-openharmony-arm64": "0.152.0", "@oxc-parser/binding-win32-arm64-msvc": "0.152.0", "@oxc-parser/binding-win32-ia32-msvc": "0.152.0", "@oxc-parser/binding-win32-x64-msvc": "0.152.0" } }, "sha512-ZztsZgaCWmPeKYMdoTT5e0oV/oxD1NeLWNR3kAtr/G707cUPYaaozRlVDHLCGnszHJRszN9mJwmPNpqgwloC0A=="],
 
