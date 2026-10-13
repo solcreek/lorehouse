@@ -129,6 +129,27 @@ Every one of them is a single always-on instance (Lorehouse holds a SQLite file 
 to answer Slack within 3 s), with the secrets from the README as environment variables.
 Render and Railway set `PORT` themselves; Lorehouse listens on it.
 
+### Not proven yet
+
+On Render and Railway only the container side is proven: the image runs, listens on the
+host's `PORT`, passes `/healthz`, and keeps `/data` across a redeploy. Every run had no
+Slack or Anthropic secrets, so Lorehouse sat in setup mode. Nothing yet shows, on either
+host:
+
+- that it answers Slack: a mention arrives through the host's proxy and gets a streamed
+  reply within Slack's 3 s
+- the backfill writing the SQLite files to the disk, and a restart reconciling from them
+  ([live-slack.md](live-slack.md) §4, items 1 and 9)
+- a sandbox runner connecting in through the host's proxy (WebSocket or long poll)
+
+To prove it, create a second Slack app from [`slack/manifest.yaml`](../slack/manifest.yaml)
+for a test channel, rather than pointing production's app at the new host, which would
+take production off Slack while it ran. Deploy with that app's secrets, run
+`lorehouse doctor --url <host URL>`, then the checks in [live-slack.md](live-slack.md) §4.
+Record the run here with its date, and change the host's row in the README.
+
+Fly.io is proven against real Slack: it is production.
+
 ### Render
 
 The [`render.yaml`](../render.yaml) Blueprint (New → Blueprint, this repository) creates
