@@ -347,6 +347,20 @@ describe("config", () => {
     expect(() => loadConfig({ ...base, PR_APPROVER: "Not-Requester" })).toThrow(/PR_APPROVER \(one of requester, anyone, not-requester, got "Not-Requester"\)/);
   });
 
+  test("PDF_REPLIES is off unless 1; anything else is reported", () => {
+    expect(loadConfig(base).pdf).toBe(false);
+    expect(loadConfig({ ...base, PDF_REPLIES: "0" }).pdf).toBe(false);
+    expect(loadConfig({ ...base, PDF_REPLIES: "1" }).pdf).toBe(true);
+    expect(() => loadConfig({ ...base, PDF_REPLIES: "yes" })).toThrow(/PDF_REPLIES \(1 for PDF replies, or unset; got "yes"\)/);
+  });
+
+  test("FILE_STORE is memory by default; blob is planned and refused for now; anything else is reported", () => {
+    expect(loadConfig(base).files.store).toBe("memory");
+    expect(loadConfig({ ...base, FILE_STORE: "memory" }).files.store).toBe("memory");
+    expect(() => loadConfig({ ...base, FILE_STORE: "blob" })).toThrow(/FILE_STORE=blob \(planned, not yet available/);
+    expect(() => loadConfig({ ...base, FILE_STORE: "s3" })).toThrow(/FILE_STORE \(one of memory, blob, got "s3"\)/);
+  });
+
   test("PR_APPROVER can come from settings.json, under the environment", () => {
     const dir = mkdtempSync(join(tmpdir(), "lorehouse-approver-"));
     try {
