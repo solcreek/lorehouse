@@ -91,6 +91,7 @@ type Stats = {
   updates: { channel: string; ts: string; text: string }[];
   responses: { path: string; text?: string; response_type?: string; replace_original?: boolean }[];
   github: { method: string; path: string; body?: unknown }[];
+  uploads: { fileId: string; filename: string; length: number; bytes?: number; contentType?: string; head?: string; channel?: string; thread_ts?: string; title?: string }[];
 };
 const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as Stats;
 const reset = () => fetch(`${MOCK}/reset`, { method: "POST" });
@@ -1009,6 +1010,35 @@ const scenarios: Scenario[] = [
       await Bun.sleep(1500);
       const s = await stats();
       return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
+    }),
+  },
+  {
+    name: "PDF replies are off by default: render_pdf isn't offered, and nothing is uploaded",
+    run: async () => {
+      await reset();
+      const ts = await mentionAndWait("[pdf] make me a report");
+      const { text = "" } = (await (await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`)).json()) as { text?: string };
+      if (text.includes("[pdf:")) return `render_pdf ran with PDF_REPLIES unset: ${text.slice(0, 120)}`;
+      const s = await stats();
+      return s.uploads.length || s.byMethod["files.completeUploadExternal"] ? `uploaded a file with PDF replies off: ${JSON.stringify(s.uploads)}` : null;
+    },
+  },
+  {
+    name: "PDF_REPLIES=1: render_pdf typesets the report and the PDF is uploaded into the asker's thread",
+    run: () => inMode({ PDF_REPLIES: "1" }, async () => {
+      await reset();
+      const ts = await mentionAndWait("[pdf] make me a report");
+      const { text = "" } = (await (await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`)).json()) as { text?: string };
+      const told = text.match(/\[pdf:([^:\]]+):(\d+)\]/);
+      if (!told) return `the model wasn't handed an attached file: ${text.slice(0, 160)}`;
+      // The upload follows the reply (after chat.stopStream), so it may land after /wait.
+      const up = await until(async () => (await stats()).uploads.find((u) => u.thread_ts === ts && u.channel));
+      if (!up) return `no file shared into the thread: ${JSON.stringify((await stats()).uploads)}`;
+      if (up.channel !== ALLOWED) return `shared to ${up.channel}, want ${ALLOWED}`;
+      if (up.filename !== "conformance-report.pdf" || told[1] !== up.filename) return `file named ${up.filename} (model told ${told[1]}), want conformance-report.pdf`;
+      if (up.head !== "%PDF-" || up.contentType !== "application/pdf") return `uploaded bytes aren't a PDF: head ${JSON.stringify(up.head)}, content-type ${up.contentType}`;
+      if (up.bytes !== up.length || String(up.bytes) !== told[2]) return `sizes disagree: reserved ${up.length}, sent ${up.bytes}, model told ${told[2]}`;
+      return (await stats()).uploads.length === 1 ? null : `want one upload, got ${(await stats()).uploads.length}`;
     }),
   },
   {

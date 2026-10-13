@@ -7,10 +7,14 @@
 //   /github/…                  GitHub's REST API, as much as open_pull_request uses: the
 //                              token's user, and listing and opening pull requests.
 //   POST /slack/response/…     an interaction's response_url: recorded (the ephemeral replies)
+//   POST /slack/upload/<id>    a file's bytes, to the upload_url files.getUploadURLExternal
+//                              handed out: recorded (the uploads)
 //   GET  /wait?thread_ts=…     long-poll until that thread's stream is stopped
 //   GET  /stats                recorded Slack calls, model call count, channels read, posts
 //                              (with their blocks), message updates, response_url replies,
-//                              GitHub requests, channels whose reactions were listed
+//                              GitHub requests, channels whose reactions were listed, and
+//                              uploads: each file's name, size, first bytes and where
+//                              files.completeUploadExternal shared it
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
@@ -27,7 +31,8 @@
 // for a thread in that channel; "[reactions:<channel>]", a slack_list_reactions tool_use for
 // a message in that channel; "[whois]", a slack_resolve_user tool_use for the first
 // person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
-// an open_pull_request tool_use for that branch); turn 2 (tool_result
+// an open_pull_request tool_use for that branch; "[pdf]", a render_pdf tool_use for a short
+// report named conformance-report.pdf); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …", and with
 // "[quote]" in the question, the hit's text verbatim: "… [quote:<text>] w0 …"), or for
@@ -37,7 +42,8 @@
 // skill, its name and the first words of its body ("[q7] [skill:<name>:<words>] …"), or for
 // "[exec] <command>" (a workspace_exec tool_use), the exit code and output
 // ("[q7] [exec:0:<stdout>] …"), for a pull request, what came of it
-// ("[q7] [pr:opened:<url>] …"), and for a tool that failed, its error text
+// ("[q7] [pr:opened:<url>] …"), for a PDF, the attached file's name and size
+// ("[q7] [pdf:conformance-report.pdf:<bytes>] …"), and for a tool that failed, its error text
 // ("[q7] [toolerror:<text>] …"), so the harness can check what the tool actually
 // handed the model.
 //
@@ -66,6 +72,10 @@ const holds = new Map<string, { waiting: number; released: Promise<void>; releas
 let calls: SlackCall[] = [];
 let modelCalls = 0;
 let githubCalls: { method: string; path: string; body?: unknown }[] = [];
+// Files uploaded through files.getUploadURLExternal: the reserved name and length, then
+// the bytes POSTed to the upload_url.
+type Upload = { fileId: string; filename: string; length: number; bytes?: number; contentType?: string; head?: string };
+let uploads: Upload[] = [];
 const waiters = new Map<string, ((c: SlackCall[]) => void)[]>();
 let nextTs = 1_700_000_000;
 
@@ -156,6 +166,18 @@ function slack(method: string, body: Record<string, unknown>, token = ""): Respo
     call.body.__ts = `${++nextTs}.000100`;
     return Response.json({ ok: true, channel: body.channel, ts: call.body.__ts });
   }
+  // A file upload, as Slack's two-step API does it: reserve an id and an upload URL (here,
+  // this mock), take the bytes there, then share the file with completeUploadExternal.
+  if (method === "files.getUploadURLExternal") {
+    const fileId = `F${++nextTs}`;
+    uploads.push({ fileId, filename: String(body.filename), length: Number(body.length) });
+    return Response.json({ ok: true, upload_url: `http://localhost:${PORT}/slack/upload/${fileId}`, file_id: fileId });
+  }
+  if (method === "files.completeUploadExternal") {
+    const files = Array.isArray(body.files) ? (body.files as { id?: string }[]) : [];
+    if (!files.every((f) => uploads.some((u) => u.fileId === f.id && u.bytes !== undefined))) return Response.json({ ok: false, error: "file_not_found" });
+    return Response.json({ ok: true, files: files.map((f) => ({ id: f.id })) });
+  }
   if (method === "auth.test") return Response.json({ ok: true, url: "https://acme.slack.com/", user_id: "UBOT", team_id: "T1", bot_id: "B1" });
   if (method === "conversations.history" || method === "conversations.replies") return conversations(method, body);
   if (method === "conversations.info") {
@@ -215,6 +237,8 @@ function answerFor(messages: Msg[], result: Block): string {
   const nonce = question.match(/\[q\d+\]/)?.[0] ?? "[q?]";
   const words = Array.from({ length: TOKENS }, (_, i) => `w${i}`);
   const value = resultValue(result.content) as { messages?: { author?: string; user?: string; text?: string }[]; id?: string; name?: string; realName?: string } | undefined;
+  const attached = (value as { file?: { name?: string; size?: number } } | undefined)?.file;
+  if (attached?.name) return `${nonce} [pdf:${attached.name}:${attached.size}] ${words.join(" ")}`;
   if (value?.id) return `${nonce} [whois:${JSON.stringify({ name: value.name, realName: value.realName })}] ${words.join(" ")}`;
   const exec = value as { exitCode?: number; stdout?: string } | undefined;
   if (typeof exec?.exitCode === "number") return `${nonce} [exec:${exec.exitCode}:${(exec.stdout ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
@@ -276,6 +300,8 @@ async function anthropic(req: Request): Promise<Response> {
     // "[exec] <command>" → run the command in the thread's sandbox (workspace_exec)
     // "[skill:<name>]" → load that skill (read_skill)
     // "[pr] <branch>" → open a pull request from that branch (open_pull_request)
+    // "[pdf]" → render a short report as a PDF (render_pdf)
+    const pdf = question.includes("[pdf]");
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
     const prBranch = /\[pr\] (\S+)/.exec(question)?.[1];
     const recent = question.includes("[recent]");
@@ -284,9 +310,9 @@ async function anthropic(req: Request): Promise<Response> {
     const reactionsIn = /\[reactions:([A-Z0-9]+)\]/.exec(question)?.[1];
     const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = pdf ? "render_pdf" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
+    const input = pdf ? { markdown: "# Conformance report\n\nOne paragraph.\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "en" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));
@@ -358,6 +384,13 @@ Bun.serve({
     }
     // An interaction's response_url (a scenario puts this one in its click): what is posted
     // here (an ephemeral reply to the clicker) is recorded like a Slack call.
+    if (url.pathname.startsWith("/slack/upload/") && req.method === "POST") {
+      const upload = uploads.find((u) => u.fileId === url.pathname.slice("/slack/upload/".length));
+      if (!upload) return new Response("unknown upload", { status: 404 });
+      const bytes = new Uint8Array(await req.arrayBuffer());
+      Object.assign(upload, { bytes: bytes.byteLength, contentType: req.headers.get("content-type") ?? "", head: new TextDecoder().decode(bytes.slice(0, 5)) });
+      return new Response("OK");
+    }
     if (url.pathname.startsWith("/slack/response/") && req.method === "POST") {
       calls.push({ t: Date.now(), method: "response_url", body: { ...(await parseBody(req)), __path: url.pathname } });
       return new Response("ok");
@@ -424,9 +457,14 @@ Bun.serve({
       const updates = calls.filter((c) => c.method === "chat.update").map((c) => ({ channel: c.body.channel, ts: c.body.ts, text: c.body.text }));
       const responses = calls.filter((c) => c.method === "response_url").map((c) => ({ path: c.body.__path, text: c.body.text, response_type: c.body.response_type, replace_original: c.body.replace_original }));
       const reactionChannels = [...new Set(calls.filter((c) => c.method === "reactions.get").map((c) => String(c.body.channel)))];
-      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, reactionChannels, posts, updates, responses, github: githubCalls });
+      // Each upload with where it was shared (the completeUploadExternal that named it).
+      const shared = uploads.map((u) => {
+        const done = calls.find((c) => c.method === "files.completeUploadExternal" && (c.body.files as { id?: string; title?: string }[] | undefined)?.some?.((f) => f.id === u.fileId));
+        return { ...u, channel: done?.body.channel_id, thread_ts: done?.body.thread_ts, title: (done?.body.files as { id?: string; title?: string }[] | undefined)?.find((f) => f.id === u.fileId)?.title };
+      });
+      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, reactionChannels, posts, updates, responses, github: githubCalls, uploads: shared });
     }
-    if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; return Response.json({ ok: true }); }
+    if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; uploads = []; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });
   },
 });
