@@ -124,7 +124,8 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     } else {
       const granted = new Set(header.split(",").map((s) => s.trim()).filter(Boolean));
       // DMs arrive only with im:history, and only DM_MODE=ignore does without them.
-      const needed = MANIFEST_SCOPES.filter((s) => !(s === "im:history" && config.agent.dm === "ignore"));
+      // files:write attaches PDFs, so only PDF_REPLIES=1 needs it.
+      const needed = MANIFEST_SCOPES.filter((s) => !(s === "im:history" && config.agent.dm === "ignore") && !(s === "files:write" && !config.pdf));
       const missing = needed.filter((s) => !granted.has(s));
       if (missing.length) add("slack", "scopes", "fail", `missing ${missing.join(", ")}: add under OAuth & Permissions (or re-create from slack/manifest.yaml), then reinstall the app`);
       else add("slack", "scopes", "ok", needed.join(", "));

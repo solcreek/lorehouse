@@ -11,8 +11,10 @@ import workspaceReadFile from "../prompts/tools/workspace_read_file.md" with { t
 import workspaceWriteFile from "../prompts/tools/workspace_write_file.md" with { type: "text" };
 import openPullRequest from "../prompts/tools/open_pull_request.md" with { type: "text" };
 import workspaceClone from "../prompts/tools/workspace_clone.md" with { type: "text" };
+import renderPdf from "../prompts/tools/render_pdf.md" with { type: "text" };
 import channelDigest from "../prompts/skills/channel-digest.md" with { type: "text" };
 import writeASkill from "../prompts/skills/write-a-skill.md" with { type: "text" };
+import pdfReport from "../prompts/skills/pdf-report.md" with { type: "text" };
 import { branchPrefix, displayName, type AgentIdentity } from "./identity";
 
 const TOOLS: Record<string, string> = {
@@ -23,12 +25,18 @@ const TOOLS: Record<string, string> = {
   workspace_write_file: workspaceWriteFile,
   open_pull_request: openPullRequest,
   workspace_clone: workspaceClone,
+  render_pdf: renderPdf,
 };
 
 // Parsed in app.ts, which keeps June out of this file.
 export const SKILLS: Record<string, string> = {
   "channel-digest": channelDigest,
   "write-a-skill": writeASkill,
+};
+
+// Skills that come with an optional feature, listed only while it is on.
+export const PDF_SKILLS: Record<string, string> = {
+  "pdf-report": pdfReport,
 };
 
 export function render(template: string, vars: Record<string, string>): string {

@@ -3,13 +3,14 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineAgent, buildSystemPrompt, parseSkill } from "@junejs/core/agent-config";
 import type { Tool } from "@junejs/core/agent-runtime";
-import { SKILLS } from "../src/prompts";
+import { PDF_SKILLS, SKILLS } from "../src/prompts";
 
 const SKILLS_DIR = join(import.meta.dir, "..", "prompts", "skills");
-const skills = () => Object.entries(SKILLS).map(([name, text]) => parseSkill(name, text));
+// Every skill, including those listed only with their feature on (PDF_SKILLS).
+const skills = () => Object.entries({ ...SKILLS, ...PDF_SKILLS }).map(([name, text]) => parseSkill(name, text));
 
 describe("skills", () => {
-  test("SKILLS covers exactly the files in prompts/skills/, by basename", () => {
+  test("SKILLS and PDF_SKILLS cover exactly the files in prompts/skills/, by basename", () => {
     const onDisk = readdirSync(SKILLS_DIR).filter((f) => f.endsWith(".md")).map((f) => f.replace(/\.md$/, "")).sort();
     expect(skills().map((s) => s.name).sort()).toEqual(onDisk);
   });

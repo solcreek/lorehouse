@@ -12,3 +12,9 @@ declare module "*.yaml" {
   const value: unknown;
   export default value;
 }
+// Bun file imports (`import path from "./x.wasm" with { type: "file" }`): a path that
+// `bun build --compile` embeds in the binary.
+declare module "*.wasm" {
+  const path: string;
+  export default path;
+}

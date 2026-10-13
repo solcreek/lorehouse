@@ -169,6 +169,14 @@ describe("slack", () => {
     expect(find(await run({ DM_MODE: "ignore" }, { scopes }), "scopes")[0]?.level).toBe("ok");
   });
 
+  test("files:write is needed only with PDF replies on", async () => {
+    const scopes = MANIFEST_SCOPES.filter((s) => s !== "files:write").join(",");
+    expect(find(await run({}, { scopes }), "scopes")[0]?.level).toBe("ok");
+    const withPdf = find(await run({ PDF_REPLIES: "1" }, { scopes }), "scopes")[0];
+    expect(withPdf).toMatchObject({ level: "fail" });
+    expect(withPdf!.detail).toStartWith("missing files:write");
+  });
+
   test("scopes Slack didn't report are a warning, not a pass", async () => {
     expect(find(await run({}, { scopes: null }), "scopes")[0]?.level).toBe("warn");
   });
