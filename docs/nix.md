@@ -179,4 +179,15 @@ railway domain                  # the public URL to give Slack
 ```
 
 In the service's settings, set the healthcheck path to `/healthz` and keep it at one
-replica.
+replica. Railway needs a paid plan once the trial ends: `railway init` refuses with
+"Your trial has expired".
+
+Proven on 2026-10-12 on the Hobby plan, without Slack secrets (so in setup mode): these
+steps pulled `:latest`, Lorehouse listened on Railway's `PORT` (8080) and passed
+`/healthz`, and a file written to `/data` was still there after a redeploy onto a new
+container. Not yet proven: a full install answering Slack on Railway.
+
+**Shell access**: `railway ssh <command>` ran but printed nothing. Register a key
+(`railway ssh keys add`), write an OpenSSH block with `railway ssh config --alias
+lorehouse`, then `ssh -tt lorehouse '<command>'`. It needs v0.1.1 or later: Railway's SSH,
+like Fly's, fails (exit 125) on an image without an `/etc/passwd` root user.
