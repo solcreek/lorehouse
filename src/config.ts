@@ -23,9 +23,9 @@ export type PrApprover = (typeof PR_APPROVERS)[number];
 
 // Where files the agent makes (a PDF from render_pdf) wait until the Slack channel has
 // uploaded them (FILE_STORE):
-//   memory  the default: in the process, bounded, gone on restart. A file's job is done
-//           once it is in the thread, and a copy kept nowhere else can't outlive a
-//           deletion in Slack.
+//   memory  the default: in the process, never on disk. A file stays after its upload
+//           until 64 MiB of newer files push it out or the process restarts; June's
+//           store has no delete yet (junebuild/june#370).
 //   blob    kept on disk across restarts. Planned, not yet available.
 export const FILE_STORES = ["memory", "blob"] as const;
 export type FileStoreKind = (typeof FILE_STORES)[number];

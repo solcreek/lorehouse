@@ -371,8 +371,9 @@ export async function createApp(config: Config) {
 }
 
 // Where the agent's files wait for the Slack channel to upload them (FILE_STORE). Only
-// memory exists yet: bounded, and gone on restart, so a file is never kept past its job.
-// loadConfig refuses blob until it is built.
+// memory exists yet: never on disk, kept until 64 MiB of newer files push it out or the
+// process restarts (no delete yet: junebuild/june#370). loadConfig refuses blob until it
+// is built.
 function fileStore(kind: Config["files"]["store"]): FileStore {
   if (kind === "memory") return memoryFileStore();
   throw new Error(`FILE_STORE=${kind} is not available yet`);
