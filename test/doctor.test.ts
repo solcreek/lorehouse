@@ -173,7 +173,8 @@ describe("slack", () => {
     expect(find(await run({}), "PDF_FONTS")).toEqual([]);
     expect(find(await run({ PDF_REPLIES: "1" }, { scopes: MANIFEST_SCOPES.join(",") }), "PDF_FONTS")).toMatchObject([{ level: "info", detail: "local: offline: rendering contacts no one" }]);
     const google = find(await run({ PDF_REPLIES: "1", PDF_FONTS: "google" }), "PDF_FONTS")[0];
-    expect(google?.detail).toStartWith("google: sends each document's characters to fonts.googleapis.com");
+    // Both hosts: the subset file's own URL on fonts.gstatic.com carries the characters too.
+    expect(google?.detail).toBe("google: sends each document's characters to fonts.googleapis.com, fonts.gstatic.com");
   });
 
   test("files:write is needed only with PDF replies on", async () => {
