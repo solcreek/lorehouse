@@ -10,6 +10,10 @@
 //           character of the document
 // Either way, a character no loaded font covers fails the render with an error the model
 // reads, instead of a PDF with that character missing.
+//
+// Noto Sans TC comes first for every character, Latin and digits included: otherwise Typst
+// sets those in its default Libertinus Serif, a smaller serif face beside the sans Chinese.
+// With google, the subsets cover only non-ASCII characters, so Latin still falls back.
 
 import { googleFontSubsets, typstWasmRenderer, type FontEgress, type FontProvider, type TypstWasmRenderer } from "@junejs/pdf-typst-wasm";
 import { notoSansTC } from "@junejs/pdf-font-noto-sans-tc";
@@ -23,7 +27,7 @@ export function fontProviders(fonts: PdfFonts): FontProvider[] {
 }
 
 export function typstRenderer(fonts: PdfFonts): TypstWasmRenderer {
-  return typstWasmRenderer({ fonts: fontProviders(fonts) });
+  return typstWasmRenderer({ fonts: fontProviders(fonts), fontFamilies: ["Noto Sans TC"] });
 }
 
 // What rendering sends where, in one line, for the doctor.
