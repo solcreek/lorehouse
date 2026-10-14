@@ -18,7 +18,7 @@ import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
 import { PDF_SKILLS, SKILLS, systemPrompt } from "./prompts";
-import { renderPdfTool } from "./tools/render-pdf";
+import { renderPdfTool, typstRenderer } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
 import { runnerRoutes } from "./runners/routes";
@@ -167,7 +167,7 @@ export async function createApp(config: Config) {
 
   // PDF replies: render_pdf puts the file in the store, and the Slack channel uploads it
   // to the thread after the reply.
-  if (config.pdf) tools.push(renderPdfTool());
+  if (config.pdf) tools.push(renderPdfTool(typstRenderer(config.pdfFonts)));
 
   // Where the agent works: the listed channels, less any ingest found private or archived
   // since the start (refused from then on; see ingest/slack.ts).

@@ -30,6 +30,12 @@ export type PrApprover = (typeof PR_APPROVERS)[number];
 export const FILE_STORES = ["memory", "blob"] as const;
 export type FileStoreKind = (typeof FILE_STORES)[number];
 
+// Where PDF fonts come from (PDF_FONTS), which decides where a document's text goes:
+//   local   the default: Noto Sans TC, bundled; rendering never touches the network
+//   google  Noto Sans TC subsets from Google Fonts, which see each document's characters
+export const PDF_FONTS = ["local", "google"] as const;
+export type PdfFonts = (typeof PDF_FONTS)[number];
+
 export type Config = {
   port: number;
   slack: { signingSecret: string; botToken: string; apiUrl?: string; botUserId?: string };
@@ -65,6 +71,8 @@ export type Config = {
   // PDF replies (PDF_REPLIES=1): the render_pdf tool, which attaches a PDF to the reply.
   // Off by default: it needs the files:write scope.
   pdf: boolean;
+  // Where PDF fonts come from (PDF_FONTS, see PDF_FONTS).
+  pdfFonts: PdfFonts;
   // Where the agent's files wait for upload (FILE_STORE, see FILE_STORES).
   files: { store: FileStoreKind };
 };
@@ -158,6 +166,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     missing.push(`PR_APPROVER (one of ${PR_APPROVERS.join(", ")}, got "${raw}")`);
     return "requester";
   };
+  const pdfFonts = (raw: string | undefined): PdfFonts => {
+    if (raw === undefined || raw === "") return "local";
+    if ((PDF_FONTS as readonly string[]).includes(raw)) return raw as PdfFonts;
+    missing.push(`PDF_FONTS (one of ${PDF_FONTS.join(", ")}, got "${raw}")`);
+    return "local";
+  };
   const fileStore = (raw: string | undefined): FileStoreKind => {
     if (raw === undefined || raw === "" || raw === "memory") return "memory";
     if (raw === "blob") missing.push("FILE_STORE=blob (planned, not yet available: use memory, the default)");
@@ -201,6 +215,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     githubApiUrl: env.GITHUB_API_URL || undefined,
     prApprover: prApprover(env.PR_APPROVER),
     pdf: env.PDF_REPLIES === "1",
+    pdfFonts: pdfFonts(env.PDF_FONTS),
     files: { store: fileStore(env.FILE_STORE) },
   };
   // One file for both would put June's session tables in Lorehouse's database: say so,
