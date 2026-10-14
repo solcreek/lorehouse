@@ -1547,6 +1547,12 @@ function appEnv(extraEnv: Record<string, string>): Record<string, string | undef
     // Set, not left to its default: the app's Bun loads the checkout's .env for every
     // variable not set here, and one naming a settings file would fill in the rest.
     LOREHOUSE_SETTINGS: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "settings.json"),
+    // The PDF settings at their defaults (empty is unset), never this shell's or the .env's:
+    // the PDF scenarios test PDF replies off by default and PDF_FONTS=local, which an
+    // inherited PDF_FONTS=google would turn into a test of Google Fonts over the network.
+    PDF_REPLIES: "",
+    PDF_FONTS: "",
+    FILE_STORE: "",
     ...extraEnv,
   };
 }
