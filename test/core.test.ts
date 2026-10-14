@@ -354,6 +354,12 @@ describe("config", () => {
     expect(() => loadConfig({ ...base, PDF_REPLIES: "yes" })).toThrow(/PDF_REPLIES \(1 for PDF replies, or unset; got "yes"\)/);
   });
 
+  test("PDF_FONTS is local by default, or google; anything else is reported", () => {
+    expect(loadConfig(base).pdfFonts).toBe("local");
+    expect(loadConfig({ ...base, PDF_FONTS: "google" }).pdfFonts).toBe("google");
+    expect(() => loadConfig({ ...base, PDF_FONTS: "system" })).toThrow(/PDF_FONTS \(one of local, google, got "system"\)/);
+  });
+
   test("FILE_STORE is memory by default; blob is planned and refused for now; anything else is reported", () => {
     expect(loadConfig(base).files.store).toBe("memory");
     expect(loadConfig({ ...base, FILE_STORE: "memory" }).files.store).toBe("memory");

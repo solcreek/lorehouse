@@ -31,6 +31,7 @@ import { agentIdentity, type AgentIdentity } from "./identity";
 import { pendingPurge, type ChannelPurge } from "./purge";
 import { loadEnv, readSettings } from "./settings";
 import { configToken, slackCall, urlMismatch, type ManagedManifest } from "./setup";
+import { describeEgress, typstRenderer } from "./tools/render-pdf";
 
 export type Level = "ok" | "warn" | "fail" | "info";
 export type Check = { section: string; name: string; level: Level; detail: string };
@@ -86,6 +87,9 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   add("configuration", "environment", "ok", `every required setting is present; agent @${identity.name}, code tools ${config.sandbox ? `on (${config.sandbox.mode})` : "off"}`);
   // Not a problem, but never a surprise: the agent tells each channel, and so does this.
   if (config.usage.recordPeople) add("configuration", "USAGE_RECORD_PEOPLE", "info", "on: usage records who asks the agent things, and each channel is told so");
+  // Where a PDF's text goes is the install's choice (PDF_FONTS): say which it made, from what
+  // the renderer itself declares.
+  if (config.pdf) add("configuration", "PDF_FONTS", "info", `${config.pdfFonts}: ${describeEgress(typstRenderer(config.pdfFonts).egress)}`);
   // Who may click Approve on a pull request card (ADR 0002 §6); it matters with code tools.
   if (config.sandbox) {
     const says: Record<typeof config.prApprover, string> = {

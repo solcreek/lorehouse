@@ -23,10 +23,11 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
-    "@junejs/core": "0.2.0-dev.66",
-    "@junejs/pdf": "0.1.0-dev.1",
-    "@junejs/pdf-typst-wasm": "0.1.0-dev.0",
-    "@junejs/server": "1.0.0-dev.47"
+    "@junejs/core": "0.2.0",
+    "@junejs/pdf": "0.2.0",
+    "@junejs/pdf-font-noto-sans-tc": "0.2.0",
+    "@junejs/pdf-typst-wasm": "0.2.0",
+    "@junejs/server": "0.2.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
