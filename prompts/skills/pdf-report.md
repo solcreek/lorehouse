@@ -11,6 +11,8 @@ when-to-use: someone asks for a PDF, or for a report, summary or document to dow
    - A `#` title, then one paragraph with the key result.
    - `##` sections, short paragraphs, bullet lists for findings.
    - Figures in tables (`| a | b |` with a `|---|---|` row; `|--:|` right-aligns numbers).
+   - Emphasize with **bold**, never *italics*: the document's Chinese font has no italic,
+     so italic text set in it comes out upright and the emphasis is lost.
    - Cite each source as a link to its Slack thread, as you would in a reply.
    - Name people as plain text. Never put secrets, tokens or passwords in the document,
      even if a message quoted one: the file stays in the thread.
