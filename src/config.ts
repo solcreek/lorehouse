@@ -21,6 +21,15 @@ export type DmMode = (typeof DM_MODES)[number];
 export const PR_APPROVERS = ["requester", "anyone", "not-requester"] as const;
 export type PrApprover = (typeof PR_APPROVERS)[number];
 
+// Where files the agent makes (a PDF from render_pdf) wait until the Slack channel has
+// uploaded them (FILE_STORE):
+//   memory  the default: in the process, never on disk. A file stays after its upload
+//           until 64 MiB of newer files push it out or the process restarts; June's
+//           store has no delete yet (junebuild/june#370).
+//   blob    kept on disk across restarts. Planned, not yet available.
+export const FILE_STORES = ["memory", "blob"] as const;
+export type FileStoreKind = (typeof FILE_STORES)[number];
+
 export type Config = {
   port: number;
   slack: { signingSecret: string; botToken: string; apiUrl?: string; botUserId?: string };
@@ -53,6 +62,11 @@ export type Config = {
   githubApiUrl?: string;
   // Who may approve opening a pull request (PR_APPROVER, see PR_APPROVERS).
   prApprover: PrApprover;
+  // PDF replies (PDF_REPLIES=1): the render_pdf tool, which attaches a PDF to the reply.
+  // Off by default: it needs the files:write scope.
+  pdf: boolean;
+  // Where the agent's files wait for upload (FILE_STORE, see FILE_STORES).
+  files: { store: FileStoreKind };
 };
 
 // A GitHub App (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY): short-lived tokens per repo, a bot
@@ -144,6 +158,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     missing.push(`PR_APPROVER (one of ${PR_APPROVERS.join(", ")}, got "${raw}")`);
     return "requester";
   };
+  const fileStore = (raw: string | undefined): FileStoreKind => {
+    if (raw === undefined || raw === "" || raw === "memory") return "memory";
+    if (raw === "blob") missing.push("FILE_STORE=blob (planned, not yet available: use memory, the default)");
+    else missing.push(`FILE_STORE (one of ${FILE_STORES.join(", ")}, got "${raw}")`);
+    return "memory";
+  };
   const config: Config = {
     port: Number(env.PORT ?? 3000),
     slack: {
@@ -180,10 +200,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     usage: { recordPeople: env.USAGE_RECORD_PEOPLE === "1" },
     githubApiUrl: env.GITHUB_API_URL || undefined,
     prApprover: prApprover(env.PR_APPROVER),
+    pdf: env.PDF_REPLIES === "1",
+    files: { store: fileStore(env.FILE_STORE) },
   };
   // One file for both would put June's session tables in Lorehouse's database: say so,
   // rather than let a LOREHOUSE_DB named sessions.db, or a link to it, quietly share it.
   if (config.db.sessions !== ":memory:" && sameFile(config.db.sessions, config.db.lorehouse)) missing.push(`SESSIONS_DB (must be a different file from LOREHOUSE_DB, got "${config.db.sessions}" for both)`);
+  if (![undefined, "", "0", "1"].includes(env.PDF_REPLIES)) missing.push(`PDF_REPLIES (1 for PDF replies, or unset; got "${env.PDF_REPLIES}")`);
   if (![undefined, "", "0", "1"].includes(env.USAGE_RECORD_PEOPLE)) missing.push(`USAGE_RECORD_PEOPLE (1 to record who asks, or unset; got "${env.USAGE_RECORD_PEOPLE}")`);
   // The admin token reads what people wrote: long, and never the status token, which is
   // the one handed to monitors.

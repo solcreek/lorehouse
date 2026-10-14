@@ -6,6 +6,7 @@ import { anthropic } from "@junejs/core/agent-models";
 import { slackChannel, type SlackNormalizedEvent } from "@junejs/core/channels";
 import { defineAgent, parseSkill, type Channel } from "@junejs/core/agent-config";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
+import { memoryFileStore, type FileStore } from "@junejs/core/agent-files";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import { assertDistinctDatabases, type Config } from "./config";
 import { agentIdentity } from "./identity";
@@ -16,7 +17,8 @@ import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
-import { SKILLS, systemPrompt } from "./prompts";
+import { PDF_SKILLS, SKILLS, systemPrompt } from "./prompts";
+import { renderPdfTool } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
 import { runnerRoutes } from "./runners/routes";
@@ -50,6 +52,7 @@ const TASK_LABELS: Record<string, string> = {
   workspace_read_file: "Reading a file",
   workspace_write_file: "Editing a file",
   open_pull_request: "Preparing a pull request",
+  render_pdf: "Making the PDF",
 };
 
 // The durable agent id is fixed; the display name is config. Renaming the agent in a
@@ -162,6 +165,10 @@ export async function createApp(config: Config) {
     );
   }
 
+  // PDF replies: render_pdf puts the file in the store, and the Slack channel uploads it
+  // to the thread after the reply.
+  if (config.pdf) tools.push(renderPdfTool());
+
   // Where the agent works: the listed channels, less any ingest found private or archived
   // since the start (refused from then on; see ingest/slack.ts).
   const listed = { has: (channel: string) => config.agent.channels.has(channel) && !ingester?.isClosed(channel) };
@@ -249,7 +256,7 @@ export async function createApp(config: Config) {
     name: AGENT_ID,
     instructions: systemPrompt(identity),
     tools,
-    skills: Object.entries(SKILLS).map(([name, text]) => parseSkill(name, text)),
+    skills: Object.entries({ ...SKILLS, ...(config.pdf ? PDF_SKILLS : {}) }).map(([name, text]) => parseSkill(name, text)),
     channels: [slack],
     authorizeAnswer,
   });
@@ -261,7 +268,7 @@ export async function createApp(config: Config) {
     // No cast: tsc checks the real SDK client against June's AnthropicClient here.
     client: new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl }),
   });
-  runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions);
+  runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions, { files: fileStore(config.files.store) });
   const mounted = mountAgent(agent, runtime);
   // Recording who asks is never silent: each channel is told when it starts, and again
   // when it stops (the record erased). Once per change, not on every start.
@@ -361,4 +368,13 @@ export async function createApp(config: Config) {
       }
     },
   };
+}
+
+// Where the agent's files wait for the Slack channel to upload them (FILE_STORE). Only
+// memory exists yet: never on disk, kept until 64 MiB of newer files push it out or the
+// process restarts (no delete yet: junebuild/june#370). loadConfig refuses blob until it
+// is built.
+function fileStore(kind: Config["files"]["store"]): FileStore {
+  if (kind === "memory") return memoryFileStore();
+  throw new Error(`FILE_STORE=${kind} is not available yet`);
 }
