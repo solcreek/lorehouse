@@ -32,7 +32,7 @@
 // a message in that channel; "[whois]", a slack_resolve_user tool_use for the first
 // person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
 // an open_pull_request tool_use for that branch; "[pdf]", a render_pdf tool_use for a short
-// report named conformance-report.pdf); turn 2 (tool_result
+// report in English and Chinese named conformance-report.pdf); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …", and with
 // "[quote]" in the question, the hit's text verbatim: "… [quote:<text>] w0 …"), or for
@@ -312,7 +312,7 @@ async function anthropic(req: Request): Promise<Response> {
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
     const toolName = pdf ? "render_pdf" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = pdf ? { markdown: "# Conformance report\n\nOne paragraph.\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "en" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
+    const input = pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));

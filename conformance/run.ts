@@ -1024,7 +1024,9 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "PDF_REPLIES=1: render_pdf typesets the report and the PDF is uploaded into the asker's thread",
+    // The report has Chinese in it, and the default fonts (PDF_FONTS=local) are bundled: a
+    // character no font covers fails the render, so this passes only if the font shipped.
+    name: "PDF_REPLIES=1: render_pdf typesets the report, Chinese included, and the PDF is uploaded into the asker's thread",
     run: () => inMode({ PDF_REPLIES: "1" }, async () => {
       await reset();
       const ts = await mentionAndWait("[pdf] make me a report");
