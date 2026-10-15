@@ -183,7 +183,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     slack: {
       signingSecret: need("SLACK_SIGNING_SECRET"),
       botToken: need("SLACK_BOT_TOKEN"),
-      apiUrl: env.SLACK_API_URL || undefined,
+      apiUrl: env.SLACK_API_URL?.replace(/\/+$/, "") || undefined,
       botUserId: env.SLACK_BOT_USER_ID || undefined,
     },
     anthropic: {
