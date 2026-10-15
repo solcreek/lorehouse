@@ -539,6 +539,23 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    name: "replies when SLACK_API_URL ends in a slash, as Slack writes its own",
+    run: async () => {
+      await stopApp();
+      try {
+        await reset();
+        await startApp({ SLACK_API_URL: `${MOCK}/slack/api/` });
+        const a = await ask("which floor is the ops room on");
+        const doubled = Object.keys((await stats()).byMethod).filter((m) => m.startsWith("/"));
+        if (doubled.length) return `called Slack at a doubled slash: ${doubled.join(", ")}`;
+        return a.cite === WOMBAT_THREAD ? null : `cited ${a.cite}, want ${WOMBAT_THREAD}: ${JSON.stringify(a.text.slice(0, 120))}`;
+      } finally {
+        await stopApp();
+        await startApp();
+      }
+    },
+  },
+  {
     name: "leaves bot and system messages out of knowledge",
     run: async () => {
       const a = await ask("platypus build succeeded");
