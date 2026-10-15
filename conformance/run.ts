@@ -539,12 +539,12 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "replies with SLACK_API_URL ending in a slash, as Slack writes its own (https://slack.com/api/)",
+    name: "replies when SLACK_API_URL ends in a slash, as Slack writes its own",
     run: async () => {
       await stopApp();
       try {
-        await startApp({ SLACK_API_URL: `${MOCK}/slack/api/` });
         await reset();
+        await startApp({ SLACK_API_URL: `${MOCK}/slack/api/` });
         const a = await ask("which floor is the ops room on");
         const doubled = Object.keys((await stats()).byMethod).filter((m) => m.startsWith("/"));
         if (doubled.length) return `called Slack at a doubled slash: ${doubled.join(", ")}`;
