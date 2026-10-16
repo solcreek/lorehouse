@@ -434,7 +434,12 @@ describe("over a real WebSocket", () => {
         ws.send(JSON.stringify({ type: "result", result: { id: job.id, status: 200, bodyBase64: b64(content) } }));
       };
       ws.send(JSON.stringify({ type: "status", capacity: 1, running: 0 }));
-      await Bun.sleep(50);
+      // Until the hub has the runner's status it has no room for a sandbox: wait for that,
+      // not a fixed time, which a loaded CI box can outlast.
+      for (const deadline = Date.now() + 5_000; !hub.status().some((r) => r.runner === "big" && r.online && r.capacity === 1); ) {
+        if (Date.now() > deadline) throw new Error("the runner's status never reached the hub");
+        await Bun.sleep(5);
+      }
       expect((await hub.sandbox("s1").readFile("/workspace/big.txt")).length).toBe(content.length);
       expect(closed).toBeUndefined();
       ws.close();
