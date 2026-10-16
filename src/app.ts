@@ -40,6 +40,7 @@ import { approvalStore, approverGate } from "./approvals";
 import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
+import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
 
 // How each tool call shows up on the reply's task timeline in Slack.
 const TASK_LABELS: Record<string, string> = {
@@ -51,6 +52,9 @@ const TASK_LABELS: Record<string, string> = {
   workspace_exec: "Running a command in the sandbox",
   workspace_read_file: "Reading a file",
   workspace_write_file: "Editing a file",
+  workspace_job_start: "Starting a job in the sandbox",
+  workspace_job_status: "Checking on the job",
+  workspace_job_cancel: "Stopping the job",
   open_pull_request: "Preparing a pull request",
   render_pdf: "Making the PDF",
 };
@@ -158,8 +162,14 @@ export async function createApp(config: Config) {
     const apiUrl = config.githubApiUrl;
     const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
+    // Who started each background job, for who may cancel it (tools/jobs.ts): pruned on
+    // start, then daily.
+    const jobs = jobStore(knowledge);
+    tally(() => jobs.prune());
+    timers.push(setInterval(() => tally(() => jobs.prune()), 86_400_000).unref());
     tools.push(
       ...workspaceTools(sandboxFor, { commitAs: github.identity }),
+      ...jobTools(sandboxFor, { store: jobs, authority: slackJobAuthority(slackReads, approverName), commitAs: github.identity }),
       cloneTool(sandboxFor, github),
       pullRequestTool({ sandboxFor, github, identity, approverName, approver: config.prApprover, approvals, apiUrl }),
     );

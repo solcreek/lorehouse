@@ -6,7 +6,7 @@
 // the git commands open_pull_request runs, answered as a checkout ready for a PR. The
 // publish ops answer as sandboxd's would for that checkout: stage returns the facts and a
 // new stage id, and push succeeds only for a stage it handed out, once, with the same
-// commit and branch (sandbox/host/src/publish.rs).
+// commit and branch (sandbox/host/src/publish.rs). Background jobs answer as guestd's do.
 
 type Job = { id: string; sandbox: string; op: string; method?: string; path?: string; bodyBase64?: string };
 
@@ -55,8 +55,41 @@ function publish(job: Job) {
   return json(job, 200, { sha: SHA, branch: req.branch });
 }
 
+// Background jobs, as guestd answers them (sandbox/guest/jobs.go): a start of an id that
+// exists returns that job (200, created: false); a job runs through one status and has
+// exited 0 by the second, its output "ran:<command>"; a cancel ends it as cancelled (143).
+const jobs = new Map<string, { id: string; command: string; cwd: string; polls: number; state: string; exitCode: number | null }>();
+
+function jobView(j: { id: string; command: string; cwd: string; state: string; exitCode: number | null }, created?: boolean) {
+  const tail = j.state === "running" ? "started\n" : `ran:${j.command}\n`;
+  return { id: j.id, command: j.command, cwd: j.cwd, state: j.state, exitCode: j.exitCode, startedAt: new Date().toISOString(), endedAt: j.state === "running" ? null : new Date().toISOString(), elapsedMs: 1500, timeoutMs: 3_600_000, outputBytes: tail.length, tail, tailTruncated: false, ...(created === undefined ? {} : { created }) };
+}
+
+function jobCall(job: Job) {
+  const route = (job.path ?? "").split("?")[0]!;
+  if (job.method === "POST" && route === "/jobs") {
+    const req = JSON.parse(Buffer.from(job.bodyBase64 ?? "", "base64").toString()) as { id: string; command: string; cwd: string };
+    const key = `${job.sandbox}/${req.id}`;
+    const existing = jobs.get(key);
+    if (existing) return json(job, 200, jobView(existing, false));
+    const j = { id: req.id, command: req.command, cwd: req.cwd, polls: 0, state: "running", exitCode: null };
+    jobs.set(key, j);
+    return json(job, 201, jobView(j, true));
+  }
+  const m = /^\/jobs\/([^/]+)(\/cancel)?$/.exec(route);
+  const j = m ? jobs.get(`${job.sandbox}/${m[1]}`) : undefined;
+  if (!j) return json(job, 404, { error: `no job ${JSON.stringify(m?.[1])} in this sandbox` });
+  if (m![2]) {
+    if (j.state === "running") Object.assign(j, { state: "cancelled", exitCode: 143 });
+  } else if (j.state === "running" && ++j.polls >= 2) {
+    Object.assign(j, { state: "exited", exitCode: 0 });
+  }
+  return json(job, 200, jobView(j));
+}
+
 function answer(job: Job) {
   if (job.op === "stage" || job.op === "push") return publish(job);
+  if (job.op === "guest" && (job.path === "/jobs" || job.path?.startsWith("/jobs/"))) return jobCall(job);
   if (job.op === "guest" && job.method === "POST" && job.path === "/exec") {
     const { command } = JSON.parse(Buffer.from(job.bodyBase64 ?? "", "base64").toString());
     const stdout = git(command) ?? `ran:${command}\n`;

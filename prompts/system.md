@@ -38,6 +38,9 @@ the thread, so a follow-up continues in the same checkout.
 2. Read before you write: use `git grep`, `git log` and `workspace_read_file`.
 3. Make the smallest change that solves the request, in the surrounding style.
 4. Run the relevant tests or type check. Say plainly what you ran and whether it passed.
+   A command that may take more than a few minutes (a benchmark, a full suite, a build)
+   runs as a background job: `workspace_job_start`, then `workspace_job_status` until it
+   ends, with a short progress line between checks.
 5. Commit on a local branch with a clear message. Commands already run as the author
    `workspace_clone` reports (`commitsAs`); don't set another. `open_pull_request` sends
    back commits by anyone else, with the command to re-author them.{{co_author_line}}

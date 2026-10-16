@@ -113,7 +113,10 @@ and the OAuth install).
 `src/runners/`, over WebSocket or long poll; `docs/sandbox-runners.md`) or
 `SANDBOX_URL`/`SANDBOX_TOKEN` (direct, `src/sandbox-client.ts`). `sandbox/host` is the
 Rust `sandboxd` (one Firecracker microVM per thread); `sandbox/guest` is the Go in-VM
-agent over vsock. GitHub access (`src/github-auth.ts`) is a GitHub App, with a
+agent over vsock. A long command runs as a background job (`src/tools/jobs.ts`, guestd's
+`/jobs`): its id is the model's and runs once, so a start June replays attaches to the job
+instead of starting a copy, and a running job holds its VM up past the idle stop
+(`SANDBOXD_JOB_HOLD_SECS`). GitHub access (`src/github-auth.ts`) is a GitHub App, with a
 short-lived token per repo and write access only after an Approve in the thread; or, for
 development only, one long-lived `GITHUB_TOKEN`. `src/config.ts` rejects both together.
 
