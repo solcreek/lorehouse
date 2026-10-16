@@ -12,7 +12,7 @@
 // jobs the runner says it never got (they never ran, so a retry is safe).
 
 import type { Database } from "bun:sqlite";
-import { EXEC_TIMEOUT_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
+import { EXEC_TIMEOUT_MS, FileTooLarge, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
 
 // `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
 // `received` (long poll only): ids from the last poll answer the runner got, so jobs whose
@@ -306,6 +306,8 @@ export class RunnerHub {
       }
       return r;
     };
+    // A file read as it came back, any status: readBytes tells 404 and 413 apart.
+    const read = (path: string) => this.submit(id, { op: "guest", method: "GET", path: `/file?path=${encodeURIComponent(path)}` }, 30_000);
     // A publish op: the request (tokens included, so never logged) as JSON; the host's
     // answer as JSON, or its reason as the error.
     const publish = async (op: "stage" | "push", request: object, timeoutMs: number): Promise<unknown> => {
@@ -324,6 +326,13 @@ export class RunnerHub {
         const r = await guest("GET", `/file?path=${encodeURIComponent(path)}`, undefined, 30_000);
         if (r.status === 404) throw new Error(`no such file: ${path}`);
         return decode(r);
+      },
+      async readBytes(path: string): Promise<Uint8Array> {
+        const r = await read(path);
+        if (r.status === 404) throw new Error(`no such file: ${path}`);
+        if (r.status === 413) throw new FileTooLarge(path, (r.error ?? decode(r)).trim().slice(0, 200));
+        if (r.status < 200 || r.status > 299) throw new Error(`sandbox GET /file: ${r.status} ${(r.error ?? decode(r)).slice(0, 200)}`);
+        return r.bodyBase64 ? new Uint8Array(Buffer.from(r.bodyBase64, "base64")) : new Uint8Array();
       },
       async writeFile(path: string, content: string): Promise<void> {
         await guest("PUT", `/file?path=${encodeURIComponent(path)}`, content, 30_000);
