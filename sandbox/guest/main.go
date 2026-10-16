@@ -5,6 +5,7 @@
 //	POST /exec   {"command","cwd","env","timeoutMs"} → {"exitCode","stdout","stderr"}
 //	GET  /file?path=…                                 → raw bytes (404 if absent)
 //	PUT  /file?path=…   body = raw bytes              → 204 (parents created)
+//	POST /jobs, GET /jobs[/{id}], POST /jobs/{id}/cancel → background jobs (jobs.go)
 //	GET  /healthz                                     → "ok"
 //
 // Commands run as bash -lc so the model gets a normal shell (pipes, &&, globs).
@@ -85,6 +86,11 @@ func main() {
 	mux.HandleFunc("POST /exec", handleExec)
 	mux.HandleFunc("GET /file", handleRead)
 	mux.HandleFunc("PUT /file", handleWrite)
+	jobs, err := newJobManager(defaultJobsDir)
+	if err != nil {
+		log.Fatalf("guestd: jobs directory %s: %v", defaultJobsDir, err)
+	}
+	jobs.routes(mux)
 	log.Fatal(http.Serve(ln, mux))
 }
 
