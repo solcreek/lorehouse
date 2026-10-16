@@ -43,9 +43,16 @@ state() {
   echo UNKNOWN
 }
 
+# One deadline for the whole wait (LAB_SSH_WAIT_SECS, 180): each try is a single ssh with
+# a short connect timeout, not remote()'s retries, so the wait can't run past it.
 wait_ssh() {
-  for _ in $(seq 1 60); do remote true >/dev/null 2>&1 && return 0; sleep 2; done
-  echo "{\"ok\":false,\"error\":\"no SSH to $N after 120 s\"}"; exit 1
+  local limit=${LAB_SSH_WAIT_SECS:-180} start=$SECONDS
+  while [ $((SECONDS - start)) -lt "$limit" ]; do
+    g compute ssh "$N" --zone "$Z" --command true -- -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR \
+      -o ConnectTimeout=$((limit - (SECONDS - start) < 10 ? 1 + limit - (SECONDS - start) : 10)) >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  echo "{\"ok\":false,\"error\":\"no SSH to $N after $limit s\"}"; exit 1
 }
 
 cmd=${1:-}; shift || true
