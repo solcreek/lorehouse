@@ -121,6 +121,7 @@ function fakeSandbox(origin?: string) {
       return { exitCode: 0, stdout: "", stderr: "" };
     },
     async readFile() { return ""; },
+    async readBytes() { return new Uint8Array(); },
     async writeFile() {},
     ...noPublish,
   };

@@ -55,6 +55,7 @@ function fakeRepo(o: { dirty?: boolean; origin?: string; authors?: string[]; fil
       return { exitCode: 1, stdout: "", stderr: `unexpected: ${command}` };
     },
     async readFile() { return ""; },
+    async readBytes() { return new Uint8Array(); },
     async writeFile() {},
     async stage(args) {
       published.push({ op: "stage", args });
@@ -860,6 +861,7 @@ describe("workspace tools", () => {
     const sb: Sandbox = {
       async exec(_c, opts) { seen.push(opts?.env); return { exitCode: 0, stdout: "", stderr: "" }; },
       async readFile() { return ""; },
+      async readBytes() { return new Uint8Array(); },
       async writeFile() {},
       ...noPublish,
     };
@@ -876,6 +878,7 @@ describe("workspace tools", () => {
     const sb: Sandbox = {
       async exec(command, opts) { seen.push({ command, opts }); return { exitCode: 1, stdout: "x".repeat(20_000) + "FAILED: 2 tests", stderr: "" }; },
       async readFile() { return ""; },
+      async readBytes() { return new Uint8Array(); },
       async writeFile() {},
       ...noPublish,
     };
@@ -889,7 +892,7 @@ describe("workspace tools", () => {
 
   test("the sandbox is resolved per session, from ctx — not from model input", async () => {
     const ids: string[] = [];
-    const tools = workspaceTools((ctx) => { ids.push(ctx.sessionId); return { exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }), readFile: async () => "", writeFile: async () => {}, ...noPublish }; });
+    const tools = workspaceTools((ctx) => { ids.push(ctx.sessionId); return { exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }), readFile: async () => "", readBytes: async () => new Uint8Array(), writeFile: async () => {}, ...noPublish }; });
     await tools[0]!.run({ command: "ls", sessionId: "slack:EVIL:1" }, { sessionId: "slack:C1:1.1" } as never);
     expect(ids).toEqual(["slack:C1:1.1"]);
   });
@@ -898,6 +901,7 @@ describe("workspace tools", () => {
     const down: Sandbox = {
       async exec() { throw new Error("no sandbox runner is connected"); },
       async readFile(path) { throw new Error(`no such file: ${path}`); },
+      async readBytes(path) { throw new Error(`no such file: ${path}`); },
       async writeFile() { throw new Error("sandbox PUT /file: 503 busy"); },
       ...noPublish,
     };

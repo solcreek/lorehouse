@@ -32,7 +32,8 @@
 // a message in that channel; "[whois]", a slack_resolve_user tool_use for the first
 // person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
 // an open_pull_request tool_use for that branch; "[pdf]", a render_pdf tool_use for a short
-// report in English and Chinese named conformance-report.pdf); turn 2 (tool_result
+// report in English and Chinese named conformance-report.pdf; "[attach] <path>", a
+// workspace_attach_file tool_use for that path titled "Conformance chart"); turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …", and with
 // "[quote]" in the question, the hit's text verbatim: "… [quote:<text>] w0 …"), or for
@@ -43,7 +44,9 @@
 // "[exec] <command>" (a workspace_exec tool_use), the exit code and output
 // ("[q7] [exec:0:<stdout>] …"), for a pull request, what came of it
 // ("[q7] [pr:opened:<url>] …"), for a PDF, the attached file's name and size
-// ("[q7] [pdf:conformance-report.pdf:<bytes>] …"), and for a tool that failed, its error text
+// ("[q7] [pdf:conformance-report.pdf:<bytes>] …"), for any other attached file, its name, size
+// and media type ("[q7] [file:Conformance chart.png:<bytes>:image/png] …"), and for a tool
+// that failed, its error text
 // ("[q7] [toolerror:<text>] …"), so the harness can check what the tool actually
 // handed the model.
 //
@@ -237,8 +240,9 @@ function answerFor(messages: Msg[], result: Block): string {
   const nonce = question.match(/\[q\d+\]/)?.[0] ?? "[q?]";
   const words = Array.from({ length: TOKENS }, (_, i) => `w${i}`);
   const value = resultValue(result.content) as { messages?: { author?: string; user?: string; text?: string }[]; id?: string; name?: string; realName?: string } | undefined;
-  const attached = (value as { file?: { name?: string; size?: number } } | undefined)?.file;
-  if (attached?.name) return `${nonce} [pdf:${attached.name}:${attached.size}] ${words.join(" ")}`;
+  const attached = (value as { file?: { name?: string; size?: number; mediaType?: string } } | undefined)?.file;
+  if (attached?.name && attached.mediaType === "application/pdf") return `${nonce} [pdf:${attached.name}:${attached.size}] ${words.join(" ")}`;
+  if (attached?.name) return `${nonce} [file:${attached.name}:${attached.size}:${attached.mediaType}] ${words.join(" ")}`;
   if (value?.id) return `${nonce} [whois:${JSON.stringify({ name: value.name, realName: value.realName })}] ${words.join(" ")}`;
   const exec = value as { exitCode?: number; stdout?: string } | undefined;
   if (typeof exec?.exitCode === "number") return `${nonce} [exec:${exec.exitCode}:${(exec.stdout ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
@@ -301,7 +305,9 @@ async function anthropic(req: Request): Promise<Response> {
     // "[skill:<name>]" → load that skill (read_skill)
     // "[pr] <branch>" → open a pull request from that branch (open_pull_request)
     // "[pdf]" → render a short report as a PDF (render_pdf)
+    // "[attach] <path>" → attach that file from the thread's sandbox (workspace_attach_file)
     const pdf = question.includes("[pdf]");
+    const attachPath = /\[attach\] (\S+)/.exec(question)?.[1];
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
     const prBranch = /\[pr\] (\S+)/.exec(question)?.[1];
     const recent = question.includes("[recent]");
@@ -310,9 +316,9 @@ async function anthropic(req: Request): Promise<Response> {
     const reactionsIn = /\[reactions:([A-Z0-9]+)\]/.exec(question)?.[1];
     const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = pdf ? "render_pdf" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = pdf ? "render_pdf" : attachPath ? "workspace_attach_file" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
+    const input = pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : attachPath ? { path: attachPath, title: "Conformance chart" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     if (!body.stream) {
       await sleep(TTFT_MS);
       return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));

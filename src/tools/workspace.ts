@@ -2,7 +2,7 @@
 //
 // A June agent lives in a Durable Object: no filesystem, no child processes. Everything
 // code-touching (clone, edit, test, push) happens in a SANDBOX the agent drives through
-// three tools. The Sandbox interface is the only thing the tools know, so the backend is
+// a few tools. The Sandbox interface is the only thing the tools know, so the backend is
 // swappable — Cloudflare Sandbox (a container bound to the worker), a runner on a box we
 // own, or an in-memory fake in tests.
 //
@@ -12,6 +12,7 @@
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { toolDescription } from "../prompts";
 import type { GitIdentity, RepoRef } from "../github-auth";
+import { MAX_ATTACH_BYTES, attachmentName, classify, formatSize } from "./file-types";
 
 export type ExecResult = { exitCode: number; stdout: string; stderr: string };
 
@@ -30,7 +31,11 @@ export const EXEC_TIMEOUT_MS = 10 * 60_000;
 
 export interface Sandbox {
   exec(command: string, opts?: ExecOptions): Promise<ExecResult>;
+  // A text file, decoded as UTF-8 (workspace_read_file).
   readFile(path: string): Promise<string>;
+  // A file's bytes as they are (workspace_attach_file). Throws "no such file: <path>" for a
+  // missing one and FileTooLarge for one over guestd's read limit (16 MiB).
+  readBytes(path: string): Promise<Uint8Array>;
   writeFile(path: string, content: string): Promise<void>;
   // Publishing, done by the sandbox host so a write token never enters the sandbox
   // (sandbox/host/src/publish.rs). stage: verify the commits the checkout has that GitHub
@@ -40,6 +45,14 @@ export interface Sandbox {
   // Both throw with the host's reason (no commits, the base isn't on GitHub, refused…).
   stage(o: { repo: RepoRef; base: string; branch: string; token?: string }): Promise<Staged>;
   push(o: { stage: string; repo: RepoRef; sha: string; branch: string; token: string }): Promise<{ sha: string; branch: string }>;
+}
+
+// A file guestd won't read: over its limit (sandbox/guest/main.go, 16 MiB). `detail` is
+// guestd's own sentence ("file is N bytes; the limit is M").
+export class FileTooLarge extends Error {
+  constructor(readonly path: string, readonly detail: string) {
+    super(`too large to read: ${path}: ${detail}`);
+  }
 }
 
 // What a stage found, all computed on the host from the verified commits. `stage`: the
@@ -139,7 +152,50 @@ export function workspaceTools(sandboxFor: SandboxFor, opts: { commitAs?: () => 
           return { path: input.path, bytes: input.content.length };
         }),
     },
+    {
+      spec: {
+        name: "workspace_attach_file",
+        description: toolDescription("workspace_attach_file", { workdir: WORKDIR, max: formatSize(MAX_ATTACH_BYTES) }),
+        input: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: `the file in the sandbox (relative paths resolve against ${WORKDIR})` },
+            title: { type: "string", description: 'the name the thread shows, e.g. "Benchmark, main vs branch"; defaults to the file\'s own name' },
+          },
+          required: ["path"],
+        },
+      },
+      run: async (input: { path?: unknown; title?: unknown }, ctx: ToolContext) => attach(sandboxFor, input, ctx),
+    },
   ];
+}
+
+const SMALLER = "Make it smaller in the sandbox (a lower resolution, or JPEG, for an image; fewer rows for a CSV) and attach that";
+
+// workspace_attach_file: the file's bytes from the thread's sandbox into June's file store;
+// the Slack channel uploads it to the thread being answered after the reply, as it does
+// render_pdf's PDF. It names no channel or thread, so it can attach nowhere else. What it
+// attaches is decided by the bytes and the name (file-types.ts), never by the model.
+async function attach(sandboxFor: SandboxFor, input: { path?: unknown; title?: unknown }, ctx: ToolContext): Promise<unknown> {
+  if (typeof input?.path !== "string" || !input.path.trim()) return { error: 'workspace_attach_file needs `path`: the file in the sandbox to attach, e.g. "chart.png" or "/tmp/out/report.pdf"' };
+  if (input.title !== undefined && input.title !== null && typeof input.title !== "string") return { error: "`title` must be a string (the name the thread shows), or left out" };
+  const path = resolve(input.path.trim());
+  let bytes: Uint8Array;
+  try {
+    bytes = await sandboxFor(ctx).readBytes(path);
+  } catch (err) {
+    if (err instanceof FileTooLarge) return { error: `${path} is too large to attach (${err.detail}); I attach files up to ${formatSize(MAX_ATTACH_BYTES)}. ${SMALLER}` };
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith("no such file")) return { error: `no such file in the sandbox: ${path}. Check the path (workspace_exec: ls -la ${path.slice(0, path.lastIndexOf("/") + 1)}); relative paths resolve against ${WORKDIR}` };
+    return { error: `couldn't read ${path} from the sandbox: ${message}` };
+  }
+  if (bytes.byteLength > MAX_ATTACH_BYTES) return { error: `${path} is ${formatSize(bytes.byteLength)}; I attach files up to ${formatSize(MAX_ATTACH_BYTES)}. ${SMALLER}` };
+  if (bytes.byteLength === 0) return { error: `${path} is empty: nothing to attach. Check that whatever writes it has finished (workspace_exec: ls -la ${path})` };
+  const verdict = classify(path, bytes);
+  if ("refusal" in verdict) return { error: verdict.refusal };
+  const name = attachmentName(path, verdict.kind, typeof input.title === "string" ? input.title : undefined);
+  const file = await ctx.files.put(bytes, { name, mediaType: verdict.kind.mediaType });
+  return { file, note: `${name} (${verdict.kind.label}, ${formatSize(file.size)}) will be attached to this thread after your reply. Don't attach it again; say in a sentence what it shows.` };
 }
 
 export function resolve(path: string): string {

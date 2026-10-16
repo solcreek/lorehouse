@@ -25,7 +25,7 @@ import { createHmac } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { MIRRORS, pollRunner, wsRunner } from "./fake-runner";
+import { CHART_PNG, MIRRORS, pollRunner, wsRunner } from "./fake-runner";
 import { parseArgs, selectScenarios, UsageError, type Args } from "./select";
 
 const ROOT = join(import.meta.dir, "..");
@@ -1317,6 +1317,39 @@ const scenarios: Scenario[] = [
         if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
         const listed = (await status() as unknown as { runners?: { runner: string; transport: string; mirrors?: unknown }[] }).runners;
         return listed?.some((r) => r.runner === "r-poll" && r.transport === "poll" && JSON.stringify(r.mirrors) === JSON.stringify(MIRRORS)) ? null : `/status runners ${JSON.stringify(listed)}`;
+      } finally {
+        await runner.stop();
+      }
+    }),
+  },
+  {
+    name: "workspace_attach_file over a runner: a PNG made in the sandbox is uploaded into the asker's thread; an SVG is refused, uploading nothing",
+    run: () => inMode(RUNNER_ENV, async () => {
+      const runner = await wsRunner(APP, RUNNER_TOKEN, "r-attach");
+      try {
+        await reset();
+        const ts = await mentionAndWait("[attach] /tmp/out/chart.png");
+        const { text = "" } = (await (await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`)).json()) as { text?: string };
+        const told = text.match(/\[file:([^:\]]+):(\d+):([^\]]+)\]/);
+        if (!told) return `the model wasn't handed an attached file: ${text.slice(0, 160)}`;
+        const read = runner.jobs.find((j) => j.op === "guest" && j.method === "GET");
+        if (read?.path !== "/file?path=%2Ftmp%2Fout%2Fchart.png") return `the file was read as ${read?.path}, want /file?path=%2Ftmp%2Fout%2Fchart.png`;
+        // The upload follows the reply (after chat.stopStream), so it may land after /wait.
+        const up = await until(async () => (await stats()).uploads.find((u) => u.thread_ts === ts && u.channel));
+        if (!up) return `no file shared into the thread: ${JSON.stringify((await stats()).uploads)}`;
+        if (up.channel !== ALLOWED) return `shared to ${up.channel}, want ${ALLOWED}`;
+        if (up.filename !== "Conformance chart.png" || told[1] !== up.filename) return `file named ${up.filename} (model told ${told[1]}), want "Conformance chart.png"`;
+        if (told[3] !== "image/png" || !up.head?.includes("PNG") || up.contentType !== "image/png") return `uploaded bytes aren't the PNG: head ${JSON.stringify(up.head)}, content-type ${up.contentType}, model told ${told[3]}`;
+        if (up.bytes !== CHART_PNG.byteLength || up.bytes !== up.length || String(up.bytes) !== told[2]) return `sizes disagree: the PNG is ${CHART_PNG.byteLength}, reserved ${up.length}, sent ${up.bytes}, model told ${told[2]}`;
+        if ((await stats()).uploads.length !== 1) return `want one upload, got ${(await stats()).uploads.length}`;
+
+        await reset();
+        const svgTs = await mentionAndWait("[attach] /tmp/out/chart.svg");
+        const svg = (await (await fetch(`${MOCK}/wait?thread_ts=${svgTs}&timeout_ms=15000`)).json()) as { text?: string };
+        if (!/\[toolerror:SVG isn't attached:[^\]]*PNG/.test(svg.text ?? "")) return `an SVG wasn't refused with why and what to do instead: ${(svg.text ?? "").slice(0, 200)}`;
+        await Bun.sleep(300); // an upload would follow the reply
+        const after = await stats();
+        return after.uploads.length || after.byMethod["files.completeUploadExternal"] ? `uploaded something for the SVG: ${JSON.stringify(after.uploads)}` : null;
       } finally {
         await runner.stop();
       }
