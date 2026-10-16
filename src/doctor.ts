@@ -128,10 +128,13 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     } else {
       const granted = new Set(header.split(",").map((s) => s.trim()).filter(Boolean));
       // DMs arrive only with im:history, and only DM_MODE=ignore does without them.
-      // files:write attaches PDFs, so only PDF_REPLIES=1 needs it.
-      const needed = MANIFEST_SCOPES.filter((s) => !(s === "im:history" && config.agent.dm === "ignore") && !(s === "files:write" && !config.pdf));
+      // files:write attaches files to a thread: a PDF (PDF_REPLIES=1) or a file made in the
+      // sandbox (workspace_attach_file, with code tools on); nothing else needs it.
+      const attachers = [config.pdf ? "PDF_REPLIES=1 (render_pdf)" : "", config.sandbox ? "code tools (workspace_attach_file)" : ""].filter(Boolean);
+      const needed = MANIFEST_SCOPES.filter((s) => !(s === "im:history" && config.agent.dm === "ignore") && !(s === "files:write" && !attachers.length));
       const missing = needed.filter((s) => !granted.has(s));
-      if (missing.length) add("slack", "scopes", "fail", `missing ${missing.join(", ")}: add under OAuth & Permissions (or re-create from slack/manifest.yaml), then reinstall the app`);
+      const why = (s: string) => (s === "files:write" ? `${s} (to attach files, for ${attachers.join(" and ")})` : s);
+      if (missing.length) add("slack", "scopes", "fail", `missing ${missing.map(why).join(", ")}: add under OAuth & Permissions (or re-create from slack/manifest.yaml), then reinstall the app`);
       else add("slack", "scopes", "ok", needed.join(", "));
     }
 
