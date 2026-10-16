@@ -108,8 +108,9 @@ fn the_kernel_is_out_of_reach() {
         assert_eq!(one(key), "yes", "{key}");
     }
     assert_eq!(one("SystemCallArchitectures"), "native");
-    // @mount for the jailer's pivot_root and chroot; nothing else beyond @system-service.
-    assert_eq!(all("SystemCallFilter"), vec!["@system-service @mount".to_string()]);
+    // @mount for the jailer's pivot_root and chroot, seccomp for Firecracker's own filters
+    // (not in systemd 255's @system-service, #122); nothing else beyond @system-service.
+    assert_eq!(all("SystemCallFilter"), vec!["@system-service @mount seccomp".to_string()]);
     // With ProtectKernelModules=yes nothing in the service loads a module: what the taps
     // and the rules use is loaded at boot.
     let modules: BTreeSet<&str> = MODULES.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
