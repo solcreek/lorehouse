@@ -52,8 +52,36 @@ function sniff(bytes: Uint8Array): "png" | "jpeg" | "pdf" | "svg" | "text" | "bi
   }
   // Control bytes other than tab, newline, form feed and carriage return: not text.
   if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f]/.test(text)) return "binary";
-  if (/^﻿?\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE svg[^>]*>\s*)?<svg[\s>]/i.test(text)) return "svg";
+  if (startsWithSvg(text)) return "svg";
   return "text";
+}
+
+// Whether the text's first element is <svg>, past a BOM, whitespace, an XML declaration,
+// comments and a doctype. A scan, not one regex: a nested quantifier over comments
+// backtracks exponentially on input like "<!--" + "--><!--" repeated (CodeQL).
+function startsWithSvg(text: string): boolean {
+  let i = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const skipSpace = () => {
+    while (i < text.length && /\s/.test(text[i]!)) i++;
+  };
+  const at = (s: string) => text.slice(i, i + s.length).toLowerCase() === s;
+  const skipPast = (end: string): boolean => {
+    const j = text.indexOf(end, i);
+    if (j < 0) return false;
+    i = j + end.length;
+    return true;
+  };
+  skipSpace();
+  if (at("<?xml") && !skipPast(">")) return false;
+  for (;;) {
+    skipSpace();
+    if (at("<!--")) {
+      if (!skipPast("-->")) return false;
+    } else if (at("<!doctype")) {
+      if (!skipPast(">")) return false;
+    } else break;
+  }
+  return at("<svg") && (i + 4 >= text.length || /[\s>/]/.test(text[i + 4]!));
 }
 
 const SVG_REFUSAL = "SVG isn't attached: an SVG can carry scripts and links to external files that would run or load wherever it's opened. Rasterise it to PNG in the sandbox (for example `rsvg-convert -o chart.png chart.svg`, or save the chart as PNG in the first place: matplotlib `savefig(\"chart.png\")`) and attach the PNG";

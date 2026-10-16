@@ -57,6 +57,18 @@ describe("what is attached", () => {
       expect(v).toContain("attach the PNG");
     }
   });
+
+  test("an SVG behind comments and a doctype is found, and a pathological prolog is decided in linear time", () => {
+    const behind = text('﻿ <?xml version="1.0"?><!-- a --><!-- b --><!DOCTYPE svg PUBLIC "x" "y">\n<svg/>');
+    expect(kindOf("/w/chart.txt", behind)).toStartWith("refused: SVG isn't attached");
+    expect(kindOf("/w/notes.md", text("<svgfoo>not svg</svgfoo>"))).toBe("text/plain");
+    expect(kindOf("/w/notes.md", text("text first\n<svg></svg>"))).toBe("text/plain");
+    // What made the old regex backtrack exponentially (CodeQL, code-scanning/13).
+    const evil = text("<!--" + "--><!--".repeat(50_000) + "x");
+    const t0 = performance.now();
+    expect(kindOf("/w/evil.txt", evil)).toBe("text/plain");
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
 });
 
 describe("the attachment's name", () => {
