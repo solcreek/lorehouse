@@ -32,7 +32,16 @@ remote() {
 }
 push() { local i; for i in 1 2 3; do g compute scp "$@" --zone "$Z" >/dev/null && return 0; echo "lab: scp failed (try $i of 3)" >&2; sleep 3; done; return 1; }
 now() { python3 -c 'import time; print(time.time())'; }
-state() { g compute instances describe "$N" --zone "$Z" --format='value(status)' 2>/dev/null || echo ABSENT; }
+# The VM's status; ABSENT only when GCE says it doesn't exist. Any other failed lookup
+# (credentials, permissions, an outage) is UNKNOWN: a VM may still exist and bill.
+state() {
+  local out
+  if out=$(g compute instances describe "$N" --zone "$Z" --format='value(status)' 2>&1); then echo "$out"; return; fi
+  # Only the instance itself not found; a missing project or zone says "was not found" too.
+  if grep -qF "zones/$Z/instances/$N' was not found" <<<"$out"; then echo ABSENT; return; fi
+  echo "lab: can't look up $N: $(tail -1 <<<"$out")" >&2
+  echo UNKNOWN
+}
 
 wait_ssh() {
   for _ in $(seq 1 60); do remote true >/dev/null 2>&1 && return 0; sleep 2; done
@@ -53,6 +62,7 @@ case "$cmd" in
           --labels purpose=sandbox-lab >&2 ;;
       TERMINATED|STOPPED) echo "lab: starting $N" >&2; g compute instances start "$N" --zone "$Z" >&2 ;;
       RUNNING) ;;
+      UNKNOWN) echo "{\"ok\":false,\"error\":\"the state of $N can't be looked up (see stderr); not creating another\"}"; exit 1 ;;
       *) echo "{\"ok\":false,\"error\":\"$N is $s; wait and retry\"}"; exit 1 ;;
     esac
     wait_ssh
@@ -90,7 +100,10 @@ case "$cmd" in
     set +e; remote "$@" | tee "$out"; rc=${PIPESTATUS[0]}; set -e
     [ -z "$(tail -c1 "$out")" ] || echo
     echo "{\"ok\":$([ "$rc" = 0 ] && echo true || echo false),\"exit\":$rc}"; exit "$rc" ;;
-  status) printf '{"ok":true,"name":"%s","state":"%s","zone":"%s","type":"%s"}\n' "$N" "$(state)" "$Z" "$T" ;;
+  status)
+    st=$(state)
+    [ "$st" != UNKNOWN ] || { echo "{\"ok\":false,\"name\":\"$N\",\"error\":\"the VM's state can't be looked up (see stderr); it may still exist\"}"; exit 1; }
+    printf '{"ok":true,"name":"%s","state":"%s","zone":"%s","type":"%s"}\n' "$N" "$st" "$Z" "$T" ;;
   stop) g compute instances stop "$N" --zone "$Z" >&2; echo "{\"ok\":true,\"state\":\"$(state)\"}" ;;
   down)
     [ "${1:-}" = --yes ] || { echo '{"ok":false,"error":"down deletes the VM and its disks; pass --yes"}'; exit 2; }
