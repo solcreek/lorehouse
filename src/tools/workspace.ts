@@ -79,9 +79,18 @@ export function jobQuery(o: { waitMs?: number; tailBytes?: number }): string {
   return q.toString();
 }
 
-// A guestd job answer (both backends): the job, or an error with guestd's reason, which
-// says what to do. A 404 that isn't guestd's JSON, or a runner refusing the path, is a host
-// that predates jobs.
+// A job call that got an answer other than the job: `status` is the host's or guestd's. A
+// 4xx means the call was refused before anything ran; a start that throws anything else
+// (a timeout, a 5xx, a dropped runner) may have started the job.
+export class JobCallError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+// A guestd job answer (both backends): the job, or a JobCallError with guestd's reason,
+// which says what to do. A 404 that isn't guestd's JSON, or a runner refusing the path, is
+// a host that predates jobs.
 export function jobReply(op: string, status: number, body: string): SandboxJob {
   let parsed: { state?: unknown; error?: unknown } | undefined;
   try {
@@ -89,11 +98,11 @@ export function jobReply(op: string, status: number, body: string): SandboxJob {
   } catch {}
   if (status >= 200 && status < 300 && typeof parsed?.state === "string") return parsed as SandboxJob;
   if (typeof parsed?.error === "string") {
-    if (parsed.error.startsWith("guest call not allowed")) throw new Error(`job ${op}: this sandbox runner's sandboxd predates background jobs and refuses them; it needs updating (sandbox/host) before jobs can run there. Use workspace_exec for commands under 10 minutes meanwhile`);
-    throw new Error(`job ${op}: ${parsed.error}`);
+    if (parsed.error.startsWith("guest call not allowed")) throw new JobCallError(`job ${op}: this sandbox runner's sandboxd predates background jobs and refuses them; it needs updating (sandbox/host) before jobs can run there. Use workspace_exec for commands under 10 minutes meanwhile`, status);
+    throw new JobCallError(`job ${op}: ${parsed.error}`, status);
   }
-  if (status === 404) throw new Error(`job ${op}: this sandbox's guest agent predates background jobs (no /jobs); its golden image needs rebuilding with the current guestd (sandbox/host/prepare-golden.sh). Use workspace_exec for commands under 10 minutes meanwhile`);
-  throw new Error(`job ${op}: ${status} ${body.slice(0, 300)}`);
+  if (status === 404) throw new JobCallError(`job ${op}: this sandbox's guest agent predates background jobs (no /jobs); its golden image needs rebuilding with the current guestd (sandbox/host/prepare-golden.sh). Use workspace_exec for commands under 10 minutes meanwhile`, status);
+  throw new JobCallError(`job ${op}: ${status} ${body.slice(0, 300)}`, status);
 }
 
 // What a stage found, all computed on the host from the verified commits. `stage`: the

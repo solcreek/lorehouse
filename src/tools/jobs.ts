@@ -16,14 +16,17 @@
 // job is done, so a "stop it" posted meanwhile reaches the agent only when it reads the
 // thread: it passes that message's ts, and the author is looked up in Slack, not taken from
 // the model. A job whose starter isn't known (no signed event) may be cancelled by anyone
-// in the thread.
+// in the thread. Who started a job is written before the start is sent, since guestd may
+// start it and the answer still be lost; a job with no such record in this thread (its
+// row pruned, or never written) may be cancelled only by an admin: the safe side, since
+// whether its starter was known can't be told then.
 
 import type { Database } from "bun:sqlite";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { toolDescription } from "../prompts";
 import type { GitIdentity } from "../github-auth";
 import type { SlackApi } from "../slack-api";
-import { WORKDIR, authorEnv, clip, type SandboxFor, type SandboxJob, type SandboxJobs } from "./workspace";
+import { JobCallError, WORKDIR, authorEnv, clip, type SandboxFor, type SandboxJob, type SandboxJobs } from "./workspace";
 
 export const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const DEFAULT_TIMEOUT_MIN = 60;
@@ -37,9 +40,13 @@ const STORE_TTL_MS = 2 * 86_400_000;
 // Who started which job (migrations/0012_sandbox_jobs.sql).
 export function jobStore(db: Database) {
   return {
-    // The first start of an id in a session writes the row; a replay leaves it.
-    record(session: string, job: string, startedBy: string | null, now = new Date()): void {
-      db.query("INSERT OR IGNORE INTO sandbox_jobs (session, job, started_by, started_at) VALUES (?, ?, ?, ?)").run(session, job, startedBy, now.toISOString());
+    // The first start of an id in a session writes the row; a replay leaves it. True when
+    // this call wrote it.
+    record(session: string, job: string, startedBy: string | null, now = new Date()): boolean {
+      return db.query("INSERT OR IGNORE INTO sandbox_jobs (session, job, started_by, started_at) VALUES (?, ?, ?, ?)").run(session, job, startedBy, now.toISOString()).changes > 0;
+    },
+    forget(session: string, job: string): void {
+      db.query("DELETE FROM sandbox_jobs WHERE session = ? AND job = ?").run(session, job);
     },
     get(session: string, job: string): { startedBy: string | null; startedAt: string } | undefined {
       return (db.query("SELECT started_by AS startedBy, started_at AS startedAt FROM sandbox_jobs WHERE session = ? AND job = ?").get(session, job) as { startedBy: string | null; startedAt: string } | null) ?? undefined;
@@ -147,9 +154,17 @@ export function jobTools(sandboxFor: SandboxFor, opts: { store: JobStore; author
           if (!(minutes > 0 && minutes <= MAX_TIMEOUT_MIN)) return fail(`timeoutMinutes ${input.timeoutMinutes}: more than 0, at most ${MAX_TIMEOUT_MIN}`);
           const jobs = jobsOf(sandboxFor, ctx);
           const who = await opts.commitAs?.().catch(() => undefined);
-          const j = await jobs.start({ id: input.id, command: input.command, cwd: input.cwd ?? WORKDIR, env: who ? authorEnv(who) : undefined, timeoutMs: Math.round(minutes * 60_000) });
-          // After the start, so a start that failed records nobody; a replay records nothing new.
-          store.record(ctx.sessionId, input.id, speakerOf(ctx));
+          // Before the start: guestd may start the job and its answer be lost (a timeout, a
+          // dropped runner), and the job must still be its starter's. Only a refusal (a 4xx:
+          // nothing ran) takes back a row this call wrote; a replay writes nothing new.
+          const wrote = store.record(ctx.sessionId, input.id, speakerOf(ctx));
+          let j: SandboxJob;
+          try {
+            j = await jobs.start({ id: input.id, command: input.command, cwd: input.cwd ?? WORKDIR, env: who ? authorEnv(who) : undefined, timeoutMs: Math.round(minutes * 60_000) });
+          } catch (err) {
+            if (wrote && err instanceof JobCallError && err.status >= 400 && err.status < 500) store.forget(ctx.sessionId, input.id);
+            throw err;
+          }
           return { ...view(j), started: j.created === false ? "this id was already started: this is that job, not a second copy" : "started" };
         }),
     },
@@ -203,7 +218,13 @@ export function jobTools(sandboxFor: SandboxFor, opts: { store: JobStore; author
             if (started && Number(input.requestTs) * 1000 < Date.parse(started.startedAt) - 60_000) return fail(`the message ${input.requestTs} is from before job ${input.id} started; give the ts of the message that asked to cancel it`);
             asker = author;
           }
-          if (started?.startedBy && asker !== started.startedBy) {
+          if (!started) {
+            // No record of its start in this thread: whether its starter was known can't be
+            // told, so only an admin may cancel it.
+            const why = `there's no record of who started job ${input.id} in this thread (it was started over two days ago, or not from here), so only a workspace admin may cancel it`;
+            if (!asker) return fail(`${why}, and who asked isn't known. Pass requestTs, the ts of the message that asked`);
+            if (!(await authority?.isAdmin(asker).catch(() => false))) return fail(`${why}; ${await name(asker)} asked. Say so in the thread; workspace_job_status still shows how it is doing`);
+          } else if (started.startedBy && asker !== started.startedBy) {
             const starter = await name(started.startedBy);
             if (!asker) return fail(`job ${input.id} was started by ${starter}; only they or a workspace admin may cancel it, and who asked isn't known. Pass requestTs, the ts of the message that asked`);
             const admin = await authority?.isAdmin(asker).catch(() => false);

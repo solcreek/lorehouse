@@ -7,7 +7,7 @@ import { openKnowledge } from "../src/knowledge";
 import { RunnerHub, type Job } from "../src/runners/hub";
 import { remoteSandbox } from "../src/sandbox-client";
 import { formatElapsed, jobStore, jobTools, type JobAuthority } from "../src/tools/jobs";
-import { WORKDIR, jobReply, type JobStart, type Sandbox, type SandboxJob } from "../src/tools/workspace";
+import { JobCallError, WORKDIR, jobReply, type JobStart, type Sandbox, type SandboxJob } from "../src/tools/workspace";
 
 const job = (o: Partial<SandboxJob> = {}): SandboxJob => ({
   id: "bench-1", command: "make bench", cwd: WORKDIR, state: "running", exitCode: null,
@@ -78,6 +78,19 @@ describe("workspace_job_start", () => {
     expect(store.get("slack:C1:1790000000.000100", "bench-1")?.startedBy).toBe("U1");
   });
 
+  test("who started it is kept when the start's answer is lost, and taken back when guestd refused it", async () => {
+    const failing = (err: Error) => ({ jobs: { start: async () => { throw err; }, cancel: async (id: string) => job({ id, state: "cancelled" }) } }) as unknown as Sandbox;
+    // The start may have run in the guest: the row stays, and the starter still owns the job.
+    const lost = tools({ sb: failing(new Error("job start: timed out after 30000 ms")) });
+    expect((await lost.run("workspace_job_start", { id: "bench-1", command: "make bench" }, ctxFor("U1"))).error).toContain("timed out");
+    expect(lost.store.get("slack:C1:1790000000.000100", "bench-1")?.startedBy).toBe("U1");
+    expect((await lost.run("workspace_job_cancel", { id: "bench-1" }, ctxFor("U2"))).error).toContain("only Kai, who started job bench-1");
+    // guestd refused it (a 4xx: nothing ran): no row is left behind.
+    const refused = tools({ sb: failing(new JobCallError("job start: cwd /x isn't a directory", 400)) });
+    await refused.run("workspace_job_start", { id: "bench-1", command: "make bench", cwd: "/x" }, ctxFor("U1"));
+    expect(refused.store.get("slack:C1:1790000000.000100", "bench-1")).toBeUndefined();
+  });
+
   test("a bad id or timeout is refused before anything runs, saying what is allowed", async () => {
     const { run, calls } = tools();
     expect((await run("workspace_job_start", { id: "../x", command: "true" }, ctxFor("U1"))).error).toContain("e.g. \"bench-1\"");
@@ -135,6 +148,16 @@ describe("workspace_job_cancel", () => {
     expect((await run2("workspace_job_cancel", { id: "bench-1", requestTs: "yesterday" }, ctxFor("U1"))).error).toContain("a Slack message ts");
   });
 
+  test("a job with no record of its start in this thread may be cancelled only by an admin", async () => {
+    const { run, calls } = tools({ authority: authority({}, ["U9"]) });
+    const refused = await run("workspace_job_cancel", { id: "bench-1" }, ctxFor("U1"));
+    expect(refused.error).toContain("no record of who started job bench-1 in this thread");
+    expect(refused.error).toContain("Kai asked");
+    expect((await run("workspace_job_cancel", { id: "bench-1" }, ctxFor(undefined))).error).toContain("no record of who started job bench-1");
+    expect(calls.some((c) => c.op === "cancel")).toBe(false);
+    expect((await run("workspace_job_cancel", { id: "bench-1" }, ctxFor("U9"))).state).toBe("cancelled");
+  });
+
   test("a job whose starter Slack didn't vouch for may be cancelled by anyone in the thread", async () => {
     const t = tools();
     await t.run("workspace_job_start", { id: "j", command: "sleep 600" }, ctxFor("U1", { attested: false }));
@@ -146,6 +169,7 @@ describe("job answers", () => {
   test("guestd's reason is passed on; a host that predates jobs is named as such", () => {
     expect(jobReply("start", 201, JSON.stringify(job()))).toMatchObject({ id: "bench-1" });
     expect(() => jobReply("start", 409, JSON.stringify({ error: "job id \"a\" already names another run" }))).toThrow("job start: job id \"a\" already names another run");
+    expect(() => jobReply("start", 409, JSON.stringify({ error: "x" }))).toThrow(expect.objectContaining({ status: 409 }));
     expect(() => jobReply("status", 404, "404 page not found\n")).toThrow(/guest agent predates background jobs/);
     expect(() => jobReply("start", 400, JSON.stringify({ error: "guest call not allowed: POST /jobs" }))).toThrow(/sandboxd predates background jobs/);
   });
