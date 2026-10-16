@@ -3,7 +3,9 @@
 // It speaks the runner protocol (docs/sandbox-runners.md) to the app under test exactly
 // as sandboxd does, but "runs" a job by answering from memory: an exec returns
 // "ran:<command>", so a scenario can tell the command went through the runner, except
-// the git commands open_pull_request runs, answered as a checkout ready for a PR. The
+// the git commands open_pull_request runs, answered as a checkout ready for a PR. A file
+// read answers, for a path ending in .png, a 1×1 PNG (CHART_PNG); in .svg, an SVG with a
+// script in it; any other path is missing (404). The
 // publish ops answer as sandboxd's would for that checkout: stage returns the facts and a
 // new stage id, and push succeeds only for a stage it handed out, once, with the same
 // commit and branch (sandbox/host/src/publish.rs).
@@ -26,6 +28,17 @@ function git(command: string): string | undefined {
   if (command.startsWith("git log --format=")) return ""; // no commit by anyone else
   if (command.includes(" push https://github.com/") || command.startsWith("git update-ref ")) return "";
   return undefined;
+}
+
+// A 1×1 PNG, the bytes a .png path reads as.
+export const CHART_PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==", "base64");
+const SVG = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+
+function file(job: Job) {
+  const path = new URL(`http://x${job.path}`).searchParams.get("path") ?? "";
+  if (path.endsWith(".png")) return { id: job.id, status: 200, contentType: "application/octet-stream", bodyBase64: CHART_PNG.toString("base64") };
+  if (path.endsWith(".svg")) return { id: job.id, status: 200, contentType: "application/octet-stream", bodyBase64: b64(SVG) };
+  return { id: job.id, status: 404 };
 }
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
@@ -62,6 +75,7 @@ function answer(job: Job) {
     const stdout = git(command) ?? `ran:${command}\n`;
     return { id: job.id, status: 200, contentType: "application/json", bodyBase64: b64(JSON.stringify({ exitCode: 0, stdout, stderr: "" })) };
   }
+  if (job.op === "guest" && job.method === "GET" && job.path?.startsWith("/file?")) return file(job);
   return { id: job.id, status: 404 };
 }
 
