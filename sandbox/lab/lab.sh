@@ -18,9 +18,11 @@ set -Eeuo pipefail
 # Any command that fails and stops the script (a create refused for quota, a stop or delete
 # that errors, an upload that never lands) still ends stdout with one JSON line. Branches
 # that print their own error JSON leave with an explicit exit, which this doesn't catch.
+# It names the failed command, not a line: bash 3.2 (macOS) reports the enclosing case
+# statement's line for a failure at the top of a branch.
 # fd 3 is the real stdout: a failing command's own redirect (>&2) would otherwise take it.
 exec 3>&1
-trap 'rc=$?; [ "$BASH_SUBSHELL" -eq 0 ] || exit $rc; printf >&3 "{\"ok\":false,\"cmd\":\"%s\",\"error\":\"line %s: %s failed (exit %s); see stderr\"}\n" "${cmd:-}" "$LINENO" "$(printf %s "$BASH_COMMAND" | tr -d "\"\\\\" | cut -c1-120)" "$rc"; exit $rc' ERR
+trap 'rc=$?; [ "$BASH_SUBSHELL" -eq 0 ] || exit $rc; printf >&3 "{\"ok\":false,\"cmd\":\"%s\",\"error\":\"%s failed (exit %s); see stderr\"}\n" "${cmd:-}" "$(printf %s "$BASH_COMMAND" | tr -d "\"\\\\" | cut -c1-120)" "$rc"; exit $rc' ERR
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 P=${LAB_PROJECT:?set LAB_PROJECT to the GCP project the lab VM lives in}
