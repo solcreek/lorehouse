@@ -63,7 +63,10 @@ case "$cmd" in
     [ "$(state)" = RUNNING ] || { echo '{"ok":false,"error":"the VM is not running; run lab.sh up"}'; exit 1; }
     tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
     # This working tree's files (tracked and new, not ignored), so uncommitted work is what gets tested.
+    # A path deleted or renamed but not staged is still in the index: drop the ones gone from
+    # disk (lexists keeps a symlink, even a dangling one), or tar would abort on them.
     (cd "$root" && { git ls-files -z --cached --others --exclude-standard sandbox/host sandbox/guest; } \
+      | python3 -c 'import os, sys; sys.stdout.buffer.write(b"".join(p + b"\0" for p in sys.stdin.buffer.read().split(b"\0") if p and os.path.lexists(p)))' \
       | tar --null -T - -czf "$tmp/lab-src.tgz" \
       && { git rev-parse --short HEAD | tr -d '\n'; git diff --quiet HEAD -- sandbox || printf '+dirty'; } >"$tmp/COMMIT")
     (cd "$tmp" && mkdir s && tar -xzf lab-src.tgz -C s && cp COMMIT s/ && tar -czf lab-src.tgz -C s .)
