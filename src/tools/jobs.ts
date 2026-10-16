@@ -97,6 +97,7 @@ function view(j: SandboxJob): Record<string, unknown> {
   };
   if (j.tailTruncated && j.tail.length <= TAIL_CHARS) out.tail = `[… earlier output not shown …]\n${j.tail}`;
   if (j.reason) out.reason = j.reason;
+  if (j.persistError) out.persistError = j.persistError;
   if (j.state === "running") out.next = "still running: post a short progress note if the last one was over a minute ago, then call workspace_job_status again";
   if (j.state === "lost") out.next = "the job did not finish; say so with the output above, and start it again under a new id only if the asker wants it";
   return out;

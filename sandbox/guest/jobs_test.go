@@ -278,3 +278,32 @@ func TestARetriedStartWithNoCwdAttachesToTheSameJob(t *testing.T) {
 	}
 	finished(t, m, "nocwd")
 }
+
+func TestAnEndingThatCantBeWrittenIsKeptInMemoryAndWrittenLater(t *testing.T) {
+	m := manager(t)
+	diskFull := errors.New("no space left on device")
+	failing := true
+	m.persist = func(rec jobRecord) error {
+		if failing && rec.State != stateRunning {
+			return diskFull
+		}
+		return m.writeRecord(rec)
+	}
+	start(t, m, "full", "exit 4")
+	v := finished(t, m, "full") // meta.json on disk still says running
+	if v.State != stateExited || v.ExitCode == nil || *v.ExitCode != 4 || !strings.Contains(v.PersistError, "no space left") {
+		t.Fatalf("while the write fails: state %s exit %v persistError %q", v.State, v.ExitCode, v.PersistError)
+	}
+	if _, list := m.list(); len(list) != 1 || list[0].State != stateExited {
+		t.Fatalf("list while the write fails: %+v", list)
+	}
+	failing = false // space again: the next status writes it
+	if v, err := m.status("full", 0, defaultTail, nil); err != nil || v.State != stateExited || v.PersistError != "" {
+		t.Fatalf("after the retry: %+v %v", v, err)
+	}
+	b, _ := os.ReadFile(filepath.Join(m.dir, "full", "meta.json"))
+	var rec jobRecord
+	if json.Unmarshal(b, &rec) != nil || rec.State != stateExited {
+		t.Fatalf("on disk after the retry: %s", b)
+	}
+}

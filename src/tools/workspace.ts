@@ -53,6 +53,8 @@ export type SandboxJob = {
   id: string; command: string; cwd: string; state: JobState; exitCode: number | null;
   startedAt: string; endedAt: string | null; elapsedMs: number; timeoutMs: number;
   outputBytes: number; tail: string; tailTruncated: boolean; reason?: string; created?: boolean;
+  // Set while guestd couldn't write the job's end to disk (it is kept in memory meanwhile).
+  persistError?: string;
 };
 export type JobStart = { id: string; command: string; cwd: string; env?: Record<string, string>; timeoutMs?: number };
 

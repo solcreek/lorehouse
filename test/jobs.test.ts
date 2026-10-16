@@ -150,6 +150,12 @@ describe("job answers", () => {
     expect(() => jobReply("start", 400, JSON.stringify({ error: "guest call not allowed: POST /jobs" }))).toThrow(/sandboxd predates background jobs/);
   });
 
+  test("guestd's word that a job's end isn't on disk yet reaches the model", async () => {
+    const sb = { jobs: { status: async (id: string) => job({ id, state: "exited", exitCode: 0, persistError: "the job's end couldn't be saved (no space left on device)" }) } } as unknown as Sandbox;
+    const { run } = tools({ sb });
+    expect(await run("workspace_job_status", { id: "bench-1" }, ctxFor("U1"))).toMatchObject({ state: "exited", persistError: expect.stringContaining("no space left") });
+  });
+
   test("elapsed reads like a person would say it", () => {
     expect([formatElapsed(4_000), formatElapsed(65_000), formatElapsed(3_725_000)]).toEqual(["4s", "1m 5s", "1h 2m"]);
   });

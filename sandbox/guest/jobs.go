@@ -90,6 +90,9 @@ type jobView struct {
 	Tail          string `json:"tail"`
 	TailTruncated bool   `json:"tailTruncated"`
 	Created       *bool  `json:"created,omitempty"`
+	// Set while the job's end couldn't be written to meta.json (a full disk): the state
+	// here is right, it lives only in guestd's memory, and each later call tries again.
+	PersistError string `json:"persistError,omitempty"`
 }
 
 type liveJob struct {
@@ -105,7 +108,16 @@ type jobManager struct {
 	dir  string
 	mu   sync.Mutex
 	live map[string]*liveJob
-	now  func() time.Time
+	// Ended jobs whose final record failed to write: kept here, and over what meta.json
+	// says (running), until a later call writes it.
+	unsaved map[string]unsavedRecord
+	now     func() time.Time
+	persist func(jobRecord) error // writeRecord; a test makes it fail
+}
+
+type unsavedRecord struct {
+	rec jobRecord
+	err string
 }
 
 type jobError struct {
@@ -125,7 +137,8 @@ func newJobManager(dir string) (*jobManager, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	m := &jobManager{dir: dir, live: map[string]*liveJob{}, now: time.Now}
+	m := &jobManager{dir: dir, live: map[string]*liveJob{}, unsaved: map[string]unsavedRecord{}, now: time.Now}
+	m.persist = m.writeRecord
 	for _, rec := range m.records() {
 		if rec.State != stateRunning {
 			continue
@@ -137,7 +150,7 @@ func newJobManager(dir string) (*jobManager, error) {
 		rec.State, rec.EndedAt = stateLost, &ended
 		rec.OutputBytes = logSize(filepath.Join(dir, rec.ID))
 		rec.Reason = "the sandbox's VM stopped (or its agent restarted) while the job ran, and its processes went with it; the output up to then is kept"
-		_ = m.writeRecord(rec)
+		_ = m.persist(rec)
 	}
 	return m, nil
 }
@@ -207,7 +220,7 @@ func (m *jobManager) start(req startReq) (jobView, bool, error) {
 	cmd.WaitDelay = 2 * time.Second
 
 	rec := jobRecord{ID: req.ID, Command: req.Command, Cwd: req.Cwd, State: stateRunning, StartedAt: m.now(), TimeoutMs: timeout.Milliseconds()}
-	if err := m.writeRecord(rec); err != nil {
+	if err := m.persist(rec); err != nil {
 		log.Close()
 		os.RemoveAll(jobDir)
 		return jobView{}, false, errf(500, "job record: %v", err)
@@ -257,7 +270,11 @@ func (m *jobManager) wait(j *liveJob, cmd *exec.Cmd, timer *time.Timer) {
 	default:
 		j.rec.State = stateExited
 	}
-	_ = m.writeRecord(j.rec)
+	if err := m.persist(j.rec); err != nil {
+		// Leaving it to meta.json would read "running" from now on: keep the end here.
+		fmt.Fprintf(os.Stderr, "guestd: job %s ended (%s) but its record wasn't written: %v\n", j.rec.ID, j.rec.State, err)
+		m.unsaved[j.rec.ID] = unsavedRecord{j.rec, err.Error()}
+	}
 	delete(m.live, j.rec.ID)
 	close(j.done)
 }
@@ -355,6 +372,14 @@ func (m *jobManager) find(id string) (jobRecord, bool) {
 	if j, ok := m.live[id]; ok {
 		return j.rec, true
 	}
+	if u, ok := m.unsaved[id]; ok {
+		if err := m.persist(u.rec); err != nil {
+			m.unsaved[id] = unsavedRecord{u.rec, err.Error()}
+		} else {
+			delete(m.unsaved, id)
+		}
+		return u.rec, true
+	}
 	if !jobID.MatchString(id) {
 		return jobRecord{}, false
 	}
@@ -390,7 +415,7 @@ func (m *jobManager) runningIDs() []string {
 	return ids
 }
 
-// Every record on disk, oldest first.
+// Every record on disk, oldest first, with an unsaved end over what the disk says.
 func (m *jobManager) records() []jobRecord {
 	entries, _ := os.ReadDir(m.dir)
 	out := []jobRecord{}
@@ -401,6 +426,9 @@ func (m *jobManager) records() []jobRecord {
 		b, err := os.ReadFile(filepath.Join(m.dir, e.Name(), "meta.json"))
 		var rec jobRecord
 		if err == nil && json.Unmarshal(b, &rec) == nil && rec.ID == e.Name() {
+			if u, ok := m.unsaved[rec.ID]; ok {
+				rec = u.rec
+			}
 			out = append(out, rec)
 		}
 	}
@@ -424,7 +452,9 @@ func (m *jobManager) writeRecord(rec jobRecord) error {
 func (m *jobManager) pruneLocked() {
 	recs := m.records()
 	for i := 0; len(recs)-i > maxJobRecords && i < len(recs); i++ {
-		if _, live := m.live[recs[i].ID]; !live && recs[i].State != stateRunning {
+		_, live := m.live[recs[i].ID]
+		_, unsaved := m.unsaved[recs[i].ID]
+		if !live && !unsaved && recs[i].State != stateRunning {
 			os.RemoveAll(filepath.Join(m.dir, recs[i].ID))
 		}
 	}
@@ -438,6 +468,9 @@ func (m *jobManager) viewLocked(rec jobRecord, tail int) jobView {
 	v := jobView{jobRecord: rec, ElapsedMs: end.Sub(rec.StartedAt).Milliseconds()}
 	if j, ok := m.live[rec.ID]; ok {
 		v.OutputBytes = j.log.written()
+	}
+	if u, ok := m.unsaved[rec.ID]; ok {
+		v.PersistError = "the job's end couldn't be saved to the sandbox's disk (" + u.err + "); it is right here, but would read lost after a restart. Free some disk space"
 	}
 	v.Tail, v.TailTruncated = readTail(filepath.Join(m.dir, rec.ID), tail)
 	return v

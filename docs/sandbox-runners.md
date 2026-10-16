@@ -186,7 +186,7 @@ POST /jobs/bench-1/cancel                     ← 200 a job, once stopped (≤ 1
 
 a job: { "id", "command", "cwd", "state": "running" | "exited" | "cancelled" | "timed_out" | "lost",
          "exitCode": 0 | null, "startedAt", "endedAt": … | null, "elapsedMs", "timeoutMs",
-         "outputBytes", "tail", "tailTruncated", "reason"?, "created"? }
+         "outputBytes", "tail", "tailTruncated", "reason"?, "created"?, "persistError"? }
 ```
 
 - **An id runs once.** Starting an id that ran before in that sandbox returns that job,
@@ -198,6 +198,8 @@ a job: { "id", "command", "cwd", "state": "running" | "exited" | "cancelled" | "
   10 s later. When the command exits, anything it left running in its group is killed too.
 - **Its output** (stdout and stderr together) goes to a file on the VM's disk, and its
   record when it starts and ends. At least the last 8 MiB are kept (up to 16). The env is never recorded.
+  If the end can't be written (a full disk), guestd keeps it in memory, answers with it
+  and a `persistError`, and tries the write again on each later call.
 - **It counts as activity.** An idle VM isn't stopped while guestd says a job runs, for up
   to `SANDBOXD_JOB_HOLD_SECS` (default 6 h) after the VM's last request.
 - **It dies with its VM.** Whatever stops the VM (that hold running out, sandboxd stopping,
