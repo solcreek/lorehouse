@@ -265,3 +265,16 @@ func TestTheHTTPRoutes(t *testing.T) {
 		t.Fatalf("list: %+v", l)
 	}
 }
+
+func TestARetriedStartWithNoCwdAttachesToTheSameJob(t *testing.T) {
+	m := manager(t)
+	req := startReq{ID: "nocwd", Command: "true"} // cwd left out: guestd runs it in /
+	if _, created, err := m.start(req); err != nil || !created {
+		t.Fatalf("first start: %v %v", created, err)
+	}
+	again, created, err := m.start(req)
+	if err != nil || created || again.Cwd != "/" {
+		t.Fatalf("the identical retry: created %v cwd %q err %v (want the same job, not a 409)", created, again.Cwd, err)
+	}
+	finished(t, m, "nocwd")
+}

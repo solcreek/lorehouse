@@ -164,6 +164,10 @@ func (m *jobManager) start(req startReq) (jobView, bool, error) {
 	if req.TimeoutMs < 0 || timeout > maxJobTimeout {
 		return jobView{}, false, errf(400, "timeoutMs %d: at most %d (%s)", req.TimeoutMs, maxJobTimeout.Milliseconds(), maxJobTimeout)
 	}
+	// Before the lookup, so a retry that leaves cwd out compares equal to the run it started.
+	if req.Cwd == "" {
+		req.Cwd = "/"
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -176,9 +180,6 @@ func (m *jobManager) start(req startReq) (jobView, bool, error) {
 	}
 	if running := m.runningIDs(); len(running) >= maxRunningJobs {
 		return jobView{}, false, errf(429, "%d jobs are already running in this sandbox (%s); wait for one to finish, or cancel one", len(running), strings.Join(running, ", "))
-	}
-	if req.Cwd == "" {
-		req.Cwd = "/"
 	}
 	if info, err := os.Stat(req.Cwd); err != nil || !info.IsDir() {
 		return jobView{}, false, errf(400, "cwd %s isn't a directory in the sandbox; clone the repo first, or give a directory that exists", req.Cwd)
