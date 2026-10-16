@@ -88,9 +88,11 @@ MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-# @mount: the jailer's mount, pivot_root and chroot. Firecracker installs its own, much
-# narrower filter on top of this one.
-SystemCallFilter=@system-service @mount
+# @mount: the jailer's mount, pivot_root and chroot. seccomp: Firecracker installs its
+# own, much narrower filter per thread on top of this one, with seccomp(2). systemd 255
+# (Ubuntu 24.04 LTS) leaves seccomp out of @system-service, and without it every VM
+# fails to boot ("Failed to set the requested seccomp filters", #122).
+SystemCallFilter=@system-service @mount seccomp
 SystemCallErrorNumber=EPERM
 
 [Install]

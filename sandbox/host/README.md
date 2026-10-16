@@ -34,7 +34,7 @@ thread). Rust. Work reaches it one of two ways:
 
 ## Needs
 
-A Linux 5.3+ host (pidfds) with KVM, cgroup v2 and systemd, Firecracker and its `jailer` from the same
+A Linux 5.3+ host (pidfds) with KVM, cgroup v2 and systemd (255 or later; run on systemd 255 with Ubuntu 24.04 and a newer one on Arch, 2026-10-16), Firecracker and its `jailer` from the same
 release on `PATH`, a guest kernel, and a btrfs or XFS filesystem for the state and golden
 files. It runs as root with a few capabilities: it creates taps and nftables rules, and
 the jailer builds each VM's chroot before dropping to the VM's own uid. systemd confines
