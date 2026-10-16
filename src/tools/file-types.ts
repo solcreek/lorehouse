@@ -5,10 +5,15 @@
 //   CSV, plain text  valid UTF-8 with no NUL or other control bytes, named .csv (CSV) or
 //                    .txt / .log / .md (plain text)
 //
-// Anything else is refused with what to do instead. SVG is refused for now, even though a
-// chart is often one: an SVG is an XML document that can carry scripts, event handlers and
-// references to external URLs (images, fonts, stylesheets), and whatever opens the file
-// from Slack would run or fetch them. Rasterise it to PNG in the sandbox first.
+// Anything else is refused with what to do instead. What Slack, a browser or a desktop does
+// with a file follows its name and media type, which are ours to set; so the name decides
+// for text, and the bytes must agree with it for the binary formats (a ".png" that is HTML
+// is refused). A file named .svg is refused, even though a chart is often one: an SVG can
+// carry scripts and references to external URLs that run or load wherever it's opened as
+// an image. Rasterise it to PNG in the sandbox first. Text whose contents happen to be SVG
+// markup is attached as the text it is, under a .txt/.md/.csv name and text/plain or
+// text/csv: nothing opens that as an image. (#136 first sniffed text for SVG; three scanner
+// findings on that sniffer showed it guarded a path that doesn't run, so it went.)
 
 export const MAX_ATTACH_BYTES = 10 * 1024 * 1024;
 
@@ -40,7 +45,7 @@ export function extensionOf(path: string): string {
 const starts = (b: Uint8Array, magic: number[]) => magic.every((m, i) => b[i] === m);
 
 // What the bytes are, from their first bytes; text only if all of it is clean UTF-8.
-function sniff(bytes: Uint8Array): "png" | "jpeg" | "pdf" | "svg" | "text" | "binary" {
+function sniff(bytes: Uint8Array): "png" | "jpeg" | "pdf" | "text" | "binary" {
   if (starts(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "png";
   if (starts(bytes, [0xff, 0xd8, 0xff])) return "jpeg";
   if (starts(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) return "pdf"; // %PDF-
@@ -52,55 +57,10 @@ function sniff(bytes: Uint8Array): "png" | "jpeg" | "pdf" | "svg" | "text" | "bi
   }
   // Control bytes other than tab, newline, form feed and carriage return: not text.
   if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f]/.test(text)) return "binary";
-  if (containsSvg(text)) return "svg";
   return "text";
 }
 
-// Whether the text holds an SVG anywhere: an element named svg, with or without a namespace
-// prefix (<svg, <s:svg), or an xmlns attribute declaring the SVG namespace. Deliberately
-// broader than "the root element is <svg>": an XML prolog has more legal forms (processing instructions, comments,
-// a doctype, prefixed roots) than a sniffer should chase, and text that merely quotes an
-// SVG is refused too, with a way out (quote it in the reply, or attach a PNG). One linear
-// scan, no regex: a backtracking pattern here was a ReDoS (CodeQL).
-function containsSvg(text: string): boolean {
-  if (declaresSvgNamespace(text)) return true;
-  const nameChar = (c: number) => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2d || c === 0x2e || c === 0x5f || c === 0x3a;
-  for (let i = text.indexOf("<"); i >= 0; i = text.indexOf("<", i + 1)) {
-    let j = i + 1;
-    while (j < text.length && nameChar(text.charCodeAt(j))) j++;
-    const name = text.slice(i + 1, j).toLowerCase();
-    const local = name.slice(name.lastIndexOf(":") + 1);
-    const next = text[j];
-    if (local === "svg" && (next === undefined || next === ">" || next === "/" || /\s/.test(next))) return true;
-  }
-  return false;
-}
-
-const SVG_NS = "http://www.w3.org/2000/svg";
-
-// Whether an xmlns or xmlns:prefix attribute's value is exactly the SVG namespace: the
-// attribute is parsed and its value compared whole, so mentioning the URL in prose doesn't
-// count. One pass over the "xmlns" occurrences.
-function declaresSvgNamespace(text: string): boolean {
-  for (let i = text.indexOf("xmlns"); i >= 0; i = text.indexOf("xmlns", i + 5)) {
-    let j = i + 5;
-    if (text[j] === ":") {
-      j++;
-      while (j < text.length && /[\w.-]/.test(text[j]!)) j++;
-    }
-    while (j < text.length && /\s/.test(text[j]!)) j++;
-    if (text[j] !== "=") continue;
-    j++;
-    while (j < text.length && /\s/.test(text[j]!)) j++;
-    const quote = text[j];
-    if (quote !== '"' && quote !== "'") continue;
-    const end = text.indexOf(quote, j + 1);
-    if (end >= 0 && text.slice(j + 1, end).trim() === SVG_NS) return true;
-  }
-  return false;
-}
-
-const SVG_REFUSAL = "SVG isn't attached: an SVG can carry scripts and links to external files that would run or load wherever it's opened. Rasterise it to PNG in the sandbox (for example `rsvg-convert -o chart.png chart.svg`, or save the chart as PNG in the first place: matplotlib `savefig(\"chart.png\")`) and attach the PNG. If the file is text that only quotes some SVG, quote what matters in your reply instead";
+const SVG_REFUSAL = "SVG isn't attached: an SVG can carry scripts and links to external files that would run or load wherever it's opened. Rasterise it to PNG in the sandbox (for example `rsvg-convert -o chart.png chart.svg`, or save the chart as PNG in the first place: matplotlib `savefig(\"chart.png\")`) and attach the PNG";
 
 // The kind to attach the file as, or why not, as a sentence the model can act on.
 export function classify(path: string, bytes: Uint8Array): { kind: Kind } | { refusal: string } {
@@ -108,7 +68,6 @@ export function classify(path: string, bytes: Uint8Array): { kind: Kind } | { re
   const base = path.slice(path.lastIndexOf("/") + 1);
   if (ext === ".svg" || ext === ".svgz") return { refusal: SVG_REFUSAL };
   const found = sniff(bytes);
-  if (found === "svg") return { refusal: SVG_REFUSAL };
   const byBytes = { png: PNG, jpeg: JPEG, pdf: PDF }[found as "png" | "jpeg" | "pdf"] as Kind | undefined;
   if (byBytes) {
     if (names(byBytes).includes(ext)) return { kind: byBytes };
