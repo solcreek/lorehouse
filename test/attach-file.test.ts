@@ -2,6 +2,8 @@
 // reads, and reading bytes the same way over a runner and from a direct sandbox host.
 
 import { describe, expect, test } from "bun:test";
+import { crc32 } from "node:zlib";
+import { CHART_PNG } from "../conformance/fake-runner";
 import { memoryFileStore, type FileRef } from "@junejs/core/agent-files";
 import { openKnowledge } from "../src/knowledge";
 import { RunnerHub, type Job } from "../src/runners/hub";
@@ -184,5 +186,21 @@ describe("reading bytes", () => {
     const busy = sb.readBytes("/w/a.png");
     link.result({ id: sent[3]!.id, status: 503, error: "all 4 sandboxes are busy; try again later" });
     await expect(busy).rejects.toThrow("sandbox GET /file: 503 all 4 sandboxes are busy");
+  });
+});
+
+describe("the conformance PNG fixture", () => {
+  test("is a valid PNG: every chunk's CRC matches its type and data", () => {
+    const b = CHART_PNG;
+    expect(b.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const chunks: string[] = [];
+    for (let i = 8; i < b.length; ) {
+      const n = b.readUInt32BE(i);
+      const typeAndData = b.subarray(i + 4, i + 8 + n);
+      expect(b.readUInt32BE(i + 8 + n)).toBe(crc32(typeAndData) >>> 0);
+      chunks.push(typeAndData.subarray(0, 4).toString("latin1"));
+      i += 12 + n;
+    }
+    expect(chunks).toEqual(["IHDR", "IDAT", "IEND"]);
   });
 });
