@@ -44,7 +44,10 @@ setup() {
   # The guest kernel: Firecracker's CI build for this release, unless one was copied in.
   if [ ! -s /usr/local/lib/lorehouse/vmlinux ]; then
     k=$(curl -fsSL "$BUCKET?list-type=2&prefix=firecracker-ci/v1.15/x86_64/vmlinux-" | grep -oE 'vmlinux-[0-9]+\.[0-9]+\.[0-9]+' | sort -uV | tail -1)
-    curl -fsSL -o /usr/local/lib/lorehouse/vmlinux "$FC_CI/$k"
+    # To a temporary name first: a download cut short must not leave a non-empty kernel that
+    # the -s check above would then keep using.
+    curl -fsSL -o /usr/local/lib/lorehouse/vmlinux.part "$FC_CI/$k"
+    mv /usr/local/lib/lorehouse/vmlinux.part /usr/local/lib/lorehouse/vmlinux
   fi
   rm -rf "$SRC" && mkdir -p "$SRC" && tar -xzf /tmp/lab-src.tgz -C "$SRC"
   (cd "$SRC/sandbox/guest" && CGO_ENABLED=0 go build -o guestd .)
