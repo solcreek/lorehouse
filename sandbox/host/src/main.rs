@@ -134,7 +134,7 @@ async fn job_forward(app: &App, id: &str, path: String) -> Response {
     let method = if path.ends_with("/cancel") { "POST" } else { "GET" };
     match vm::job_call(method, &path) {
         Some(m) => forward(app, id, m, path, Bytes::new()).await,
-        None => error(400, "job id: 1–64 of [A-Za-z0-9_.-], starting with a letter or digit; status takes only waitMs and tailBytes, in digits"),
+        None => error(400, vm::job_call_refusal(&path)),
     }
 }
 

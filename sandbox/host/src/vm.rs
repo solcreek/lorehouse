@@ -226,6 +226,17 @@ pub fn job_call(method: &str, path: &str) -> Option<Method> {
     }
 }
 
+/// Why job_call refused a call, as a sentence the caller can act on: the job id, or the query.
+pub fn job_call_refusal(path: &str) -> &'static str {
+    let route = path.split_once('?').map_or(path, |(r, _)| r);
+    let job = route.strip_prefix("/jobs/").map(|r| r.split_once('/').map_or(r, |(j, _)| j));
+    match job {
+        Some(j) if !valid_job_id(j) => "bad job id: use 1–64 of [A-Za-z0-9_.-], starting with a letter or digit",
+        Some(_) if path.contains('?') && !route.ends_with("/cancel") => "bad status query: it takes only waitMs and tailBytes, each in digits",
+        _ => "not a job call: POST /jobs, GET /jobs/<id>?waitMs=&tailBytes=, or POST /jobs/<id>/cancel (with no query)",
+    }
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') && !id.starts_with('.')
 }
@@ -720,6 +731,17 @@ mod tests {
         ] {
             assert!(job_call(m, p).is_none(), "{m} {p}");
         }
+    }
+
+    #[test]
+    fn a_refused_job_call_says_whether_the_id_or_the_query_was_wrong() {
+        use super::job_call_refusal;
+        assert!(job_call_refusal("/jobs/.hidden").starts_with("bad job id"));
+        assert!(job_call_refusal(&format!("/jobs/{}?waitMs=1", "a".repeat(65))).starts_with("bad job id"));
+        assert!(job_call_refusal("/jobs/bench-1?tailBytes=abc").starts_with("bad status query"));
+        assert!(job_call_refusal("/jobs/bench-1?waitMs=1&path=/etc/passwd").starts_with("bad status query"));
+        assert!(job_call_refusal("/jobs/bench-1/cancel?now=1").starts_with("not a job call"));
+        assert!(job_call_refusal("/jobs/bench-1/kill").starts_with("not a job call"));
     }
 
     #[test]
