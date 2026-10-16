@@ -100,7 +100,8 @@ type jobView struct {
 	TailTruncated bool   `json:"tailTruncated"`
 	Created       *bool  `json:"created,omitempty"`
 	// Set while the job's end couldn't be written to meta.json (a full disk): the state
-	// here is right, it lives only in guestd's memory, and each later call tries again.
+	// here is right, it lives only in guestd's memory, and each later call, for any job,
+	// tries again.
 	PersistError string `json:"persistError,omitempty"`
 }
 
@@ -118,7 +119,7 @@ type jobManager struct {
 	mu   sync.Mutex
 	live map[string]*liveJob
 	// Ended jobs whose final record failed to write: kept here, and over what meta.json
-	// says (running), until a later call writes it.
+	// says (running), until a later call, for any job, writes it (retryUnsavedLocked).
 	unsaved map[string]unsavedRecord
 	keep    int // maxJobRecords; a test lowers it
 	now     func() time.Time
@@ -398,16 +399,24 @@ func (m *jobManager) list() (int, []jobSummary) {
 
 // ── under m.mu ──────────────────────────────────────────────────────────────────────────
 
-func (m *jobManager) find(id string) (jobRecord, bool) {
-	if j, ok := m.live[id]; ok {
-		return j.rec, true
-	}
-	if u, ok := m.unsaved[id]; ok {
+// retryUnsavedLocked writes every ended job whose record failed to write, keeping the ones
+// that fail again. Every call runs it, through find or records, whichever job it names.
+func (m *jobManager) retryUnsavedLocked() {
+	for id, u := range m.unsaved {
 		if err := m.persist(u.rec); err != nil {
 			m.unsaved[id] = unsavedRecord{u.rec, err.Error()}
 		} else {
 			delete(m.unsaved, id)
 		}
+	}
+}
+
+func (m *jobManager) find(id string) (jobRecord, bool) {
+	m.retryUnsavedLocked()
+	if j, ok := m.live[id]; ok {
+		return j.rec, true
+	}
+	if u, ok := m.unsaved[id]; ok {
 		return u.rec, true
 	}
 	if !jobID.MatchString(id) {
@@ -445,8 +454,10 @@ func (m *jobManager) runningIDs() []string {
 	return ids
 }
 
-// Every record on disk, oldest first, with an unsaved end over what the disk says.
+// Every record on disk, oldest first, with an unsaved end over what the disk says (after
+// trying those writes again).
 func (m *jobManager) records() []jobRecord {
+	m.retryUnsavedLocked()
 	entries, _ := os.ReadDir(m.dir)
 	out := []jobRecord{}
 	for _, e := range entries {

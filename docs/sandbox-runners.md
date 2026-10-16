@@ -204,7 +204,7 @@ a job: { "id", "command", "cwd", "state": "running" | "exited" | "cancelled" | "
 - **Its output** (stdout and stderr together) goes to a file on the VM's disk, and its
   record when it starts and ends. At least the last 8 MiB are kept (up to 16). The env is never recorded.
   If the end can't be written (a full disk), guestd keeps it in memory, answers with it
-  and a `persistError`, and tries the write again on each later call.
+  and a `persistError`, and tries the write again on each later call, whichever job it names.
 - **It counts as activity.** An idle VM isn't stopped while guestd says a job runs, for up
   to `SANDBOXD_JOB_HOLD_SECS` (default 6 h) after the VM's last request.
 - **It dies with its VM.** Whatever stops the VM (that hold running out, sandboxd stopping,

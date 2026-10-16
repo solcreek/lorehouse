@@ -308,6 +308,50 @@ func TestAnEndingThatCantBeWrittenIsKeptInMemoryAndWrittenLater(t *testing.T) {
 	}
 }
 
+func TestAnUnsavedEndingIsWrittenByACallForAnotherJob(t *testing.T) {
+	m := manager(t)
+	failing := true
+	m.persist = func(rec jobRecord) error {
+		if failing && rec.State != stateRunning {
+			return errors.New("no space left on device")
+		}
+		return m.writeRecord(rec)
+	}
+	start(t, m, "full", "exit 4")
+	finished(t, m, "full")
+	onDisk := func(id string) jobState {
+		b, _ := os.ReadFile(filepath.Join(m.dir, id, "meta.json"))
+		var rec jobRecord
+		_ = json.Unmarshal(b, &rec)
+		return rec.State
+	}
+	if onDisk("full") != stateRunning {
+		t.Fatalf("while the write fails, meta.json says %s, want running", onDisk("full"))
+	}
+	failing = false
+	// Space again; the next call names another job, never "full".
+	start(t, m, "other", "true")
+	m.mu.Lock()
+	left := len(m.unsaved)
+	m.mu.Unlock()
+	if onDisk("full") != stateExited || left != 0 {
+		t.Fatalf("after another job's start: meta.json says %s, %d still unsaved; want exited, none", onDisk("full"), left)
+	}
+	finished(t, m, "other")
+
+	// The same for a status of another job.
+	failing = true
+	start(t, m, "full2", "exit 5")
+	finished(t, m, "full2")
+	failing = false
+	if _, err := m.status("other", 0, defaultTail, nil); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk("full2") != stateExited {
+		t.Fatalf("after another job's status: meta.json says %s, want exited", onDisk("full2"))
+	}
+}
+
 func TestAPrunedJobsIdStillNamesItsRun(t *testing.T) {
 	m := manager(t)
 	m.keep = 2
