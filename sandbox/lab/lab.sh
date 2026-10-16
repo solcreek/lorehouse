@@ -84,8 +84,10 @@ case "$cmd" in
     push "$here/bench.py" "$N:/tmp/bench.py"
     remote "sudo python3 /tmp/bench.py $*" ;;
   ssh)
-    # The command's own output as it comes, then the JSON line; the exit status is the command's.
-    rc=0; remote "$@" || rc=$?
+    # The command's output, then the JSON line on a line of its own even when the output
+    # doesn't end in a newline; the exit status is the command's.
+    out=$(mktemp); rc=0; remote "$@" >"$out" || rc=$?
+    cat "$out"; [ -z "$(tail -c1 "$out")" ] || echo; rm -f "$out"
     echo "{\"ok\":$([ "$rc" = 0 ] && echo true || echo false),\"exit\":$rc}"; exit "$rc" ;;
   status) printf '{"ok":true,"name":"%s","state":"%s","zone":"%s","type":"%s"}\n' "$N" "$(state)" "$Z" "$T" ;;
   stop) g compute instances stop "$N" --zone "$Z" >&2; echo "{\"ok\":true,\"state\":\"$(state)\"}" ;;
