@@ -179,8 +179,12 @@ def cpupar(n):
         if not ready:
             errs.append(f"prep: {str(o)[:200]}")
             return
-        dt, o = exec_(sid, build)
-        (res.append(dt) if ok(o) else errs.append(str(o)[:200]))
+        try:
+            dt, o = exec_(sid, build)
+        except Exception as e:  # a thread's exception never reaches join(): record it
+            errs.append(f"build: {str(e)[:200]}")
+            return
+        (res.append(dt) if ok(o) else errs.append(f"build: {str(o)[:200]}"))
     parallel(n, one)
     report(f"cpupar {n}", res, errs)
 
