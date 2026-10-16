@@ -8,7 +8,9 @@
 // An id names one run, ever, in this sandbox: starting an id again returns that job (its
 // state, whatever it is) instead of starting a second copy, so a caller that retries a
 // start (Lorehouse replays a tool call after a crash) attaches to the job it started. The
-// same id with another command is refused (409).
+// same id with another command is refused (409). Past 256 jobs the oldest finished ones'
+// output is removed, but a tombstone of each stays (its command's SHA-256, not its text), so
+// an id still can't run twice.
 //
 // A job runs as bash -lc in a process group of its own, stdin closed, stdout and stderr
 // together into a file under its directory (the last 2 × maxJobLog bytes are kept). Its
@@ -19,6 +21,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,7 +47,8 @@ const (
 	defaultJobsDir = "/var/lib/guestd/jobs"
 	// Jobs running at once in one sandbox.
 	maxRunningJobs = 8
-	// Job records kept; past this the oldest finished ones are removed.
+	// Jobs whose output is kept; past this the oldest finished ones' output is removed, and
+	// their record cut to a tombstone (see pruneLocked).
 	maxJobRecords = 256
 	// Each output file's size before it is rotated (one previous file is kept).
 	maxJobLog         = 8 << 20
@@ -81,6 +86,10 @@ type jobRecord struct {
 	TimeoutMs   int64      `json:"timeoutMs"`
 	OutputBytes int64      `json:"outputBytes"`
 	Reason      string     `json:"reason,omitempty"`
+	// A tombstone (pruneLocked): its output is gone and Command with it; what an id ran is
+	// then known by the command's SHA-256.
+	Pruned        bool   `json:"pruned,omitempty"`
+	CommandSHA256 string `json:"commandSha256,omitempty"`
 }
 
 // A job as an answer: its record, how long it has run, and the tail of its output.
@@ -111,6 +120,7 @@ type jobManager struct {
 	// Ended jobs whose final record failed to write: kept here, and over what meta.json
 	// says (running), until a later call writes it.
 	unsaved map[string]unsavedRecord
+	keep    int // maxJobRecords; a test lowers it
 	now     func() time.Time
 	persist func(jobRecord) error // writeRecord; a test makes it fail
 }
@@ -137,7 +147,7 @@ func newJobManager(dir string) (*jobManager, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	m := &jobManager{dir: dir, live: map[string]*liveJob{}, unsaved: map[string]unsavedRecord{}, now: time.Now}
+	m := &jobManager{dir: dir, live: map[string]*liveJob{}, unsaved: map[string]unsavedRecord{}, keep: maxJobRecords, now: time.Now}
 	m.persist = m.writeRecord
 	for _, rec := range m.records() {
 		if rec.State != stateRunning {
@@ -186,8 +196,12 @@ func (m *jobManager) start(req startReq) (jobView, bool, error) {
 
 	// An id that ran before: the same job, never a second copy.
 	if rec, ok := m.find(req.ID); ok {
-		if rec.Command != req.Command || rec.Cwd != req.Cwd {
-			return jobView{}, false, errf(409, "job id %q already names another run in this sandbox (command %q in %s, started %s, %s); an id names one run: choose a new id, or check that one's status", req.ID, rec.Command, rec.Cwd, rec.StartedAt.UTC().Format(time.RFC3339), rec.State)
+		if !sameRun(rec, req) {
+			ran := fmt.Sprintf("command %q", rec.Command)
+			if rec.Pruned {
+				ran = "a command no longer kept"
+			}
+			return jobView{}, false, errf(409, "job id %q already names another run in this sandbox (%s in %s, started %s, %s); an id names one run: choose a new id, or check that one's status", req.ID, ran, rec.Cwd, rec.StartedAt.UTC().Format(time.RFC3339), rec.State)
 		}
 		return m.viewLocked(rec, defaultTail), false, nil
 	}
@@ -236,6 +250,22 @@ func (m *jobManager) start(req startReq) (jobView, bool, error) {
 	go m.wait(j, cmd, timer)
 	m.pruneLocked()
 	return m.viewLocked(rec, defaultTail), true, nil
+}
+
+// Whether a start asks for the run rec names: the same command, in the same directory.
+func sameRun(rec jobRecord, req startReq) bool {
+	if rec.Cwd != req.Cwd {
+		return false
+	}
+	if rec.Pruned {
+		return rec.CommandSHA256 == commandSHA256(req.Command)
+	}
+	return rec.Command == req.Command
+}
+
+func commandSHA256(c string) string {
+	sum := sha256.Sum256([]byte(c))
+	return hex.EncodeToString(sum[:])
 }
 
 // wait records how the job ended, once its command has exited.
@@ -448,14 +478,34 @@ func (m *jobManager) writeRecord(rec jobRecord) error {
 	return os.Rename(path+".tmp", path)
 }
 
-// The oldest finished records beyond maxJobRecords are removed.
+// Past m.keep jobs with output, the oldest finished ones lose theirs, and their record is
+// cut to a tombstone: id, cwd, the command's SHA-256, how and when it ran (a few hundred
+// bytes). The tombstone stays for the sandbox's life, so its id still names that run: a
+// start replayed after the prune attaches to it rather than running the command again
+// (a whole record kept forever would keep every command's text; refusing new ids at the cap
+// would end jobs in a long-lived sandbox).
 func (m *jobManager) pruneLocked() {
-	recs := m.records()
-	for i := 0; len(recs)-i > maxJobRecords && i < len(recs); i++ {
-		_, live := m.live[recs[i].ID]
-		_, unsaved := m.unsaved[recs[i].ID]
-		if !live && !unsaved && recs[i].State != stateRunning {
-			os.RemoveAll(filepath.Join(m.dir, recs[i].ID))
+	full := []jobRecord{}
+	for _, rec := range m.records() {
+		if !rec.Pruned {
+			full = append(full, rec)
+		}
+	}
+	for i := 0; len(full)-i > m.keep && i < len(full); i++ {
+		rec := full[i]
+		_, live := m.live[rec.ID]
+		_, unsaved := m.unsaved[rec.ID]
+		if live || unsaved || rec.State == stateRunning {
+			continue
+		}
+		rec.Pruned, rec.CommandSHA256, rec.Command = true, commandSHA256(rec.Command), ""
+		rec.Reason = strings.TrimPrefix(rec.Reason+"; its output was removed (only the newest "+strconv.Itoa(m.keep)+" jobs' output is kept)", "; ")
+		if m.persist(rec) != nil {
+			continue // its output stays until a write works
+		}
+		jobDir := filepath.Join(m.dir, rec.ID)
+		for _, name := range []string{"output.log", "output.log.1"} {
+			os.Remove(filepath.Join(jobDir, name))
 		}
 	}
 }

@@ -307,3 +307,33 @@ func TestAnEndingThatCantBeWrittenIsKeptInMemoryAndWrittenLater(t *testing.T) {
 		t.Fatalf("on disk after the retry: %s", b)
 	}
 }
+
+func TestAPrunedJobsIdStillNamesItsRun(t *testing.T) {
+	m := manager(t)
+	m.keep = 2
+	cwd := t.TempDir()
+	runs := filepath.Join(cwd, "runs")
+	cmd := func(id string) string { return "echo " + id + " >> " + runs }
+	for _, id := range []string{"p1", "p2", "p3"} { // p3's start prunes p1's output
+		if _, _, err := m.start(startReq{ID: id, Command: cmd(id), Cwd: cwd}); err != nil {
+			t.Fatal(err)
+		}
+		finished(t, m, id)
+	}
+	if _, err := os.Stat(filepath.Join(m.dir, "p1", "output.log")); !os.IsNotExist(err) {
+		t.Fatalf("p1's output is still kept: %v", err)
+	}
+	v, created, err := m.start(startReq{ID: "p1", Command: cmd("p1"), Cwd: cwd}) // a replay, long after
+	if err != nil || created || v.State != stateExited || !strings.Contains(v.Reason, "output was removed") {
+		t.Fatalf("p1 again: created %v %+v %v (want its record, not a second run)", created, v, err)
+	}
+	if b, _ := os.ReadFile(runs); string(b) != "p1\np2\np3\n" {
+		t.Fatalf("runs %q: p1 ran again", b)
+	}
+	if _, _, err := m.start(startReq{ID: "p1", Command: "echo other", Cwd: cwd}); status(err) != 409 {
+		t.Fatalf("p1 with another command: %v", err)
+	}
+	if v, err := m.status("p1", 0, defaultTail, nil); err != nil || v.State != stateExited || v.ExitCode == nil {
+		t.Fatalf("p1's status: %+v %v", v, err)
+	}
+}

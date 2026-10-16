@@ -192,7 +192,10 @@ a job: { "id", "command", "cwd", "state": "running" | "exited" | "cancelled" | "
 - **An id runs once.** Starting an id that ran before in that sandbox returns that job,
   whatever its state, and doesn't start a second copy. Lorehouse re-runs a tool call that
   was in flight when it stopped, so a start can arrive twice. The same id with another
-  command or directory is refused (409).
+  command or directory is refused (409). That holds past the 256 jobs whose output is
+  kept: an older finished job's output is removed, and its record cut to a tombstone (its
+  id, directory, state, times and the command's SHA-256, not its text) that stays as long
+  as the sandbox does.
 - **Its process group.** The command runs as `bash -lc`, stdin closed, in a process group
   of its own. Cancel and the timeout (default 1 h, at most 6 h) send it SIGTERM, then SIGKILL
   10 s later. When the command exits, anything it left running in its group is killed too.
