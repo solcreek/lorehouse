@@ -110,7 +110,8 @@ case "$cmd" in
     # The command's output as it comes, then the JSON line on a line of its own even when
     # the output doesn't end in a newline; the exit status is the command's.
     out=$(mktemp); trap 'rm -f "$out"' EXIT
-    set +e; remote "$@" | tee "$out"; rc=${PIPESTATUS[0]}; set -e
+    # "|| rc=": a failing command is an answer here, not an error for the ERR trap.
+    rc=0; remote "$@" | tee "$out" || rc=${PIPESTATUS[0]}
     [ -z "$(tail -c1 "$out")" ] || echo
     echo "{\"ok\":$([ "$rc" = 0 ] && echo true || echo false),\"exit\":$rc}"; exit "$rc" ;;
   status)
