@@ -97,8 +97,9 @@ def boots(name, n, gap=0.0):
     res, errs = [], []
     def one(i):
         try:
-            dt, _ = exec_(f"{name}-{RUN}-{i}", "true")
-            res.append(dt)
+            dt, out = exec_(f"{name}-{RUN}-{i}", "true")
+            # A guest failure or timeout is a 200 with a nonzero exitCode: not a sample.
+            (res.append(dt) if ok(out) else errs.append(f"exec: {str(out)[:200]}"))
         except Exception as e:
             errs.append(str(e)[:200])
     wall = parallel(n, one, gap)
@@ -110,8 +111,11 @@ def cold(n):
     for i in range(n):
         sid = f"cold-{RUN}-{i}"
         try:
-            dt, _ = exec_(sid, "true")
-            dt2, _ = exec_(sid, "true")
+            dt, out = exec_(sid, "true")
+            dt2, out2 = exec_(sid, "true")
+            if not (ok(out) and ok(out2)):
+                errs.append(f"exec: {str(out if not ok(out) else out2)[:200]}")
+                continue
             res.append(dt); warm.append(dt2)
             print(f"  cold {i}: first exec {dt:.2f}s, second exec {dt2 * 1000:.0f} ms")
         except Exception as e:
