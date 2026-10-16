@@ -14,7 +14,13 @@
 # Env: LAB_PROJECT (required), LAB_ZONE (us-east4-a), LAB_NAME (sbx-lab),
 # LAB_TYPE (n4-standard-16), LAB_DISK_GB (200).
 # Every command ends with one JSON line on stdout; progress goes to stderr.
-set -euo pipefail
+set -Eeuo pipefail
+# Any command that fails and stops the script (a create refused for quota, a stop or delete
+# that errors, an upload that never lands) still ends stdout with one JSON line. Branches
+# that print their own error JSON leave with an explicit exit, which this doesn't catch.
+# fd 3 is the real stdout: a failing command's own redirect (>&2) would otherwise take it.
+exec 3>&1
+trap 'rc=$?; [ "$BASH_SUBSHELL" -eq 0 ] || exit $rc; printf >&3 "{\"ok\":false,\"cmd\":\"%s\",\"error\":\"line %s: %s failed (exit %s); see stderr\"}\n" "${cmd:-}" "$LINENO" "$(printf %s "$BASH_COMMAND" | tr -d "\"\\\\" | cut -c1-120)" "$rc"; exit $rc' ERR
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 P=${LAB_PROJECT:?set LAB_PROJECT to the GCP project the lab VM lives in}
