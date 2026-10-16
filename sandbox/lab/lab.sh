@@ -6,7 +6,7 @@
 #   lab.sh deploy          build this working tree's sandbox/ there (uncommitted changes
 #                          included) and (re)start sandboxd in serve mode
 #   lab.sh bench ARGS...   run bench.py there (bench.py's own usage)
-#   lab.sh ssh CMD...      run a command there
+#   lab.sh ssh CMD...      run a command there; its output, then {"ok":…,"exit":N}
 #   lab.sh status          the VM's state
 #   lab.sh stop            stop the VM (disks kept, ~$20/month for them)
 #   lab.sh down --yes      delete the VM and its disks
@@ -83,7 +83,10 @@ case "$cmd" in
     [ $# -gt 0 ] || { echo '{"ok":false,"error":"usage: lab.sh bench cold|burst|stagger|work|workpar|cpupar|clean ..."}'; exit 2; }
     push "$here/bench.py" "$N:/tmp/bench.py"
     remote "sudo python3 /tmp/bench.py $*" ;;
-  ssh) remote "$@" ;;
+  ssh)
+    # The command's own output as it comes, then the JSON line; the exit status is the command's.
+    rc=0; remote "$@" || rc=$?
+    echo "{\"ok\":$([ "$rc" = 0 ] && echo true || echo false),\"exit\":$rc}"; exit "$rc" ;;
   status) printf '{"ok":true,"name":"%s","state":"%s","zone":"%s","type":"%s"}\n' "$N" "$(state)" "$Z" "$T" ;;
   stop) g compute instances stop "$N" --zone "$Z" >&2; echo "{\"ok\":true,\"state\":\"$(state)\"}" ;;
   down)

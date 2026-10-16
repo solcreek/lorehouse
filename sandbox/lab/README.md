@@ -18,7 +18,8 @@ sandbox/lab/lab.sh stop                # stop paying for compute (disks stay, �
 sandbox/lab/lab.sh down --yes          # delete the VM and its disks
 ```
 
-Every command ends with one JSON line on stdout (`{"ok": …}`), and progress goes to
+Every command ends with one JSON line on stdout (`{"ok": …}`; `ssh` prints the command's
+output first, then `{"ok": …, "exit": N}`), and progress goes to
 stderr, so an agent can read the result without parsing prose. `deploy` copies the
 tracked and new (not ignored) files under `sandbox/host` and `sandbox/guest`, so
 uncommitted work is what gets tested. Its `commit` says `+dirty` when that work differs
