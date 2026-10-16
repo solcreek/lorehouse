@@ -158,6 +158,36 @@ describe("workspace_job_cancel", () => {
     expect((await run("workspace_job_cancel", { id: "bench-1" }, ctxFor("U9"))).state).toBe("cancelled");
   });
 
+  test("an id with no record and no job in the sandbox gets guestd's not-found, not the admin-only refusal", async () => {
+    const calls: string[] = [];
+    const notFound = "no job \"bench-9\" in this sandbox; the latest jobs here: bench-1, bench-2";
+    const sb = {
+      jobs: {
+        async status(id: string) {
+          calls.push(`status ${id}`);
+          if (id === "bench-9") throw new JobCallError(`job status: ${notFound}`, 404);
+          return job({ id });
+        },
+        async cancel(id: string) {
+          calls.push(`cancel ${id}`);
+          return job({ id, state: "cancelled", exitCode: 143 });
+        },
+      },
+    } as unknown as Sandbox;
+    const { run } = tools({ sb, authority: authority({}, ["U9"]) });
+    const missing = await run("workspace_job_cancel", { id: "bench-9" }, ctxFor("U1"));
+    expect(missing.error).toBe(`job status: ${notFound}`);
+    expect(missing.error).not.toContain("only a workspace admin");
+    // A job that exists, still with no record here: the admin-only refusal stands.
+    const exists = await run("workspace_job_cancel", { id: "bench-1" }, ctxFor("U1"));
+    expect(exists.error).toContain("no record of who started job bench-1 in this thread");
+    expect(exists.error).toContain("only a workspace admin may cancel it");
+    expect(calls).toEqual(["status bench-9", "status bench-1"]);
+    // guestd failing some other way (here a 5xx) still leaves only an admin able to cancel.
+    const flaky = { jobs: { status: async () => { throw new JobCallError("job status: 502 bad gateway", 502); }, cancel: async () => job({ state: "cancelled" }) } } as unknown as Sandbox;
+    expect((await tools({ sb: flaky }).run("workspace_job_cancel", { id: "bench-1" }, ctxFor("U1"))).error).toContain("only a workspace admin may cancel it");
+  });
+
   test("a job whose starter Slack didn't vouch for may be cancelled by anyone in the thread", async () => {
     const t = tools();
     await t.run("workspace_job_start", { id: "j", command: "sleep 600" }, ctxFor("U1", { attested: false }));

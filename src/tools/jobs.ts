@@ -19,7 +19,8 @@
 // in the thread. Who started a job is written before the start is sent, since guestd may
 // start it and the answer still be lost; a job with no such record in this thread (its
 // row pruned, or never written) may be cancelled only by an admin: the safe side, since
-// whether its starter was known can't be told then.
+// whether its starter was known can't be told then. An id guestd has no job for gets
+// guestd's not-found instead, so a mistyped id isn't refused as if it existed.
 
 import type { Database } from "bun:sqlite";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
@@ -220,7 +221,14 @@ export function jobTools(sandboxFor: SandboxFor, opts: { store: JobStore; author
           }
           if (!started) {
             // No record of its start in this thread: whether its starter was known can't be
-            // told, so only an admin may cancel it.
+            // told, so only an admin may cancel it. But first ask guestd whether the job
+            // exists at all: for an id that never ran, its not-found (which lists the real
+            // ids) is the answer, not a refusal that implies there is such a job.
+            try {
+              await jobsOf(sandboxFor, ctx).status(input.id, { waitMs: 0, tailBytes: 0 });
+            } catch (err) {
+              if (err instanceof JobCallError && err.status === 404) return fail(err.message);
+            }
             const why = `there's no record of who started job ${input.id} in this thread (it was started over two days ago, or not from here), so only a workspace admin may cancel it`;
             if (!asker) return fail(`${why}, and who asked isn't known. Pass requestTs, the ts of the message that asked`);
             if (!(await authority?.isAdmin(asker).catch(() => false))) return fail(`${why}; ${await name(asker)} asked. Say so in the thread; workspace_job_status still shows how it is doing`);
