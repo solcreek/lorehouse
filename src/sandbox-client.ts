@@ -7,13 +7,14 @@
 // API (guestd, over vsock) under /v1/sandboxes/{id}/…:
 //
 //   POST /v1/sandboxes/{id}/exec   {command, cwd, env, timeoutMs} → {exitCode, stdout, stderr}
-//   GET  /v1/sandboxes/{id}/file?path=…                            → bytes (404 if absent)
+//   GET  /v1/sandboxes/{id}/file?path=…                            → bytes (404 if absent,
+//                                                                     413 over 16 MiB)
 //   PUT  /v1/sandboxes/{id}/file?path=…                            → 204
 //   POST /v1/sandboxes/{id}/jobs, GET …/jobs/{job}, POST …/jobs/{job}/cancel → a background job
 //
 // Feasibility numbers (boot, exec, persistence): sandbox/spike/.
 
-import { EXEC_TIMEOUT_MS, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type SandboxJob, type Staged } from "./tools/workspace";
+import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type SandboxJob, type Staged } from "./tools/workspace";
 
 export type RemoteSandboxOptions = {
   url: string; // daemon base URL, e.g. https://sandbox.example.com
@@ -63,6 +64,13 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
       const res = await call(`/file?path=${encodeURIComponent(path)}`, { method: "GET" });
       if (res.status === 404) throw new Error(`no such file: ${path}`);
       return res.text();
+    },
+    async readBytes(path: string): Promise<Uint8Array> {
+      const res = await f(`${base}/file?path=${encodeURIComponent(path)}`, { method: "GET", headers: auth });
+      if (res.status === 404) throw new Error(`no such file: ${path}`);
+      if (res.status === 413) throw new FileTooLarge(path, (await res.text()).trim().slice(0, 200));
+      if (!res.ok) throw new Error(`sandbox GET /file: ${res.status} ${(await res.text()).slice(0, 200)}`);
+      return new Uint8Array(await res.arrayBuffer());
     },
     async writeFile(path: string, content: string): Promise<void> {
       await call(`/file?path=${encodeURIComponent(path)}`, { method: "PUT", body: content });

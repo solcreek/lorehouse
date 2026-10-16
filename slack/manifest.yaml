@@ -29,7 +29,7 @@ oauth_config:
       - channels:join      # joining the channels named to `lorehouse setup`, instead of an /invite
       - channels:read      # finding those channels by name; checking each AGENT_CHANNELS id is public (conversations.info), or the app refuses to start
       - chat:write         # replying in the thread (streamed)
-      - files:write        # with PDF_REPLIES=1: attaching the PDF render_pdf made to the thread
+      - files:write        # attaching a file to the thread: the PDF render_pdf made (PDF_REPLIES=1), or a file from the sandbox (workspace_attach_file, code tools)
       - im:history         # message.im events: DMs to the agent (never indexed)
       - reactions:read     # reaction_added/removed events: 👍/👎 on the agent's replies (usage, GET /api/v1/usage)
       - users:read         # naming people in knowledge ("Wendy: …" instead of a user id)

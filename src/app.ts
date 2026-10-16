@@ -55,6 +55,7 @@ const TASK_LABELS: Record<string, string> = {
   workspace_job_start: "Starting a job in the sandbox",
   workspace_job_status: "Checking on the job",
   workspace_job_cancel: "Stopping the job",
+  workspace_attach_file: "Attaching a file",
   open_pull_request: "Preparing a pull request",
   render_pdf: "Making the PDF",
 };
@@ -380,7 +381,8 @@ export async function createApp(config: Config) {
   };
 }
 
-// Where the agent's files wait for the Slack channel to upload them (FILE_STORE). Only
+// Where the agent's files (render_pdf's PDFs, workspace_attach_file's files from the sandbox)
+// wait for the Slack channel to upload them (FILE_STORE). Only
 // memory exists yet: never on disk, kept until 64 MiB of newer files push it out or the
 // process restarts (no delete yet: junebuild/june#370). loadConfig refuses blob until it
 // is built.

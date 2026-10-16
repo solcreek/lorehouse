@@ -177,12 +177,18 @@ describe("slack", () => {
     expect(google?.detail).toBe("google: sends each document's characters to fonts.googleapis.com, fonts.gstatic.com");
   });
 
-  test("files:write is needed only with PDF replies on", async () => {
+  test("files:write is needed only with PDF replies or code tools on, and the failure says which", async () => {
     const scopes = MANIFEST_SCOPES.filter((s) => s !== "files:write").join(",");
     expect(find(await run({}, { scopes }), "scopes")[0]?.level).toBe("ok");
     const withPdf = find(await run({ PDF_REPLIES: "1" }, { scopes }), "scopes")[0];
     expect(withPdf).toMatchObject({ level: "fail" });
-    expect(withPdf!.detail).toStartWith("missing files:write");
+    expect(withPdf!.detail).toStartWith("missing files:write (to attach files, for PDF_REPLIES=1 (render_pdf)):");
+    const sandbox = { SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" };
+    const withCode = find(await run(sandbox, { scopes }), "scopes")[0];
+    expect(withCode).toMatchObject({ level: "fail" });
+    expect(withCode!.detail).toStartWith("missing files:write (to attach files, for code tools (workspace_attach_file)):");
+    const both = find(await run({ ...sandbox, PDF_REPLIES: "1" }, { scopes }), "scopes")[0];
+    expect(both!.detail).toContain("for PDF_REPLIES=1 (render_pdf) and code tools (workspace_attach_file)");
   });
 
   test("scopes Slack didn't report are a warning, not a pass", async () => {

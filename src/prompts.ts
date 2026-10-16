@@ -12,6 +12,7 @@ import workspaceWriteFile from "../prompts/tools/workspace_write_file.md" with {
 import workspaceJobStart from "../prompts/tools/workspace_job_start.md" with { type: "text" };
 import workspaceJobStatus from "../prompts/tools/workspace_job_status.md" with { type: "text" };
 import workspaceJobCancel from "../prompts/tools/workspace_job_cancel.md" with { type: "text" };
+import workspaceAttachFile from "../prompts/tools/workspace_attach_file.md" with { type: "text" };
 import openPullRequest from "../prompts/tools/open_pull_request.md" with { type: "text" };
 import workspaceClone from "../prompts/tools/workspace_clone.md" with { type: "text" };
 import renderPdf from "../prompts/tools/render_pdf.md" with { type: "text" };
@@ -29,6 +30,7 @@ const TOOLS: Record<string, string> = {
   workspace_job_start: workspaceJobStart,
   workspace_job_status: workspaceJobStatus,
   workspace_job_cancel: workspaceJobCancel,
+  workspace_attach_file: workspaceAttachFile,
   open_pull_request: openPullRequest,
   workspace_clone: workspaceClone,
   render_pdf: renderPdf,
