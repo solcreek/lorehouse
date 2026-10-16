@@ -58,13 +58,19 @@ describe("what is attached", () => {
     }
   });
 
-  test("an SVG behind comments and a doctype is found, and a pathological prolog is decided in linear time", () => {
+  test("an SVG is found anywhere in text (prologs, prefixes, its namespace), in linear time", () => {
     const behind = text('﻿ <?xml version="1.0"?><!-- a --><!-- b --><!DOCTYPE svg PUBLIC "x" "y">\n<svg/>');
     expect(kindOf("/w/chart.txt", behind)).toStartWith("refused: SVG isn't attached");
     expect(kindOf("/w/notes.md", text("<svgfoo>not svg</svgfoo>"))).toBe("text/plain");
-    expect(kindOf("/w/notes.md", text("text first\n<svg></svg>"))).toBe("text/plain");
+    // Anywhere in the text, past any prolog, and with a namespace prefix (Copilot on #136).
+    expect(kindOf("/w/notes.md", text("text first\n<svg></svg>"))).toStartWith("refused: SVG isn't attached");
+    expect(kindOf("/w/chart.txt", text('<?xml version="1.0"?>\n<?xml-stylesheet href="x.css"?>\n<svg width="1"/>'))).toStartWith("refused: SVG isn't attached");
+    expect(kindOf("/w/chart.csv", text('<s:svg xmlns:s="http://www.w3.org/2000/svg"></s:svg>'))).toStartWith("refused: SVG isn't attached");
+    expect(kindOf("/w/chart.md", text('<root xmlns="http://www.w3.org/2000/svg"/>'))).toStartWith("refused: SVG isn't attached");
+    expect(kindOf("/w/chart.txt", text("<SVG>"))).toStartWith("refused: SVG isn't attached");
+    expect(kindOf("/w/notes.md", text("a < b and svg > c; <svgish/> <x:svgfoo/>"))).toBe("text/plain");
     // What made the old regex backtrack exponentially (CodeQL, code-scanning/13).
-    const evil = text("<!--" + "--><!--".repeat(50_000) + "x");
+    const evil = text("<!--" + "--><!--".repeat(50_000) + "x" + "<".repeat(200_000) + "<a".repeat(100_000));
     const t0 = performance.now();
     expect(kindOf("/w/evil.txt", evil)).toBe("text/plain");
     expect(performance.now() - t0).toBeLessThan(1000);

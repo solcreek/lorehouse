@@ -52,39 +52,31 @@ function sniff(bytes: Uint8Array): "png" | "jpeg" | "pdf" | "svg" | "text" | "bi
   }
   // Control bytes other than tab, newline, form feed and carriage return: not text.
   if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f]/.test(text)) return "binary";
-  if (startsWithSvg(text)) return "svg";
+  if (containsSvg(text)) return "svg";
   return "text";
 }
 
-// Whether the text's first element is <svg>, past a BOM, whitespace, an XML declaration,
-// comments and a doctype. A scan, not one regex: a nested quantifier over comments
-// backtracks exponentially on input like "<!--" + "--><!--" repeated (CodeQL).
-function startsWithSvg(text: string): boolean {
-  let i = text.charCodeAt(0) === 0xfeff ? 1 : 0;
-  const skipSpace = () => {
-    while (i < text.length && /\s/.test(text[i]!)) i++;
-  };
-  const at = (s: string) => text.slice(i, i + s.length).toLowerCase() === s;
-  const skipPast = (end: string): boolean => {
-    const j = text.indexOf(end, i);
-    if (j < 0) return false;
-    i = j + end.length;
-    return true;
-  };
-  skipSpace();
-  if (at("<?xml") && !skipPast(">")) return false;
-  for (;;) {
-    skipSpace();
-    if (at("<!--")) {
-      if (!skipPast("-->")) return false;
-    } else if (at("<!doctype")) {
-      if (!skipPast(">")) return false;
-    } else break;
+// Whether the text holds an SVG anywhere: an element named svg, with or without a namespace
+// prefix (<svg, <s:svg), or the SVG namespace itself. Deliberately broader than "the root
+// element is <svg>": an XML prolog has more legal forms (processing instructions, comments,
+// a doctype, prefixed roots) than a sniffer should chase, and text that merely quotes an
+// SVG is refused too, with a way out (quote it in the reply, or attach a PNG). One linear
+// scan, no regex: a backtracking pattern here was a ReDoS (CodeQL).
+function containsSvg(text: string): boolean {
+  if (text.includes("http://www.w3.org/2000/svg")) return true;
+  const nameChar = (c: number) => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2d || c === 0x2e || c === 0x5f || c === 0x3a;
+  for (let i = text.indexOf("<"); i >= 0; i = text.indexOf("<", i + 1)) {
+    let j = i + 1;
+    while (j < text.length && nameChar(text.charCodeAt(j))) j++;
+    const name = text.slice(i + 1, j).toLowerCase();
+    const local = name.slice(name.lastIndexOf(":") + 1);
+    const next = text[j];
+    if (local === "svg" && (next === undefined || next === ">" || next === "/" || /\s/.test(next))) return true;
   }
-  return at("<svg") && (i + 4 >= text.length || /[\s>/]/.test(text[i + 4]!));
+  return false;
 }
 
-const SVG_REFUSAL = "SVG isn't attached: an SVG can carry scripts and links to external files that would run or load wherever it's opened. Rasterise it to PNG in the sandbox (for example `rsvg-convert -o chart.png chart.svg`, or save the chart as PNG in the first place: matplotlib `savefig(\"chart.png\")`) and attach the PNG";
+const SVG_REFUSAL = "SVG isn't attached: an SVG can carry scripts and links to external files that would run or load wherever it's opened. Rasterise it to PNG in the sandbox (for example `rsvg-convert -o chart.png chart.svg`, or save the chart as PNG in the first place: matplotlib `savefig(\"chart.png\")`) and attach the PNG. If the file is text that only quotes some SVG, quote what matters in your reply instead";
 
 // The kind to attach the file as, or why not, as a sentence the model can act on.
 export function classify(path: string, bytes: Uint8Array): { kind: Kind } | { refusal: string } {
