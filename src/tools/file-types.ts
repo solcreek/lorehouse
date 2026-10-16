@@ -57,13 +57,13 @@ function sniff(bytes: Uint8Array): "png" | "jpeg" | "pdf" | "svg" | "text" | "bi
 }
 
 // Whether the text holds an SVG anywhere: an element named svg, with or without a namespace
-// prefix (<svg, <s:svg), or the SVG namespace itself. Deliberately broader than "the root
-// element is <svg>": an XML prolog has more legal forms (processing instructions, comments,
+// prefix (<svg, <s:svg), or an xmlns attribute declaring the SVG namespace. Deliberately
+// broader than "the root element is <svg>": an XML prolog has more legal forms (processing instructions, comments,
 // a doctype, prefixed roots) than a sniffer should chase, and text that merely quotes an
 // SVG is refused too, with a way out (quote it in the reply, or attach a PNG). One linear
 // scan, no regex: a backtracking pattern here was a ReDoS (CodeQL).
 function containsSvg(text: string): boolean {
-  if (text.includes("http://www.w3.org/2000/svg")) return true;
+  if (declaresSvgNamespace(text)) return true;
   const nameChar = (c: number) => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2d || c === 0x2e || c === 0x5f || c === 0x3a;
   for (let i = text.indexOf("<"); i >= 0; i = text.indexOf("<", i + 1)) {
     let j = i + 1;
@@ -72,6 +72,30 @@ function containsSvg(text: string): boolean {
     const local = name.slice(name.lastIndexOf(":") + 1);
     const next = text[j];
     if (local === "svg" && (next === undefined || next === ">" || next === "/" || /\s/.test(next))) return true;
+  }
+  return false;
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// Whether an xmlns or xmlns:prefix attribute's value is exactly the SVG namespace: the
+// attribute is parsed and its value compared whole, so mentioning the URL in prose doesn't
+// count. One pass over the "xmlns" occurrences.
+function declaresSvgNamespace(text: string): boolean {
+  for (let i = text.indexOf("xmlns"); i >= 0; i = text.indexOf("xmlns", i + 5)) {
+    let j = i + 5;
+    if (text[j] === ":") {
+      j++;
+      while (j < text.length && /[\w.-]/.test(text[j]!)) j++;
+    }
+    while (j < text.length && /\s/.test(text[j]!)) j++;
+    if (text[j] !== "=") continue;
+    j++;
+    while (j < text.length && /\s/.test(text[j]!)) j++;
+    const quote = text[j];
+    if (quote !== '"' && quote !== "'") continue;
+    const end = text.indexOf(quote, j + 1);
+    if (end >= 0 && text.slice(j + 1, end).trim() === SVG_NS) return true;
   }
   return false;
 }

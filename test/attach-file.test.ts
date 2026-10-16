@@ -68,6 +68,10 @@ describe("what is attached", () => {
     expect(kindOf("/w/chart.csv", text('<s:svg xmlns:s="http://www.w3.org/2000/svg"></s:svg>'))).toStartWith("refused: SVG isn't attached");
     expect(kindOf("/w/chart.md", text('<root xmlns="http://www.w3.org/2000/svg"/>'))).toStartWith("refused: SVG isn't attached");
     expect(kindOf("/w/chart.txt", text("<SVG>"))).toStartWith("refused: SVG isn't attached");
+    expect(kindOf("/w/chart.txt", text("<g:root xmlns:g = 'http://www.w3.org/2000/svg'/>"))).toStartWith("refused: SVG isn't attached");
+    // The namespace URL in prose, or as some other attribute's value, isn't a declaration.
+    expect(kindOf("/w/notes.md", text("See http://www.w3.org/2000/svg for the spec."))).toBe("text/plain");
+    expect(kindOf("/w/notes.md", text('<a href="http://www.w3.org/2000/svg">spec</a>'))).toBe("text/plain");
     expect(kindOf("/w/notes.md", text("a < b and svg > c; <svgish/> <x:svgfoo/>"))).toBe("text/plain");
     // What made the old regex backtrack exponentially (CodeQL, code-scanning/13).
     const evil = text("<!--" + "--><!--".repeat(50_000) + "x" + "<".repeat(200_000) + "<a".repeat(100_000));
