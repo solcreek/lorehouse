@@ -86,7 +86,7 @@ def parallel(n, one, gap=0.0):
         t = threading.Thread(target=one, args=(i,))
         t.start()
         threads.append(t)
-        if gap:
+        if gap and i < n - 1:  # between launches only, so wall_s isn't padded by a last gap
             time.sleep(gap)
     for t in threads:
         t.join()
