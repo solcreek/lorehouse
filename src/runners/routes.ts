@@ -50,6 +50,12 @@ function parseResult(v: unknown): JobResult | undefined {
 
 const bad = (why: string) => new Response(why, { status: 400 });
 
+// The largest frame a runner may send. A result carries its body as base64 (4/3 of the
+// bytes) inside JSON, and guestd reads files up to 16 MiB (sandbox/guest/main.go), so a
+// 16 MiB read arrives as ~21.4 MiB. Bun's default, 16 MiB, drops the whole connection (1006)
+// on a larger frame, failing every job in flight on that runner, not just the one read.
+export const MAX_FRAME_BYTES = 24 * 1024 * 1024;
+
 export function runnerRoutes(hub: RunnerHub, token: string) {
   // undefined: not a runner path; the caller goes on routing.
   async function handle(req: Request, server?: Server<RunnerSocketData>): Promise<Response | undefined> {
@@ -104,6 +110,7 @@ export function runnerRoutes(hub: RunnerHub, token: string) {
     // Fly and most proxies drop a connection idle for ~60 s; the runner's status frames
     // every 20 s keep it alive, and Bun pings as well.
     idleTimeout: 120,
+    maxPayloadLength: MAX_FRAME_BYTES,
   };
 
   return { handle, websocket };

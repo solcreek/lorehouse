@@ -413,3 +413,33 @@ describe("results and failures", () => {
     for (const [runner, , want] of cases) expect(listed.find((r) => r.runner === runner)?.mirrors).toEqual(want);
   });
 });
+
+describe("over a real WebSocket", () => {
+  test("a result as large as guestd reads (16 MiB, ~21 MiB as base64) arrives, and the runner stays connected", async () => {
+    const hub = hubWith();
+    const token = "t".repeat(32);
+    const { handle, websocket } = runnerRoutes(hub, token);
+    const server = Bun.serve({ port: 0, fetch: async (req, srv) => (await handle(req, srv as never)) ?? new Response("no", { status: 404 }), websocket });
+    try {
+      const ws = new WebSocket(`ws://localhost:${server.port}/runners/connect`, { headers: { authorization: `Bearer ${token}`, "x-lorehouse-runner": "big" } } as unknown as string[]);
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error("no connection"));
+      });
+      let closed: number | undefined;
+      ws.onclose = (e) => (closed = e.code);
+      const content = "a".repeat(16 * 1024 * 1024);
+      ws.onmessage = (e) => {
+        const { job } = JSON.parse(String(e.data)) as { job: Job };
+        ws.send(JSON.stringify({ type: "result", result: { id: job.id, status: 200, bodyBase64: b64(content) } }));
+      };
+      ws.send(JSON.stringify({ type: "status", capacity: 1, running: 0 }));
+      await Bun.sleep(50);
+      expect((await hub.sandbox("s1").readFile("/workspace/big.txt")).length).toBe(content.length);
+      expect(closed).toBeUndefined();
+      ws.close();
+    } finally {
+      server.stop(true);
+    }
+  });
+});

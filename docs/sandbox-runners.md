@@ -105,6 +105,8 @@ A **result** answers one job with an HTTP-like status:
 - The runner sends a `status` frame first, then every 20 s.
 - Lorehouse sends `{ "type": "job", "job": … }`.
 - The runner sends `{ "type": "result", "result": … }`, in any order, as jobs finish.
+- A frame may be up to 24 MiB, enough for the largest file guestd reads (16 MiB, ~21.4 MiB
+  as base64). A larger frame closes the connection.
 
 ### Over long poll
 
