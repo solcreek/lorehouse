@@ -13,6 +13,16 @@ thread). Rust. Work reaches it one of two ways:
 - **First use** reflinks the golden rootfs (copy-on-write, milliseconds) and boots it.
 - **Idle** VMs are stopped after `SANDBOXD_IDLE_SECS`; the disk is kept, so a thread that
   comes back finds the same checkout.
+- **Background jobs** (`POST /jobs`, `GET /jobs/{job}`, `POST /jobs/{job}/cancel` under
+  `/v1/sandboxes/{id}`, or the same guest calls through a runner): a command that outlives
+  its request, run by guestd in a process group of its own, its output and exit status
+  kept on the VM's disk (`sandbox/guest/jobs.go`). A job id runs once: starting it again
+  returns that job, so a retried start never runs a second copy. A running job counts as
+  activity: an idle VM isn't stopped while guestd says a job runs, for up to
+  `SANDBOXD_JOB_HOLD_SECS` after its last request. A job dies with its VM, whatever stops
+  it (that hold running out, `DELETE`, sandboxd stopping, the network rules failing
+  closed): after an idle stop or a shutdown its status reads `lost`, its output up to then
+  kept; after `DELETE` the job is gone with the disk.
 - **Stopping** always flushes the guest's disk cache first.
 - **Network**: a sandbox reaches the internet and nothing else. There is no route to
   private networks (LAN, tailnet, link-local, other sandboxes), no connection into the
@@ -67,6 +77,7 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_STATE` | `/var/lib/lorehouse-sandboxes` | one directory per sandbox |
 | `SANDBOXD_MAX_VMS` | `4` | running at once (1–64); more gets a 503 |
 | `SANDBOXD_IDLE_SECS` | `900` | idle time before a VM is stopped |
+| `SANDBOXD_JOB_HOLD_SECS` | `21600` | how long after its last request a VM with a running background job is kept from its idle stop (0–604800; 0: jobs don't hold a VM). The guest says whether a job runs, so this caps how long a guest can keep its slot that way; 6 h is guestd's longest job timeout |
 | `SANDBOXD_VCPUS` `SANDBOXD_MEM_MIB` | `2`, `2048` | per VM |
 | `SANDBOXD_MIRROR_MAX_GIB` | `4` | the most one repo's publish mirror may use; a stage of a repo over it gets a 507 |
 | `SANDBOXD_MIRRORS_MAX_GIB` | `24` | the most all mirrors may use; idle ones (over 24 h) are dropped first. New mirrors are made one at a time (a second new repo's stage waits for the first's fetch); existing mirrors growing at once can pass it by what those stages fetch (about 10 KB for a typical stage); a refused stage's bundle is collected by the gc, its refresh stays with the mirror |

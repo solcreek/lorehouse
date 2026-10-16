@@ -90,8 +90,14 @@ publishing step (`stage`, `push`; see [Publishing](#publishing)):
 `timeoutMs` is the command's own limit. `deadlineMs` is how long Lorehouse will still wait
 for the result, as of handing the job out. It is relative, so the clocks needn't agree.
 
-A runner accepts only these guest calls: `POST /exec`, `GET /file?path=…` and
-`PUT /file?path=…`. It refuses anything else.
+A runner accepts only these guest calls, and refuses anything else:
+
+- `POST /exec`, `GET /file?path=…` and `PUT /file?path=…`;
+- a background job's (see [Background jobs](#background-jobs)): `POST /jobs` with no query,
+  `GET /jobs/<job>` with at most `waitMs` and `tailBytes` (digits) in its query, and
+  `POST /jobs/<job>/cancel`, where `<job>` is 1–64 of `[A-Za-z0-9_.-]` starting with a
+  letter or digit. `GET /jobs`, the list, isn't one: sandboxd asks it itself, for the idle
+  stop.
 
 A **result** answers one job with an HTTP-like status:
 
@@ -165,6 +171,42 @@ lost because a connection dropped while the job ran.
   answered with a 500 that says it may have partly run, rather than left to its deadline
   or retried blindly. A job that can't be recorded first isn't run at all.
 - **A runner that disconnects** has 60 s to come back before its pending jobs fail.
+
+## Background jobs
+
+A command that runs longer than one job should (a benchmark, a test suite, a build) runs as
+a background job in the sandbox: guestd starts it and answers at once, and later calls ask
+how it is doing. Each is an ordinary `guest` job, with its own short deadline.
+
+```json
+POST /jobs              → { "id": "bench-1", "command": "make bench", "cwd": "/workspace/repo", "env": {…}, "timeoutMs": 3600000 }
+                        ← 201 (200: that id was started already) a job
+GET  /jobs/bench-1?waitMs=60000&tailBytes=8192 ← 200 a job, once it ends or waitMs passes
+POST /jobs/bench-1/cancel                     ← 200 a job, once stopped (≤ 12 s)
+
+a job: { "id", "command", "cwd", "state": "running" | "exited" | "cancelled" | "timed_out" | "lost",
+         "exitCode": 0 | null, "startedAt", "endedAt": … | null, "elapsedMs", "timeoutMs",
+         "outputBytes", "tail", "tailTruncated", "reason"?, "created"? }
+```
+
+- **An id runs once.** Starting an id that ran before in that sandbox returns that job,
+  whatever its state, and doesn't start a second copy. Lorehouse re-runs a tool call that
+  was in flight when it stopped, so a start can arrive twice. The same id with another
+  command or directory is refused (409).
+- **Its process group.** The command runs as `bash -lc`, stdin closed, in a process group
+  of its own. Cancel and the timeout (default 1 h, at most 6 h) send it SIGTERM, then SIGKILL
+  10 s later. When the command exits, anything it left running in its group is killed too.
+- **Its output** (stdout and stderr together) goes to a file on the VM's disk, and its
+  record when it starts and ends. At least the last 8 MiB are kept (up to 16). The env is never recorded.
+- **It counts as activity.** An idle VM isn't stopped while guestd says a job runs, for up
+  to `SANDBOXD_JOB_HOLD_SECS` (default 6 h) after the VM's last request.
+- **It dies with its VM.** Whatever stops the VM (that hold running out, sandboxd stopping,
+  the network rules failing closed) stops its jobs. The next status boots the VM again and
+  reads `lost`, with the output up to then. A `destroy` deletes the disk, and the jobs with
+  it: a status after that is a 404.
+- **Failures** are JSON `{ "error" }` that say what to do: 400 (a bad id, cwd or timeout),
+  404 (no such job; the message lists the latest ids), 409 (the id names another run), 429
+  (8 jobs already running in the sandbox).
 
 ## Publishing
 

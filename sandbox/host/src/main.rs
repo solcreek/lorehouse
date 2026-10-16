@@ -6,7 +6,10 @@
 //!   POST   /v1/sandboxes/{id}/exec   {command, cwd, env, timeoutMs} → {exitCode, stdout, stderr}
 //!   GET    /v1/sandboxes/{id}/file?path=…                         → bytes (404 if absent)
 //!   PUT    /v1/sandboxes/{id}/file?path=…                         → 204
-//!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone)
+//!   POST   /v1/sandboxes/{id}/jobs   {id, command, cwd, env, timeoutMs} → 201 a background job (200: that id's job, already started)
+//!   GET    /v1/sandboxes/{id}/jobs/{job}?waitMs=…&tailBytes=…       → the job: state, exit code, elapsed, output tail
+//!   POST   /v1/sandboxes/{id}/jobs/{job}/cancel                     → the job, once stopped (its process group killed)
+//!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone, its jobs with it)
 //!   GET    /v1/sandboxes                                          → what exists, running or not
 //!   POST   /v1/sandboxes/{id}/stage  {owner, name, base, branch, token?} → the commits to publish, verified, and a stage id
 //!   POST   /v1/sandboxes/{id}/push   {stage, owner, name, sha, branch, token} → pushed (see publish.rs)
@@ -120,6 +123,31 @@ async fn read_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): 
 
 async fn write_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): RawQuery, body: Bytes) -> Response {
     forward(&app, &id, Method::PUT, file_path(q), body).await
+}
+
+async fn job_start(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> Response {
+    forward(&app, &id, Method::POST, "/jobs".into(), body).await
+}
+
+/// A job call passed through if it is one guestd serves (vm::job_call); else a 400 that says why.
+async fn job_forward(app: &App, id: &str, path: String) -> Response {
+    let method = if path.ends_with("/cancel") { "POST" } else { "GET" };
+    match vm::job_call(method, &path) {
+        Some(m) => forward(app, id, m, path, Bytes::new()).await,
+        None => error(400, "job id: 1–64 of [A-Za-z0-9_.-], starting with a letter or digit; status takes only waitMs and tailBytes, in digits"),
+    }
+}
+
+async fn job_status(State(app): State<App>, Path((id, job)): Path<(String, String)>, RawQuery(q): RawQuery) -> Response {
+    let path = match q {
+        Some(q) => format!("/jobs/{job}?{q}"),
+        None => format!("/jobs/{job}"),
+    };
+    job_forward(&app, &id, path).await
+}
+
+async fn job_cancel(State(app): State<App>, Path((id, job)): Path<(String, String)>) -> Response {
+    job_forward(&app, &id, format!("/jobs/{job}/cancel")).await
 }
 
 async fn destroy(State(app): State<App>, Path(id): Path<String>) -> Response {
@@ -299,6 +327,9 @@ async fn main() {
                 .route("/v1/sandboxes/{id}", axum::routing::delete(destroy))
                 .route("/v1/sandboxes/{id}/exec", post(exec))
                 .route("/v1/sandboxes/{id}/file", get(read_file).put(write_file))
+                .route("/v1/sandboxes/{id}/jobs", post(job_start))
+                .route("/v1/sandboxes/{id}/jobs/{job}", get(job_status))
+                .route("/v1/sandboxes/{id}/jobs/{job}/cancel", post(job_cancel))
                 .route("/v1/sandboxes/{id}/stage", post(stage))
                 .route("/v1/sandboxes/{id}/push", post(push))
                 .layer(middleware::from_fn_with_state(app.clone(), auth));

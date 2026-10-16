@@ -105,8 +105,54 @@ pub async fn healthy(uds: &Path) -> bool {
     matches!(request(uds, Method::GET, "/healthz", Bytes::new()).await, Ok(r) if r.status.is_success())
 }
 
+/// How many background jobs guestd says are running (`GET /jobs`), or None when it doesn't
+/// answer within 2 s or answers anything else. The guest's word: it decides only how long
+/// an idle VM is kept up, and that is capped (vm.rs `reap`).
+pub async fn running_jobs(uds: &Path) -> Option<u64> {
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), request(uds, Method::GET, "/jobs", Bytes::new())).await.ok()?.ok()?;
+    if !reply.status.is_success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&reply.body).ok()?.get("running")?.as_u64()
+}
+
 #[cfg(test)]
 mod tests {
+    /// A guest at `path` that answers one request per connection with `status` and `body`,
+    /// after the vsock handshake, as Firecracker's socket and guestd would.
+    async fn fake_guest(path: &std::path::Path, status: u16, body: &'static str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    assert!(buf[..n].starts_with(b"CONNECT 1024\n"));
+                    s.write_all(b"OK 1\n").await.unwrap();
+                    let _ = s.read(&mut buf).await; // the request
+                    let reply = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                    let _ = s.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn running_jobs_is_what_guestd_says_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("sandboxd-jobs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (two, broken, refused) = (dir.join("two.sock"), dir.join("broken.sock"), dir.join("refused.sock"));
+        fake_guest(&two, 200, r#"{"running":2,"jobs":[]}"#).await;
+        fake_guest(&broken, 200, "not json").await;
+        fake_guest(&refused, 404, r#"{"running":5}"#).await; // an old guestd with no jobs
+        assert_eq!(super::running_jobs(&two).await, Some(2));
+        assert_eq!(super::running_jobs(&broken).await, None);
+        assert_eq!(super::running_jobs(&refused).await, None);
+        assert_eq!(super::running_jobs(&dir.join("absent.sock")).await, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_socket_deeper_than_sun_path_is_still_reached() {
