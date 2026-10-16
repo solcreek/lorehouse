@@ -150,20 +150,32 @@ func newJobManager(dir string) (*jobManager, error) {
 	}
 	m := &jobManager{dir: dir, live: map[string]*liveJob{}, unsaved: map[string]unsavedRecord{}, keep: maxJobRecords, now: time.Now}
 	m.persist = m.writeRecord
+	m.recoverLost()
+	return m, nil
+}
+
+// recoverLost marks every record still "running" on disk lost: no process of this guestd
+// runs it. When that write fails (a full disk), the lost record is kept in m.unsaved, as
+// a failed ending is, so calls read "lost" and the write is retried; dropping it would
+// leave "running" on disk for a job nothing will ever finish.
+func (m *jobManager) recoverLost() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, rec := range m.records() {
 		if rec.State != stateRunning {
 			continue
 		}
 		ended := rec.StartedAt
-		if info, err := os.Stat(filepath.Join(dir, rec.ID, "output.log")); err == nil && info.ModTime().After(ended) {
+		if info, err := os.Stat(filepath.Join(m.dir, rec.ID, "output.log")); err == nil && info.ModTime().After(ended) {
 			ended = info.ModTime()
 		}
 		rec.State, rec.EndedAt = stateLost, &ended
-		rec.OutputBytes = logSize(filepath.Join(dir, rec.ID))
+		rec.OutputBytes = logSize(filepath.Join(m.dir, rec.ID))
 		rec.Reason = "the sandbox's VM stopped (or its agent restarted) while the job ran, and its processes went with it; the output up to then is kept"
-		_ = m.persist(rec)
+		if err := m.persist(rec); err != nil {
+			m.unsaved[rec.ID] = unsavedRecord{rec, err.Error()}
+		}
 	}
-	return m, nil
 }
 
 type startReq struct {

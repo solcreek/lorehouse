@@ -381,3 +381,35 @@ func TestAPrunedJobsIdStillNamesItsRun(t *testing.T) {
 		t.Fatalf("p1's status: %+v %v", v, err)
 	}
 }
+
+func TestALostJobWhoseRecoveryCantBeWrittenStillReadsLostAndIsWrittenLater(t *testing.T) {
+	m := manager(t)
+	// A record left "running" by a guestd that is gone, as a VM stop leaves it.
+	started := time.Now().Add(-time.Minute)
+	if err := os.MkdirAll(filepath.Join(m.dir, "orphan"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.writeRecord(jobRecord{ID: "orphan", Command: "sleep 600", Cwd: "/", State: stateRunning, StartedAt: started}); err != nil {
+		t.Fatal(err)
+	}
+	failing := true
+	m.persist = func(rec jobRecord) error {
+		if failing {
+			return errors.New("no space left on device")
+		}
+		return m.writeRecord(rec)
+	}
+	m.recoverLost() // what a restarted guestd does, with the disk full
+	if v, err := m.status("orphan", 0, defaultTail, nil); err != nil || v.State != stateLost || !strings.Contains(v.PersistError, "no space left") {
+		t.Fatalf("while the write fails: %+v %v", v, err)
+	}
+	failing = false
+	if v, err := m.status("orphan", 0, defaultTail, nil); err != nil || v.State != stateLost || v.PersistError != "" {
+		t.Fatalf("after the retry: %+v %v", v, err)
+	}
+	b, _ := os.ReadFile(filepath.Join(m.dir, "orphan", "meta.json"))
+	var rec jobRecord
+	if json.Unmarshal(b, &rec) != nil || rec.State != stateLost {
+		t.Fatalf("on disk after the retry: %s", b)
+	}
+}
