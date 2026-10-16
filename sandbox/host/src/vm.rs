@@ -226,12 +226,14 @@ pub fn job_call(method: &str, path: &str) -> Option<Method> {
     }
 }
 
+pub const BAD_JOB_ID: &str = "bad job id: use 1–64 of [A-Za-z0-9_.-], starting with a letter or digit";
+
 /// Why job_call refused a call, as a sentence the caller can act on: the job id, or the query.
 pub fn job_call_refusal(path: &str) -> &'static str {
     let route = path.split_once('?').map_or(path, |(r, _)| r);
     let job = route.strip_prefix("/jobs/").map(|r| r.split_once('/').map_or(r, |(j, _)| j));
     match job {
-        Some(j) if !valid_job_id(j) => "bad job id: use 1–64 of [A-Za-z0-9_.-], starting with a letter or digit",
+        Some(j) if !valid_job_id(j) => BAD_JOB_ID,
         Some(_) if path.contains('?') && !route.ends_with("/cancel") => "bad status query: it takes only waitMs and tailBytes, each in digits",
         _ => "not a job call: POST /jobs, GET /jobs/<id>?waitMs=&tailBytes=, or POST /jobs/<id>/cancel (with no query)",
     }
