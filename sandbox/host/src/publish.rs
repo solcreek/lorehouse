@@ -426,7 +426,7 @@ fn git_command(cmd: &mut Command, home: &Path, args: &[String], global_config: &
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1");
-    let config: [(&str, &str); 9] = [
+    let config: [(&str, &str); 10] = [
         ("core.hooksPath", "/dev/null"),
         ("fetch.fsckObjects", "true"),
         ("transfer.fsckObjects", "true"),
@@ -442,6 +442,10 @@ fn git_command(cmd: &mut Command, home: &Path, args: &[String], global_config: &
         // The remote is reached over plain HTTP to sandboxd's listener, never via a proxy
         // a mirror's config names.
         ("http.proxy", ""),
+        // A push's whole request in one buffer: over http.postBuffer (1 MiB by default),
+        // remote-curl would first probe receive-pack with a bare flush-pkt and then stream
+        // the request chunked. The proxy reads at most this much anyway (remote.rs).
+        ("http.postBuffer", remote::MAX_PUSH_REQUEST_STR),
     ];
     cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
     for (i, (k, v)) in config.iter().enumerate() {
@@ -1473,6 +1477,19 @@ mod tests {
         let net = Net::Push { owner: "acme", name: "widgets", token: "write-tok", old: &zero, new: &head, refname: "refs/heads/scout/q" };
         let env = s.publisher.git.run_net(&s.dir(), &["-c", "alias.env=!env; git config --list", "env"], net, GIT_LOCAL).await.unwrap();
         assert!(!env.contains("write-tok") && !env.contains(&basic("write-tok")[6..]) && !env.to_lowercase().contains("authorization"), "{env}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_over_a_mebibyte_goes_through_the_proxy() {
+        // Over http.postBuffer's default (1 MiB), git's remote-curl would first probe
+        // receive-pack with a bare flush-pkt, which a strict check refuses.
+        let mut s = scratch("bigpush");
+        let (url, _seen, _server) = smart_http(s.root.clone()).await;
+        s.publisher.git = Git::new(None, &url);
+        let head = sh(&s.vm, "head -c 3000000 /dev/urandom > big.bin && git add big.bin && git commit -qm big && git rev-parse HEAD");
+        let staged = s.stage("scout/big").await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/big")).await.unwrap();
+        assert_eq!(s.remote("scout/big").as_deref(), Some(head.as_str()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

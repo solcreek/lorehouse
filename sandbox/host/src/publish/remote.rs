@@ -33,6 +33,9 @@ const MAX_FETCH_REQUEST: usize = 16 << 20;
 /// The most of a push's request git may send: the pack of the staged commits, which came
 /// out of the VM as a bundle of at most MAX_BUNDLE.
 const MAX_PUSH_REQUEST: usize = (super::MAX_BUNDLE as usize) + (32 << 20);
+/// The same, as git's http.postBuffer (git_command): git then sends a push's request
+/// whole, never first a probe (a test checks the two agree).
+pub const MAX_PUSH_REQUEST_STR: &str = "134217728";
 /// The most of the remote's ref advertisement sandboxd reads itself (push's pre-check).
 const MAX_ADVERTISEMENT: usize = 64 << 20;
 /// What git sends that is forwarded; nothing else of its request is.
@@ -228,6 +231,12 @@ fn allowed_capability(c: &str) -> bool {
 /// only the capabilities a plain push asks for (no push options, no certificate, no
 /// shallow lines), then the pack.
 pub fn check_push(body: &[u8], old: &str, new: &str, refname: &str) -> Result<(), String> {
+    // remote-curl's probe of a large request (probe_rpc): a bare flush-pkt, no command. It
+    // asks for nothing; git_command's http.postBuffer means git doesn't send it, but one
+    // through is harmless.
+    if body == b"0000" {
+        return Ok(());
+    }
     let (first, rest) = pkt(body).map_err(|e| format!("the push request: {e}"))?;
     let line = first.ok_or("the push request has no command")?;
     let line = line.strip_suffix(b"\n").unwrap_or(line);
@@ -331,7 +340,10 @@ mod tests {
         // Not pkt-lines at all.
         assert!(check_push(b"PACK", OLD, NEW, "refs/heads/lorehouse/x").is_err());
         assert!(check_push(b"", OLD, NEW, "refs/heads/lorehouse/x").is_err());
-        assert!(check_push(b"0000", OLD, NEW, "refs/heads/lorehouse/x").is_err());
+        // remote-curl's probe, alone, asks for nothing; a flush followed by more is refused.
+        assert_eq!(check_push(b"0000", OLD, NEW, "refs/heads/lorehouse/x"), Ok(()));
+        assert!(check_push(b"0000PACK", OLD, NEW, "refs/heads/lorehouse/x").is_err());
+        assert_eq!(MAX_PUSH_REQUEST_STR.parse::<usize>(), Ok(MAX_PUSH_REQUEST));
     }
 
     #[test]
