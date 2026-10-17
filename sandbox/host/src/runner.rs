@@ -816,11 +816,11 @@ mod tests {
             mem_mib: 128,
             github_url: format!("file://{}", dir.display()),
             mirrors: crate::publish::Policy::default(),
-            jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, mem_headroom_mib: 512 },
+            jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, git_uid_base: 1_900_100_000, git_mem_mib: 2048, mem_headroom_mib: 512 },
             limits: crate::config::Limits::default(),
             net_check: Duration::from_secs(10),
         };
-        (crate::vm::Manager::new(cfg, std::sync::Arc::new(crate::jail::tests::host()), crate::quota::Quota::Off, crate::net::Firewall::new("lo", 2)), std::sync::Arc::new(crate::publish::Publisher::new(dir.join("mirrors"), format!("file://{}", dir.display()))))
+        (crate::vm::Manager::new(cfg, std::sync::Arc::new(crate::jail::tests::host()), crate::quota::Quota::Off, crate::net::Firewall::new("lo", 2)), std::sync::Arc::new(crate::publish::Publisher::unconfined(dir.join("mirrors"), format!("file://{}", dir.display()))))
     }
 
     #[tokio::test]

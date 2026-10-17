@@ -256,8 +256,12 @@ push → { "stage": "<id>", "owner": "acme", "name": "widgets", "sha": "…", "b
   - A record expires 24 h after it was made. Expired records and refs, and refs with no
     record, are dropped by the host's housekeeping.
 - **Every git command** on the host runs with no user or system config, no prompts, no
-  replace objects and no hooks. A token travels as an HTTP header in the command's
-  environment, never in argv. Tokens are in jobs only, never logged or recorded.
+  replace objects and no hooks, isolated from sandboxd: a uid of its own per run, a mount
+  namespace with only its mirror and git's binaries, no network, a cgroup of its own
+  killed whole after it ([`sandbox/host/README.md`](../sandbox/host/README.md#publishings-git)).
+  A fetch or push reaches GitHub only through sandboxd, which forwards that one repo's
+  upload-pack or receive-pack and adds the token itself: no git process ever holds a
+  token. Tokens are in jobs only, never logged or recorded.
 - **A mirror is written by one job at a time**, under its lock. Git's automatic maintenance
   is off (`maintenance.auto=false`, `gc.auto=0`): it runs detached, after the lock is
   released, and a gc from outside the lock was seen to wedge a mirror (#76). A git command

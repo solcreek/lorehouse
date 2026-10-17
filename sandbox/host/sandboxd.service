@@ -42,8 +42,11 @@ TimeoutStopSec=120
 # pivot_root, SYS_CHROOT, MKNOD for /dev/kvm and /dev/net/tun in it, CHOWN), then drops
 # to the VM's uid (SETUID, SETGID). sandboxd reaches into a jail, owned by that uid, for
 # the vsock and to clean up (DAC_OVERRIDE), and signals the jailed VMM (KILL). The VMM
-# itself ends with no capability at all.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_KILL
+# itself ends with no capability at all. FOWNER: the jailed run that empties a dropped
+# mirror keeps it, with DAC_OVERRIDE, to delete a tree another uid wrote (sticky
+# directories included). Besides that tree it sees only read-only binds of /usr and
+# ld.so.cache, a tmpfs /tmp of its own and no device node (src/gitjail.rs, remover).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_KILL CAP_FOWNER
 # The jailer drops privileges with setuid(2), which NoNewPrivileges doesn't stop.
 NoNewPrivileges=yes
 # Each VM gets its own cgroup (CPU, memory, pids, IO limits) under this unit's, and
@@ -74,8 +77,11 @@ DeviceAllow=/dev/urandom m
 # AF_INET/AF_INET6: Lorehouse and GitHub. AF_UNIX: each VM's vsock and API sockets.
 # AF_NETLINK: ip and nft.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# The jailer's mount namespace, and no other.
-RestrictNamespaces=mnt
+# The jailer's mount namespace; and publishing's git, which reads what a VM hands over,
+# runs in a mount, a network and an IPC namespace of its own (src/gitjail.rs): it sees
+# only its mirror and /usr, has no network but a listener sandboxd serves, and no IPC
+# object of another run's or sandboxd's. No user, pid, uts or cgroup namespaces.
+RestrictNamespaces=mnt net ipc
 # net.ipv4.ip_forward comes from sandboxd.sysctl.conf at boot (sandboxd checks it is on
 # and refuses to start otherwise), and nft's modules from sandboxd.modules.conf.
 ProtectKernelTunables=yes

@@ -68,6 +68,10 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_UPLINK` | (required) | the host's internet-facing interface |
 | `SANDBOXD_JAILER` `SANDBOXD_FIRECRACKER` | `jailer`, `firecracker` | the binaries, as paths or names on `PATH`; they must be from the same release. Without a jailer sandboxd doesn't start: no setting runs a VM unjailed |
 | `SANDBOXD_JAIL_UID_BASE` | `1900000000` | the VM in slot *n* runs as uid and gid base + *n*; sandboxd refuses to start if any of them belongs to a user or group |
+| `SANDBOXD_GIT_UID_BASE` | `1900100000` | each run of publishing's git runs as a uid and gid of its own from base + 0..31 ([Publishing's git](#publishings-git)); like the VMs', sandboxd refuses to start if any of them belongs to a user or group, or overlaps the VMs' range |
+| `SANDBOXD_GIT_MEM_MIB` | `2048` | the most memory one run of publishing's git may use, no swap (256–65536); past it that run alone is killed. A gc of a mirror near `SANDBOXD_MIRROR_MAX_GIB` may need more |
+| `SANDBOXD_GIT_CHECK_SECS` | `300` | the most a push to an existing branch may spend on its ancestry check (10–3600): fetching both sides' commit history into a fresh repo and `merge-base`. About 4 s for 53k commits; past it the push is refused, saying so (raise this, or push to a new branch) |
+| `SANDBOXD_MIRROR_MAX_ENTRIES` | `1000000` | the most entries a walk of one mirror may meet (10000–100000000); past it, or past 262144 in one directory, 128 levels deep or twice `SANDBOXD_MIRROR_MAX_GIB` in bytes, the mirror is dropped as an anomaly and fetched again when next needed |
 | `SANDBOXD_NET_RX_MIBPS` `SANDBOXD_NET_TX_MIBPS` | `50`, `10` | per VM, into and out of the guest (MiB/s, 0 = unlimited); see [Limits](#limits) |
 | `SANDBOXD_DISK_MIBPS` `SANDBOXD_DISK_IOPS` | `200`, `5000` | per VM, its disk (0 = unlimited) |
 | `SANDBOXD_DISK_QUOTA_GIB` | `8` | what one sandbox may write to its disk. Unset: enforced where the state directory can (btrfs with quotas on), else a warning at start; set: enforced or sandboxd won't start; `0`: off. Either way, sandboxes made before quotas were on stay uncapped; `0` doesn't lift a limit already set |
@@ -165,18 +169,59 @@ jail, cgroup and tap were gone, the disk root's again, and the next request boot
 same disk in 0.94 s. With sandboxd SIGKILLed, systemd killed the VM and restarted it in
 6 s, disk intact.
 
+### Publishing's git
+
+The `git` that reads what a VM hands over (a stage's bundle, then its objects in the
+mirror: verify, describe, push, gc) runs isolated from sandboxd
+([`src/gitjail.rs`](src/gitjail.rs), ADR 0003 layer 3), so a git bug a VM's objects reach
+gets one repo's mirror and nothing more:
+
+| | |
+|---|---|
+| user | a uid and gid of its own for each run, from `SANDBOXD_GIT_UID_BASE` + 0..31, back in the pool only once nothing of the run is left. Not 0, not a VM's; sandboxd refuses to start if any of them is a user or group. Two runs at once never share one. No capabilities, `NoNewPrivs`, no core dumps |
+| files | its own mount namespace: an empty tmpfs root holding `/usr` (and `/nix/store`, for a Nix-built git) read-only, the merged-usr links, `/etc/ld.so.cache`, `/dev/null`, `zero`, `full`, `random`, `urandom`, a private `/tmp`, and its mirror at `/repo` (no exec), chowned to the run's uid first. No `/etc/lorehouse`, `/run/credentials`, `/proc`, `/sys` or cgroup tree, no other mirror, no sandbox. sandboxd keeps nothing of its own in a mirror (the upkeep state is in `<mirrors>/.upkeep`), and writes there only new files. It reads a mirror only through [`src/mirrorfs.rs`](src/mirrorfs.rs): every path resolved beneath the mirror's root, never leaving it or going through a link, as the file or as a directory on the way (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, else an `O_NOFOLLOW` walk), regular files only, non-blocking, capped |
+| network | its own network namespace, with nothing in it. A run that fetches from or pushes to GitHub gets one whose only address is a listener sandboxd serves (`http://127.0.0.1:<port>/<owner>/<name>.git`): sandboxd forwards that repo's upload-pack (fetch) or receive-pack (push) to GitHub, nothing else, and adds the token itself ([`src/publish/remote.rs`](src/publish/remote.rs)). No git process ever holds a token. A push may send only the one update its stage recorded, `<old> <staged sha> refs/heads/<branch>`, where sandboxd read `<old>` from GitHub itself and checked the push is a fast-forward from it. That is decided in a fresh bare repo under `<mirrors>/.check`, never in the mirror: one isolated run fetches into it from the mirror (read-only) only the commits of both, re-hashed by fsck, and `merge-base --is-ancestor` runs there with git's view pinned to that repo (no commondir, grafts, shallow file, replace refs or commit-graph). A run's proxy takes at most 4 connections at once (one more is closed), and all runs' request bodies share 256 MiB in sandboxd (a request past it gets a 503) |
+| IPC | its own IPC namespace: no SysV or POSIX IPC object outlives its run |
+| a mirror is a cache | host traversal of a mirror ([`src/mirrorfs.rs`](src/mirrorfs.rs)) streams entries, holds one open directory per level, and stops at caps (entries per directory and in all, `SANDBOXD_MIRROR_MAX_ENTRIES`; depth; bytes, twice `SANDBOXD_MIRROR_MAX_GIB`). Past a cap or on any error the mirror is dropped, never trusted in part, and the job fails (the status counts `anomalies`). A dropped tree is renamed into `<mirrors>/.drop` and emptied later by a jailed run (`find -delete`, a leased uid keeping only `CAP_DAC_OVERRIDE` and `CAP_FOWNER`), never walked by sandboxd. A run whose cgroup can't be emptied takes its trees out of use the same way, fails its job, and its uid waits until the cgroup is empty |
+| cgroup | `<sandboxd.service>/git/u<uid>`, beside `vms/`, `pids.max` 512, `memory.max` `SANDBOXD_GIT_MEM_MIB` with no swap and `memory.oom.group` 1 (at the limit the run alone is killed, never sandboxd or a VM); killed whole (`cgroup.kill`) once the run is over, however it ended, so a process that left git's process group (`setsid`) is gone too before the uid or the mirror's lock is released |
+
+None of it can be turned off: at start, sandboxd runs `git version` through all of it and
+refuses to start if that fails, and a run that can't be set up doesn't run.
+
+Verified on the lab (GCE `n4-standard-16`, Ubuntu 24.04, systemd 255, git 2.43, 2026-10-16),
+the repo's unit, a stage from a real VM against github.com (a public repo, no token), then a
+stage and push against a local smart-HTTP remote with made-up tokens, every git process
+polled every 2 ms: all 16 seen had uid and gid 1900100000, `CapEff` and `CapPrm` 0,
+`NoNewPrivs` 1, cgroup `…/sandboxd.service/git/u1900100000`, mount and network namespaces
+not the host's, a root of only `bin dev etc lib lib64 repo sbin tmp usr`, an `/etc` of only
+`ld.so.cache`, no `/proc`, and no token or `Authorization` in its environment. During the
+push, its network namespace had only `lo` and sandboxd's listener; 1.1.1.1 was unreachable
+and so was the host's loopback. The remote got the read token on upload-pack and the write
+token on receive-pack, from sandboxd. From git's uids on the host, writing another mirror, a
+sandbox's disk, `vms/cgroup.procs` or `git/cgroup.procs` was refused, and so was signalling
+sandboxd.
+
+The isolation's own tests run in user namespaces (`unshare --user --map-root-user`, some
+with `--map-auto` and the user's subuids) and say `NOTE: … skipped` where the host can't
+give them one (no `unshare(1)`, unprivileged user namespaces refused, as on Ubuntu's
+default AppArmor, or no capabilities inside one). On a host meant to run them (a
+developer's Linux box, starship), run `SANDBOXD_REQUIRE_USERNS=1 cargo test --locked`: a
+skip is then a failure. CI doesn't set it. `isolated_git_as_root` (`cargo test -- --ignored`, as root in a
+`systemd-run --scope -p Delegate=yes`, and under the unit's own confinement) passes there:
+a `setsid` escapee is gone when its run returns, and two runs at once had different uids.
+
 [`sandboxd.service`](sandboxd.service) confines sandboxd and every process it starts
 (the jailer and Firecracker, `ip`, `nft`, `git`):
 
 | | |
 |---|---|
-| capabilities | `CAP_NET_ADMIN` (taps, nftables), and for the jailer `SYS_ADMIN`, `SYS_CHROOT`, `MKNOD`, `CHOWN`, `SETUID`, `SETGID`; `DAC_OVERRIDE` and `KILL` to reach into and stop a jailed VM; `NoNewPrivileges=yes`. `git`, which reads what a VM hands over, runs with none of them (dropped between fork and exec) |
-| environment | every process sandboxd starts begins from a clean environment, `PATH` and `LC_ALL=C` and nothing inherited ([`src/child.rs`](src/child.rs)), so none of them, the jailer and Firecracker above all, inherits `SANDBOXD_RUNNER_TOKEN` or `SANDBOXD_TOKEN`; a test fails a spawn that bypasses it. A caller adds only what its tool needs on top: `git` gets its own `HOME`, `GIT_*` settings and, when it talks to GitHub, that request's short-lived token ([`src/publish.rs`](src/publish.rs)) |
+| capabilities | `CAP_NET_ADMIN` (taps, nftables), and for the jailer `SYS_ADMIN`, `SYS_CHROOT`, `MKNOD`, `CHOWN`, `SETUID`, `SETGID`; `DAC_OVERRIDE` and `KILL` to reach into and stop a jailed VM; `FOWNER`, kept with `DAC_OVERRIDE` by the jailed run that empties a dropped mirror; `NoNewPrivileges=yes`. `git`, which reads what a VM hands over, runs with none of them, as a uid of its own ([above](#publishings-git)) |
+| environment | every process sandboxd starts begins from a clean environment, `PATH` and `LC_ALL=C` and nothing inherited ([`src/child.rs`](src/child.rs)), so none of them, the jailer and Firecracker above all, inherits `SANDBOXD_RUNNER_TOKEN` or `SANDBOXD_TOKEN`; a test fails a spawn that bypasses it. A caller adds only what its tool needs on top: `git` gets its own `HOME` and `GIT_*` settings, and never a token: sandboxd adds that request's short-lived token to what it forwards to GitHub ([`src/publish.rs`](src/publish.rs)) |
 | file system | read-only (`ProtectSystem=strict`) but the state directory; no `/home` or `/root`; private `/tmp` |
 | devices | `/dev/kvm` and `/dev/net/tun`, beyond the standard pseudo-devices (`DevicePolicy=closed`; `ProtectClock` adds read access to the RTC), plus making nodes of those, `/dev/userfaultfd` and `/dev/urandom` in a jail |
 | sockets | `AF_UNIX` (vsock, API), `AF_INET`/`AF_INET6` (Lorehouse, GitHub), `AF_NETLINK` (ip, nft) |
-| cgroups | delegated (`Delegate=yes`): sandboxd moves itself to `supervisor/` and each VM gets a cgroup under `vms/`. sandboxd refuses to start without the delegation. The whole cgroup tree is writable to it (no `ProtectControlGroups`), and with the jailer's `SYS_ADMIN` and `@mount` it could remount `/` in a namespace of its own: this confines sandboxd against mistakes, not against itself being compromised (ADR 0003) |
-| kernel | tunables, modules, logs, clock and hostname read-only or out of reach; `@system-service` and `@mount` system calls only; no W+X memory, no namespaces but mount, no realtime, no set-uid files |
+| cgroups | delegated (`Delegate=yes`): sandboxd moves itself to `supervisor/`, each VM gets a cgroup under `vms/` and each run of publishing's git one under `git/`. sandboxd refuses to start without the delegation. The whole cgroup tree is writable to it (no `ProtectControlGroups`), and with the jailer's `SYS_ADMIN` and `@mount` it could remount `/` in a namespace of its own: this confines sandboxd against mistakes, not against itself being compromised (ADR 0003) |
+| kernel | tunables, modules, logs, clock and hostname read-only or out of reach; `@system-service` and `@mount` system calls only; no W+X memory, no namespaces but mount, network and IPC (the jailer's, and git's), no realtime, no set-uid files |
 | stop | `KillMode=mixed`: only sandboxd gets the SIGTERM and stops each VM after the guest's sync. Firecracker dies on SIGTERM, so the default (`control-group`) killed every VM before its disk cache was flushed |
 
 Because of that, the host sets up two things sandboxd used to do itself:
@@ -186,7 +231,9 @@ it at start and refuses to run without it) and the modules for taps and nftables
 
 `systemd-analyze security --offline=yes sandboxd.service` (systemd 261, 2026-10-12):
 **9.4 UNSAFE** for the unit before any of this, **2.2 OK** confined, **3.9 OK** with the
-jailer's privileges added. That score measures sandboxd; the VMs, which run the untrusted
+jailer's privileges added; letting it make network and IPC namespaces for git
+(`RestrictNamespaces=mnt net ipc`, #143) costs 0.2 more: 3.9 → 4.1 (systemd 261, starship,
+2026-10-17; `mnt net` alone was 4.0 there and on the lab's systemd 255). That score measures sandboxd; the VMs, which run the untrusted
 code, went from root with every capability to an unprivileged uid with none. What counts
 against it is what the job needs: root, the jailer's capabilities and `@mount`, a
 delegated cgroup, the host's network, `/dev/kvm`, internet and netlink sockets. Cargo

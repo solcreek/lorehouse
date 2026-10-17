@@ -31,9 +31,14 @@
 //!   (every 5 minutes). The quotas are enforced against it at admission and again after
 //!   each fetch, so a lag of one pass can't let a mirror grow without bound.
 //!
-//! What a mirror was last used for is kept in it, in `sandboxd.json` (git ignores the file).
+//! What a mirror was last used for is kept beside the mirrors, in
+//! `<mirrors>/.upkeep/<owner>/<name>.json`, not in the mirror: a mirror is writable by the
+//! uid its git runs as (gitjail.rs), which must neither set its own retention nor plant a
+//! link sandboxd would write through. (It was the mirror's `sandboxd.json` before: that
+//! file is removed when the mirror's state is next written.)
 
-use super::{expired, git, remove_mirror, Failure, Publisher, StageRecord};
+use super::{expired, has_head, remove_mirror, Failure, Publisher, StageRecord};
+use crate::mirrorfs::{Anomaly, Kind, Mirror};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,8 +49,8 @@ pub const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 /// Eviction stops once the mirrors use this share of mirrors_max (in percent).
 const EVICT_TO_PCT: u64 = 80;
-/// Where a mirror keeps what its upkeep needs.
-const STATE: &str = "sandboxd.json";
+/// Where a mirror's upkeep state was kept before, in the mirror itself.
+const OLD_STATE: &str = "sandboxd.json";
 /// After a gc fails (or runs out of time), how long until the next try on that mirror.
 const GC_RETRY: u64 = 3600;
 
@@ -72,6 +77,12 @@ pub struct Policy {
     pub gc_idle: Duration,
     /// The deadline of one gc.
     pub gc_deadline: Duration,
+    /// The deadline of a push's ancestry check: fetching both sides' commits into a fresh
+    /// repo and merge-base (SANDBOXD_GIT_CHECK_SECS). 53k commits took about 4 s.
+    pub check_deadline: Duration,
+    /// The most entries a walk of one mirror may meet before the mirror is dropped as an
+    /// anomaly (SANDBOXD_MIRROR_MAX_ENTRIES; mirrorfs::Caps).
+    pub mirror_entries: u64,
     /// A stage whose bundle is over this, and that fails, is cut off or expires unpushed, is
     /// collected after (what it brought is kept byte for byte otherwise, for 2 weeks).
     pub heavy_bundle: u64,
@@ -89,6 +100,8 @@ impl Default for Policy {
             gc_every: Duration::from_secs(86_400),
             gc_idle: Duration::from_secs(10 * 60),
             gc_deadline: Duration::from_secs(600),
+            check_deadline: Duration::from_secs(super::DEFAULT_CHECK_SECS),
+            mirror_entries: 1_000_000,
             heavy_bundle: 8 * MIB,
         }
     }
@@ -104,8 +117,9 @@ impl Policy {
 /// Where sizes come from: the disk in production, set by hand in tests.
 pub trait Disk: Send + Sync {
     /// The bytes a mirror uses (apparent sizes, as `du -sb`), and how many of those are
-    /// garbage (git's partial packs, stage bundles).
-    fn usage(&self, dir: &Path) -> (u64, u64);
+    /// garbage (git's partial packs, stage bundles); an anomaly if the walk couldn't be
+    /// whole (mirrorfs), never a partial total.
+    fn usage(&self, dir: &Path) -> Result<(u64, u64), Anomaly>;
     /// Free bytes (for an unprivileged user) and the size of the filesystem `dir` is on.
     fn fs(&self, dir: &Path) -> Option<(u64, u64)>;
 }
@@ -113,29 +127,24 @@ pub trait Disk: Send + Sync {
 pub struct RealDisk;
 
 impl Disk for RealDisk {
-    fn usage(&self, dir: &Path) -> (u64, u64) {
+    fn usage(&self, dir: &Path) -> Result<(u64, u64), Anomaly> {
         // Garbage by the names remove_garbage() goes by, each only where that file lives (a
-        // branch may be called tmp_pack_x).
-        fn walk(top: &Path, place: &Path, sum: &mut (u64, u64)) {
-            let packs = place == top.join("objects").join("pack");
-            for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
-                // DirEntry::metadata doesn't follow a symlink.
-                let Ok(meta) = entry.metadata() else { continue };
-                if meta.is_dir() {
-                    walk(top, &entry.path(), sum);
-                    continue;
-                }
-                sum.0 += meta.len();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_"))) || (place == top && name.starts_with("stage-") && name.ends_with(".bundle")) {
-                    sum.1 += meta.len();
-                }
-            }
-        }
+        // branch may be called tmp_pack_x). Through mirrorfs: a link is counted as itself,
+        // never what it names.
         let mut sum = (0, 0);
-        walk(dir, dir, &mut sum);
-        sum
+        let mirror = Mirror::open(dir).map_err(|e| Anomaly(format!("the mirror: {e}")))?;
+        mirror.walk(|place, _, name, st| {
+            if st.kind == Kind::Dir {
+                return;
+            }
+            sum.0 += st.len;
+            let name = name.to_string_lossy();
+            let packs = place == Path::new("objects/pack");
+            if (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_"))) || (place.as_os_str().is_empty() && name.starts_with("stage-") && name.ends_with(".bundle")) {
+                sum.1 += st.len;
+            }
+        })?;
+        Ok(sum)
     }
 
     // f_bavail and the rest are u32 on some platforms and u64 on others.
@@ -168,18 +177,34 @@ pub(super) struct MirrorState {
     pub(super) heavy: Vec<String>,
 }
 
-fn read_state(dir: &Path) -> Option<MirrorState> {
-    serde_json::from_slice(&std::fs::read(dir.join(STATE)).ok()?).ok()
+/// Where the upkeep state of the mirror in `dir` (`<mirrors>/<owner>/<name>.git`) is:
+/// `<mirrors>/.upkeep/<owner>/<name>.json`, out of the mirror's reach.
+pub(super) fn state_path(dir: &Path) -> PathBuf {
+    let name = dir.file_name().map(|n| n.to_string_lossy().trim_end_matches(".git").to_string()).unwrap_or_default();
+    let owner = dir.parent();
+    let mirrors = owner.and_then(Path::parent).unwrap_or(Path::new("."));
+    mirrors.join(".upkeep").join(owner.and_then(Path::file_name).unwrap_or_default()).join(format!("{name}.json"))
+}
+
+pub(super) fn read_state(dir: &Path) -> Option<MirrorState> {
+    serde_json::from_slice(&std::fs::read(state_path(dir)).ok()?).ok()
 }
 
 /// Written whole (a temporary file renamed into place). Not synced: losing it to a crash
 /// costs a gc or a few days' retention, nothing else.
 fn write_state(dir: &Path, state: &MirrorState) {
-    let tmp = dir.join(format!(".{STATE}.tmp"));
-    let written = serde_json::to_vec(state).map_err(std::io::Error::other).and_then(|json| std::fs::write(&tmp, json)).and_then(|()| std::fs::rename(&tmp, dir.join(STATE)));
+    let path = state_path(dir);
+    let Some(parent) = path.parent() else { return };
+    let tmp = parent.join(format!(".{}.tmp", path.file_name().unwrap_or_default().to_string_lossy()));
+    let written = std::fs::create_dir_all(parent)
+        .and_then(|()| serde_json::to_vec(state).map_err(std::io::Error::other))
+        .and_then(|json| std::fs::write(&tmp, json))
+        .and_then(|()| std::fs::rename(&tmp, &path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+    // Where it was kept before: unlinked, never followed.
+    let _ = std::fs::remove_file(dir.join(OLD_STATE));
 }
 
 /// `owner/name` of a mirror's directory (`<mirrors>/<owner>/<name>.git`).
@@ -189,11 +214,17 @@ fn repo_of(dir: &Path) -> String {
     format!("{owner}/{name}")
 }
 
-/// A mirror's refs/stage refs, loose or packed.
-fn count_stage_refs(dir: &Path) -> u64 {
-    let loose = std::fs::read_dir(dir.join("refs").join("stage")).map_or(0, |d| d.flatten().count() as u64);
-    let packed = std::fs::read_to_string(dir.join("packed-refs")).map_or(0, |p| p.lines().filter(|l| l.contains(" refs/stage/")).count() as u64);
-    loose + packed
+/// The most of a mirror's packed-refs sandboxd reads to count its stage refs.
+const PACKED_REFS_CAP: u64 = 64 << 20;
+
+/// A mirror's refs/stage refs, loose or packed, as sandboxd reads them (publish.rs, "What
+/// sandboxd reads in a mirror"): a refs/stage that is a link, or a packed-refs that isn't a
+/// regular file under its cap, counts nothing; a refs/stage past its cap is an anomaly.
+pub(super) fn count_stage_refs(dir: &Path) -> Result<u64, Anomaly> {
+    let Ok(mirror) = Mirror::open(dir) else { return Ok(0) };
+    let loose = mirror.count("refs/stage")?.unwrap_or(0);
+    let packed = mirror.read("packed-refs", PACKED_REFS_CAP).map_or(0, |p| p.split(|&b| b == b'\n').filter(|l| l.windows(12).any(|w| w == b" refs/stage/")).count() as u64);
+    Ok(loose + packed)
 }
 
 /// Bytes in GiB for a message: whole when they are, else to one decimal.
@@ -224,6 +255,11 @@ pub(super) struct Stats {
     evicted: u64,
     refused_for_space: u64,
     refresh_timeouts: u64,
+    /// Mirrors dropped for an anomaly in their traversal (mirrorfs).
+    anomalies: u64,
+    /// Trees in the graveyard not emptied yet, with the bytes each was last measured at
+    /// (0 when unknown): they still take their space, so they count in total().
+    buried: HashMap<PathBuf, u64>,
     fs_unknown_logged: bool,
 }
 
@@ -238,6 +274,12 @@ enum Short {
 }
 
 impl Publisher {
+    /// How far a walk of one of these mirrors may go (mirrorfs): entries as set, bytes at
+    /// twice a mirror's quota (one over its quota is refused as that, not as an anomaly).
+    pub fn caps(&self) -> crate::mirrorfs::Caps {
+        crate::mirrorfs::Caps { entries: self.policy.mirror_entries, bytes: self.policy.mirror_max.saturating_mul(2), ..Default::default() }
+    }
+
     /// The upkeep's limits and schedule; Policy::default() unless set.
     pub fn with_policy(mut self, policy: Policy) -> Publisher {
         self.policy = policy;
@@ -290,9 +332,14 @@ impl Publisher {
     }
 
     /// Measure a mirror (and the filesystem, and the records) for the quotas and the status.
-    /// Its size in bytes.
-    fn measure(&self, dir: &Path) -> u64 {
-        let (bytes, garbage) = self.disk.usage(dir);
+    /// Its size in bytes. A mirror that can't be measured whole (an anomaly: mirrorfs) is a
+    /// cache that can't be trusted: dropped, and the job that measured it refused.
+    pub(super) fn measure(&self, dir: &Path) -> Result<u64, Failure> {
+        let measured = self.disk.usage(dir).and_then(|u| Ok((u, count_stage_refs(dir)?)));
+        let ((bytes, garbage), stage_refs) = match measured {
+            Ok(m) => m,
+            Err(a) => return Err(self.drop_anomalous(dir, &a)),
+        };
         let last_used = match read_state(dir) {
             Some(s) => s.last_used,
             None => {
@@ -302,14 +349,23 @@ impl Publisher {
                 now
             }
         };
-        let m = Measured { bytes, garbage, stage_refs: count_stage_refs(dir), last_used };
+        let m = Measured { bytes, garbage, stage_refs, last_used };
         let fs_free = self.fs().map(|(free, _)| free);
         let records = self.count_records();
         let mut st = self.stats();
         st.mirrors.insert(dir.to_path_buf(), m);
         st.fs_free = fs_free;
         st.records = records;
-        bytes
+        Ok(bytes)
+    }
+
+    /// A mirror whose traversal hit an anomaly: dropped (it is a cache of GitHub, fetched
+    /// again when next needed), and what to answer the job that found it.
+    pub(super) fn drop_anomalous(&self, dir: &Path, why: &Anomaly) -> Failure {
+        eprintln!("sandboxd: dropped the mirror of {}: {why}", repo_of(dir));
+        self.drop_mirror(dir);
+        self.stats().anomalies += 1;
+        (500, format!("the mirror of {} couldn't be trusted ({why}) and was dropped; nothing was staged or pushed, stage again", repo_of(dir)))
     }
 
     fn count_records(&self) -> u64 {
@@ -317,9 +373,14 @@ impl Publisher {
     }
 
     /// Remove a mirror (its lock held) and forget it.
-    pub(super) fn drop_mirror(&self, dir: &Path) {
-        remove_mirror(dir);
+    pub(super) fn drop_mirror(&self, dir: &Path) -> Option<PathBuf> {
+        let bytes = self.stats().mirrors.get(dir).map_or(0, |m| m.bytes);
+        let tree = remove_mirror(dir);
+        if let Some(tree) = &tree {
+            self.stats().buried.insert(tree.clone(), bytes);
+        }
         self.forget(dir);
+        tree
     }
 
     fn forget(&self, dir: &Path) {
@@ -327,7 +388,8 @@ impl Publisher {
     }
 
     fn total(&self) -> u64 {
-        self.stats().mirrors.values().map(|m| m.bytes).sum()
+        let st = self.stats();
+        st.mirrors.values().map(|m| m.bytes).sum::<u64>() + st.buried.values().sum::<u64>()
     }
 
     /// Whether the mirrors, with `extra` bytes more, fit, and the filesystem keeps its floor
@@ -356,7 +418,7 @@ impl Publisher {
     /// never `keep`, one a live stage record names, or one whose lock is held (it is never
     /// waited for: the caller holds `keep`'s). Until the mirrors, with `extra` bytes more, use at
     /// most EVICT_TO_PCT of mirrors_max and the filesystem keeps its floor, or none is left.
-    fn evict(&self, keep: &Path, extra: u64) {
+    async fn evict(&self, keep: &Path, extra: u64) {
         let now = self.now();
         let live = self.live_repos();
         let mut idle: Vec<(u64, PathBuf)> = self.stats().mirrors.iter().filter(|(d, m)| d.as_path() != keep && now.saturating_sub(m.last_used) > self.policy.evict_idle.as_secs()).map(|(d, m)| (m.last_used, d.clone())).collect();
@@ -377,20 +439,34 @@ impl Publisher {
             if now.saturating_sub(used) <= self.policy.evict_idle.as_secs() || self.live_repos().contains(&repo_of(&dir)) {
                 continue;
             }
-            remove_mirror(&dir);
-            self.forget(&dir);
+            let tree = self.drop_mirror(&dir);
             self.stats().evicted += 1;
             eprintln!("sandboxd: dropped the mirror of {} to make room (idle {} h)", repo_of(&dir), now.saturating_sub(last_used) / 3600);
+            // Its space is only free once the tree is emptied: now, before room is looked at
+            // again, or every idle mirror would go for no change. If it couldn't be emptied
+            // (no uid free, find's error, its deadline), no more go: the room wouldn't change.
+            self.empty_graveyard().await;
+            if tree.is_some_and(|t| self.stats().buried.contains_key(&t)) {
+                eprintln!("sandboxd: the mirror of {} couldn't be emptied yet; no more mirrors are evicted for now", repo_of(&dir));
+                break;
+            }
         }
     }
 
     /// Room for `extra` bytes more, evicting if needed; else a 507 that says why. `need` is
     /// what the message says this mirror needs.
-    fn make_room(&self, dir: &Path, owner: &str, name: &str, extra: u64, need: u64) -> Result<(), Failure> {
+    async fn make_room(&self, dir: &Path, owner: &str, name: &str, extra: u64, need: u64) -> Result<(), Failure> {
         if self.room(extra).is_ok() {
             return Ok(());
         }
-        self.evict(dir, extra);
+        // What was dropped but not emptied yet still takes its space: freed first.
+        if !self.stats().buried.is_empty() {
+            self.empty_graveyard().await;
+            if self.room(extra).is_ok() {
+                return Ok(());
+            }
+        }
+        self.evict(dir, extra).await;
         let short = match self.room(extra) {
             Ok(()) => return Ok(()),
             Err(short) => short,
@@ -422,8 +498,7 @@ impl Publisher {
     /// push needs the mirror; the first stage after no record does, removes it).
     fn over_cap(&self, dir: &Path, owner: &str, name: &str, bytes: u64) -> Failure {
         if !self.live_repos().contains(&repo_of(dir)) {
-            remove_mirror(dir);
-            self.forget(dir);
+            self.drop_mirror(dir);
         }
         self.stats().refused_for_space += 1;
         (507, format!("the mirror of {owner}/{name} is {} GiB, over the {} GiB a repo may use on this sandbox host: nothing was staged. An operator can raise SANDBOXD_MIRROR_MAX_GIB.", gib(bytes), gib(self.policy.mirror_max)))
@@ -432,30 +507,30 @@ impl Publisher {
     /// Before a stage's refresh, under the mirror's lock: the mirror as last measured is
     /// within its cap, and there is room for it. A `new` one (never fetched into: is_new)
     /// counts at mirror_max, and is admitted under `new_mirrors`.
-    pub(super) fn admit(&self, dir: &Path, owner: &str, name: &str, new: bool) -> Result<(), Failure> {
+    pub(super) async fn admit(&self, dir: &Path, owner: &str, name: &str, new: bool) -> Result<(), Failure> {
         if new {
-            return self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max);
+            return self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max).await;
         }
         let mut known = self.stats().mirrors.get(dir).map(|m| m.bytes);
-        if known.is_none() && dir.join("HEAD").exists() {
+        if known.is_none() && has_head(dir) {
             // On disk, not measured yet: put there after the start's inventory, not by a stage.
-            known = Some(self.measure(dir));
+            known = Some(self.measure(dir)?);
         }
         match known {
             Some(bytes) if bytes > self.policy.mirror_max => Err(self.over_cap(dir, owner, name, bytes)),
-            Some(bytes) => self.make_room(dir, owner, name, 0, bytes),
-            None => self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max),
+            Some(bytes) => self.make_room(dir, owner, name, 0, bytes).await,
+            None => self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max).await,
         }
     }
 
     /// After a fetch into the mirror (the refresh, a bundle), under its lock: measured; over
     /// its cap, it is removed; either way, refused when there is no room.
-    pub(super) fn check_size(&self, dir: &Path, owner: &str, name: &str) -> Result<(), Failure> {
-        let bytes = self.measure(dir);
+    pub(super) async fn check_size(&self, dir: &Path, owner: &str, name: &str) -> Result<(), Failure> {
+        let bytes = self.measure(dir)?;
         if bytes > self.policy.mirror_max {
             return Err(self.over_cap(dir, owner, name, bytes));
         }
-        self.make_room(dir, owner, name, 0, bytes)
+        self.make_room(dir, owner, name, 0, bytes).await
     }
 
     /// A refresh failed: counted if it ran out of time, forgotten if the mirror is gone, and
@@ -464,8 +539,8 @@ impl Publisher {
         if error.contains(" took over ") {
             self.stats().refresh_timeouts += 1;
         }
-        if dir.join("HEAD").exists() {
-            self.measure(dir);
+        if has_head(dir) {
+            let _ = self.measure(dir);
         } else {
             self.forget(dir);
         }
@@ -474,7 +549,8 @@ impl Publisher {
     /// A stage's bundle was read: if it is heavy, the stage is noted, so that what it brought
     /// is collected once it can't be pushed (it failed, was cut off, or expired).
     pub(super) fn mark_heavy(&self, dir: &Path, bundle: &Path, id: &str) {
-        if std::fs::metadata(bundle).is_ok_and(|m| m.len() > self.policy.heavy_bundle) {
+        let name = bundle.strip_prefix(dir).ok().and_then(Path::to_str);
+        if name.and_then(|n| Mirror::open(dir).ok()?.stat(n)).is_some_and(|st| st.kind == Kind::File && st.len > self.policy.heavy_bundle) {
             let mut state = read_state(dir).unwrap_or_default();
             state.heavy.push(id.to_string());
             write_state(dir, &state);
@@ -485,7 +561,7 @@ impl Publisher {
     /// as used, what a heavy stage that won't be pushed brought is collected, and the mirror
     /// is measured. `pushed`: the stage a push just pushed.
     pub(super) async fn after_job(&self, dir: &Path, pushed: Option<&str>) {
-        if !dir.join("HEAD").exists() {
+        if !has_head(dir) {
             self.forget(dir);
             return;
         }
@@ -496,7 +572,7 @@ impl Publisher {
         }
         write_state(dir, &state);
         self.collect_heavy(dir, &mut state).await;
-        self.measure(dir);
+        let _ = self.measure(dir);
     }
 
     /// gc --prune=now if a heavy stage of this mirror has no record any more (it failed, was
@@ -518,11 +594,11 @@ impl Publisher {
         if self.now().saturating_sub(state.gc_failed_at) < GC_RETRY {
             return false;
         }
-        let before = self.disk.usage(dir).0;
+        let before = self.disk.usage(dir).map_or(0, |u| u.0);
         let started = Instant::now();
-        let done = git(dir, &["gc", "--quiet", "--prune=now"], None, self.policy.gc_deadline).await;
+        let done = self.git.run(dir, &["gc", "--quiet", "--prune=now"], self.policy.gc_deadline).await;
         let ms = started.elapsed().as_millis() as u64;
-        let reclaimed = before.saturating_sub(self.disk.usage(dir).0);
+        let reclaimed = before.saturating_sub(self.disk.usage(dir).map_or(0, |u| u.0));
         if let Err(e) = &done {
             eprintln!("sandboxd: gc of the mirror of {}: {e}", repo_of(dir));
             state.gc_failed_at = self.now();
@@ -536,12 +612,39 @@ impl Publisher {
         true
     }
 
+    /// Empty and remove what was dropped (`<mirrors>/.drop`): each tree emptied by a jailed
+    /// run (Git::empty), then its now-empty directory removed by sandboxd (one rmdir). One
+    /// that can't be emptied yet stays for the next pass.
+    pub(super) async fn empty_graveyard(&self) {
+        let graveyard = self.mirrors.join(super::GRAVEYARD);
+        for entry in std::fs::read_dir(&graveyard).into_iter().flatten().flatten() {
+            let tree = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = std::fs::remove_file(&tree);
+                continue;
+            }
+            match self.git.empty(&tree, self.policy.gc_deadline).await {
+                Ok(()) => match std::fs::remove_dir(&tree) {
+                    Ok(()) => {
+                        self.stats().buried.remove(&tree);
+                    }
+                    Err(e) => eprintln!("sandboxd: a dropped tree {}: {e}; tried again at the next pass", tree.display()),
+                },
+                Err(e) => eprintln!("sandboxd: emptying a dropped tree {}: {e}; tried again at the next pass", tree.display()),
+            }
+        }
+    }
+
     /// Every mirror on disk measured, for the quotas: run at start, before any job is taken
     /// (the first upkeep pass may take minutes to reach them all, a gc at a time).
     pub fn inventory(&self) {
+        // A fast-forward check's repo a previous sandboxd left (killed mid-push).
+        for left in std::fs::read_dir(self.mirrors.join(".check")).into_iter().flatten().flatten() {
+            crate::gitjail::bury(&left.path(), &self.mirrors.join(super::GRAVEYARD));
+        }
         for dir in self.mirror_dirs() {
-            if dir.join("HEAD").exists() {
-                self.measure(&dir);
+            if has_head(&dir) {
+                let _ = self.measure(&dir);
             }
         }
     }
@@ -550,6 +653,7 @@ impl Publisher {
     /// free (a busy one is skipped, never waited for): retention, the housekeeping (prune),
     /// what heavy stages left, the daily gc; then every mirror is measured for the status.
     pub async fn maintain(&self) {
+        self.empty_graveyard().await;
         let live = self.live_repos();
         let dirs = self.mirror_dirs();
         for dir in &dirs {
@@ -557,15 +661,14 @@ impl Publisher {
             let Ok(_held) = lock.try_lock() else { continue };
             let now = self.now();
             let Some(mut state) = read_state(dir) else {
-                self.measure(dir); // stamps it as used now
+                let _ = self.measure(dir); // stamps it as used now
                 continue;
             };
             let idle = now.saturating_sub(state.last_used);
             // Looked at again under its lock, as evict() does: a stage of it may have written
             // its record since the pass began.
             if idle > self.policy.retention.as_secs() && !live.contains(&repo_of(dir)) && !self.live_repos().contains(&repo_of(dir)) {
-                remove_mirror(dir);
-                self.forget(dir);
+                self.drop_mirror(dir);
                 self.stats().evicted += 1;
                 eprintln!("sandboxd: dropped the mirror of {}: no stage in {} days", repo_of(dir), idle / 86_400);
                 continue;
@@ -576,14 +679,14 @@ impl Publisher {
             if gc_due {
                 self.gc(dir, &mut state).await;
             }
-            self.measure(dir);
+            let _ = self.measure(dir);
         }
         // Mirrors no longer on disk (removed by hand) are forgotten; not by the list the pass
         // started from, which a stage may have added a mirror to since.
         let fs_free = self.fs().map(|(free, _)| free);
         let records = self.count_records();
         let mut st = self.stats();
-        st.mirrors.retain(|d, _| d.join("HEAD").exists());
+        st.mirrors.retain(|d, _| has_head(d));
         st.fs_free = fs_free;
         st.records = records;
     }
@@ -592,6 +695,8 @@ impl Publisher {
     /// measured, never the disk now. Counters are since sandboxd started.
     pub fn status(&self) -> serde_json::Value {
         let now = self.now();
+        // Uids of git runs that couldn't be stopped, held until their cgroup empties.
+        let held = self.git.held();
         let st = self.stats();
         let largest = st.mirrors.iter().max_by_key(|(_, m)| m.bytes).map(|(d, m)| serde_json::json!({ "repo": repo_of(d), "bytes": m.bytes }));
         serde_json::json!({
@@ -609,6 +714,11 @@ impl Publisher {
             "evicted": st.evicted,
             "refusedForSpace": st.refused_for_space,
             "refreshTimeouts": st.refresh_timeouts,
+            "anomalies": st.anomalies,
+            "graveyardTrees": std::fs::read_dir(self.mirrors.join(super::GRAVEYARD)).map_or(0, |d| d.count()),
+            "graveyardBytes": st.buried.values().sum::<u64>(),
+            "gitUidsHeld": held.0,
+            "gitUidsHeldSince": held.1,
         })
     }
 }

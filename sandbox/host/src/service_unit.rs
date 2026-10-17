@@ -52,7 +52,7 @@ fn root_keeps_only_the_capabilities_it_uses() {
     // the VM's uid. Firecracker itself ends with none.
     assert_eq!(
         words("CapabilityBoundingSet"),
-        set(&["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL"])
+        set(&["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL", "CAP_FOWNER"])
     );
     assert_eq!(one("NoNewPrivileges"), "yes");
 }
@@ -88,8 +88,8 @@ fn only_kvm_and_tun_are_reachable() {
         set(&["/dev/kvm rwm", "/dev/net/tun rwm", "/dev/userfaultfd m", "/dev/urandom m"])
     );
     assert_eq!(words("RestrictAddressFamilies"), set(&["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"]));
-    // The jailer's mount namespace only.
-    assert_eq!(one("RestrictNamespaces"), "mnt");
+    // The jailer's mount namespace, and git's mount, network and IPC namespaces (gitjail.rs).
+    assert_eq!(words("RestrictNamespaces"), set(&["mnt", "net", "ipc"]));
 }
 
 #[test]

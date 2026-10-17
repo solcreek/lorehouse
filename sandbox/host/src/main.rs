@@ -20,7 +20,9 @@
 
 mod child;
 mod config;
+mod gitjail;
 mod jail;
+mod mirrorfs;
 mod net;
 mod pidfd;
 mod publish;
@@ -218,6 +220,25 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Publishing's git runs isolated from sandboxd (gitjail.rs), or not at all: a host that
+    // can't set that up, as a probe run shows, doesn't start.
+    let git_jail = match gitjail::GitJail::prepare(&cfg.state_dir, jail::git_cgroups(&host), cfg.jail.git_uid_base, (cfg.jail.git_mem_mib as u64) << 20) {
+        Ok(j) => Arc::new(j),
+        Err(e) => {
+            eprintln!("sandboxd: {e}");
+            std::process::exit(1);
+        }
+    };
+    match git_jail.probe(&cfg.state_dir.join(".git-probe")).await {
+        Ok(version) => eprintln!(
+            "sandboxd: publishing's {version} runs isolated: its own uid per run (SANDBOXD_GIT_UID_BASE + n), only its mirror and /usr in view, no network but through sandboxd, a cgroup per run under {}",
+            jail::git_cgroups(&host).display()
+        ),
+        Err(e) => {
+            eprintln!("sandboxd: publishing's git can't run isolated here: {e}");
+            std::process::exit(1);
+        }
+    }
     // A disk quota set explicitly but not enforceable here refuses the start too.
     let quota = match quota::detect(&cfg.state_dir, &cfg.limits.disk_quota).await {
         Ok(q) => q,
@@ -276,7 +297,9 @@ async fn main() {
         }
     });
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
-    let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone()).with_policy(cfg.mirrors.clone()));
+    let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone(), git_jail).with_policy(cfg.mirrors.clone()));
+    // Every walk of a mirror (mirrorfs) stops at these, and any anomaly drops the mirror.
+    mirrorfs::set_caps(publisher.caps());
 
     // Every mirror measured before any job is taken, so the quotas count them all.
     let inventory = publisher.clone();

@@ -90,6 +90,13 @@ pub struct JailConfig {
     /// The VM in slot n runs as uid and gid `uid_base + n`. These ids must belong to no
     /// user or group; sandboxd checks at start.
     pub uid_base: u32,
+    /// Publishing's git runs as one of `git_uid_base .. + gitjail::GIT_UIDS`, a uid of its
+    /// own per run (gitjail.rs). These must belong to no user or group either, and not be
+    /// a VM's.
+    pub git_uid_base: u32,
+    /// Each run of publishing's git may use this much memory (its cgroup's memory.max, no
+    /// swap); past it the run alone is killed.
+    pub git_mem_mib: u32,
     /// A VM's cgroup memory limit is its guest RAM plus this.
     pub mem_headroom_mib: u32,
 }
@@ -97,6 +104,11 @@ pub struct JailConfig {
 /// Above every regular and system user (and systemd's dynamic users), and below the
 /// ids some tools read as signed: 1_900_000_000 + 63 is still under 2^31.
 pub const DEFAULT_JAIL_UID_BASE: u64 = 1_900_000_000;
+/// Past the VMs' default range (64 at most), for the same reasons.
+pub const DEFAULT_GIT_UID_BASE: u64 = 1_900_100_000;
+/// A run of publishing's git: a diff or a pack of a bundle (at most 96 MiB) and a gc of a
+/// mirror (at most SANDBOXD_MIRROR_MAX_GIB, 4 GiB by default) fit in this.
+pub const DEFAULT_GIT_MEM_MIB: u64 = 2048;
 
 /// Seconds between checks of the nftables table: how long a flushed table can leave
 /// running guests unfiltered. A check is one `nft list table`.
@@ -238,6 +250,10 @@ impl Config {
         let free_gib = num("SANDBOXD_MIRRORS_FREE_GIB", d.free_min / GIB);
         let retention_days = num("SANDBOXD_MIRROR_RETENTION_DAYS", d.retention.as_secs() / 86_400);
         let uid_base = num("SANDBOXD_JAIL_UID_BASE", DEFAULT_JAIL_UID_BASE);
+        let git_uid_base = num("SANDBOXD_GIT_UID_BASE", DEFAULT_GIT_UID_BASE);
+        let git_mem = num("SANDBOXD_GIT_MEM_MIB", DEFAULT_GIT_MEM_MIB);
+        let check_secs = num("SANDBOXD_GIT_CHECK_SECS", crate::publish::DEFAULT_CHECK_SECS);
+        let mirror_entries = num("SANDBOXD_MIRROR_MAX_ENTRIES", d.mirror_entries);
         let headroom = num("SANDBOXD_VM_MEM_HEADROOM_MIB", 512);
         let net_check = num("SANDBOXD_NET_CHECK_SECS", DEFAULT_NET_CHECK_SECS);
         let dl = Limits::default();
@@ -274,9 +290,24 @@ impl Config {
         if !(1..=365).contains(&retention_days) {
             problems.push("SANDBOXD_MIRROR_RETENTION_DAYS must be 1..=365".into());
         }
-        let mirrors = Policy { mirror_max: mirror_max * GIB, mirrors_max: mirrors_max * GIB, free_min_pct: free_pct, free_min: free_gib * GIB, retention: Duration::from_secs(retention_days * 86_400), ..d };
+        let mirrors = Policy { mirror_max: mirror_max * GIB, mirrors_max: mirrors_max * GIB, free_min_pct: free_pct, free_min: free_gib * GIB, retention: Duration::from_secs(retention_days * 86_400), check_deadline: Duration::from_secs(check_secs), mirror_entries, ..d };
         if !(65_536..=2_000_000_000).contains(&uid_base) {
             problems.push("SANDBOXD_JAIL_UID_BASE must be 65536..=2000000000 (above every real user, below 2^31 with room for 64 VMs)".into());
+        }
+        if !(10_000..=100_000_000).contains(&mirror_entries) {
+            problems.push("SANDBOXD_MIRROR_MAX_ENTRIES must be 10000..=100000000".into());
+        }
+        if !(10..=3600).contains(&check_secs) {
+            problems.push("SANDBOXD_GIT_CHECK_SECS must be 10..=3600".into());
+        }
+        if !(256..=65_536).contains(&git_mem) {
+            problems.push("SANDBOXD_GIT_MEM_MIB must be 256..=65536".into());
+        }
+        let git_uids = crate::gitjail::GIT_UIDS as u64;
+        if !(65_536..=2_000_000_000).contains(&git_uid_base) {
+            problems.push(format!("SANDBOXD_GIT_UID_BASE must be 65536..=2000000000 (above every real user, below 2^31 with room for {git_uids} runs of git)"));
+        } else if git_uid_base < uid_base + max_vms && uid_base < git_uid_base + git_uids {
+            problems.push(format!("SANDBOXD_GIT_UID_BASE: git's {git_uids} uids from {git_uid_base} overlap the VMs' (SANDBOXD_JAIL_UID_BASE {uid_base}, {max_vms} VMs)"));
         }
         if !(64..=65_536).contains(&headroom) {
             problems.push("SANDBOXD_VM_MEM_HEADROOM_MIB must be 64..=65536".into());
@@ -310,6 +341,8 @@ impl Config {
             jailer: var("SANDBOXD_JAILER").unwrap_or_else(|| "jailer".into()).into(),
             firecracker: var("SANDBOXD_FIRECRACKER").unwrap_or_else(|| "firecracker".into()).into(),
             uid_base: uid_base as u32,
+            git_uid_base: git_uid_base as u32,
+            git_mem_mib: git_mem as u32,
             mem_headroom_mib: headroom as u32,
         };
         if !problems.is_empty() {
@@ -438,11 +471,43 @@ mod tests {
 
         // The jail: always on, its binaries from PATH, uids far above real users.
         let jail = Config::from_env().unwrap().jail;
-        assert_eq!(jail, super::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, mem_headroom_mib: 512 });
+        assert_eq!(jail, super::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, git_uid_base: 1_900_100_000, git_mem_mib: 2048, mem_headroom_mib: 512 });
         std::env::set_var("SANDBOXD_JAILER", "/opt/fc/jailer");
         std::env::set_var("SANDBOXD_JAIL_UID_BASE", "3000000");
         let set = Config::from_env().unwrap().jail;
         assert_eq!((set.jailer.to_str(), set.uid_base), (Some("/opt/fc/jailer"), 3_000_000));
+        // Publishing's git: a range of its own, never the VMs' (3000000 + 4 VMs here).
+        for v in ["1000", "4294967200", "3000000", "2999990"] {
+            std::env::set_var("SANDBOXD_GIT_UID_BASE", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_GIT_UID_BASE"), "{v}");
+        }
+        std::env::set_var("SANDBOXD_GIT_UID_BASE", "3000004");
+        assert_eq!(Config::from_env().unwrap().jail.git_uid_base, 3_000_004);
+        std::env::remove_var("SANDBOXD_GIT_UID_BASE");
+        // git's memory: 2 GiB a run by default, a setting within bounds.
+        std::env::set_var("SANDBOXD_GIT_MEM_MIB", "4096");
+        assert_eq!(Config::from_env().unwrap().jail.git_mem_mib, 4096);
+        for v in ["0", "255", "65537", "x"] {
+            std::env::set_var("SANDBOXD_GIT_MEM_MIB", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_GIT_MEM_MIB"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_GIT_MEM_MIB");
+        // A push's ancestry check: 300 s by default.
+        assert_eq!(Config::from_env().unwrap().mirrors.check_deadline, std::time::Duration::from_secs(300));
+        std::env::set_var("SANDBOXD_GIT_CHECK_SECS", "900");
+        assert_eq!(Config::from_env().unwrap().mirrors.check_deadline, std::time::Duration::from_secs(900));
+        for v in ["0", "9", "3601", "x"] {
+            std::env::set_var("SANDBOXD_GIT_CHECK_SECS", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_GIT_CHECK_SECS"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_GIT_CHECK_SECS");
+        // How far a walk of a mirror may go: a million entries by default.
+        assert_eq!(Config::from_env().unwrap().mirrors.mirror_entries, 1_000_000);
+        for v in ["9999", "100000001", "x"] {
+            std::env::set_var("SANDBOXD_MIRROR_MAX_ENTRIES", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_MIRROR_MAX_ENTRIES"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_MIRROR_MAX_ENTRIES");
         for (k, v) in [("SANDBOXD_JAIL_UID_BASE", "1000"), ("SANDBOXD_JAIL_UID_BASE", "4294967200"), ("SANDBOXD_VM_MEM_HEADROOM_MIB", "0")] {
             std::env::set_var(k, v);
             assert!(Config::from_env().unwrap_err().contains(k), "{k}={v}");

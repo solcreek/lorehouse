@@ -704,7 +704,7 @@ mod tests {
             mem_mib: 2048,
             github_url: "https://github.com".into(),
             mirrors: crate::publish::Policy::default(),
-            jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, mem_headroom_mib: 512 },
+            jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, git_uid_base: 1_900_100_000, git_mem_mib: 2048, mem_headroom_mib: 512 },
             limits: crate::config::Limits::default(),
             net_check: Duration::from_secs(10),
         }
