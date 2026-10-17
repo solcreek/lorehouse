@@ -183,6 +183,7 @@ export const SLACK_DOC_VERSION = "names-2"; // names-2: speaker lines with "disp
 export class SlackIngester {
   private workspaceUrl = "";
   private botUserId?: string;
+  private teamId?: string;
   private readonly users: SlackUsers;
   private state: IngestStatus["state"] = "idle";
   private error?: string;
@@ -206,6 +207,11 @@ export class SlackIngester {
   // The bot's own user id, once start() has asked auth.test.
   get ownUserId(): string | undefined {
     return this.botUserId;
+  }
+
+  // The workspace the bot token belongs to, from the same auth.test.
+  get ownTeamId(): string | undefined {
+    return this.teamId;
   }
 
   // People's names, as knowledge names them (and from the same cache).
@@ -260,9 +266,10 @@ export class SlackIngester {
   async start(): Promise<void> {
     this.state = "backfilling";
     try {
-      const auth = await this.api.call<{ url: string; user_id?: string }>("auth.test");
+      const auth = await this.api.call<{ url: string; user_id?: string; team_id?: string }>("auth.test");
       this.workspaceUrl = auth.url;
       this.botUserId = auth.user_id;
+      this.teamId = auth.team_id;
       // A channel Slack wouldn't confirm (an outage) has its history skipped on this start.
       const unverified = new Set(await this.recheckChannels("start"));
       const readable = [...this.opts.channels].filter((c) => !this.closed.has(c) && !unverified.has(c));

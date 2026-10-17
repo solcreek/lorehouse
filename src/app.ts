@@ -149,7 +149,11 @@ export async function createApp(config: Config) {
   tally(() => approvals.prune());
   timers.push(setInterval(() => tally(() => approvals.prune()), 86_400_000).unref());
   let runtime: Awaited<ReturnType<typeof createNativeRuntime>> | undefined;
-  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session));
+  // An approver must be a full member of the workspace, like an asker (#145). memberCheck
+  // and the ingester are set up below; a click only comes later, once both exist.
+  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session), async (user) =>
+    (await memberCheck.check(user, ingester?.ownTeamId)).member,
+  );
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
   const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
