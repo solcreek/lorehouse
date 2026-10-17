@@ -193,12 +193,14 @@ func (m *jobManager) start(req startReq) (jobView, bool, error) {
 	if strings.TrimSpace(req.Command) == "" {
 		return jobView{}, false, errf(400, "command is empty")
 	}
+	// Bounds on the milliseconds before converting: a huge value overflows Duration to a
+	// negative one, which would pass the bound and time the job out at once.
+	if req.TimeoutMs < 0 || req.TimeoutMs > maxJobTimeout.Milliseconds() {
+		return jobView{}, false, errf(400, "timeoutMs %d: at most %d (%s)", req.TimeoutMs, maxJobTimeout.Milliseconds(), maxJobTimeout)
+	}
 	timeout := defaultJobTimeout
 	if req.TimeoutMs > 0 {
 		timeout = time.Duration(req.TimeoutMs) * time.Millisecond
-	}
-	if req.TimeoutMs < 0 || timeout > maxJobTimeout {
-		return jobView{}, false, errf(400, "timeoutMs %d: at most %d (%s)", req.TimeoutMs, maxJobTimeout.Milliseconds(), maxJobTimeout)
 	}
 	// Before the lookup, so a retry that leaves cwd out compares equal to the run it started.
 	if req.Cwd == "" {

@@ -145,6 +145,10 @@ func TestAJobIsStoppedAtItsTimeout(t *testing.T) {
 	if _, _, err := m.start(startReq{ID: "t2", Command: "true", Cwd: t.TempDir(), TimeoutMs: maxJobTimeout.Milliseconds() + 1}); status(err) != 400 {
 		t.Fatalf("over the longest timeout: %v", err)
 	}
+	// Large enough to overflow time.Duration (it would wrap negative and pass the bound).
+	if _, _, err := m.start(startReq{ID: "t3", Command: "true", Cwd: t.TempDir(), TimeoutMs: 9223372036855}); status(err) != 400 {
+		t.Fatalf("an overflowing timeoutMs: %v", err)
+	}
 }
 
 func TestAJobThatWasRunningWhenGuestdStoppedIsLost(t *testing.T) {
