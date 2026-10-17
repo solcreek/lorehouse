@@ -233,13 +233,23 @@ pub struct Git {
     client: reqwest::Client,
     /// What every run's proxy may hold of requests' bodies at once (remote.rs).
     budget: Arc<remote::Budget>,
+    /// Tests only: emptying a dropped tree fails.
+    #[cfg(test)]
+    fail_empty: std::sync::atomic::AtomicBool,
 }
 
 impl Git {
     fn new(jail: Option<Arc<GitJail>>, remote_base: &str) -> Git {
         // No redirects: a run's requests go to its repo at the remote, nowhere else.
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(30)).build().unwrap_or_default();
-        Git { jail, remote: Remote::new(remote_base), client, budget: remote::Budget::new(remote::BODY_BUDGET) }
+        Git {
+            jail,
+            remote: Remote::new(remote_base),
+            client,
+            budget: remote::Budget::new(remote::BODY_BUDGET),
+            #[cfg(test)]
+            fail_empty: Default::default(),
+        }
     }
 
     /// Start one git command in `dir`, in the guarded environment (git_command).
@@ -331,6 +341,10 @@ impl Git {
     /// Empty `dir`, a dropped tree, in a jailed run (GitJail::remover): sandboxd never walks
     /// a tree a run wrote. Unisolated (tests), as the test's user.
     async fn empty(&self, dir: &Path, limit: Duration) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_empty.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("emptying failed, as a test asked".into());
+        }
         let Some(jail) = &self.jail else {
             return std::fs::remove_dir_all(dir).and_then(|()| std::fs::create_dir(dir)).map_err(|e| e.to_string());
         };
@@ -3107,11 +3121,11 @@ mod tests {
         }).sum()
     }
 
-    #[tokio::test]
-    async fn eviction_under_the_floor_frees_the_space_it_counts_on_and_stops_once_there_is_room() {
-        // The filesystem's free space as it really changes: 10 MiB less what is under the
-        // mirrors, the graveyard included (a buried mirror still takes its space).
-        let mut s = scratch("floorevict");
+    /// Three idle-to-be mirrors of 2 MiB each, and a filesystem whose free space is 10 MiB
+    /// less what is really under the mirrors (the graveyard included): a new mirror (cap
+    /// 1 MiB, floor 4 MiB) needs exactly one of them gone.
+    async fn floor_scratch(name: &str) -> Scratch {
+        let mut s = scratch(name);
         s.publisher.policy.mirror_max = 1 << 20;
         s.publisher.policy.free_min_pct = 0;
         s.publisher.policy.free_min = 4 << 20;
@@ -3128,6 +3142,14 @@ mod tests {
         for name in ["gadgets", "gizmos", "gears"] {
             s.publisher.measure(&s.publisher.mirror("acme", name)).unwrap();
         }
+        s
+    }
+
+    #[tokio::test]
+    async fn eviction_under_the_floor_frees_the_space_it_counts_on_and_stops_once_there_is_room() {
+        // The filesystem's free space as it really changes: 10 MiB less what is under the
+        // mirrors, the graveyard included (a buried mirror still takes its space).
+        let s = floor_scratch("floorevict").await;
         // A day later all are idle. The new mirror needs its cap (1 MiB) above the 4 MiB
         // floor: one mirror freed (2 MiB) is enough, so only the least recently used goes.
         s.advance(86_400);
@@ -3137,6 +3159,21 @@ mod tests {
         let status = s.publisher.status();
         assert_eq!((status["evicted"].as_u64(), status["refusedForSpace"].as_u64(), status["graveyardTrees"].as_u64()), (Some(1), Some(0), Some(0)), "{status}");
     }
+
+    #[tokio::test]
+    async fn eviction_stops_when_the_tree_it_dropped_couldnt_be_emptied() {
+        // The jailed run that empties the graveyard fails (every uid held, find's error, its
+        // deadline): the space didn't come back, so no more mirrors go for nothing.
+        let s = floor_scratch("floorstuck").await;
+        s.advance(86_400);
+        s.publisher.git.fail_empty.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = s.stage_all(request("scout/t"), || {}).await.unwrap_err();
+        assert_eq!(err.0, 507, "{}", err.1);
+        let exists = |name: &str| s.publisher.mirror("acme", name).exists();
+        assert_eq!((exists("gadgets"), exists("gizmos"), exists("gears")), (false, true, true), "evicted more for no change");
+        assert_eq!(s.publisher.status()["evicted"].as_u64(), Some(1));
+    }
+
 
     #[tokio::test]
     async fn eviction_skips_a_mirror_a_live_stage_names_or_a_busy_one_and_a_new_mirror_without_room_goes() {

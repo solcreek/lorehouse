@@ -373,12 +373,14 @@ impl Publisher {
     }
 
     /// Remove a mirror (its lock held) and forget it.
-    pub(super) fn drop_mirror(&self, dir: &Path) {
+    pub(super) fn drop_mirror(&self, dir: &Path) -> Option<PathBuf> {
         let bytes = self.stats().mirrors.get(dir).map_or(0, |m| m.bytes);
-        if let Some(tree) = remove_mirror(dir) {
-            self.stats().buried.insert(tree, bytes);
+        let tree = remove_mirror(dir);
+        if let Some(tree) = &tree {
+            self.stats().buried.insert(tree.clone(), bytes);
         }
         self.forget(dir);
+        tree
     }
 
     fn forget(&self, dir: &Path) {
@@ -437,12 +439,17 @@ impl Publisher {
             if now.saturating_sub(used) <= self.policy.evict_idle.as_secs() || self.live_repos().contains(&repo_of(&dir)) {
                 continue;
             }
-            self.drop_mirror(&dir);
+            let tree = self.drop_mirror(&dir);
             self.stats().evicted += 1;
             eprintln!("sandboxd: dropped the mirror of {} to make room (idle {} h)", repo_of(&dir), now.saturating_sub(last_used) / 3600);
             // Its space is only free once the tree is emptied: now, before room is looked at
-            // again, or every idle mirror would go for no change.
+            // again, or every idle mirror would go for no change. If it couldn't be emptied
+            // (no uid free, find's error, its deadline), no more go: the room wouldn't change.
             self.empty_graveyard().await;
+            if tree.is_some_and(|t| self.stats().buried.contains_key(&t)) {
+                eprintln!("sandboxd: the mirror of {} couldn't be emptied yet; no more mirrors are evicted for now", repo_of(&dir));
+                break;
+            }
         }
     }
 
