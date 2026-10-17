@@ -1203,21 +1203,7 @@ mod tests {
     /// every capability, as sandboxd is: it must pass there.
     #[cfg(target_os = "linux")]
     fn in_userns(test: &str) {
-        let me = std::env::current_exe().unwrap();
-        let inner = [&format!("publish::tests::{test}"), "--exact", "--ignored", "--nocapture"];
-        let Ok(out) = std::process::Command::new("unshare").arg("--user").arg("--map-root-user").arg(&me).args(inner).output() else {
-            eprintln!("skipped: no unshare(1)");
-            return;
-        };
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // Hosts that forbid unprivileged user namespaces (Ubuntu's AppArmor default): the
-        // inner test never started, so there is nothing to check here.
-        if stderr.starts_with("unshare:") {
-            eprintln!("skipped: {}", stderr.trim());
-            return;
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+        crate::gitjail::tests::in_userns(&format!("publish::tests::{test}"), false);
     }
 
     #[cfg(target_os = "linux")]

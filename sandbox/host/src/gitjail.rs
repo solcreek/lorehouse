@@ -668,7 +668,7 @@ pub fn explain(e: &std::io::Error) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -696,21 +696,72 @@ mod tests {
         assert_eq!(explain(&std::io::Error::from_raw_os_error(libc::ENOENT)), format!("git: {}", std::io::Error::from_raw_os_error(libc::ENOENT)));
     }
 
+    /// Run one ignored test (its full path) in a user namespace where the test is root with
+    /// every capability, as sandboxd is: it must pass there. With `more_ids`, ids 1..65536
+    /// are mapped too (`--map-auto`: the user's subuids), so the test can chown to another
+    /// id. Skipped where unprivileged user namespaces (or subuids) aren't available.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn in_userns(test: &str, more_ids: bool) {
+        let me = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new("unshare");
+        cmd.arg("--user").arg("--map-root-user");
+        if more_ids {
+            cmd.arg("--map-auto");
+        }
+        let Ok(out) = cmd.arg(&me).args([test, "--exact", "--ignored", "--nocapture"]).output() else {
+            eprintln!("skipped: no unshare(1)");
+            return;
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Hosts that forbid unprivileged user namespaces (Ubuntu's AppArmor default), or
+        // have no subuids for --map-auto: the inner test never started.
+        if stderr.starts_with("unshare:") {
+            eprintln!("skipped: {}", stderr.trim());
+            return;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_mirror_is_given_to_the_runs_uid_without_following_links() {
+        in_userns("gitjail::tests::own_in_userns", true);
+    }
+
+    /// own() as root, giving a mirror to id 1: every entry, links included, becomes id 1's,
+    /// and nothing a link points at (a file, a directory, what is in that directory) changes
+    /// or is walked into.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by a_mirror_is_given_to_the_runs_uid_without_following_links, in a user namespace"]
+    fn own_in_userns() {
         use std::os::unix::fs::MetadataExt;
-        let (me, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        let dir = std::env::temp_dir().join(format!("gitjail-own-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("objects/ab")).unwrap();
-        std::fs::write(dir.join("objects/ab/cd"), b"x").unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", dir.join("planted")).unwrap();
-        // As the owner already: nothing to change, and the link's target is never touched.
-        own(&dir, me, gid).unwrap();
-        assert_eq!(std::fs::symlink_metadata(dir.join("objects/ab/cd")).unwrap().uid(), me);
+        assert_eq!(unsafe { libc::geteuid() }, 0, "root in the user namespace");
+        let top = std::env::temp_dir().join(format!("gitjail-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let (mirror, outside) = (top.join("mirror.git"), top.join("outside"));
+        std::fs::create_dir_all(mirror.join("objects/ab")).unwrap();
+        std::fs::write(mirror.join("objects/ab/cd"), b"x").unwrap();
+        std::fs::create_dir_all(outside.join("dir")).unwrap();
+        std::fs::write(outside.join("file"), b"host").unwrap();
+        std::fs::write(outside.join("dir/inner"), b"host").unwrap();
+        std::os::unix::fs::symlink(outside.join("file"), mirror.join("link-to-file")).unwrap();
+        std::os::unix::fs::symlink(outside.join("dir"), mirror.join("objects/link-to-dir")).unwrap();
+        own(&mirror, 1, 1).unwrap();
+        let ids = |p: &Path| {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            (m.uid(), m.gid())
+        };
+        for p in ["", "objects", "objects/ab", "objects/ab/cd", "link-to-file", "objects/link-to-dir"] {
+            assert_eq!(ids(&mirror.join(p)), (1, 1), "{p}");
+        }
+        for p in ["file", "dir", "dir/inner"] {
+            assert_eq!(ids(&outside.join(p)), (0, 0), "{p}, outside the mirror, changed owner");
+        }
         // A file isn't a mirror.
-        assert!(own(&dir.join("objects/ab/cd"), me, gid).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(own(&mirror.join("objects/ab/cd"), 1, 1).is_err());
+        std::fs::remove_dir_all(&top).unwrap();
     }
 
     #[cfg(target_os = "linux")]
