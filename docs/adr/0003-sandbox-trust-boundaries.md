@@ -92,6 +92,22 @@ directory, reaches only `/dev/kvm` and `/dev/net/tun`, and runs under a system c
 list. `src/service_unit.rs` checks these directives. Every process it starts gets a clean
 environment. Tokens come as systemd credentials.
 
+**This confinement doesn't contain sandboxd itself once it's compromised.** The jailer
+needs `CAP_SYS_ADMIN`, `@mount` and mount namespaces, and the delegated cgroup tree is
+writable, so sandboxd, or any child that keeps its capabilities (`ip`, `nft`), could
+make a namespace of its own and remount `/` writable (`sandbox/host/README.md`,
+"Hardening"). The boundary this layer adds is between a VM and sandboxd. It isn't
+around sandboxd. So:
+- **Every child that reads what a VM produced runs with no capabilities and
+  `no_new_privs`.** Today that's `git`, which verifies a VM's bundles in the publishing
+  mirror (`publish.rs`, `jail::drop_capabilities`). A git bug reached through a bundle
+  gets root's file ownership in the state directory, not the jailer's privileges.
+- **Any new child that parses guest output follows the same rule.** The other children
+  keep the capabilities they need.
+- Follow-ups: drop capabilities from every child that doesn't need them, and
+  `ProtectControlGroups=private` (systemd 257+) once the jail's cgroup paths are checked
+  under a cgroup namespace.
+
 **A guest reaches exactly two things, and each one is a channel sandboxd parses as
 hostile input:**
 
