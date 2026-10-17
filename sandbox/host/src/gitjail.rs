@@ -250,13 +250,12 @@ impl GitJail {
         self.reap_stuck();
         let lease = match &self.uids {
             Some(pool) => {
-                // None free while runs that couldn't be stopped hold some: refused at once
-                // rather than waited for (they may never be free).
+                // A free uid is taken. With none free: refused at once if every uid is held
+                // by a run that couldn't be stopped (they may never be free); otherwise one
+                // that is busy now frees up, and is waited for (callers bound the wait).
                 match pool.available.try_acquire() {
                     Ok(permit) => permit.forget(),
                     Err(_) => {
-                        // Refused at once only when every uid is held: otherwise one that is
-                        // busy now frees up, and is waited for.
                         let held = self.stuck.lock().unwrap_or_else(|e| e.into_inner()).len();
                         if held >= pool.size {
                             return Err(format!("no git uid is free: {held} runs couldn't be stopped (their cgroups didn't empty), and their uids are held until they do"));
