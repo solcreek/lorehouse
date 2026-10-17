@@ -33,6 +33,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { formatWithOptions } from "node:util";
 
 type Env = Record<string, string | undefined>;
 
@@ -348,16 +349,18 @@ export function sandboxIdFor(tenant: string, sessionId: string): string {
   return `${id.slice(0, SANDBOX_ID_MAX - hash.length - 1)}-${hash}`;
 }
 
-// Every line the process logs starts with its tenant: console.log, info, warn, error and
-// debug each get "tenant=<id>" as their first word. Installed once, by the serve command
-// (server.ts); a second call changes the id. Returns what puts the console back.
+// Every line the process logs starts with its tenant: what console.log, info, warn, error
+// and debug print is rendered as they would (util.format: an Error as its stack, an object
+// inspected), and each rendered line, not only the first, gets "tenant=<id> " in front.
+// Installed once, by the serve command (server.ts); a second call changes the id. Returns
+// what puts the console back.
 const ORIGINAL = { log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug };
 export function logAsTenant(id: string): () => void {
   const prefix = `tenant=${id}`;
   const keys = Object.keys(ORIGINAL) as (keyof typeof ORIGINAL)[];
   for (const k of keys) {
     const write = ORIGINAL[k];
-    console[k] = (...args: unknown[]) => write.call(console, prefix, ...args);
+    console[k] = (...args: unknown[]) => write.call(console, formatWithOptions({ colors: false }, ...args).split("\n").map((line) => `${prefix} ${line}`).join("\n"));
   }
   return () => {
     for (const k of keys) console[k] = ORIGINAL[k];

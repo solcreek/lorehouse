@@ -365,11 +365,17 @@ describe("log lines", () => {
     logAsTenant("t-abc")();
     expect(console.log).toBe(original);
     // In a process of its own, as the serve command installs it.
-    const proc = Bun.spawnSync(["bun", "-e", `const { logAsTenant } = require(${JSON.stringify(join(import.meta.dir, "../src/tenant.ts"))}); logAsTenant("t-abc"); console.log("lorehouse: up"); console.error("ingest:", new Error("boom")); console.warn("w")`]);
-    const out = proc.stdout.toString().trim().split("\n");
-    expect(out).toEqual(["tenant=t-abc lorehouse: up"]);
-    const err = proc.stderr.toString();
-    expect(err.startsWith("tenant=t-abc ingest:")).toBe(true);
-    expect(err).toContain("tenant=t-abc w");
+    // Every rendered line: a message with line breaks, an Error's stack, an object printed
+    // across lines, each line of each one.
+    const proc = Bun.spawnSync(["bun", "-e", `const { logAsTenant } = require(${JSON.stringify(join(import.meta.dir, "../src/tenant.ts"))}); logAsTenant("t-abc"); console.log("lorehouse: up"); console.log("first\\nsecond"); console.info({ a: 1, b: { c: [1, 2, 3], d: "x".repeat(80) } }); console.error("ingest:", new Error("boom")); console.warn("w")`]);
+    const out = proc.stdout.toString().replace(/\n$/, "").split("\n");
+    expect(out.slice(0, 3)).toEqual(["tenant=t-abc lorehouse: up", "tenant=t-abc first", "tenant=t-abc second"]);
+    expect(out.length).toBeGreaterThan(4); // the object took several lines
+    for (const line of out) expect([line, line.startsWith("tenant=t-abc ")]).toEqual([line, true]);
+    const err = proc.stderr.toString().replace(/\n$/, "").split("\n");
+    expect(err[0]).toBe("tenant=t-abc ingest: Error: boom");
+    expect(err.length).toBeGreaterThan(2); // the stack
+    for (const line of err) expect([line, line.startsWith("tenant=t-abc ")]).toEqual([line, true]);
+    expect(err.at(-1)).toBe("tenant=t-abc w");
   });
 });
