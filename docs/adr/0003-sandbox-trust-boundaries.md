@@ -151,6 +151,13 @@ around sandboxd. So:
   it gets is a forced update of the stage's own branch to the staged commit, the one an
   approval binds; never another branch or commit.
 
+  **A known cost.** The check copies the whole commit history of both sides into the fresh
+  repo: about 4 s and 28 MB for 53k commits. Those files are in no quota and are removed
+  when the check ends, however it ends. A history of around a million commits would near the
+  check's own time limit (`SANDBOXD_GIT_CHECK_SECS`, 300 s by default) and git's memory
+  limit (`SANDBOXD_GIT_MEM_MIB`). Such a push is refused, saying so; raise the limit, or
+  push to a new branch, which needs no check.
+
   A fetch gets the stage's read token on the same terms, which the VM holds anyway (layer
   1's exception).
 

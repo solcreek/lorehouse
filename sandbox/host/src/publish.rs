@@ -61,6 +61,8 @@ const STAGE_TTL: Duration = Duration::from_secs(24 * 3600);
 const CLOCK_SLACK: u64 = 300;
 const GIT_LOCAL: Duration = Duration::from_secs(120);
 const GIT_NETWORK: Duration = Duration::from_secs(600);
+/// A push's ancestry check, by default (Policy::check_deadline).
+pub const DEFAULT_CHECK_SECS: u64 = 300;
 /// How old a temporary file in a mirror (git's partial packs, a stage's bundle) must be
 /// before prune() removes it. Nothing else writes to a mirror while its lock is held (a git
 /// command that is cut off is stopped with its helpers before the lock is released,
@@ -1113,16 +1115,27 @@ impl Publisher {
             git(pinned(&["config", k, v]), Net::Off).await?;
         }
         let upload = "git -c uploadpack.allowFilter=true -c uploadpack.allowAnySHA1InWant=true upload-pack";
-        let fetched = self
+        let deadline = self.policy.check_deadline;
+        let (url, upload) = (format!("remote.mirror.url={REMOTE}"), format!("remote.mirror.uploadpack={upload}"));
+        let (theirs, ours) = (format!("{old}:refs/check/old"), format!("{sha}:refs/check/new"));
+        let args = ["-c", &url, "-c", &upload, "fetch", "-q", "--no-tags", "--filter=tree:0", "mirror", &theirs, &ours];
+        let fetch = self
             .git
             .run_with(
                 &check,
-                &["-c", &format!("remote.mirror.url={REMOTE}"), "-c", &format!("remote.mirror.uploadpack={upload}"), "fetch", "-q", "--no-tags", "--filter=tree:0", "mirror", &format!("{old}:refs/check/old"), &format!("{sha}:refs/check/new")],
+                &args,
                 Net::Source(dir),
                 true,
-                GIT_LOCAL,
-            )
-            .await;
+                deadline + Duration::from_secs(1),
+            );
+        // The whole commit history of both sides comes in (nothing of it is in a quota, and
+        // it is gone when this returns): a very long one can take longer than the check may.
+        let Ok(fetched) = tokio::time::timeout(deadline, fetch).await else {
+            return Err(format!(
+                "the ancestry check couldn't finish in {} s for a history this large; raise SANDBOXD_GIT_CHECK_SECS or push to a new branch (nothing was pushed)",
+                deadline.as_secs()
+            ));
+        };
         if let Err(e) = fetched {
             return Err(format!("[rejected] {refname} (fetch first): the branch is at {old}, which couldn't be read from the stage's mirror as itself: {e}"));
         }
@@ -1682,6 +1695,27 @@ mod tests {
         s.publisher.push(SANDBOX, s.push(&staged, "scout/g")).await.unwrap();
         assert_eq!(s.remote("scout/g").as_deref(), Some(staged.sha.as_str()));
         assert!(!s.publisher.mirrors.join(".check").exists() || std::fs::read_dir(s.publisher.mirrors.join(".check")).unwrap().next().is_none(), "a check's repo was left");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ancestry_check_that_runs_out_of_time_says_so_and_leaves_nothing() {
+        let mut s = scratch("slowcheck");
+        let (url, _seen, _server) = smart_http(s.root.clone()).await;
+        s.publisher.git = Git::new(None, &url);
+        sh(&s.vm, "echo t1 > t1 && git add t1 && git commit -qm t1");
+        let first = s.stage("scout/t").await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&first, "scout/t")).await.unwrap();
+        sh(&s.vm, "echo t2 > t2 && git add t2 && git commit -qm t2");
+        let staged = s.stage("scout/t").await.unwrap();
+        // Far too little time for the check's fetch: refused with its own message, the
+        // check's repo gone, the branch where it was.
+        s.publisher.policy.check_deadline = Duration::from_millis(1);
+        let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/t")).await.unwrap_err();
+        assert!(err.1.contains("the ancestry check couldn't finish in") && err.1.contains("SANDBOXD_GIT_CHECK_SECS"), "{err:?}");
+        assert!(!err.1.contains("as itself"), "{err:?}");
+        assert_eq!(s.remote("scout/t").as_deref(), Some(first.sha.as_str()));
+        let check = s.publisher.mirrors.join(".check");
+        assert!(std::fs::read_dir(&check).map_or(true, |mut d| d.next().is_none()), "the check's repo was left");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

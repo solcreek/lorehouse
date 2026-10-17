@@ -77,6 +77,9 @@ pub struct Policy {
     pub gc_idle: Duration,
     /// The deadline of one gc.
     pub gc_deadline: Duration,
+    /// The deadline of a push's ancestry check: fetching both sides' commits into a fresh
+    /// repo and merge-base (SANDBOXD_GIT_CHECK_SECS). 53k commits took about 4 s.
+    pub check_deadline: Duration,
     /// A stage whose bundle is over this, and that fails, is cut off or expires unpushed, is
     /// collected after (what it brought is kept byte for byte otherwise, for 2 weeks).
     pub heavy_bundle: u64,
@@ -94,6 +97,7 @@ impl Default for Policy {
             gc_every: Duration::from_secs(86_400),
             gc_idle: Duration::from_secs(10 * 60),
             gc_deadline: Duration::from_secs(600),
+            check_deadline: Duration::from_secs(super::DEFAULT_CHECK_SECS),
             heavy_bundle: 8 * MIB,
         }
     }
