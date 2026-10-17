@@ -1320,7 +1320,7 @@ mod tests {
         assert_eq!(s.remote("scout/root").as_deref(), Some(staged.sha.as_str()));
         // The mirror belongs to the last run's uid, one of git's.
         let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(s.dir().join("HEAD")).unwrap());
-        assert!((BASE..BASE + gitjail::GIT_UIDS).contains(&owner), "{owner}");
+        assert!((BASE..BASE + gitjail::GIT_UIDS).contains(&owner), "the mirror isn't a git uid's");
         // A run, seen from outside while it runs: its uid, no capabilities, no_new_privs, its
         // own cgroup under git/, its own mount and network namespaces, a root with no /etc
         // of the host's in it.
@@ -1340,7 +1340,7 @@ mod tests {
         let (pid, uid) = *seen.first().expect("a git run to look at");
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim).unwrap_or_default().to_string();
-        eprintln!("pid {pid} uid {uid}: CapEff {} CapPrm {} NoNewPrivs {}", field("CapEff:"), field("CapPrm:"), field("NoNewPrivs:"));
+        eprintln!("pid {pid}, a git uid: CapEff {} CapPrm {} NoNewPrivs {}", field("CapEff:"), field("CapPrm:"), field("NoNewPrivs:"));
         assert_ne!(uid, 0);
         assert_eq!(field("Uid:").split_whitespace().collect::<Vec<_>>(), vec![uid.to_string(); 4]);
         assert_eq!(field("CapEff:"), "0000000000000000");
@@ -1378,7 +1378,7 @@ mod tests {
         let git = Git::new(Some(jail.clone()), "file:///nonexistent");
         git.run(&s.dir(), &["-c", "alias.escape=!setsid sleep 300 </dev/null >/dev/null 2>&1 & echo started", "escape"], GIT_LOCAL).await.unwrap();
         let left = git_uid_processes(BASE);
-        assert!(left.is_empty(), "left after the run: {left:?}");
+        assert!(left.is_empty(), "{} processes of git's uids left after the run", left.len());
         let cgroups_left: Vec<_> = std::fs::read_dir(&cgroups).unwrap().flatten().filter(|e| e.file_type().unwrap().is_dir()).map(|e| e.file_name()).collect();
         assert!(cgroups_left.is_empty(), "{cgroups_left:?}");
         // Two runs at once never share a uid.
