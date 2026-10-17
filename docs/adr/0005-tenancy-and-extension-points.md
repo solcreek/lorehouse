@@ -60,8 +60,20 @@ means a migration of identifiers.
 - maps `(platform, platform tenant id)` to a tenant;
 - hands the event to that tenant's data plane, which may be starting up at the time.
 
-Delivery from the edge is **at least once, with an idempotency key** (the platform's
-event id). Redelivery, which every platform above does, never produces a second answer.
+**The edge acknowledges an event only after it is durable.** Before answering the
+platform, the edge writes the event to that tenant's **inbox**:
+- **Where it lives:** in the data plane's storage for that tenant, not in the control
+  plane's registry.
+- **Encryption:** with the tenant's key (section 1).
+- **Retention:** an event stays only until its data plane has taken it, and at most a
+  bounded time (24 h), after which it is dropped and counted.
+
+The registry stays free of content. The inbox is the one place outside a running data
+plane where a tenant's events rest, briefly and under that tenant's key. An edge that
+restarts after acknowledging loses nothing.
+
+Delivery from the inbox to the data plane is **at least once, with an idempotency key**.
+Redelivery, which every platform above does, never produces a second answer.
 A data plane that is stopped or cold therefore never misses a platform's deadline, so
 an idle tenant's compute can scale to zero.
 
