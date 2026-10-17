@@ -106,8 +106,13 @@ around sandboxd. So:
     and libraries), a few pseudo-devices, a private `/tmp`, and the one mirror it works on,
     chowned to the run's uid. No `/etc/lorehouse`, no `/run/credentials`, no `/proc`,
     `/sys` or cgroup tree, no other mirror, no sandbox. sandboxd keeps nothing of its own
-    in a mirror, writes there only new files, and reads there without following a link,
-    waiting on a FIFO or reading past a cap: whatever a run leaves is planted;
+    in a mirror and writes there only new files. Whatever a run leaves there may be
+    planted, so sandboxd reads a mirror through one helper (`mirrorfs.rs`): every path
+    resolved beneath the mirror's root, never leaving it and never through a link, as the
+    file or as a directory on the way (`openat2` with `RESOLVE_BENEATH |
+    RESOLVE_NO_SYMLINKS`, or a component-by-component `O_NOFOLLOW` walk), regular files
+    only, never waiting on one, up to a cap. It doesn't list the files that are dangerous;
+    it never reads outside the mirror or as git would;
   - **its own network namespace**, empty. A run that fetches or pushes gets one whose only
     address is a listener sandboxd serves; sandboxd forwards that repo's upload-pack or
     receive-pack, and nothing else, to GitHub (`publish/remote.rs`);
@@ -129,15 +134,22 @@ around sandboxd. So:
   read the branch at GitHub. Anything else (another branch, another commit, a delete, push
   options) is refused before it is forwarded, whatever the git sending it.
 
-  **Never forced, with one limit.** Before that, an isolated, offline run checks that the
-  staged commit follows `<old>` (`merge-base --is-ancestor`). That run reads the mirror,
-  which earlier runs wrote. So sandboxd first refuses (and drops) a mirror holding anything
-  that makes git see another history than the commits' own: `info/grafts`, `shallow`,
-  alternates, or replace refs, loose or packed. The check runs with the commit-graph and
-  replace refs off. What it still trusts is the content of the commit objects the mirror
-  stores under their ids, which git doesn't re-hash on read. Only a git bug can store a
-  forged one, and then the most it gets is a forced update of the stage's own branch to the
-  staged commit, the one an approval binds; never another branch or commit.
+  **Never forced: ancestry is decided in a fresh repo, from re-hashed commits.** The mirror
+  is written by earlier runs, so nothing about history is decided there. Before a push,
+  sandboxd makes an empty bare repo that no earlier run could have touched. One isolated
+  run fetches into it, from the mirror (bound read-only), only the commits of `<old>` and
+  the staged commit (`--filter=tree:0`), with fsck on: each commit is re-hashed as it comes
+  in, so one stored under another's id doesn't arrive as that id. `merge-base
+  --is-ancestor` then runs there with git's view pinned to that repo: no commondir, grafts,
+  shallow file, replace refs, commit-graph or lazy fetch. Whatever a mirror holds can make
+  that fetch fail (the push is refused as "fetch first"), never make the answer wrong. The
+  push itself still goes from the mirror: the proxy pins its one update, and GitHub hashes
+  what it receives.
+
+  What the check still relies on is that its own fetch isn't compromised: a git bug that
+  the mirror's content triggers in that run could write the fresh repo too. Then the most
+  it gets is a forced update of the stage's own branch to the staged commit, the one an
+  approval binds; never another branch or commit.
 
   A fetch gets the stage's read token on the same terms, which the VM holds anyway (layer
   1's exception).
