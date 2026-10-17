@@ -58,6 +58,7 @@ means a migration of identifiers.
 - verifies the platform's signature;
 - answers inside the platform's deadline;
 - maps `(platform, platform tenant id)` to a tenant;
+- computes the event's idempotency key (below);
 - hands the event to that tenant's data plane, which may be starting up at the time.
 
 **The edge acknowledges an event only after it is durable.** Before answering the
@@ -74,6 +75,14 @@ restarts after acknowledging loses nothing.
 
 Delivery from the inbox to the data plane is **at least once, with an idempotency key**.
 Redelivery, which every platform above does, never produces a second answer.
+
+**Each chat surface's contract defines its idempotency key.** The key is scoped to the
+tenant and the platform, and stays the same across the platform's retries:
+- Where the platform has a native event id, the key uses it.
+- Where it doesn't (Google Chat's HTTP events carry none for every event type), the
+  contract documents how the key is derived, for example from the message or
+  interaction's resource name and type. Its conformance scenarios prove that a resent
+  event maps to the same key.
 A data plane that is stopped or cold therefore never misses a platform's deadline, so
 an idle tenant's compute can scale to zero.
 
