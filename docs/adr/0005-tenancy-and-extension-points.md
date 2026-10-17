@@ -62,16 +62,22 @@ means a migration of identifiers.
 - hands the event to that tenant's data plane, which may be starting up at the time.
 
 **The edge acknowledges an event only after it is durable.** Before answering the
-platform, the edge writes the event to that tenant's **inbox**:
-- **Where it lives:** in the data plane's storage for that tenant, not in the control
-  plane's registry.
-- **Encryption:** with the tenant's key (section 1).
-- **Retention:** an event stays only until its data plane has taken it, and at most a
-  bounded time (24 h), after which it is dropped and counted.
+platform, the edge appends the event to that tenant's **inbox**: a queue held by the
+control plane, of events the edge can't read back.
+- **Sealed to a key the edge doesn't hold.** Each tenant has an inbox key pair. The edge
+  holds only the public half, and each event is sealed to it (public-key encryption). The
+  private half stays with the tenant's data plane, under that tenant's KMS key (ADR 0004).
+  The edge can write a tenant's inbox but never decrypt it. It never touches the data key
+  that encrypts the tenant's files.
+- **Taken by the data plane, which connects out.** Like a sandbox runner, the data plane
+  takes its events over an outbound connection. A stopped data plane loses nothing: its
+  events wait until it starts. A deployment in a tenant's own cloud account needs no way
+  in from the control plane.
+- **Kept briefly.** An event stays until its data plane has taken and acknowledged it, and
+  at most a bounded time (24 h), after which it is dropped and counted.
 
-The registry stays free of content. The inbox is the one place outside a running data
-plane where a tenant's events rest, briefly and under that tenant's key. An edge that
-restarts after acknowledging loses nothing.
+So the control plane holds tenants' content only as ciphertext it can't open. Its registry
+holds none at all. An edge that restarts after acknowledging loses nothing.
 
 Delivery from the inbox to the data plane is **at least once, with an idempotency key**.
 Redelivery, which every platform above does, never produces a second answer.
