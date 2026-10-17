@@ -80,8 +80,8 @@ further approval step for reading:
   anonymously.
 - **Where it shows**: in the thread the agent answers in. Whatever the agent reads from
   the checkout (a file, a diff, test output) it can quote there, and everyone in that
-  channel sees it: Slack guests, and in a shared channel people from other
-  organizations, included.
+  channel sees it, Slack guests who are in that channel included. (A channel shared
+  with another organization can't be listed, #145.)
 - **What still needs a person**: writing. Pushing a branch and opening a pull request
   waits for an Approve in the thread; only then is a write token asked for.
 

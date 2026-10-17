@@ -1,9 +1,12 @@
 // members.ts — who may be answered: full members of this workspace, as Slack says (#145).
 //
-// An answer may quote any listed channel, so whoever reads it must be able to open every
+// An answer may quote any listed channel, so whoever reads it should be able to open every
 // one of them (ADR 0005 §4: what reaches the model is what everyone who will read the
-// answer may see). A full member of the workspace can open every public channel. Others
-// can't, and are refused before any search or model call, with one line saying why:
+// answer may see). This gate checks the *asker* only. A full member of the workspace can
+// open every public channel. Others can't, and are refused before any search or model call,
+// with one line saying why. Not covered: guests who are members of a listed channel can
+// read a full member's answer there. Filtering by the reply's whole audience is #155.
+// Askers refused here:
 //   • a guest (users.info is_restricted: a multi-channel guest; is_ultra_restricted: a
 //     single-channel guest), who can open only the channels they were invited to
 //   • someone from another workspace (Slack Connect, or another workspace of the same

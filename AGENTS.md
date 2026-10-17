@@ -89,9 +89,13 @@ supports redaction (junebuild/june#360). DMs are never indexed.
 payload says so; mentions and reactions carry no channel type, and ingest reads every listed
 channel, so the list must hold only public channels, and that is enforced: on start,
 `src/channel-check.ts` looks each one up (`conversations.info`) and refuses to start while
-any is private, archived or can't be looked up (fail closed), and ingest looks again
-hourly, closing one that turned private (no reads, its events refused) until the next
-start. June's Slack tools that take a channel id (read a thread, list or add reactions)
+any is private, archived, shared with another workspace (Slack Connect, pending or
+org-shared) or can't be looked up (fail closed), and ingest looks again hourly, closing one
+that turned private or shared (no reads, its events refused) until the next
+start. Only full members of the workspace are answered, and only they may approve a
+pull request: `src/members.ts` looks the asker (or clicker) up with `users.info` and refuses
+guests, people from other workspaces and deactivated accounts, failing closed. June's Slack
+tools that take a channel id (read a thread, list or add reactions)
 are refused any channel but the one being answered in and the listed ones
 (`src/tools/slack-channels.ts`). On start, `src/purge.ts` removes what was kept for a
 channel no longer listed from `LOREHOUSE_DB` (its documents, joined threads, cursor, asks
