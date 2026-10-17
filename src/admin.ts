@@ -27,6 +27,8 @@ type RunnerSummary = { runner: string; transport: string; online: boolean; capac
 
 export type AdminOptions = {
   db: Database;
+  // Whose data this is (tenant.ts): every answer names it.
+  tenant: string;
   token?: string;
   ingest: () => IngestStatus | undefined; // undefined: no channels, so no ingest
   sandbox: "off" | "direct" | "runners";
@@ -44,8 +46,6 @@ class BadRequest extends Error {}
 // served on after ADMIN_TOKEN is set).
 const NO_STORE = { "cache-control": "no-store" };
 
-const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
-  Response.json(body, { status, headers: { ...NO_STORE, ...headers } });
 
 // A whole number from 1 to max, or the fallback when absent. Strict: "3days", "7.9" or
 // "-5" are a 400, never read as something else.
@@ -79,6 +79,9 @@ function page<T extends { rowid: number }>(rows: T[], limit: number, key: (row: 
 }
 
 export function adminRoutes(opts: AdminOptions) {
+  // Every JSON answer to the token, errors included, starts with the tenant it is about.
+  const json = (body: Record<string, unknown>, status = 200, headers: Record<string, string> = {}) =>
+    Response.json({ tenant: opts.tenant, ...body }, { status, headers: { ...NO_STORE, ...headers } });
   const { db } = opts;
 
   async function route(url: URL): Promise<Response> {
@@ -162,7 +165,8 @@ export function adminRoutes(opts: AdminOptions) {
     // Closed: the same plain 404 as any path the app doesn't serve, so it doesn't say
     // there is an API here.
     if (!opts.token) return new Response("not found", { status: 404, headers: NO_STORE });
-    if (!bearerMatches(req, opts.token)) return json({ error: "unauthorized: send Authorization: Bearer <ADMIN_TOKEN>" }, 401, { "www-authenticate": "Bearer" });
+    // A refusal says nothing about the install, its tenant included.
+    if (!bearerMatches(req, opts.token)) return Response.json({ error: "unauthorized: send Authorization: Bearer <ADMIN_TOKEN>" }, { status: 401, headers: { ...NO_STORE, "www-authenticate": "Bearer" } });
     if (req.method !== "GET") return json({ error: "method not allowed: the admin API only reads" }, 405, { allow: "GET" });
     try {
       return await route(url);

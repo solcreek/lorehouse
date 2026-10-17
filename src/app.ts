@@ -356,6 +356,7 @@ export async function createApp(config: Config) {
   // The read-only admin API (/api/v1), behind ADMIN_TOKEN.
   const admin = adminRoutes({
     db: knowledge,
+    tenant: tenant.id,
     token: config.adminToken,
     ingest: () => ingester?.status(),
     sandbox: config.sandbox?.mode ?? "off",
@@ -394,6 +395,10 @@ export async function createApp(config: Config) {
         if (refusal) return refusal;
         return Response.json({
           agent: identity.name,
+          // Whose data this is, and the install's data directory: the tenant's files are in
+          // <dataDir>/<tenant>/ unless LOREHOUSE_DB or SESSIONS_DB name others.
+          tenant: tenant.id,
+          dataDir: tenant.dataDir,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
           // Whether usage records who asks: a setting, not anyone's data.
           recordsWhoAsks: recordPeople,

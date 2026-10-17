@@ -13,7 +13,7 @@ const TOKEN = "a".repeat(32);
 
 function setup(o: Partial<AdminOptions> = {}) {
   const db = openKnowledge(":memory:");
-  const handle = adminRoutes({ db, token: TOKEN, ingest: () => undefined, sandbox: "off", ...o });
+  const handle = adminRoutes({ db, tenant: "t-test", token: TOKEN, ingest: () => undefined, sandbox: "off", ...o });
   const get = async (path: string, init: RequestInit & { token?: string | null } = {}) => {
     const { token = TOKEN, ...rest } = init;
     const res = await handle(new Request(`http://x${path}`, { ...rest, headers: token === null ? {} : { authorization: `Bearer ${token}` } }));
@@ -47,6 +47,18 @@ describe("who may use it", () => {
     expect((await get("/api/v1/documents", { token: null })).status).toBe(401);
     expect((await get("/api/v1/documents", { token: "wrong" })).status).toBe(401);
     expect((await get("/api/v1/documents")).status).toBe(200);
+  });
+
+  // ADR 0005 §1: the tenant id is in every answer, errors included; a refusal of the token
+  // says nothing about the install.
+  test("every answer to the token names the tenant; a refusal doesn't", async () => {
+    const { db, get } = setup();
+    fill(db);
+    for (const path of ["/api/v1/documents", "/api/v1/documents/seed-1", "/api/v1/search?q=wombat", "/api/v1/channels", "/api/v1/threads", "/api/v1/runners", "/api/v1/sandboxes", "/api/v1/usage", "/api/v1/documents?limit=0", "/api/v1/nope"]) {
+      const r = await get(path);
+      expect([path, ((await r.json()) as { tenant?: string }).tenant]).toEqual([path, "t-test"]);
+    }
+    expect(await (await get("/api/v1/documents", { token: "wrong" })).text()).not.toContain("t-test");
   });
 
   test("it only reads: anything but GET is 405", async () => {
@@ -230,7 +242,7 @@ describe("channels, threads and sandboxes", () => {
   test("each allowed channel's ingest, with when it last saw a message", async () => {
     const status: IngestStatus = { state: "ready", documents: 3, channels: { C1: { cursor: "1790000005.000100", threads: 3 }, C2: { threads: 0 } }, reconciled: { refreshed: 0, removed: 0 } };
     const { body } = setup({ ingest: () => status });
-    expect(await body("/api/v1/channels")).toEqual({
+    expect(await body("/api/v1/channels")).toEqual({ tenant: "t-test",
       state: "ready",
       channels: [
         { id: "C1", threads: 3, lastMessageAt: new Date(1790000005.0001 * 1000).toISOString() },
@@ -241,8 +253,8 @@ describe("channels, threads and sandboxes", () => {
 
   test("an ingest error is passed on; no channels at all is idle", async () => {
     const failed: IngestStatus = { state: "error", documents: 0, channels: {}, reconciled: { refreshed: 0, removed: 0 }, error: "not_in_channel" };
-    expect(await setup({ ingest: () => failed }).body("/api/v1/channels")).toEqual({ state: "error", error: "not_in_channel", channels: [] });
-    expect(await setup().body("/api/v1/channels")).toEqual({ state: "idle", channels: [] });
+    expect(await setup({ ingest: () => failed }).body("/api/v1/channels")).toEqual({ tenant: "t-test", state: "error", error: "not_in_channel", channels: [] });
+    expect(await setup().body("/api/v1/channels")).toEqual({ tenant: "t-test", state: "idle", channels: [] });
   });
 
   test("threads the agent was asked into, newest first, linked to their document when indexed", async () => {
@@ -263,15 +275,15 @@ describe("channels, threads and sandboxes", () => {
 
   test("runners in runner mode; none otherwise", async () => {
     const r = { runner: "starship", transport: "ws", online: true, capacity: 2, running: 1, lastSeenSecs: 3 };
-    expect(await setup({ sandbox: "runners", runners: () => [r] }).body("/api/v1/runners")).toEqual({ mode: "runners", runners: [r] });
-    expect(await setup().body("/api/v1/runners")).toEqual({ mode: "off", runners: [] });
+    expect(await setup({ sandbox: "runners", runners: () => [r] }).body("/api/v1/runners")).toEqual({ tenant: "t-test", mode: "runners", runners: [r] });
+    expect(await setup().body("/api/v1/runners")).toEqual({ tenant: "t-test", mode: "off", runners: [] });
   });
 
   test("which runner each sandbox lives on, newest first", async () => {
     const { db, body } = setup({ sandbox: "runners" });
     db.query("INSERT INTO sandbox_placements (sandbox, runner, placed_at) VALUES (?, ?, ?)").run("slack_C1_1", "starship", "2026-09-01T00:00:00.000Z");
     db.query("INSERT INTO sandbox_placements (sandbox, runner, placed_at) VALUES (?, ?, ?)").run("slack_C1_2", "falcon", "2026-09-02T00:00:00.000Z");
-    expect(await body("/api/v1/sandboxes")).toEqual({
+    expect(await body("/api/v1/sandboxes")).toEqual({ tenant: "t-test",
       sandboxes: [
         { sandbox: "slack_C1_2", runner: "falcon", placedAt: "2026-09-02T00:00:00.000Z" },
         { sandbox: "slack_C1_1", runner: "starship", placedAt: "2026-09-01T00:00:00.000Z" },
@@ -285,7 +297,7 @@ describe("usage", () => {
   // Wired as the app wires it: usage read from the same database.
   function setupUsage() {
     const db = openKnowledge(":memory:");
-    const handle = adminRoutes({ db, token: TOKEN, ingest: () => undefined, sandbox: "off", usage: (since) => usageSummary(db, { since }) });
+    const handle = adminRoutes({ db, tenant: "t-test", token: TOKEN, ingest: () => undefined, sandbox: "off", usage: (since) => usageSummary(db, { since }) });
     const get = async (path: string) => (await handle(new Request(`http://x${path}`, { headers: { authorization: `Bearer ${TOKEN}` } })))!;
     return { db, get, body: async (path: string) => (await (await get(path)).json()) as Record<string, any> };
   }

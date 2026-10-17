@@ -27,7 +27,12 @@ the other secrets.
 
 Answers are JSON. An error, a 401 or a 405 included, is `{ "error": "…" }` saying what
 was wrong; a 401 also carries `WWW-Authenticate: Bearer` and a 405 `Allow: GET`. A bad
-parameter gets a 400. The one exception is the closed API: its 404 is the same plain
+parameter gets a 400.
+
+Every answer to the admin token, errors included, also has `"tenant"`: the id of the
+tenant whose data it is (`TENANT_ID`, [README](../README.md#run-it); ADR 0005 §1).
+The examples below leave it out. A 401 doesn't have it: a refusal says nothing about the
+install. The one exception is the closed API: its 404 is the same plain
 `not found` as any path the app doesn't serve, so it doesn't say there is an API there.
 
 Every answer, refusals included, carries `Cache-Control: no-store`. An answer holds
