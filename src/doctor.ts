@@ -313,6 +313,18 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     // database's own aside rather than let SQLite replay it.
     if (!plan.refusal && plan.setAside) add("storage", "upgrade", "warn", `the next start sets aside ${plan.setAside.join(" and ")} (renamed .stale-<time>): side files that aren't ${m.from}'s own, never replayed`);
   }
+  // The move writes in the tenant's directory (a hard link of each file), or in the data
+  // directory where that is made: a destination the start can't write fails the start.
+  const writable = (p: string) => { try { accessSync(p, constants.W_OK | constants.X_OK); return true; } catch { return false; } };
+  const into = new Map<string, string[]>();
+  for (const { m, plan } of plans) {
+    if (plan.refusal || plan.state === "done") continue;
+    const dest = existsSync(dirname(m.to)) ? dirname(m.to) : tenant.dataDir;
+    into.set(dest, [...(into.get(dest) ?? []), m.from]);
+  }
+  for (const [dest, froms] of into) {
+    if (!writable(dest)) add("storage", "upgrade", "fail", `${dest} must be writable and enterable: the next start moves ${froms.join(" and ")} into it`);
+  }
   const toMove = plans.filter(({ plan }) => plan.state === "pending" && !plan.refusal).map(({ m }) => m);
   if (toMove.length) add("storage", "upgrade", "info", `the next start moves ${toMove.map((m) => basename(m.from)).join(" and ")} (with their -wal and -shm) from ${tenant.dataDir} into ${tenant.source === "new" ? `${tenant.dataDir}/<id>` : tenant.dir}, leaving a symlink at each old path`);
   for (const [key, configured] of [["LOREHOUSE_DB", config.db.lorehouse], ["SESSIONS_DB", config.db.sessions]] as const) {

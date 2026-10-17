@@ -527,6 +527,26 @@ describe("the tenant", () => {
     }
   });
 
+  // The move writes in the tenant's directory (a hard link, a symlink beside the old path):
+  // a destination the start can't write fails the start, so it fails here.
+  test("a move into a tenant directory that can't be written fails, naming it", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      chmodSync(`${dir}/acme`, 0o500);
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail").map((c) => c.detail)).toEqual([`${dir}/acme must be writable and enterable: the next start moves ${dir}/lorehouse.db into it`]);
+      chmodSync(`${dir}/acme`, 0o700);
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade").filter((c) => c.level === "fail")).toEqual([]);
+    } finally {
+      chmodSync(`${dir}/acme`, 0o700);
+      rmSync(dir, { recursive: true });
+    }
+  });
+
   test("another tenant's directory beside this one's fails; TENANT_NEW=1 makes it a warning", async () => {
     const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
     try {
