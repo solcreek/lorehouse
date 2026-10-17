@@ -2,7 +2,9 @@
 -- that workspace_job_cancel can let only them, or a workspace admin, stop it. One row per job
 -- id in a session (one Slack thread, one sandbox); the first start writes it, before the start
 -- is sent (its answer may be lost after guestd started it), and a replayed start leaves it as
--- it was; a start guestd refused (nothing ran) removes the row it wrote. `started_by` is the
+-- it was; a start guestd refused (nothing ran) removes the row it wrote, and one guestd
+-- answers as a new run (created) takes the row over, as when the sandbox was made again with
+-- the same id (a lost answer there still leaves the older row: #141). `started_by` is the
 -- Slack user id of the turn's speaker when Slack vouched for it (a signed event), else NULL:
 -- then anyone in the thread may cancel. A job with no row may be cancelled only by an admin.
 -- No text is kept: the command stays in the sandbox. Rows older than two days (a job runs at
