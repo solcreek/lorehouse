@@ -4,11 +4,11 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { loadConfig } from "../src/config";
 import { closeKnowledge, countDocuments, openKnowledge } from "../src/knowledge";
 import { settingsPath } from "../src/settings";
-import { logAsTenant, newTenantId, pendingMoves, planMove, prepareTenant, resolveTenant, sandboxIdFor, SANDBOX_ID_MAX, tenantsIn, upgradeLayout, UpgradeError, validTenantId, type Tenant } from "../src/tenant";
+import { logAsTenant, newTenantId, pendingMoves, planMove, prepareTenant, upgradeSteps, resolveTenant, sandboxIdFor, SANDBOX_ID_MAX, tenantsIn, upgradeLayout, UpgradeError, validTenantId, type Tenant } from "../src/tenant";
 
 const base = { SLACK_SIGNING_SECRET: "s", SLACK_BOT_TOKEN: "t", ANTHROPIC_API_KEY: "k" };
 const dir = () => mkdtempSync(join(tmpdir(), "lorehouse-tenant-"));
@@ -352,6 +352,28 @@ describe("an install laid out before tenants upgrades in place", () => {
       expect(config.db.upgrade.map(planMove)).toEqual([]);
       expect(rows(first.config.db.lorehouse)).toBe(25);
     });
+  });
+
+  // Power loss can't be simulated, so the order is checked: for each file, the hard link at
+  // the new place is made durable (its directory fsynced) before the old path becomes a
+  // symlink to it, and the old path's directory is fsynced after.
+  test("each file's new name is fsynced before the old path links to it, and the old directory after", async () => {
+    const d = await todaysLayout();
+    const steps: [string, string][] = [];
+    upgradeSteps.trace = (step, path) => void steps.push([step, path]);
+    let config;
+    try {
+      config = start(d).config;
+    } finally {
+      upgradeSteps.trace = undefined;
+    }
+    const links = steps.flatMap(([step, path], i) => (step === "link" ? [i] : []));
+    expect(links.length).toBeGreaterThanOrEqual(2); // both databases, and any side files left
+    for (const i of links) {
+      const to = steps[i]![1];
+      const from = join(d, basename(to));
+      expect(steps.slice(i, i + 4)).toEqual([["link", to], ["fsync", config.tenant.dir], ["rename", from], ["fsync", d]]);
+    }
   });
 
   test("a start that died part-way (the database moved, its side files not yet) finishes the move", async () => {

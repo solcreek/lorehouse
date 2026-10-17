@@ -125,7 +125,12 @@ export function resolveTenant(env: Env): Tenant | { problem: string } {
 }
 
 // fsync a directory, so the names just created or renamed in it survive a crash.
+// For tests: each link, rename and directory fsync of a move, in order (power loss can't
+// be simulated; the order that survives it can be checked).
+export const upgradeSteps: { trace?: (step: "link" | "rename" | "fsync", path: string) => void } = {};
+
 function syncDir(dir: string): void {
+  upgradeSteps.trace?.("fsync", dir);
   const fd = openSync(dir, constants.O_RDONLY);
   try {
     fsyncSync(fd);
@@ -245,12 +250,18 @@ function setAside(path: string): string {
 // renamed over the old path. The old path is never missing (a version from before tenants
 // always finds the file there), and nothing is copied. A start that died between the two
 // finds the old path still a real file, the same file as the one at `to`, and finishes.
+// Durable in that order: the new place's directory is fsynced once the hard link is made,
+// before the old path becomes a symlink to it (a power loss can never leave the old path a
+// link to a name that didn't survive), and the old place's directory after.
 function linkOver(from: string, to: string): void {
   const tmp = linkTemp(from);
   rmSync(tmp, { force: true });
   symlinkSync(relative(dirname(from), to), tmp);
   try {
-    if (!lexists(to)) linkSync(from, to);
+    if (!lexists(to)) {
+      linkSync(from, to);
+      upgradeSteps.trace?.("link", to);
+    }
   } catch (e) {
     rmSync(tmp, { force: true });
     const code = (e as NodeJS.ErrnoException).code;
@@ -258,7 +269,10 @@ function linkOver(from: string, to: string): void {
     if (code === "EPERM" || code === "ENOTSUP") throw new UpgradeError(`${dirname(to)}'s filesystem doesn't take hard links (${code}): move ${from} yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
     throw e;
   }
+  syncDir(dirname(to));
   renameSync(tmp, from);
+  upgradeSteps.trace?.("rename", from);
+  syncDir(dirname(from));
 }
 
 const otherLink = (from: string, to: string) => new UpgradeError(`${from} is a symlink, not to ${to}: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
