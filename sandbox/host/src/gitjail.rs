@@ -928,14 +928,30 @@ pub(crate) mod tests {
     /// id. Skipped where unprivileged user namespaces (or subuids) aren't available.
     #[cfg(target_os = "linux")]
     pub(crate) fn in_userns(test: &str, more_ids: bool) {
+        userns_run("unshare", test, more_ids, std::env::var_os("SANDBOXD_REQUIRE_USERNS").is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_required_user_namespace_test_fails_rather_than_skips_without_unshare() {
+        let missing = || userns_run("/nonexistent/unshare", "gitjail::tests::own_in_userns", false, true);
+        assert!(std::panic::catch_unwind(missing).is_err(), "required, with no unshare(1), it passed");
+        // Not required: said aloud, and skipped.
+        userns_run("/nonexistent/unshare", "gitjail::tests::own_in_userns", false, false);
+    }
+
+    /// in_userns, with `unshare` as `program`; `require`: a skip is a failure.
+    #[cfg(target_os = "linux")]
+    fn userns_run(program: &str, test: &str, more_ids: bool, require: bool) {
         let me = std::env::current_exe().unwrap();
-        let mut cmd = std::process::Command::new("unshare");
+        let mut cmd = std::process::Command::new(program);
         cmd.arg("--user").arg("--map-root-user");
         if more_ids {
             cmd.arg("--map-auto");
         }
         let Ok(out) = cmd.arg(&me).args([test, "--exact", "--ignored", "--nocapture"]).output() else {
-            eprintln!("skipped: no unshare(1)");
+            eprintln!("NOTE: {test} skipped: no unshare(1)");
+            assert!(!require, "{test} skipped (no unshare(1)), but SANDBOXD_REQUIRE_USERNS is set");
             return;
         };
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -943,7 +959,7 @@ pub(crate) mod tests {
         // have no subuids for --map-auto: the inner test never started.
         if stderr.starts_with("unshare:") {
             eprintln!("NOTE: {test} skipped: {}", stderr.trim());
-            assert!(std::env::var_os("SANDBOXD_REQUIRE_USERNS").is_none(), "{test} skipped, but SANDBOXD_REQUIRE_USERNS is set: {}", stderr.trim());
+            assert!(!require, "{test} skipped, but SANDBOXD_REQUIRE_USERNS is set: {}", stderr.trim());
             return;
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -953,7 +969,7 @@ pub(crate) mod tests {
         // (starship), so a host that can run it never passes it silently.
         if let Some(line) = stdout.lines().chain(stderr.lines()).find(|l| l.starts_with("skipped:")) {
             eprintln!("NOTE: {test} skipped inside its user namespace: {line}");
-            assert!(std::env::var_os("SANDBOXD_REQUIRE_USERNS").is_none(), "{test} skipped, but SANDBOXD_REQUIRE_USERNS is set: {line}");
+            assert!(!require, "{test} skipped, but SANDBOXD_REQUIRE_USERNS is set: {line}");
         }
     }
 

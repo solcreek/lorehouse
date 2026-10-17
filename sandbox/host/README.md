@@ -199,7 +199,14 @@ push, its network namespace had only `lo` and sandboxd's listener; 1.1.1.1 was u
 and so was the host's loopback. The remote got the read token on upload-pack and the write
 token on receive-pack, from sandboxd. From git's uids on the host, writing another mirror, a
 sandbox's disk, `vms/cgroup.procs` or `git/cgroup.procs` was refused, and so was signalling
-sandboxd. `isolated_git_as_root` (`cargo test -- --ignored`, as root in a
+sandboxd.
+
+The isolation's own tests run in user namespaces (`unshare --user --map-root-user`, some
+with `--map-auto` and the user's subuids) and say `NOTE: … skipped` where the host can't
+give them one (no `unshare(1)`, unprivileged user namespaces refused, as on Ubuntu's
+default AppArmor, or no capabilities inside one). On a host meant to run them (a
+developer's Linux box, starship), run `SANDBOXD_REQUIRE_USERNS=1 cargo test --locked`: a
+skip is then a failure. CI doesn't set it. `isolated_git_as_root` (`cargo test -- --ignored`, as root in a
 `systemd-run --scope -p Delegate=yes`, and under the unit's own confinement) passes there:
 a `setsid` escapee is gone when its run returns, and two runs at once had different uids.
 
