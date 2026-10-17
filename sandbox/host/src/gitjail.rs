@@ -376,7 +376,8 @@ fn own(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
                 failed = Some(e);
             }
         }
-    })?;
+    })
+    .map_err(|a| std::io::Error::other(a.to_string()))?;
     failed.map_or(Ok(()), Err)
 }
 

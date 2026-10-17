@@ -253,6 +253,7 @@ impl Config {
         let git_uid_base = num("SANDBOXD_GIT_UID_BASE", DEFAULT_GIT_UID_BASE);
         let git_mem = num("SANDBOXD_GIT_MEM_MIB", DEFAULT_GIT_MEM_MIB);
         let check_secs = num("SANDBOXD_GIT_CHECK_SECS", crate::publish::DEFAULT_CHECK_SECS);
+        let mirror_entries = num("SANDBOXD_MIRROR_MAX_ENTRIES", d.mirror_entries);
         let headroom = num("SANDBOXD_VM_MEM_HEADROOM_MIB", 512);
         let net_check = num("SANDBOXD_NET_CHECK_SECS", DEFAULT_NET_CHECK_SECS);
         let dl = Limits::default();
@@ -289,9 +290,12 @@ impl Config {
         if !(1..=365).contains(&retention_days) {
             problems.push("SANDBOXD_MIRROR_RETENTION_DAYS must be 1..=365".into());
         }
-        let mirrors = Policy { mirror_max: mirror_max * GIB, mirrors_max: mirrors_max * GIB, free_min_pct: free_pct, free_min: free_gib * GIB, retention: Duration::from_secs(retention_days * 86_400), check_deadline: Duration::from_secs(check_secs), ..d };
+        let mirrors = Policy { mirror_max: mirror_max * GIB, mirrors_max: mirrors_max * GIB, free_min_pct: free_pct, free_min: free_gib * GIB, retention: Duration::from_secs(retention_days * 86_400), check_deadline: Duration::from_secs(check_secs), mirror_entries, ..d };
         if !(65_536..=2_000_000_000).contains(&uid_base) {
             problems.push("SANDBOXD_JAIL_UID_BASE must be 65536..=2000000000 (above every real user, below 2^31 with room for 64 VMs)".into());
+        }
+        if !(10_000..=100_000_000).contains(&mirror_entries) {
+            problems.push("SANDBOXD_MIRROR_MAX_ENTRIES must be 10000..=100000000".into());
         }
         if !(10..=3600).contains(&check_secs) {
             problems.push("SANDBOXD_GIT_CHECK_SECS must be 10..=3600".into());
@@ -497,6 +501,13 @@ mod tests {
             assert!(Config::from_env().unwrap_err().contains("SANDBOXD_GIT_CHECK_SECS"), "{v}");
         }
         std::env::remove_var("SANDBOXD_GIT_CHECK_SECS");
+        // How far a walk of a mirror may go: a million entries by default.
+        assert_eq!(Config::from_env().unwrap().mirrors.mirror_entries, 1_000_000);
+        for v in ["9999", "100000001", "x"] {
+            std::env::set_var("SANDBOXD_MIRROR_MAX_ENTRIES", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_MIRROR_MAX_ENTRIES"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_MIRROR_MAX_ENTRIES");
         for (k, v) in [("SANDBOXD_JAIL_UID_BASE", "1000"), ("SANDBOXD_JAIL_UID_BASE", "4294967200"), ("SANDBOXD_VM_MEM_HEADROOM_MIB", "0")] {
             std::env::set_var(k, v);
             assert!(Config::from_env().unwrap_err().contains(k), "{k}={v}");

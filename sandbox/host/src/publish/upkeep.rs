@@ -38,7 +38,7 @@
 //! file is removed when the mirror's state is next written.)
 
 use super::{expired, has_head, remove_mirror, Failure, Publisher, StageRecord};
-use crate::mirrorfs::{Kind, Mirror};
+use crate::mirrorfs::{Anomaly, Kind, Mirror};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -80,6 +80,9 @@ pub struct Policy {
     /// The deadline of a push's ancestry check: fetching both sides' commits into a fresh
     /// repo and merge-base (SANDBOXD_GIT_CHECK_SECS). 53k commits took about 4 s.
     pub check_deadline: Duration,
+    /// The most entries a walk of one mirror may meet before the mirror is dropped as an
+    /// anomaly (SANDBOXD_MIRROR_MAX_ENTRIES; mirrorfs::Caps).
+    pub mirror_entries: u64,
     /// A stage whose bundle is over this, and that fails, is cut off or expires unpushed, is
     /// collected after (what it brought is kept byte for byte otherwise, for 2 weeks).
     pub heavy_bundle: u64,
@@ -98,6 +101,7 @@ impl Default for Policy {
             gc_idle: Duration::from_secs(10 * 60),
             gc_deadline: Duration::from_secs(600),
             check_deadline: Duration::from_secs(super::DEFAULT_CHECK_SECS),
+            mirror_entries: 1_000_000,
             heavy_bundle: 8 * MIB,
         }
     }
@@ -113,8 +117,9 @@ impl Policy {
 /// Where sizes come from: the disk in production, set by hand in tests.
 pub trait Disk: Send + Sync {
     /// The bytes a mirror uses (apparent sizes, as `du -sb`), and how many of those are
-    /// garbage (git's partial packs, stage bundles).
-    fn usage(&self, dir: &Path) -> (u64, u64);
+    /// garbage (git's partial packs, stage bundles); an anomaly if the walk couldn't be
+    /// whole (mirrorfs), never a partial total.
+    fn usage(&self, dir: &Path) -> Result<(u64, u64), Anomaly>;
     /// Free bytes (for an unprivileged user) and the size of the filesystem `dir` is on.
     fn fs(&self, dir: &Path) -> Option<(u64, u64)>;
 }
@@ -122,13 +127,13 @@ pub trait Disk: Send + Sync {
 pub struct RealDisk;
 
 impl Disk for RealDisk {
-    fn usage(&self, dir: &Path) -> (u64, u64) {
+    fn usage(&self, dir: &Path) -> Result<(u64, u64), Anomaly> {
         // Garbage by the names remove_garbage() goes by, each only where that file lives (a
         // branch may be called tmp_pack_x). Through mirrorfs: a link is counted as itself,
         // never what it names.
         let mut sum = (0, 0);
-        let Ok(mirror) = Mirror::open(dir) else { return sum };
-        let _ = mirror.walk(|place, _, name, st| {
+        let mirror = Mirror::open(dir).map_err(|e| Anomaly(format!("the mirror: {e}")))?;
+        mirror.walk(|place, _, name, st| {
             if st.kind == Kind::Dir {
                 return;
             }
@@ -138,8 +143,8 @@ impl Disk for RealDisk {
             if (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_"))) || (place.as_os_str().is_empty() && name.starts_with("stage-") && name.ends_with(".bundle")) {
                 sum.1 += st.len;
             }
-        });
-        sum
+        })?;
+        Ok(sum)
     }
 
     // f_bavail and the rest are u32 on some platforms and u64 on others.
@@ -214,12 +219,12 @@ const PACKED_REFS_CAP: u64 = 64 << 20;
 
 /// A mirror's refs/stage refs, loose or packed, as sandboxd reads them (publish.rs, "What
 /// sandboxd reads in a mirror"): a refs/stage that is a link, or a packed-refs that isn't a
-/// regular file under its cap, counts nothing. For the status only.
-pub(super) fn count_stage_refs(dir: &Path) -> u64 {
-    let Ok(mirror) = Mirror::open(dir) else { return 0 };
-    let loose = mirror.count("refs/stage").unwrap_or(0);
+/// regular file under its cap, counts nothing; a refs/stage past its cap is an anomaly.
+pub(super) fn count_stage_refs(dir: &Path) -> Result<u64, Anomaly> {
+    let Ok(mirror) = Mirror::open(dir) else { return Ok(0) };
+    let loose = mirror.count("refs/stage")?.unwrap_or(0);
     let packed = mirror.read("packed-refs", PACKED_REFS_CAP).map_or(0, |p| p.split(|&b| b == b'\n').filter(|l| l.windows(12).any(|w| w == b" refs/stage/")).count() as u64);
-    loose + packed
+    Ok(loose + packed)
 }
 
 /// Bytes in GiB for a message: whole when they are, else to one decimal.
@@ -250,6 +255,8 @@ pub(super) struct Stats {
     evicted: u64,
     refused_for_space: u64,
     refresh_timeouts: u64,
+    /// Mirrors dropped for an anomaly in their traversal (mirrorfs).
+    anomalies: u64,
     fs_unknown_logged: bool,
 }
 
@@ -264,6 +271,12 @@ enum Short {
 }
 
 impl Publisher {
+    /// How far a walk of one of these mirrors may go (mirrorfs): entries as set, bytes at
+    /// twice a mirror's quota (one over its quota is refused as that, not as an anomaly).
+    pub fn caps(&self) -> crate::mirrorfs::Caps {
+        crate::mirrorfs::Caps { entries: self.policy.mirror_entries, bytes: self.policy.mirror_max.saturating_mul(2), ..Default::default() }
+    }
+
     /// The upkeep's limits and schedule; Policy::default() unless set.
     pub fn with_policy(mut self, policy: Policy) -> Publisher {
         self.policy = policy;
@@ -316,9 +329,14 @@ impl Publisher {
     }
 
     /// Measure a mirror (and the filesystem, and the records) for the quotas and the status.
-    /// Its size in bytes.
-    fn measure(&self, dir: &Path) -> u64 {
-        let (bytes, garbage) = self.disk.usage(dir);
+    /// Its size in bytes. A mirror that can't be measured whole (an anomaly: mirrorfs) is a
+    /// cache that can't be trusted: dropped, and the job that measured it refused.
+    pub(super) fn measure(&self, dir: &Path) -> Result<u64, Failure> {
+        let measured = self.disk.usage(dir).and_then(|u| Ok((u, count_stage_refs(dir)?)));
+        let ((bytes, garbage), stage_refs) = match measured {
+            Ok(m) => m,
+            Err(a) => return Err(self.drop_anomalous(dir, &a)),
+        };
         let last_used = match read_state(dir) {
             Some(s) => s.last_used,
             None => {
@@ -328,14 +346,23 @@ impl Publisher {
                 now
             }
         };
-        let m = Measured { bytes, garbage, stage_refs: count_stage_refs(dir), last_used };
+        let m = Measured { bytes, garbage, stage_refs, last_used };
         let fs_free = self.fs().map(|(free, _)| free);
         let records = self.count_records();
         let mut st = self.stats();
         st.mirrors.insert(dir.to_path_buf(), m);
         st.fs_free = fs_free;
         st.records = records;
-        bytes
+        Ok(bytes)
+    }
+
+    /// A mirror whose traversal hit an anomaly: dropped (it is a cache of GitHub, fetched
+    /// again when next needed), and what to answer the job that found it.
+    pub(super) fn drop_anomalous(&self, dir: &Path, why: &Anomaly) -> Failure {
+        eprintln!("sandboxd: dropped the mirror of {}: {why}", repo_of(dir));
+        self.drop_mirror(dir);
+        self.stats().anomalies += 1;
+        (500, format!("the mirror of {} couldn't be trusted ({why}) and was dropped; nothing was staged or pushed, stage again", repo_of(dir)))
     }
 
     fn count_records(&self) -> u64 {
@@ -465,7 +492,7 @@ impl Publisher {
         let mut known = self.stats().mirrors.get(dir).map(|m| m.bytes);
         if known.is_none() && has_head(dir) {
             // On disk, not measured yet: put there after the start's inventory, not by a stage.
-            known = Some(self.measure(dir));
+            known = Some(self.measure(dir)?);
         }
         match known {
             Some(bytes) if bytes > self.policy.mirror_max => Err(self.over_cap(dir, owner, name, bytes)),
@@ -477,7 +504,7 @@ impl Publisher {
     /// After a fetch into the mirror (the refresh, a bundle), under its lock: measured; over
     /// its cap, it is removed; either way, refused when there is no room.
     pub(super) fn check_size(&self, dir: &Path, owner: &str, name: &str) -> Result<(), Failure> {
-        let bytes = self.measure(dir);
+        let bytes = self.measure(dir)?;
         if bytes > self.policy.mirror_max {
             return Err(self.over_cap(dir, owner, name, bytes));
         }
@@ -491,7 +518,7 @@ impl Publisher {
             self.stats().refresh_timeouts += 1;
         }
         if has_head(dir) {
-            self.measure(dir);
+            let _ = self.measure(dir);
         } else {
             self.forget(dir);
         }
@@ -523,7 +550,7 @@ impl Publisher {
         }
         write_state(dir, &state);
         self.collect_heavy(dir, &mut state).await;
-        self.measure(dir);
+        let _ = self.measure(dir);
     }
 
     /// gc --prune=now if a heavy stage of this mirror has no record any more (it failed, was
@@ -545,11 +572,11 @@ impl Publisher {
         if self.now().saturating_sub(state.gc_failed_at) < GC_RETRY {
             return false;
         }
-        let before = self.disk.usage(dir).0;
+        let before = self.disk.usage(dir).map_or(0, |u| u.0);
         let started = Instant::now();
         let done = self.git.run(dir, &["gc", "--quiet", "--prune=now"], self.policy.gc_deadline).await;
         let ms = started.elapsed().as_millis() as u64;
-        let reclaimed = before.saturating_sub(self.disk.usage(dir).0);
+        let reclaimed = before.saturating_sub(self.disk.usage(dir).map_or(0, |u| u.0));
         if let Err(e) = &done {
             eprintln!("sandboxd: gc of the mirror of {}: {e}", repo_of(dir));
             state.gc_failed_at = self.now();
@@ -570,7 +597,7 @@ impl Publisher {
         let _ = std::fs::remove_dir_all(self.mirrors.join(".check"));
         for dir in self.mirror_dirs() {
             if has_head(&dir) {
-                self.measure(&dir);
+                let _ = self.measure(&dir);
             }
         }
     }
@@ -586,7 +613,7 @@ impl Publisher {
             let Ok(_held) = lock.try_lock() else { continue };
             let now = self.now();
             let Some(mut state) = read_state(dir) else {
-                self.measure(dir); // stamps it as used now
+                let _ = self.measure(dir); // stamps it as used now
                 continue;
             };
             let idle = now.saturating_sub(state.last_used);
@@ -605,7 +632,7 @@ impl Publisher {
             if gc_due {
                 self.gc(dir, &mut state).await;
             }
-            self.measure(dir);
+            let _ = self.measure(dir);
         }
         // Mirrors no longer on disk (removed by hand) are forgotten; not by the list the pass
         // started from, which a stage may have added a mirror to since.
@@ -638,6 +665,7 @@ impl Publisher {
             "evicted": st.evicted,
             "refusedForSpace": st.refused_for_space,
             "refreshTimeouts": st.refresh_timeouts,
+            "anomalies": st.anomalies,
         })
     }
 }

@@ -14,16 +14,62 @@
 //! `O_NONBLOCK`, must be a regular file by fstat, and is read up to a cap. Walks open each
 //! directory from its parent's handle the same way and act on entries by name
 //! (fstatat/unlinkat/fchownat with no-follow), so a link is seen as a link and never
-//! entered. Any other failure is "not there".
+//! entered. Any other failure of a single read is "not there".
+//!
+//! **A mirror is a cache of GitHub: host traversal is bounded, and any anomaly drops it.**
+//! Walks and listings stream entries (never a whole listing in memory), hold one open
+//! directory per level of depth, and stop at caps on entries per directory, entries in all,
+//! depth and bytes (`Caps`). Going past a cap, or any error on the way (a directory that
+//! can't be opened or read, an entry that can't be looked at), is an `Anomaly`: never a
+//! partial answer. Callers drop the mirror on one (publish.rs).
 
 use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+/// How far a walk of a mirror may go before it is an anomaly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Caps {
+    /// Entries in one directory (a git directory holds a few hundred; loose objects at
+    /// most 256 fan-out directories of a few thousand, loose refs as many as a repo has).
+    pub per_dir: u64,
+    /// Entries in all (SANDBOXD_MIRROR_MAX_ENTRIES).
+    pub entries: u64,
+    /// Directories deep (a ref name is at most 200 bytes, so at most 100 components).
+    pub depth: usize,
+    /// Bytes of the files seen (twice the mirror's own quota: one over its quota is
+    /// refused as that, not as an anomaly).
+    pub bytes: u64,
+}
+
+impl Default for Caps {
+    fn default() -> Caps {
+        Caps { per_dir: 262_144, entries: 1_000_000, depth: 128, bytes: 8 << 30 }
+    }
+}
+
+static CAPS: std::sync::OnceLock<Caps> = std::sync::OnceLock::new();
+
+/// The caps every Mirror::open gets, set once at start from the configuration.
+pub fn set_caps(caps: Caps) {
+    let _ = CAPS.set(caps);
+}
+
+/// What made a walk stop short: the mirror can't be trusted to be what git left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Anomaly(pub String);
+
+impl std::fmt::Display for Anomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A mirror's root, held open.
 pub struct Mirror {
     root: OwnedFd,
+    caps: Caps,
 }
 
 /// What an entry is, without following it.
@@ -142,34 +188,66 @@ pub fn chown_at(dir: BorrowedFd, name: &OsStr, uid: u32, gid: u32) -> std::io::R
     Ok(())
 }
 
-/// The names in a directory (not `.` or `..`).
-fn names(dir: BorrowedFd) -> std::io::Result<Vec<OsString>> {
-    // SAFETY: fdopendir takes a duplicate we own (closedir closes it); readdir's entries are
-    // read before the next call.
-    unsafe {
-        let dup = libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
-        if dup < 0 {
-            return Err(errno());
-        }
-        let d = libc::fdopendir(dup);
-        if d.is_null() {
+#[cfg(target_os = "linux")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
+}
+
+/// A directory being read, one entry at a time: its one descriptor is the stream's.
+struct Listing {
+    dir: *mut libc::DIR,
+}
+
+impl Listing {
+    /// `fd` (a directory opened O_RDONLY) as a stream; the stream owns it.
+    fn new(fd: OwnedFd) -> std::io::Result<Listing> {
+        use std::os::fd::IntoRawFd;
+        let raw = fd.into_raw_fd();
+        // SAFETY: fdopendir takes ownership of raw on success; on failure it is ours to close.
+        let dir = unsafe { libc::fdopendir(raw) };
+        if dir.is_null() {
             let e = errno();
-            libc::close(dup);
+            unsafe { libc::close(raw) };
             return Err(e);
         }
-        let mut out = Vec::new();
+        Ok(Listing { dir })
+    }
+
+    fn fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the stream's descriptor, valid while it is open (as long as self).
+        unsafe { BorrowedFd::borrow_raw(libc::dirfd(self.dir)) }
+    }
+
+    /// The next name (not `.` or `..`), None at the end, or the error readdir gave.
+    fn next(&mut self) -> Option<std::io::Result<OsString>> {
         loop {
-            let entry = libc::readdir(d);
-            if entry.is_null() {
-                break;
-            }
-            let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes();
-            if name != b"." && name != b".." {
-                out.push(OsStr::from_bytes(name).to_os_string());
+            // SAFETY: errno is cleared first so that a null return is told apart (end or
+            // error); the entry is read before the next readdir.
+            unsafe {
+                *errno_location() = 0;
+                let entry = libc::readdir(self.dir);
+                if entry.is_null() {
+                    let e = *errno_location();
+                    return (e != 0).then(|| Err(std::io::Error::from_raw_os_error(e)));
+                }
+                let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes();
+                if name != b"." && name != b".." {
+                    return Some(Ok(OsStr::from_bytes(name).to_os_string()));
+                }
             }
         }
-        libc::closedir(d);
-        Ok(out)
+    }
+}
+
+impl Drop for Listing {
+    fn drop(&mut self) {
+        // SAFETY: the stream we opened, closed once.
+        unsafe { libc::closedir(self.dir) };
     }
 }
 
@@ -177,6 +255,11 @@ impl Mirror {
     /// The mirror whose directory is `dir` (sandboxd's own: `<mirrors>/<owner>/<name>.git`,
     /// under directories only root writes). Not a link.
     pub fn open(dir: &Path) -> std::io::Result<Mirror> {
+        Mirror::open_with(dir, CAPS.get().copied().unwrap_or_default())
+    }
+
+    /// open(), with these caps.
+    pub fn open_with(dir: &Path, caps: Caps) -> std::io::Result<Mirror> {
         let path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         // SAFETY: a NUL-terminated path.
         let fd = unsafe { libc::open(path.as_ptr(), O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
@@ -184,7 +267,7 @@ impl Mirror {
             return Err(errno());
         }
         // SAFETY: a new descriptor of ours.
-        Ok(Mirror { root: unsafe { OwnedFd::from_raw_fd(fd) } })
+        Ok(Mirror { root: unsafe { OwnedFd::from_raw_fd(fd) }, caps })
     }
 
     /// `rel` (plain names joined by `/`) opened under the root, never leaving it, never
@@ -242,30 +325,69 @@ impl Mirror {
         (out.len() as u64 <= cap).then_some(out)
     }
 
-    /// How many entries directory `rel` has, if it is a real directory.
-    pub fn count(&self, rel: &str) -> Option<u64> {
-        let fd = self.at(rel, libc::O_RDONLY | libc::O_DIRECTORY).ok()?;
-        names(fd.as_fd_borrowed()).ok().map(|n| n.len() as u64)
+    /// How many entries directory `rel` has: None if it isn't there or isn't a real
+    /// directory, an anomaly past the per-directory cap or if it can't be read through.
+    pub fn count(&self, rel: &str) -> Result<Option<u64>, Anomaly> {
+        let Ok(fd) = self.at(rel, libc::O_RDONLY | libc::O_DIRECTORY) else { return Ok(None) };
+        let mut listing = Listing::new(fd).map_err(|e| Anomaly(format!("{rel}: {e}")))?;
+        let mut n = 0;
+        while let Some(name) = listing.next() {
+            name.map_err(|e| Anomaly(format!("{rel}: {e}")))?;
+            n += 1;
+            if n > self.caps.per_dir {
+                return Err(Anomaly(format!("{rel} holds more than {} entries", self.caps.per_dir)));
+            }
+        }
+        Ok(Some(n))
     }
 
     /// Every entry under the root, depth first, as `f(directory's path relative to the root,
-    /// its handle, entry name, what the entry is)`. Only real directories are entered, each
-    /// opened from its parent's handle without following a link. Entries `f` removes are
-    /// gone before the walk would enter them.
-    pub fn walk(&self, mut f: impl FnMut(&Path, BorrowedFd, &OsStr, &Stat)) -> std::io::Result<()> {
-        let top = openat(self.root.as_fd_borrowed(), &CString::new(".").unwrap_or_default(), libc::O_RDONLY | libc::O_DIRECTORY)?;
-        let mut stack: Vec<(PathBuf, OwnedFd)> = vec![(PathBuf::new(), top)];
-        while let Some((rel, dir)) = stack.pop() {
-            for name in names(dir.as_fd_borrowed())? {
-                let Ok(st) = stat_at(dir.as_fd_borrowed(), &name) else { continue };
-                f(&rel, dir.as_fd_borrowed(), &name, &st);
-                if st.kind == Kind::Dir {
-                    if let Ok(cname) = c(&name) {
-                        if let Ok(sub) = openat(dir.as_fd_borrowed(), &cname, libc::O_RDONLY | libc::O_DIRECTORY) {
-                            stack.push((rel.join(&name), sub));
-                        }
-                    }
+    /// its handle, entry name, what the entry is)`, streamed: one open directory per level,
+    /// nothing listed whole. Only real directories are entered, each opened from its
+    /// parent's handle without following a link. An entry `f` removes is gone before the
+    /// walk would enter it. Past a cap, or on any error, it stops: an anomaly.
+    pub fn walk(&self, mut f: impl FnMut(&Path, BorrowedFd, &OsStr, &Stat)) -> Result<(), Anomaly> {
+        let caps = self.caps;
+        let top = openat(self.root.as_fd_borrowed(), &CString::new(".").unwrap_or_default(), libc::O_RDONLY | libc::O_DIRECTORY).map_err(|e| Anomaly(format!("the mirror: {e}")))?;
+        let mut stack: Vec<(PathBuf, Listing, u64)> = vec![(PathBuf::new(), Listing::new(top).map_err(|e| Anomaly(format!("the mirror: {e}")))?, 0)];
+        let (mut entries, mut bytes) = (0u64, 0u64);
+        loop {
+            let level = stack.len();
+            let Some((rel, listing, here)) = stack.last_mut() else { break };
+            let name = match listing.next() {
+                None => {
+                    stack.pop();
+                    continue;
                 }
+                Some(Err(e)) => return Err(Anomaly(format!("{}: {e}", rel.display()))),
+                Some(Ok(name)) => name,
+            };
+            *here += 1;
+            entries += 1;
+            if *here > caps.per_dir {
+                return Err(Anomaly(format!("{} holds more than {} entries", rel.display(), caps.per_dir)));
+            }
+            if entries > caps.entries {
+                return Err(Anomaly(format!("the mirror holds more than {} entries", caps.entries)));
+            }
+            let at = listing.fd();
+            let st = stat_at(at, &name).map_err(|e| Anomaly(format!("{}: {e}", rel.join(&name).display())))?;
+            if st.kind == Kind::File {
+                bytes += st.len;
+                if bytes > caps.bytes {
+                    return Err(Anomaly(format!("the mirror's files come to more than {} bytes", caps.bytes)));
+                }
+            }
+            f(rel, at, &name, &st);
+            if st.kind == Kind::Dir {
+                let path = rel.join(&name);
+                if level >= caps.depth {
+                    return Err(Anomaly(format!("{} is more than {} directories deep", path.display(), caps.depth)));
+                }
+                let cname = c(&name).map_err(|e| Anomaly(format!("{}: {e}", path.display())))?;
+                let sub = openat(at, &cname, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|e| Anomaly(format!("{}: {e}", path.display())))?;
+                let sub = Listing::new(sub).map_err(|e| Anomaly(format!("{}: {e}", path.display())))?;
+                stack.push((path, sub, 0));
             }
         }
         Ok(())
@@ -316,6 +438,74 @@ mod tests {
         std::fs::remove_dir_all(&top).unwrap();
     }
 
+    fn open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count())
+    }
+
+    #[test]
+    fn a_wide_tree_is_walked_holding_one_directory_open_per_level() {
+        // Before, every sibling directory was opened before any was visited.
+        let (top, mirror, _) = tree("wide");
+        for i in 0..400 {
+            std::fs::create_dir_all(mirror.join(format!("objects/{i:03}"))).unwrap();
+            std::fs::write(mirror.join(format!("objects/{i:03}/x")), b"").unwrap();
+        }
+        let m = Mirror::open(&mirror).unwrap();
+        let before = open_fds();
+        let mut most = 0;
+        let mut seen = 0;
+        let _ = m.walk(|_, _, _, _| {
+            seen += 1;
+            most = most.max(open_fds());
+        });
+        assert!(seen >= 800, "{seen}");
+        // Other tests run at once and open their own: a margin, far under 400.
+        assert!(most < before + 60, "{most} descriptors open during the walk, {before} before");
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_directory_that_cant_be_read_stops_the_walk_rather_than_being_skipped() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads any directory");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (top, mirror, _) = tree("unreadable");
+        std::fs::create_dir_all(mirror.join("objects/ab")).unwrap();
+        std::fs::write(mirror.join("objects/ab/cd"), b"x").unwrap();
+        std::fs::set_permissions(mirror.join("objects/ab"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let walked = Mirror::open(&mirror).unwrap().walk(|_, _, _, _| {});
+        std::fs::set_permissions(mirror.join("objects/ab"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(walked.is_err(), "a subtree that couldn't be read was skipped");
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn past_any_cap_a_walk_or_a_count_is_an_anomaly_not_a_partial_answer() {
+        let (top, mirror, _) = tree("caps");
+        for i in 0..6 {
+            std::fs::write(mirror.join(format!("refs/stage/{i}")), b"0123456789").unwrap();
+        }
+        let mut deep = mirror.join("objects");
+        for i in 0..5 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let roomy = Caps { per_dir: 100, entries: 100, depth: 16, bytes: 1000 };
+        let m = |caps| Mirror::open_with(&mirror, caps).unwrap();
+        assert!(m(roomy).walk(|_, _, _, _| {}).is_ok());
+        assert_eq!(m(roomy).count("refs/stage"), Ok(Some(6)));
+        // Entries in one directory, in all, depth, bytes: each an anomaly naming it.
+        let per_dir = m(Caps { per_dir: 5, ..roomy });
+        assert!(per_dir.walk(|_, _, _, _| {}).is_err_and(|a| a.0.contains("more than 5 entries")));
+        assert!(per_dir.count("refs/stage").is_err());
+        assert!(m(Caps { entries: 8, ..roomy }).walk(|_, _, _, _| {}).is_err_and(|a| a.0.contains("more than 8 entries")));
+        assert!(m(Caps { depth: 4, ..roomy }).walk(|_, _, _, _| {}).is_err_and(|a| a.0.contains("directories deep")));
+        assert!(m(Caps { bytes: 50, ..roomy }).walk(|_, _, _, _| {}).is_err_and(|a| a.0.contains("bytes")));
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
     #[test]
     fn a_path_never_leaves_the_mirror_nor_goes_through_a_link() {
         let (top, mirror, host) = tree("beneath");
@@ -328,13 +518,13 @@ mod tests {
         // Through a link as the file, as a directory on the way, or out of the mirror: not read.
         assert_eq!(m.read("packed-refs", 100), None);
         assert_eq!(m.read("objects/secret", 100), None);
-        assert_eq!(m.count("objects/stage"), None);
+        assert_eq!(m.count("objects/stage"), Ok(None));
         assert!(m.at("../host/secret", libc::O_RDONLY).is_err());
         assert!(m.at("/etc/passwd", libc::O_RDONLY).is_err());
         // A link is there, as a link.
         assert!(m.exists("packed-refs"));
         assert_eq!(m.stat("packed-refs").map(|s| s.kind), Some(Kind::Other));
-        assert_eq!(m.count("refs/stage"), Some(0));
+        assert_eq!(m.count("refs/stage"), Ok(Some(0)));
         // Nor a FIFO: not waited on.
         let fifo = CString::new(mirror.join("fifo").as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);

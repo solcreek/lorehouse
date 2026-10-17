@@ -665,11 +665,11 @@ impl Drop for NewMirror<'_> {
 /// `packed-refs.lock` fails every later fetch), and stage bundles a crash left. Each name is
 /// matched only where that file lives: a branch may be called `tmp_pack_x` or
 /// `stage-x.bundle`, but no ref name ends in `.lock`. Whether it removed a lock file.
-fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
-    let Ok(mirror) = Mirror::open(dir) else { return false };
+fn remove_garbage(dir: &Path, now: SystemTime) -> Result<bool, mirrorfs::Anomaly> {
+    let Ok(mirror) = Mirror::open(dir) else { return Ok(false) };
     let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let mut unlocked = false;
-    let _ = mirror.walk(|place, at, name, st| {
+    mirror.walk(|place, at, name, st| {
         let packs = place == Path::new("objects/pack");
         let name_s = name.to_string_lossy();
         let lock = name_s.ends_with(".lock");
@@ -680,8 +680,8 @@ fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
         if garbage && st.kind == mirrorfs::Kind::File && old && mirrorfs::unlink_at(at, name).is_ok() {
             unlocked |= lock;
         }
-    });
-    unlocked
+    })?;
+    Ok(unlocked)
 }
 
 fn unix_secs() -> u64 {
@@ -1183,7 +1183,13 @@ impl Publisher {
     /// object, a lock file).
     async fn prune(&self, dir: &Path) -> bool {
         let now = self.now();
-        let mut repaired = remove_garbage(dir, SystemTime::now());
+        let mut repaired = match remove_garbage(dir, SystemTime::now()) {
+            Ok(r) => r,
+            Err(a) => {
+                self.drop_anomalous(dir, &a);
+                return false;
+            }
+        };
         if let Ok(entries) = std::fs::read_dir(self.records()) {
             for entry in entries.flatten() {
                 let file = entry.file_name();
@@ -1596,6 +1602,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mirror_that_cant_be_measured_whole_is_dropped_and_its_stage_refused() {
+        // A walk past a cap or that fails on the way (mirrorfs) is an anomaly: the mirror is a
+        // cache, so it goes, and nothing partial is counted.
+        let s = scratch("anomalous");
+        sh(&s.vm, "echo an > an && git add an && git commit -qm an");
+        s.stage_all(request("scout/an"), || {}).await.unwrap();
+        assert!(has_head(&s.dir()));
+        *s.disk.anomalous.lock().unwrap() = Some(s.dir().to_string_lossy().into_owned());
+        let err = s.stage_all(request("scout/an"), || {}).await.unwrap_err();
+        assert!(err.1.contains("couldn't be trusted") && err.1.contains("was dropped"), "{err:?}");
+        assert!(!has_head(&s.dir()), "the mirror is still there");
+        assert_eq!(s.publisher.status()["anomalies"], 1);
+        // Fetched again on the next stage.
+        *s.disk.anomalous.lock().unwrap() = None;
+        s.stage_all(request("scout/an"), || {}).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn sandboxd_reads_a_mirror_without_following_links_or_waiting_on_a_fifo() {
         // A mirror's files are git's (an untrusted uid's) to write: what sandboxd reads
         // there, as root, may be a link anywhere or a FIFO no one writes.
@@ -1611,7 +1635,7 @@ mod tests {
         let refs = s.root.join("refs-kept");
         std::fs::rename(dir.join("refs"), &refs).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("refs")).unwrap();
-        assert_eq!(upkeep::count_stage_refs(&dir), 0, "counted through a linked refs/");
+        assert_eq!(upkeep::count_stage_refs(&dir), Ok(0), "counted through a linked refs/");
         std::fs::remove_file(dir.join("refs")).unwrap();
         std::fs::rename(&refs, dir.join("refs")).unwrap();
         // objects -> a host directory with a large file and git-garbage names, old: not
@@ -1622,8 +1646,8 @@ mod tests {
         let objects = s.root.join("objects-kept");
         std::fs::rename(dir.join("objects"), &objects).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("objects")).unwrap();
-        assert!(RealDisk.usage(&dir).0 < 1 << 20, "measured through a linked objects/");
-        remove_garbage(&dir, SystemTime::now());
+        assert!(RealDisk.usage(&dir).unwrap().0 < 1 << 20, "measured through a linked objects/");
+        remove_garbage(&dir, SystemTime::now()).unwrap();
         assert!(outside.join("pack/tmp_pack_host").exists(), "removed a host file through a linked objects/");
         std::fs::remove_file(dir.join("objects")).unwrap();
         std::fs::rename(&objects, dir.join("objects")).unwrap();
@@ -1632,7 +1656,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("stage"), dir.join("refs/stage")).unwrap();
         let _ = std::fs::remove_file(dir.join("packed-refs"));
         std::os::unix::fs::symlink(outside.join("packed"), dir.join("packed-refs")).unwrap();
-        assert_eq!(upkeep::count_stage_refs(&dir), 0, "counted through links");
+        assert_eq!(upkeep::count_stage_refs(&dir), Ok(0), "counted through links");
         // A FIFO: read without waiting (before, measure() blocked on it for good).
         std::fs::remove_file(dir.join("packed-refs")).unwrap();
         let fifo = std::ffi::CString::new(dir.join("packed-refs").to_string_lossy().as_bytes()).unwrap();
@@ -1640,7 +1664,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let d = dir.clone();
         std::thread::spawn(move || tx.send(upkeep::count_stage_refs(&d)));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(0), "reading a FIFO in the mirror blocked");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(0)), "reading a FIFO in the mirror blocked");
         // Nor a file past its cap: a packed-refs of more than 64 MiB isn't read.
         std::fs::remove_file(dir.join("packed-refs")).unwrap();
         std::fs::File::create(dir.join("packed-refs")).unwrap().set_len(65 << 20).unwrap();
@@ -1785,12 +1809,17 @@ mod tests {
         fs_on_measure: Mutex<Option<(String, (u64, u64))>>,
         /// Run once this mirror is measured.
         on_measure: Mutex<Option<(String, Hook)>>,
+        /// This mirror's walk is an anomaly (as mirrorfs finds one past a cap).
+        anomalous: Mutex<Option<String>>,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
 
     impl Disk for FakeDisk {
-        fn usage(&self, dir: &Path) -> (u64, u64) {
+        fn usage(&self, dir: &Path) -> Result<(u64, u64), crate::mirrorfs::Anomaly> {
+            if self.anomalous.lock().unwrap().as_deref() == Some(dir.to_string_lossy().as_ref()) {
+                return Err(crate::mirrorfs::Anomaly("more than 5 entries".into()));
+            }
             let repo = format!("{}/{}", dir.parent().unwrap().file_name().unwrap().to_string_lossy(), dir.file_name().unwrap().to_string_lossy().trim_end_matches(".git"));
             if let Some((_, fs)) = self.fs_on_measure.lock().unwrap().as_ref().filter(|(r, _)| *r == repo) {
                 *self.fs.lock().unwrap() = Some(*fs);
@@ -1800,7 +1829,7 @@ mod tests {
                 run();
             }
             match self.sizes.lock().unwrap().get(&repo) {
-                Some(&bytes) => (bytes, 0),
+                Some(&bytes) => Ok((bytes, 0)),
                 None => RealDisk.usage(dir),
             }
         }
@@ -2387,7 +2416,7 @@ mod tests {
         sh(&s.dir(), "for i in $(seq 1 55); do echo $i | git hash-object --stdin -w | git pack-objects -q objects/pack/pack >/dev/null; done");
         s.publisher.push(SANDBOX, s.push(&staged, "scout/m")).await.unwrap();
         assert!(packs(&s.dir()) <= 2, "{}", packs(&s.dir()));
-        assert_eq!(s.publisher.status()["bytes"].as_u64().unwrap(), RealDisk.usage(&s.dir()).0, "the size kept is the size after gc");
+        assert_eq!(s.publisher.status()["bytes"].as_u64().unwrap(), RealDisk.usage(&s.dir()).unwrap().0, "the size kept is the size after gc");
     }
 
     #[tokio::test]
@@ -2947,7 +2976,7 @@ mod tests {
         s.stage_all(request("scout/b"), || {}).await.unwrap();
         // The same commits again: they are in the mirror already, so it grows by the ref and
         // the bundle file (64 KiB) only. A cap with half the bundle to spare holds.
-        let size = RealDisk.usage(&s.dir()).0;
+        let size = RealDisk.usage(&s.dir()).unwrap().0;
         s.publisher.policy.mirror_max = size + (32 << 10);
         s.stage_all(request("scout/b2"), || {}).await.unwrap();
     }
@@ -3003,7 +3032,7 @@ mod tests {
             serde_json::json!({
                 "count": 1, "bytes": GIB, "maxBytes": 24 * GIB, "perMirrorMaxBytes": 4 * GIB, "fsFreeBytes": 300 * GIB,
                 "garbageBytes": 0, "stageRefs": 1, "records": 1, "largest": { "repo": "acme/widgets", "bytes": GIB },
-                "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0,
+                "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0, "anomalies": 0,
             })
         );
     }
@@ -3035,10 +3064,10 @@ mod tests {
         sh(&s.vm, "git push -q origin HEAD:refs/heads/tmp_pack_release");
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
         assert!(dir.join("refs/heads/tmp_pack_release").is_file());
-        assert_eq!(RealDisk.usage(&dir).1, 0, "a branch is not garbage");
+        assert_eq!(RealDisk.usage(&dir).unwrap().1, 0, "a branch is not garbage");
         std::fs::write(dir.join("objects/pack/tmp_pack_x"), [0u8; 100]).unwrap();
         std::fs::write(dir.join("stage-x.bundle"), [0u8; 10]).unwrap();
-        assert_eq!(RealDisk.usage(&dir).1, 110);
+        assert_eq!(RealDisk.usage(&dir).unwrap().1, 110);
     }
 
     #[test]

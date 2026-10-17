@@ -298,6 +298,8 @@ async fn main() {
     });
     // Mirrors of the repos published from here; the dot keeps them out of the sandbox list.
     let publisher = Arc::new(publish::Publisher::new(cfg.state_dir.join(".mirrors"), cfg.github_url.clone(), git_jail).with_policy(cfg.mirrors.clone()));
+    // Every walk of a mirror (mirrorfs) stops at these, and any anomaly drops the mirror.
+    mirrorfs::set_caps(publisher.caps());
 
     // Every mirror measured before any job is taken, so the quotas count them all.
     let inventory = publisher.clone();
