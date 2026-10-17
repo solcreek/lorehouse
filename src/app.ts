@@ -80,7 +80,7 @@ export async function createApp(config: Config) {
   const tenant = config.tenant;
   if (prepareTenant(tenant)) console.log(`lorehouse: tenant ${tenant.id} is new: its files go in ${tenant.dir}`);
   const moved = upgradeLayout(config.db.upgrade);
-  if (moved.length) console.log(`lorehouse: storage: moved ${moved.join(", ")} from ${tenant.dataDir} into ${tenant.dir}, tenant ${tenant.id}'s directory`);
+  if (moved.length) console.log(`lorehouse: storage: moved ${moved.join(", ")} from ${tenant.dataDir} into ${tenant.dir}, tenant ${tenant.id}'s directory, leaving a symlink at each old path (an older version opens the same files)`);
   const others = tenant.source === "throwaway" ? [] : tenantsIn(tenant.dataDir).filter((id) => id !== tenant.id);
   if (others.length) console.warn(`lorehouse: storage: ${tenant.dataDir} also holds tenant ${others.join(", ")}, not served here (TENANT_ID=${tenant.id})`);
 

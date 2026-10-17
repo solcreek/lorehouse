@@ -2,7 +2,7 @@
 // laid out before tenants moved into its tenant's directory on the first start.
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
@@ -156,8 +156,11 @@ describe("an install laid out before tenants upgrades in place", () => {
     const { config, moved } = start(d);
     const t = config.tenant.dir;
     expect(moved).toEqual(["lorehouse.db (+ -wal, -shm)", "sessions.db (+ -wal, -shm)"]);
-    expect(readdirSync(d).sort()).toEqual([config.tenant.id, "settings.json"].sort());
-    expect(readdirSync(t).sort()).toEqual(["lorehouse.db", "lorehouse.db-shm", "lorehouse.db-wal", "sessions.db", "sessions.db-shm", "sessions.db-wal", "tenant.json"]);
+    const FILES = ["lorehouse.db", "lorehouse.db-shm", "lorehouse.db-wal", "sessions.db", "sessions.db-shm", "sessions.db-wal"];
+    expect(readdirSync(t).sort()).toEqual([...FILES, "tenant.json"]);
+    // Each old path is now a symlink to the file's new place, relative to the data directory.
+    expect(readdirSync(d).sort()).toEqual([...FILES, config.tenant.id, "settings.json"].sort());
+    for (const f of FILES) expect([f, lstatSync(join(d, f)).isSymbolicLink(), readlinkSync(join(d, f))]).toEqual([f, true, `${config.tenant.id}/${f}`]);
     // The writes only the WAL held are there: the -wal came along.
     expect(rows(join(t, "lorehouse.db"))).toBe(25);
     expect(rows(join(t, "sessions.db"))).toBe(7);
@@ -168,8 +171,67 @@ describe("an install laid out before tenants upgrades in place", () => {
     const again = start(d);
     expect(again.config.tenant).toEqual({ ...config.tenant, source: "found" });
     expect(again.moved).toEqual([]);
-    expect(pendingMoves(again.config.db.upgrade)).toEqual([]);
+    expect(pendingMoves(config.db.upgrade)).toEqual([]);
     expect(rows(join(t, "lorehouse.db"))).toBe(25);
+  });
+
+  // Rolling back: a version from before tenants still names <data>/lorehouse.db and
+  // <data>/sessions.db. Through the symlinks it opens the same files, and SQLite puts
+  // their -wal and -shm beside the files themselves, in the tenant's directory.
+  test("after the move, the old paths open the same databases: reads and writes land in the tenant's files, the WAL beside them", async () => {
+    const d = await todaysLayout();
+    const { config } = start(d);
+    const t = config.tenant.dir;
+    // A process holding the old path open, writing without a checkpoint, while another
+    // reads the new path: both see one database.
+    await killedWriter(join(d, "lorehouse.db"), 5);
+    // Its writes are in the WAL beside the target (a read's close may checkpoint it after).
+    expect(lstatSync(join(t, "lorehouse.db-wal")).isFile()).toBe(true);
+    expect(statSync(join(t, "lorehouse.db-wal")).size).toBeGreaterThan(0);
+    expect(rows(join(t, "lorehouse.db"))).toBe(30);
+    expect(rows(join(d, "lorehouse.db"))).toBe(30);
+    // Nothing real appeared at the old place: every name there is still a link.
+    for (const f of readdirSync(d).filter((f) => f.startsWith("lorehouse.db") || f.startsWith("sessions.db"))) expect([f, lstatSync(join(d, f)).isSymbolicLink()]).toEqual([f, true]);
+  });
+
+  test("a rollback (the old path opened, written, closed) then a roll forward: the start succeeds, moves nothing, and has the write", async () => {
+    const d = await todaysLayout();
+    const { config } = start(d);
+    // The old version: open the old path, write, close (its close may checkpoint and
+    // remove the -wal, leaving the link to it dangling).
+    const r = Bun.spawnSync(["bun", "-e", `const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(join(d, "lorehouse.db"))}); db.exec("PRAGMA journal_mode = WAL"); db.query("INSERT INTO walrows VALUES (99, 'rolledback')").run(); db.close();`], { stderr: "inherit" });
+    expect(r.exitCode).toBe(0);
+    const forward = start(d);
+    expect(forward.config.tenant.id).toBe(config.tenant.id);
+    expect(forward.moved).toEqual([]);
+    expect(rows(forward.config.db.lorehouse)).toBe(26);
+    expect(pendingMoves(forward.config.db.upgrade)).toEqual([]);
+  });
+
+  test("a start that died between moving a file and linking it finishes on the next: the link made, nothing refused", async () => {
+    const d = await todaysLayout();
+    const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
+    prepareTenant(config.tenant);
+    // As moveOne leaves it when it dies after the rename: the temp link beside the old
+    // path, the file already in the tenant's directory.
+    symlinkSync(`${config.tenant.id}/lorehouse.db`, join(d, "lorehouse.db.tenant-link"));
+    renameSync(join(d, "lorehouse.db"), config.db.lorehouse);
+    expect(pendingMoves(config.db.upgrade).map((m) => m.from)).toEqual([join(d, "lorehouse.db"), join(d, "sessions.db")]);
+    expect(upgradeLayout(config.db.upgrade)).toEqual(["lorehouse.db (+ -wal, -shm)", "sessions.db (+ -wal, -shm)"]);
+    expect(readlinkSync(join(d, "lorehouse.db"))).toBe(`${config.tenant.id}/lorehouse.db`);
+    expect(existsSync(join(d, "lorehouse.db.tenant-link"))).toBe(false);
+    expect(rows(config.db.lorehouse)).toBe(25);
+    expect(upgradeLayout(config.db.upgrade)).toEqual([]);
+  });
+
+  test("an old path that is a symlink to somewhere else is refused, never followed or moved", async () => {
+    const d = await todaysLayout();
+    const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
+    prepareTenant(config.tenant);
+    renameSync(join(d, "sessions.db"), join(d, "elsewhere.db"));
+    symlinkSync("elsewhere.db", join(d, "sessions.db"));
+    expect(() => upgradeLayout(config.db.upgrade)).toThrow(/sessions\.db is a symlink, not to /);
+    expect(existsSync(join(d, "elsewhere.db"))).toBe(true);
   });
 
   test("a start that died part-way (the -wal moved, the database not yet) finishes the move", async () => {

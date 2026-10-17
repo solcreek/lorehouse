@@ -20,12 +20,15 @@
 // An install laid out as before (<data>/lorehouse.db, <data>/sessions.db) upgrades in place
 // on its first start: each database moves into its tenant's directory by rename(2), its
 // -wal, -shm and -journal before it, then both directories are fsynced. Nothing is copied.
-// A start that dies part-way finishes the move on the next one; a second start moves
-// nothing. A LOREHOUSE_DB or SESSIONS_DB an operator set is used where it is and never moved.
+// Each old path is left a symlink to the file's new place, so a version from before
+// tenants, rolled back to, opens the same database; removing the links is a later,
+// deliberate cleanup. A start that dies part-way finishes the move on the next one; a
+// second start moves nothing. A LOREHOUSE_DB or SESSIONS_DB an operator set is used where
+// it is and never moved.
 
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, constants, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
 
 type Env = Record<string, string | undefined>;
 
@@ -136,39 +139,108 @@ export type Move = { from: string; to: string };
 
 export class UpgradeError extends Error {}
 
-// Moves each database still at its old place, with its side files, by rename only; then
-// fsyncs both directories. Refuses, moving nothing more, where the tenant's directory
-// already has a file by that name (two copies: an operator decides which is the data), or
-// the rename would cross filesystems (it would be a copy). Returns what moved, as
+// Where a file being moved stands, by what is at its old path (never followed):
+//   file   a real file: still to move
+//   moved  a symlink to its place in the tenant's directory: moved (dangling is fine:
+//          SQLite removes a -wal on close, and makes it again beside the target)
+//   other  a symlink anywhere else: not ours to touch
+//   none   nothing
+type Standing = "file" | "moved" | "other" | "none";
+function standing(from: string, to: string): Standing {
+  let st;
+  try {
+    st = lstatSync(from);
+  } catch {
+    return "none";
+  }
+  if (!st.isSymbolicLink()) return "file";
+  return resolve(dirname(from), readlinkSync(from)) === resolve(to) ? "moved" : "other";
+}
+const lexists = (p: string) => {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+// The link made beside the old path before the rename, then renamed over it: until that
+// last rename, its being there says a move of this file is under way.
+const linkTemp = (from: string) => `${from}.tenant-link`;
+
+// One file: a symlink to its new place made beside it, the file renamed into the tenant's
+// directory, then the symlink renamed onto the old path. The old path is never a missing
+// file except between those two renames, and a start that died there finds the temp link
+// and finishes. Returns whether this start moved it.
+function moveOne(from: string, to: string): boolean {
+  const tmp = linkTemp(from);
+  const now = standing(from, to);
+  if (now === "moved") {
+    rmSync(tmp, { force: true });
+    return false;
+  }
+  if (now === "other") throw new UpgradeError(`${from} is a symlink, not to ${to}: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
+  if (now === "none") {
+    if (!lexists(tmp)) return false;
+    if (!lexists(to)) {
+      rmSync(tmp, { force: true }); // a link made, nothing renamed: nothing to finish
+      return false;
+    }
+    renameSync(tmp, from); // died between the renames: finish
+    return true;
+  }
+  rmSync(tmp, { force: true });
+  symlinkSync(relative(dirname(from), to), tmp);
+  try {
+    renameSync(from, to);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    if ((e as NodeJS.ErrnoException).code === "EXDEV") throw new UpgradeError(`${from} and ${dirname(to)} are on different filesystems: a rename can't move it, and it is never copied. Move it yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
+    throw e;
+  }
+  renameSync(tmp, from);
+  return true;
+}
+
+// Moves each database still at its old place, with its side files, by rename only, and
+// leaves at each old path a symlink to the file's new place; then fsyncs both directories.
+// The symlinks keep a version from before tenants working: it still names the old paths,
+// and SQLite opens the file a symlink points at (its -wal and -shm go beside that), so a
+// rollback finds the same database, and a later start finds every file moved already.
+// Refuses, moving nothing more, where the tenant's directory already has a file by that
+// name and the old path holds a real one (two copies: an operator decides which is the
+// data), or the rename would cross filesystems (it would be a copy). Returns what moved, as
 // "lorehouse.db (+ -wal, -shm)". Run before either database is opened.
 export function upgradeLayout(moves: Move[]): string[] {
   const moved: string[] = [];
   const dirs = new Set<string>();
   for (const { from, to } of moves) {
-    if (!existsSync(from)) continue; // moved already, or a new install
-    if (existsSync(to)) throw new UpgradeError(`both ${from} and ${to} exist: keep the one that holds the data (stop the app, move or remove the other), then start again`);
-    const sides = SIDE_FILES.filter((s) => existsSync(from + s));
-    for (const s of sides) {
-      if (existsSync(to + s)) throw new UpgradeError(`both ${from + s} and ${to + s} exist: keep the one that belongs to ${from} (stop the app, move or remove the other), then start again`);
+    const main = standing(from, to);
+    if (main === "moved" && !lexists(linkTemp(from))) continue; // moved already
+    if (main === "none" && !lexists(linkTemp(from))) continue; // a new install
+    if (main === "other") throw new UpgradeError(`${from} is a symlink, not to ${to}: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
+    const files = [...SIDE_FILES, ""];
+    for (const s of files) {
+      if (standing(from + s, to + s) === "file" && lexists(to + s)) {
+        throw new UpgradeError(s
+          ? `both ${from + s} and ${to + s} exist: keep the one that belongs to ${from} (stop the app, move or remove the other), then start again`
+          : `both ${from} and ${to} exist: keep the one that holds the data (stop the app, move or remove the other), then start again`);
+      }
     }
     mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
-    try {
-      for (const s of sides) renameSync(from + s, to + s);
-      renameSync(from, to);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "EXDEV") throw new UpgradeError(`${from} and ${dirname(to)} are on different filesystems: a rename can't move it, and it is never copied. Move it yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
-      throw e;
-    }
+    const sides = SIDE_FILES.filter((s) => moveOne(from + s, to + s));
+    const itself = moveOne(from, to);
     dirs.add(dirname(from)).add(dirname(to));
-    moved.push(basename(to) + (sides.length ? ` (+ ${sides.join(", ")})` : ""));
+    if (itself || sides.length) moved.push(basename(to) + (sides.length ? ` (+ ${sides.join(", ")})` : ""));
   }
   for (const dir of dirs) syncDir(dir);
   return moved;
 }
 
-// The databases still to move, for the doctor: those whose old file exists.
+// The databases still to move, for the doctor: those whose old path is a real file, or
+// whose move is under way.
 export function pendingMoves(moves: Move[]): Move[] {
-  return moves.filter((m) => existsSync(m.from) && statSync(m.from).isFile());
+  return moves.filter((m) => standing(m.from, m.to) === "file" || lexists(linkTemp(m.from)));
 }
 
 // A sandbox id for one thread of this tenant: "<tenant>.<session>", the session's

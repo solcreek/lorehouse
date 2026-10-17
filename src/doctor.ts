@@ -303,7 +303,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   if (moves.length) {
     const clash = moves.filter((m) => existsSync(m.to));
     if (clash.length) add("storage", "upgrade", "fail", clash.map((m) => `both ${m.from} and ${m.to} exist`).join("; ") + ": the start refuses until one of each is moved away");
-    else add("storage", "upgrade", "info", `the next start moves ${moves.map((m) => basename(m.from)).join(" and ")} (with their -wal and -shm) from ${tenant.dataDir} into ${tenant.source === "new" ? `${tenant.dataDir}/<id>` : tenant.dir}`);
+    else add("storage", "upgrade", "info", `the next start moves ${moves.map((m) => basename(m.from)).join(" and ")} (with their -wal and -shm) from ${tenant.dataDir} into ${tenant.source === "new" ? `${tenant.dataDir}/<id>` : tenant.dir}, leaving a symlink at each old path`);
   }
   for (const [key, configured] of [["LOREHOUSE_DB", config.db.lorehouse], ["SESSIONS_DB", config.db.sessions]] as const) {
     // A database still to move is checked where it is now.

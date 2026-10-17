@@ -23,7 +23,7 @@
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CHART_PNG, MIRRORS, pollRunner, wsRunner } from "./fake-runner";
@@ -440,9 +440,10 @@ const scenarios: Scenario[] = [
   {
     // An install laid out before tenants (the databases in the data directory, as
     // LOREHOUSE_DB named them) started with LOREHOUSE_DB unset and LOREHOUSE_DATA_DIR set:
-    // the first start moves both databases into the tenant's directory, by rename, and what
-    // they held comes along (a thread the agent was asked into is the agent's own record,
-    // never rebuilt from Slack); a second start moves nothing.
+    // the first start moves both databases into the tenant's directory, by rename, leaving a
+    // symlink at each old path, and what they held comes along (a thread the agent was
+    // asked into is the agent's own record, never rebuilt from Slack); a second start moves
+    // nothing.
     name: "an install laid out before tenants moves into its tenant's directory on the first start, once, with what it holds",
     run: async () => {
       const db = freshDb();
@@ -464,8 +465,10 @@ const scenarios: Scenario[] = [
           if (s.tenant !== before.tenant) return `start ${start}: tenant ${s.tenant}, want ${before.tenant} (the one kept in the data directory)`;
           if (s.dataDir !== resolve(dir)) return `start ${start}: dataDir ${s.dataDir}, want ${resolve(dir)}`;
           for (const f of ["lorehouse.db", "sessions.db"]) {
-            if (existsSync(join(dir, f))) return `start ${start}: ${f} is still in the data directory`;
-            if (!existsSync(join(at, f))) return `start ${start}: no ${f} in ${at}`;
+            // Moved, and the old path left a symlink to it, so an older version still opens it.
+            if (!lstatSync(join(at, f), { throwIfNoEntry: false })?.isFile()) return `start ${start}: no ${f} in ${at}`;
+            const old = lstatSync(join(dir, f), { throwIfNoEntry: false });
+            if (!old?.isSymbolicLink() || resolve(dir, readlinkSync(join(dir, f))) !== join(at, f)) return `start ${start}: ${join(dir, f)} isn't a symlink to ${join(at, f)}`;
           }
           if (!existsSync(join(dir, "settings.json")) && existsSync(join(at, "settings.json"))) return `start ${start}: settings.json moved into the tenant's directory`;
           if (!(await joined()).includes(ts)) return `start ${start}: the thread the agent was asked into before the move is gone: ${(await joined()).slice(0, 200)}`;

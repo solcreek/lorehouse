@@ -471,7 +471,7 @@ describe("the tenant", () => {
       writeFileSync(`${dir}/sessions.db`, "");
       const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
       expect(find(checks, "tenant")[0]?.detail).toBe("acme (TENANT_ID)");
-      expect(find(checks, "upgrade")[0]).toMatchObject({ level: "info", detail: `the next start moves lorehouse.db and sessions.db (with their -wal and -shm) from ${dir} into ${dir}/acme` });
+      expect(find(checks, "upgrade")[0]).toMatchObject({ level: "info", detail: `the next start moves lorehouse.db and sessions.db (with their -wal and -shm) from ${dir} into ${dir}/acme, leaving a symlink at each old path` });
       expect(find(checks, "LOREHOUSE_DB")[0]?.detail).toBe(`${dir}/lorehouse.db (moves to ${dir}/acme/lorehouse.db on the next start)`);
       // What a start would purge is read from where the database is now.
       expect(find(checks, "purge on start")[0]?.detail).toContain("C9 (1 document)");
