@@ -6,9 +6,10 @@
 //
 // With `lookUp` (the app passes conversations.info, channel-check.ts), each channel is
 // looked up again before ingest first reads it, and again on every recheckChannels()
-// (hourly, from the app). One that Slack now says is private or archived, or that it
-// won't show this token (channel_not_found, missing_scope: what a channel turned private
-// likely answers), is closed, sticky until a restart: no longer read, its live events
+// (hourly, from the app). One that Slack now says is private, archived or shared with
+// another workspace (Slack Connect), or that it won't show this token (channel_not_found,
+// missing_scope: what a channel turned private likely answers), is closed, sticky until a
+// restart: no longer read, its live events
 // dropped, and isClosed() tells the policy to refuse events there. What was indexed from
 // it stays until the next start, which refuses while the channel is listed; unlisting it
 // purges it (purge.ts). An outage (5xx, rate limit, no answer) closes nothing.

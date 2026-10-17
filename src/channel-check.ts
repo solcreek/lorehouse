@@ -16,6 +16,18 @@
 // channel_not_found rather than is_private (not yet seen against real Slack). Those are
 // Slack's answer about the channel (isDefiniteFailure), not an outage, and a running
 // app closes a channel on them as on is_private.
+//
+// A public channel shared beyond this workspace is refused like a private one (#145):
+// its readers include people who can't open the other listed channels, and an answer
+// there quotes those. conversations.info says so in four fields, each decided here:
+//   • is_ext_shared: shared with another organization (Slack Connect). Refused.
+//   • is_pending_ext_shared: a Slack Connect invitation is out, and the other side can
+//     accept it at any moment, up to an hour before a recheck would notice. Refused.
+//   • is_org_shared: shared with other workspaces of the same Enterprise Grid org. The
+//     same employer, but their members aren't members of this workspace and can't open
+//     its other channels; one install serves one workspace. Refused.
+//   • is_shared: shared in some way (true for both kinds above). Refused, and it must be
+//     present and false, as is_private must: what Slack leaves unsaid fails closed.
 
 import { ConfigError } from "./config";
 import type { SlackApi } from "./slack-api";
@@ -30,16 +42,25 @@ export type ChannelInfo = {
   is_mpim?: boolean;
   is_private?: boolean;
   is_archived?: boolean;
+  is_shared?: boolean;
+  is_ext_shared?: boolean;
+  is_org_shared?: boolean;
+  is_pending_ext_shared?: boolean;
 };
+
+// With whom a shared channel is shared, as far as Slack said.
+export type Sharing = "external" | "pending_external" | "org" | "other";
 
 export type ChannelVerdict =
   | { channel: string; name?: string; public: true }
   | { channel: string; name?: string; public: false; reason: "private" | "group_dm" | "dm" | "archived" }
+  | { channel: string; name?: string; public: false; reason: "shared"; sharing: Sharing }
   | { channel: string; name?: string; public: false; reason: "lookup_failed"; error: string };
 
-// Public means Slack said so: not a DM, group DM or private channel, is_private and
-// is_archived present and false, and is_channel true (a conversation of a kind this doesn't
-// know is not vouched for). Anything Slack left unsaid fails closed.
+// Public means Slack said so: not a DM, group DM or private channel, is_private,
+// is_archived and is_shared present and false, shared with no one (see above), and
+// is_channel true (a conversation of a kind this doesn't know is not vouched for).
+// Anything Slack left unsaid fails closed.
 export function classifyChannel(channel: string, info: ChannelInfo | undefined): ChannelVerdict {
   if (!info || typeof info !== "object") return { channel, public: false, reason: "lookup_failed", error: "Slack's answer had no channel" };
   const name = typeof info.name === "string" && info.name ? info.name : undefined;
@@ -51,6 +72,11 @@ export function classifyChannel(channel: string, info: ChannelInfo | undefined):
   if (info.is_channel !== true) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say it is a channel" };
   if (info.is_archived) return { ...base, public: false, reason: "archived" };
   if (info.is_archived !== false) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say whether it is archived" };
+  if (info.is_ext_shared) return { ...base, public: false, reason: "shared", sharing: "external" };
+  if (info.is_pending_ext_shared) return { ...base, public: false, reason: "shared", sharing: "pending_external" };
+  if (info.is_org_shared) return { ...base, public: false, reason: "shared", sharing: "org" };
+  if (info.is_shared) return { ...base, public: false, reason: "shared", sharing: "other" };
+  if (info.is_shared !== false) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say whether it is shared" };
   return { ...base, public: true };
 }
 
@@ -102,9 +128,17 @@ export function describeVerdict(v: ChannelVerdict): string {
     case "group_dm": return `${who} is a group DM`;
     case "dm": return `${who} is a DM`;
     case "archived": return `${who} is archived`;
+    case "shared": return `${who} ${SHARED[v.sharing]}, so its readers include people who can't open the other listed channels`;
     case "lookup_failed": return `${who} couldn't be looked up, so it counts as not public: conversations.info said ${v.error}${hint(v.error)}`;
   }
 }
+
+const SHARED: Record<Sharing, string> = {
+  external: "is shared with another organization (Slack Connect)",
+  pending_external: "has a pending Slack Connect invitation (shared with another organization once accepted)",
+  org: "is shared with other workspaces of this Enterprise Grid organization",
+  other: "is shared with another workspace",
+};
 
 function hint(error: string): string {
   if (error === "channel_not_found") return " (no such channel, or a private one the bot can't see)";
@@ -116,6 +150,6 @@ function hint(error: string): string {
 export async function assertPublicChannels(api: SlackApi, channels: Iterable<string>): Promise<void> {
   const refused = (await lookUpChannels(api, channels)).filter((v) => !v.public);
   if (refused.length) {
-    throw new ConfigError(refused.map((v) => `AGENT_CHANNELS (${describeVerdict(v)}; list only public channels)`));
+    throw new ConfigError(refused.map((v) => `AGENT_CHANNELS (${describeVerdict(v)}; list only public channels${v.reason === "shared" ? " of this workspace alone" : ""})`));
   }
 }

@@ -8,7 +8,7 @@ import { docIdsWithPrefix, getCursor, openKnowledge, upsertDocument } from "../s
 import { SLACK_DOC_VERSION, SlackIngester } from "../src/ingest/slack";
 import { SlackApiError, type SlackApi } from "../src/slack-api";
 
-const PUBLIC: ChannelInfo = { name: "general", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false };
+const PUBLIC: ChannelInfo = { name: "general", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false, is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false };
 
 describe("classifyChannel", () => {
   test("a public channel, as Slack describes one", () => {
@@ -43,6 +43,25 @@ describe("classifyChannel", () => {
     expect(classifyChannel("C1", { ...PUBLIC, is_channel: false })).toMatchObject({ public: false, reason: "lookup_failed", error: "Slack didn't say it is a channel" });
   });
 
+  // Slack Connect and Enterprise Grid sharing (#145): every kind is refused, each named.
+  test("a channel shared beyond this workspace is refused, whichever way it is shared", () => {
+    expect(classifyChannel("C3", { ...PUBLIC, is_shared: true, is_ext_shared: true })).toEqual({ channel: "C3", name: "general", public: false, reason: "shared", sharing: "external" });
+    expect(classifyChannel("C5", { ...PUBLIC, is_pending_ext_shared: true })).toMatchObject({ public: false, reason: "shared", sharing: "pending_external" });
+    expect(classifyChannel("C4", { ...PUBLIC, is_shared: true, is_org_shared: true })).toMatchObject({ public: false, reason: "shared", sharing: "org" });
+    // is_shared alone: shared, with whom Slack didn't say
+    expect(classifyChannel("C6", { ...PUBLIC, is_shared: true })).toMatchObject({ public: false, reason: "shared", sharing: "other" });
+    // a private shared channel reads as private
+    expect(classifyChannel("C7", { ...PUBLIC, is_private: true, is_ext_shared: true })).toMatchObject({ public: false, reason: "private" });
+  });
+
+  test("a channel Slack didn't say is unshared fails closed", () => {
+    const { is_shared: _, ...unsaid } = PUBLIC;
+    expect(classifyChannel("C1", unsaid)).toMatchObject({ public: false, reason: "lookup_failed", error: "Slack didn't say whether it is shared" });
+    // the other three may be absent: only true refuses
+    const { is_ext_shared: _e, is_org_shared: _o, is_pending_ext_shared: _p, ...bare } = PUBLIC;
+    expect(classifyChannel("C1", bare)).toMatchObject({ public: true });
+  });
+
   test("a channel Slack didn't say is unarchived fails closed", () => {
     const { is_archived: _, ...unsaid } = PUBLIC;
     expect(classifyChannel("C1", unsaid)).toMatchObject({ public: false, reason: "lookup_failed", error: "Slack didn't say whether it is archived" });
@@ -53,6 +72,9 @@ describe("describeVerdict", () => {
   test("names the channel, with its name when Slack gave one, and why", () => {
     expect(describeVerdict(classifyChannel("C7", { ...PUBLIC, name: "board", is_private: true }))).toBe("C7 (#board) is a private channel");
     expect(describeVerdict(classifyChannel("C8", { ...PUBLIC, name: "", is_archived: true }))).toBe("C8 is archived");
+    expect(describeVerdict(classifyChannel("C3", { ...PUBLIC, name: "partners", is_shared: true, is_ext_shared: true }))).toBe("C3 (#partners) is shared with another organization (Slack Connect), so its readers include people who can't open the other listed channels");
+    expect(describeVerdict(classifyChannel("C4", { ...PUBLIC, name: "", is_shared: true, is_org_shared: true }))).toStartWith("C4 is shared with other workspaces of this Enterprise Grid organization");
+    expect(describeVerdict(classifyChannel("C5", { ...PUBLIC, name: "", is_pending_ext_shared: true }))).toStartWith("C5 has a pending Slack Connect invitation");
     expect(describeVerdict({ channel: "C4", public: false, reason: "lookup_failed", error: "missing_scope" })).toContain("C4 couldn't be looked up, so it counts as not public: conversations.info said missing_scope (the app needs channels:read");
   });
 });
@@ -140,6 +162,15 @@ describe("assertPublicChannels", () => {
     expect(problems.join(" ")).not.toContain("C1 ");
   });
 
+  test("a Slack Connect channel refuses the start, named, saying why", async () => {
+    const { api } = infoApi({ C1: PUBLIC, C3: { ...PUBLIC, name: "partners", is_shared: true, is_ext_shared: true } });
+    const err = await assertPublicChannels(api, ["C1", "C3"]).then(() => undefined, (e) => e);
+    expect(err).toBeInstanceOf(ConfigError);
+    expect((err as ConfigError).problems).toEqual([
+      "AGENT_CHANNELS (C3 (#partners) is shared with another organization (Slack Connect), so its readers include people who can't open the other listed channels; list only public channels of this workspace alone)",
+    ]);
+  });
+
   test("no channels: nothing to ask", async () => {
     const { api, calls } = infoApi({});
     await assertPublicChannels(api, []);
@@ -214,6 +245,18 @@ describe("ingest looks channels up", () => {
     info.C1 = PUBLIC;
     await ing.recheckChannels();
     expect(ing.isClosed("C1")).toBe(true);
+  });
+
+  test("a channel shared with another organization while running is closed at the recheck, as one turned private", async () => {
+    const { api, info } = readingApi({ C1: PUBLIC, C2: PUBLIC });
+    const ing = ingester(api, ["C1", "C2"]);
+    await ing.start();
+    info.C1 = { ...PUBLIC, is_shared: true, is_ext_shared: true };
+    info.C2 = { ...PUBLIC, is_pending_ext_shared: true };
+    expect(await ing.recheckChannels()).toEqual([]);
+    expect(ing.isClosed("C1")).toBe(true);
+    expect(ing.isClosed("C2")).toBe(true);
+    expect(ing.status().channels).toMatchObject({ C1: { closed: "shared" }, C2: { closed: "shared" } });
   });
 
   // What Slack likely answers for a channel turned private, to a token without groups:read.
