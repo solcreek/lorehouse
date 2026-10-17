@@ -35,13 +35,16 @@ files (knowledge, sessions, Lorehouse's own state). That content is every messag
 document, answer, session and usage record.
 - **One key per tenant.** The files are encrypted with that tenant's own data key, held
   as an envelope under KMS (ADR 0004).
-- **Deleting a tenant** is deleting its files and destroying its key.
-- **Moving a tenant to another region** is moving its files.
+- **Deleting a tenant** is deleting its files, destroying its key, and purging its
+  events not yet delivered (section 2).
+- **Moving a tenant to another region** is moving its files, after its pending events
+  are delivered or purged.
 
 **No tenant's content shares a table with another tenant's.** A query can't reach
 another tenant's rows because they aren't in the database it opened. Pooled tables are
 for the control plane only (section 2): the tenant registry, routing, installations and
-entitlements. They hold no customer content.
+entitlements. They hold no customer content. The one bounded exception is events not yet
+delivered (section 2, invariant 4).
 
 **The tenant id is part of every key, log line, metric, job and file path from now on**,
 in single-tenant installs too. Moving between deployment forms (section 3) then never
@@ -51,7 +54,8 @@ means a migration of identifiers.
 
 - **The control plane** owns the tenant registry, provisioning and installations: which
   chat workspace, Teams tenant or Google Workspace domain belongs to which tenant. It
-  also routes events. It is multi-tenant by nature and holds no customer content.
+  also routes events. It is multi-tenant by nature, and holds no customer content beyond
+  events not yet delivered (invariant 4).
 - **A data plane** runs Lorehouse for one or more tenants (section 3), against their files.
 
 **Every chat platform's events arrive at the control plane's edge.** The edge:
@@ -59,33 +63,34 @@ means a migration of identifiers.
 - answers inside the platform's deadline;
 - maps `(platform, platform tenant id)` to a tenant;
 - computes the event's idempotency key (below);
-- hands the event to that tenant's data plane, which may be starting up at the time.
+- queues the event for that tenant's data plane, which may be stopped or starting up at the time.
 
-**The edge acknowledges an event only after it is durable.** Before answering the
-platform, the edge appends the event to that tenant's **inbox**: a short-lived queue in
-the control plane, kept apart per tenant.
-- **Encrypted at rest** under the control plane's own key, like any of its storage.
-- **Taken by the data plane over an outbound connection,** as a sandbox runner takes
-  work. A stopped data plane loses nothing: its events wait until it starts. A deployment
-  in a tenant's own cloud account needs no way in from the control plane.
-- **Deleted once taken**, and kept at most a bounded time (24 h) otherwise, after which an
-  event is dropped and counted.
-
-The edge necessarily sees an event in the clear while it verifies and routes it. The
-inbox adds no reader beyond the edge itself.
-
-**What the control plane never holds is a tenant's data key.** It can't open a tenant's
-files, and nothing it stores outlives the brief inbox. **Everything that works on
-content happens only in the tenant's data plane**, which opens the tenant's files with
-the tenant's key: indexing, search, embeddings, assembling context, and the model call.
-Embeddings and indexes are stored in the tenant's files like the rest of its content.
-
-An edge that restarts after acknowledging loses nothing. A data plane that is stopped or
-cold therefore never misses a platform's deadline, so an idle tenant's compute can scale
-to zero.
-
-Delivery from the inbox to the data plane is **at least once, with an idempotency key**.
-Redelivery, which every platform above does, never produces a second answer.
+**Delivery from the edge to a data plane must hold these invariants.** The mechanism
+(the queue, how it's stored, how a stopped data plane is woken) is an implementation
+choice, made in its own issue against them:
+1. **Durable before acknowledged.** The edge answers the platform only after the event
+   is durably accepted, so an edge restart loses nothing.
+2. **At least once, until the data plane says so.** A pending event is redelivered until
+   the data plane acknowledges it. The data plane acknowledges only after it has written
+   the event and its idempotency key to the tenant's files, in one transaction.
+3. **No second answer.** The data plane checks each key against the keys it has recorded,
+   in the tenant's files. It keeps them at least as long as pending events are kept, plus
+   the platform's retry window.
+4. **Pending events are the one exception to "content lives in the tenant's files".**
+   They are kept for a bounded time (at most 24 h).
+   - Only the edge may write them, and only that tenant's data plane may read them.
+   - They're excluded from backups and snapshots, and they stay in the tenant's region
+     where the deployment form promises one.
+   - They're purged when the tenant is deleted or moved.
+5. **The control plane never holds a tenant's data key.** It can't open a tenant's files.
+   Everything that works on content happens only in that tenant's data plane, which opens
+   its files with the tenant's key: indexing, search, embeddings, assembling context and
+   the model call. Embeddings and indexes are stored in the tenant's files like the rest
+   of its content.
+6. **A data plane that is stopped or cold never misses a platform's deadline.** The edge
+   answers for it. A data plane that scales to zero is started by something allowed to
+   start it. In a tenant's own cloud account, that is something in that account, or a
+   start call the tenant grants. Otherwise that form doesn't scale to zero.
 
 **Each chat surface's contract defines its idempotency key.** The key is scoped to the
 tenant and the platform, and stays the same across the platform's retries:
@@ -179,7 +184,8 @@ Anthropic are the first implementations, never assumptions in the core:
   directory of files per tenant, each with its own key, and the tenant id threaded
   through config, logs and jobs. Every other item builds on it.
 - **New services and code:**
-  - an edge with per-platform verification and acknowledgement, and an idempotent hand-off;
+  - an edge with per-platform verification and acknowledgement, and a delivery mechanism
+    meeting section 2's six invariants, designed in its own issue;
   - a tenant registry, and provisioning that creates a single-tenant deployment from
     code.
 - **New June channels for Teams and Google Chat.** The conformance mock grows a surface
