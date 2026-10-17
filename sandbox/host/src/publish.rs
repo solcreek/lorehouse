@@ -306,7 +306,7 @@ impl Git {
     /// for-each-ref that couldn't run or failed says nothing about the mirror, and a failed
     /// refresh mustn't remove one that has been fetched.
     async fn is_new(&self, dir: &Path) -> bool {
-        !dir.join("HEAD").exists() || matches!(self.run(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty())
+        !has_head(dir) || matches!(self.run(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty())
     }
 
     /// One git command with no network, in `dir`; its stdout, which must fit OUTPUT_CAP.
@@ -570,6 +570,42 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+// ── What sandboxd reads in a mirror ────────────────────────────────────────────────────
+//
+// A mirror's contents are written by its git runs, which run as an untrusted uid
+// (gitjail.rs). sandboxd (root, outside any jail) touches a mirror only while no run of it
+// is alive (under the mirror's lock, runs killed whole before it is released), so nothing
+// changes under it, but anything a run left there may be planted: a link anywhere on the
+// host, a FIFO no one writes, a file of any size. So sandboxd, in a mirror:
+// - never follows a link: presence is lstat (has_head), walks use DirEntry's no-follow
+//   metadata and recurse only into real directories (remove_garbage, RealDisk::usage,
+//   gitjail::own), a directory is read only after lstat says it is one;
+// - opens a file only with read_in_mirror: O_NOFOLLOW | O_NONBLOCK, fstat'd to be a
+//   regular file, and read up to a cap;
+// - writes only new files (create_new: the bundle) and removes with unlink (remove_file,
+//   remove_dir_all), neither of which follows a link;
+// - leaves everything else, refs and objects included, to a jailed git run.
+
+/// A file in a mirror, as sandboxd reads one: not through a link, not a FIFO or device
+/// (opened O_NOFOLLOW | O_NONBLOCK, then fstat'd), and at most `cap` bytes. None if it
+/// isn't there, isn't a regular file, or is longer.
+pub(crate) fn read_in_mirror(path: &Path, cap: u64) -> Option<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() || meta.len() > cap {
+        return None;
+    }
+    let mut out = Vec::new();
+    f.take(cap + 1).read_to_end(&mut out).ok()?;
+    (out.len() as u64 <= cap).then_some(out)
+}
+
+/// Whether a mirror has a HEAD (git made it one), without following it if it is a link.
+pub(crate) fn has_head(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join("HEAD")).is_ok()
+}
+
 /// Remove a mirror. Its owner's directory stays: another repo of the same owner may be
 /// creating its mirror in it, under its own lock.
 fn remove_mirror(dir: &Path) {
@@ -754,7 +790,7 @@ impl Publisher {
 
     /// The mirror, created if new, with GitHub's branches as they are now.
     async fn refresh(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
-        if !dir.join("HEAD").exists() {
+        if !has_head(dir) {
             tokio::fs::create_dir_all(dir).await.map_err(|e| format!("mirror dir: {e}"))?;
             self.git.run(dir, &["init", "-q", "--bare"], GIT_LOCAL).await?;
         }
@@ -1477,6 +1513,47 @@ mod tests {
         let net = Net::Push { owner: "acme", name: "widgets", token: "write-tok", old: &zero, new: &head, refname: "refs/heads/scout/q" };
         let env = s.publisher.git.run_net(&s.dir(), &["-c", "alias.env=!env; git config --list", "env"], net, GIT_LOCAL).await.unwrap();
         assert!(!env.contains("write-tok") && !env.contains(&basic("write-tok")[6..]) && !env.to_lowercase().contains("authorization"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn sandboxd_reads_a_mirror_without_following_links_or_waiting_on_a_fifo() {
+        // A mirror's files are git's (an untrusted uid's) to write: what sandboxd reads
+        // there, as root, may be a link anywhere or a FIFO no one writes.
+        let s = scratch("planted");
+        let dir = s.dir();
+        s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap();
+        let outside = s.root.join("outside");
+        std::fs::create_dir_all(outside.join("stage")).unwrap();
+        std::fs::write(outside.join("stage/a"), b"").unwrap();
+        std::fs::write(outside.join("packed"), format!("{} refs/stage/x\n", "1".repeat(40)).repeat(3)).unwrap();
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("refs/stage"));
+        std::os::unix::fs::symlink(outside.join("stage"), dir.join("refs/stage")).unwrap();
+        let _ = std::fs::remove_file(dir.join("packed-refs"));
+        std::os::unix::fs::symlink(outside.join("packed"), dir.join("packed-refs")).unwrap();
+        assert_eq!(upkeep::count_stage_refs(&dir), 0, "counted through links");
+        // A FIFO: read without waiting (before, measure() blocked on it for good).
+        std::fs::remove_file(dir.join("packed-refs")).unwrap();
+        let fifo = std::ffi::CString::new(dir.join("packed-refs").to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.clone();
+        std::thread::spawn(move || tx.send(upkeep::count_stage_refs(&d)));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(0), "reading a FIFO in the mirror blocked");
+        // Nor a file past its cap: a packed-refs of more than 64 MiB isn't read.
+        std::fs::remove_file(dir.join("packed-refs")).unwrap();
+        std::fs::File::create(dir.join("packed-refs")).unwrap().set_len(65 << 20).unwrap();
+        assert_eq!(read_in_mirror(&dir.join("packed-refs"), 64 << 20), None);
+        // HEAD as a link (to nothing) is a mirror's HEAD all the same; nothing follows it.
+        std::fs::remove_file(dir.join("packed-refs")).unwrap();
+        std::fs::remove_file(dir.join("HEAD")).unwrap();
+        std::os::unix::fs::symlink(s.root.join("nothing"), dir.join("HEAD")).unwrap();
+        assert!(has_head(&dir));
+        // A heavy-stage check doesn't follow a link at the bundle's name.
+        std::fs::File::create(outside.join("big")).unwrap().set_len(1 << 30).unwrap();
+        std::os::unix::fs::symlink(outside.join("big"), dir.join("stage-x.bundle")).unwrap();
+        s.publisher.mark_heavy(&dir, &dir.join("stage-x.bundle"), "x");
+        assert!(upkeep::read_state(&dir).is_none_or(|st| st.heavy.is_empty()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

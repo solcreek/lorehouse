@@ -37,7 +37,7 @@
 //! link sandboxd would write through. (It was the mirror's `sandboxd.json` before: that
 //! file is removed when the mirror's state is next written.)
 
-use super::{expired, remove_mirror, Failure, Publisher, StageRecord};
+use super::{expired, has_head, read_in_mirror, remove_mirror, Failure, Publisher, StageRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -209,10 +209,16 @@ fn repo_of(dir: &Path) -> String {
     format!("{owner}/{name}")
 }
 
-/// A mirror's refs/stage refs, loose or packed.
-fn count_stage_refs(dir: &Path) -> u64 {
-    let loose = std::fs::read_dir(dir.join("refs").join("stage")).map_or(0, |d| d.flatten().count() as u64);
-    let packed = std::fs::read_to_string(dir.join("packed-refs")).map_or(0, |p| p.lines().filter(|l| l.contains(" refs/stage/")).count() as u64);
+/// The most of a mirror's packed-refs sandboxd reads to count its stage refs.
+const PACKED_REFS_CAP: u64 = 64 << 20;
+
+/// A mirror's refs/stage refs, loose or packed, as sandboxd reads them (publish.rs, "What
+/// sandboxd reads in a mirror"): a refs/stage that is a link, or a packed-refs that isn't a
+/// regular file under its cap, counts nothing. For the status only.
+pub(super) fn count_stage_refs(dir: &Path) -> u64 {
+    let stage = dir.join("refs").join("stage");
+    let loose = if std::fs::symlink_metadata(&stage).is_ok_and(|m| m.is_dir()) { std::fs::read_dir(&stage).map_or(0, |d| d.flatten().count() as u64) } else { 0 };
+    let packed = read_in_mirror(&dir.join("packed-refs"), PACKED_REFS_CAP).map_or(0, |p| p.split(|&b| b == b'\n').filter(|l| l.windows(12).any(|w| w == b" refs/stage/")).count() as u64);
     loose + packed
 }
 
@@ -457,7 +463,7 @@ impl Publisher {
             return self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max);
         }
         let mut known = self.stats().mirrors.get(dir).map(|m| m.bytes);
-        if known.is_none() && dir.join("HEAD").exists() {
+        if known.is_none() && has_head(dir) {
             // On disk, not measured yet: put there after the start's inventory, not by a stage.
             known = Some(self.measure(dir));
         }
@@ -484,7 +490,7 @@ impl Publisher {
         if error.contains(" took over ") {
             self.stats().refresh_timeouts += 1;
         }
-        if dir.join("HEAD").exists() {
+        if has_head(dir) {
             self.measure(dir);
         } else {
             self.forget(dir);
@@ -494,7 +500,7 @@ impl Publisher {
     /// A stage's bundle was read: if it is heavy, the stage is noted, so that what it brought
     /// is collected once it can't be pushed (it failed, was cut off, or expired).
     pub(super) fn mark_heavy(&self, dir: &Path, bundle: &Path, id: &str) {
-        if std::fs::metadata(bundle).is_ok_and(|m| m.len() > self.policy.heavy_bundle) {
+        if std::fs::symlink_metadata(bundle).is_ok_and(|m| m.is_file() && m.len() > self.policy.heavy_bundle) {
             let mut state = read_state(dir).unwrap_or_default();
             state.heavy.push(id.to_string());
             write_state(dir, &state);
@@ -505,7 +511,7 @@ impl Publisher {
     /// as used, what a heavy stage that won't be pushed brought is collected, and the mirror
     /// is measured. `pushed`: the stage a push just pushed.
     pub(super) async fn after_job(&self, dir: &Path, pushed: Option<&str>) {
-        if !dir.join("HEAD").exists() {
+        if !has_head(dir) {
             self.forget(dir);
             return;
         }
@@ -560,7 +566,7 @@ impl Publisher {
     /// (the first upkeep pass may take minutes to reach them all, a gc at a time).
     pub fn inventory(&self) {
         for dir in self.mirror_dirs() {
-            if dir.join("HEAD").exists() {
+            if has_head(&dir) {
                 self.measure(&dir);
             }
         }
@@ -603,7 +609,7 @@ impl Publisher {
         let fs_free = self.fs().map(|(free, _)| free);
         let records = self.count_records();
         let mut st = self.stats();
-        st.mirrors.retain(|d, _| d.join("HEAD").exists());
+        st.mirrors.retain(|d, _| has_head(d));
         st.fs_free = fs_free;
         st.records = records;
     }
