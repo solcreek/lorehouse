@@ -1513,6 +1513,16 @@ mod tests {
         jail.fail_kills(false);
         s.stage_all(request("scout/st"), || {}).await.unwrap();
         assert_eq!(jail.free_uids(), 1);
+        // A mirror past a walk's caps (here, deeper than any git directory) isn't half
+        // chowned to a run: it is taken out of use.
+        let mut deep = s.dir().join("objects");
+        for _ in 0..140 {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let err = s.publisher.git.run(&s.dir(), &["for-each-ref"], GIT_LOCAL).await.unwrap_err();
+        assert!(err.contains("deep") && err.contains("taken out of use"), "{err}");
+        assert!(!has_head(&s.dir()));
     }
 
     /// The processes whose real uid is in git's range: (pid, uid).

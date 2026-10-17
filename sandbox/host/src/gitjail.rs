@@ -264,7 +264,14 @@ impl GitJail {
         let uid = lease.as_ref().map(|l| l.uid);
         let mut confined = Confined { lease, cgroup: None, net: None, trees: vec![dir.to_path_buf()], stuck, jail: self.clone() };
         if let Some(uid) = uid.filter(|_| !remove) {
-            own(dir, uid, uid).map_err(|e| format!("giving the mirror to its run's uid: {e}"))?;
+            // A tree that can't be walked whole within the caps (mirrorfs) is never half
+            // given to the run: it is taken out of use, as a cache that can't be trusted.
+            if let Err(e) = own(dir, uid, uid) {
+                if let Some(graveyard) = self.graveyard.get() {
+                    bury(dir, graveyard);
+                }
+                return Err(format!("giving the mirror to its run's uid: {e}; the mirror was taken out of use, stage again"));
+            }
         }
         if let Some(parent) = &self.cgroups {
             let cgroup = parent.join(format!("u{}", uid.unwrap_or(0)));
