@@ -260,11 +260,22 @@ describe("config", () => {
   });
 
   test("defaults: port 3000, claude-opus-5, both databases in the tenant's directory, empty channel allowlist", () => {
-    const c = loadConfig(base);
+    // The data directory defaults to the working directory, which is the checkout here, and
+    // a local `bun start` leaves a tenant's directory in it: read in an empty one instead.
+    const here = process.cwd();
+    const empty = mkdtempSync(join(tmpdir(), "lorehouse-defaults-"));
+    let c;
+    try {
+      process.chdir(empty);
+      c = loadConfig(base);
+      // No tenant yet in the working directory: a new one, its directory under it.
+      expect(c.tenant).toMatchObject({ source: "new", dataDir: process.cwd(), dir: join(process.cwd(), c.tenant.id) });
+    } finally {
+      process.chdir(here);
+      rmSync(empty, { recursive: true, force: true });
+    }
     expect(c.port).toBe(3000);
     expect(c.anthropic.model).toBe("claude-opus-5");
-    // No tenant yet in the working directory: a new one, its directory under it.
-    expect(c.tenant).toMatchObject({ source: "new", dataDir: process.cwd(), dir: join(process.cwd(), c.tenant.id) });
     expect(c.db).toMatchObject({ lorehouse: join(c.tenant.dir, "lorehouse.db"), sessions: join(c.tenant.dir, "sessions.db") });
     expect(c.agent.channels.size).toBe(0);
     expect(c.agent.dm).toBe("redirect");
