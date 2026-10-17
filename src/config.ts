@@ -90,7 +90,7 @@ export type GithubCredentials = { kind: "app"; appId: string; privateKey: string
 import { closeSync, openSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { normalizePem } from "./github-auth";
-import { dataDirOf, resolveTenant, type Move, type Tenant } from "./tenant";
+import { dataDirOf, ownsLegacyLayout, resolveTenant, type Move, type Tenant } from "./tenant";
 
 // Where the framework's sessions live when SESSIONS_DB is unset and LOREHOUSE_DB is set:
 // sessions.db beside LOREHOUSE_DB, so a turn parked on an Approve, or a durable automation, survives a
@@ -196,8 +196,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const lorehouseDb = explicitDb ?? join(tenant.dir, "lorehouse.db");
   const sessionsDb = env.SESSIONS_DB || (explicitDb ? sessionsDbFor(explicitDb) : join(tenant.dir, "sessions.db"));
   const upgrade: Move[] = [];
-  if (!explicitDb) upgrade.push({ from: join(tenant.dataDir, "lorehouse.db"), to: lorehouseDb });
-  if (!explicitDb && !env.SESSIONS_DB) upgrade.push({ from: join(tenant.dataDir, "sessions.db"), to: sessionsDb });
+  // Only the first tenant's: one made beside another never takes the old layout's files.
+  const legacy = !("problem" in resolved) && ownsLegacyLayout(tenant);
+  if (legacy && !explicitDb) upgrade.push({ from: join(tenant.dataDir, "lorehouse.db"), to: lorehouseDb });
+  if (legacy && !explicitDb && !env.SESSIONS_DB) upgrade.push({ from: join(tenant.dataDir, "sessions.db"), to: sessionsDb });
   const config: Config = {
     port: Number(env.PORT ?? 3000),
     slack: {

@@ -311,6 +311,49 @@ describe("an install laid out before tenants upgrades in place", () => {
     expect(lstatSync(join(d, "lorehouse.db")).isFile()).toBe(true);
   });
 
+  // The databases at the top of the data directory are the first tenant's. A tenant made
+  // beside another (TENANT_NEW=1) never takes them: not moved into its directory, not
+  // linked over, not set aside, not refused for the first one's rollback links.
+  describe("a second tenant leaves the old layout to the first", () => {
+    const listing = (d: string) => readdirSync(d).map((f) => `${f}:${lstatSync(join(d, f)).isSymbolicLink() ? "link" : "file"}`).sort();
+    const second = (d: string) => {
+      const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d, TENANT_ID: "globex", TENANT_NEW: "1" });
+      prepareTenant(config.tenant);
+      return { config, moved: upgradeLayout(config.db.upgrade) };
+    };
+
+    test("the first using LOREHOUSE_DB at the top: the second starts on its own files, the first's untouched", async () => {
+      const d = await todaysLayout();
+      const acme = loadConfig({ ...base, LOREHOUSE_DB: join(d, "lorehouse.db"), TENANT_ID: "acme" });
+      prepareTenant(acme.tenant);
+      const before = listing(d);
+      const { config, moved } = second(d);
+      expect(config.db.upgrade).toEqual([]);
+      expect(moved).toEqual([]);
+      expect(listing(d)).toEqual([...before, "globex:file"].sort());
+      expect(readdirSync(config.tenant.dir)).toEqual(["tenant.json"]);
+      expect(rows(join(d, "lorehouse.db"))).toBe(25);
+      // And on every later start of the second, without TENANT_NEW.
+      expect(loadConfig({ ...base, LOREHOUSE_DATA_DIR: d, TENANT_ID: "globex" }).db.upgrade).toEqual([]);
+      // The first still owns them: unsetting its LOREHOUSE_DB moves them into acme/.
+      const first = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d, TENANT_ID: "acme" });
+      expect(upgradeLayout(first.db.upgrade).map((m) => m.split(" ")[0])).toEqual(["lorehouse.db", "sessions.db"]);
+      expect(rows(first.db.lorehouse)).toBe(25);
+    });
+
+    test("the first already upgraded (its rollback links at the top): the second starts, and nothing is refused or touched", async () => {
+      const d = await todaysLayout();
+      const first = start(d);
+      const before = listing(d);
+      const { config, moved } = second(d);
+      expect(moved).toEqual([]);
+      expect(listing(d)).toEqual([...before, "globex:file"].sort());
+      expect(readdirSync(config.tenant.dir)).toEqual(["tenant.json"]);
+      expect(config.db.upgrade.map(planMove)).toEqual([]);
+      expect(rows(first.config.db.lorehouse)).toBe(25);
+    });
+  });
+
   test("a start that died part-way (the database moved, its side files not yet) finishes the move", async () => {
     const d = await todaysLayout();
     const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });

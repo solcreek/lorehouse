@@ -527,6 +527,26 @@ describe("the tenant", () => {
     }
   });
 
+  // The old layout's files are the first tenant's: a second one never moves them, so the
+  // doctor reports no upgrade for it (the start's own rule: ownsLegacyLayout).
+  test("a second tenant beside the first: no upgrade of the first's files, and nothing fails over its links", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "globex", TENANT_NEW: "1" });
+      expect(find(checks, "upgrade")).toEqual([]);
+      expect(find(checks, "LOREHOUSE_DB")[0]?.detail).toBe(`${dir}/globex/lorehouse.db (created on first start)`);
+      expect(checks.filter((c) => c.section === "storage" && c.level === "fail")).toEqual([]);
+      // As the first tenant, the same files are its to move.
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade").map((c) => c.level)).toEqual(["info"]);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
   test("a side file in both places is named: the next start sets the stale one aside", async () => {
     const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
     try {

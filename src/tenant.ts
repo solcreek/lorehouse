@@ -78,6 +78,21 @@ export function tenantsIn(dataDir: string): string[] {
   }).sort();
 }
 
+// Whether the old layout's files (<data>/lorehouse.db, <data>/sessions.db and their side
+// files, or the links a move left there) are this tenant's to move: they belong to the
+// first tenant only. One made beside another (TENANT_NEW=1) never moves, links over, sets
+// aside or refuses anything there; its tenant.json says so ("legacy": false), so it stays
+// that way on every later start. A tenant with no directory yet owns them only if no other
+// tenant's directory is there.
+export function ownsLegacyLayout(tenant: Tenant): boolean {
+  if (tenant.source === "throwaway") return false;
+  try {
+    return (JSON.parse(readFileSync(join(tenant.dir, MARKER), "utf8")) as { legacy?: unknown }).legacy !== false;
+  } catch {
+    return !tenantsIn(tenant.dataDir).some((id) => id !== tenant.id);
+  }
+}
+
 // Where the tenant id came from:
 //   configured  TENANT_ID
 //   found       the one tenant directory in the data directory
@@ -126,11 +141,13 @@ export function prepareTenant(tenant: Tenant): boolean {
   if (tenant.source === "throwaway") return false;
   const marker = join(tenant.dir, MARKER);
   if (existsSync(marker)) return false;
+  // Made beside another tenant (TENANT_NEW=1): the old layout's files aren't its own.
+  const legacy = ownsLegacyLayout(tenant);
   mkdirSync(tenant.dir, { recursive: true, mode: 0o700 });
   const tmp = `${marker}.${randomBytes(6).toString("hex")}.tmp`;
   const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
   try {
-    writeFileSync(fd, JSON.stringify({ id: tenant.id, created: new Date().toISOString() }) + "\n");
+    writeFileSync(fd, JSON.stringify({ id: tenant.id, created: new Date().toISOString(), ...(legacy ? {} : { legacy: false }) }) + "\n");
     fsyncSync(fd);
   } catch (e) {
     closeSync(fd);
