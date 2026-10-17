@@ -1095,7 +1095,7 @@ impl Publisher {
     /// commit the mirror stores under another's id doesn't come in as that id. Then the
     /// check runs there with git's view pinned to that repo (git_command): no commondir,
     /// grafts, shallow file, replace refs, alternates of the mirror's, commit-graph or lazy
-    /// fetch. Whatever the mirror holds can make the fetch fail, never the answer wrong.
+    /// fetch. Whatever the mirror holds can make the check fail and the push be refused, never the answer wrong.
     async fn follows(&self, dir: &Path, refname: &str, old: &str, sha: &str) -> Result<(), String> {
         let check = self.mirrors.join(".check").join(new_stage_id_at(self.now())?);
         std::fs::create_dir_all(check.parent().unwrap_or(&self.mirrors)).map_err(|e| format!("the check's repo: {e}"))?;

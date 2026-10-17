@@ -142,7 +142,9 @@ around sandboxd. So:
   in, so one stored under another's id doesn't arrive as that id. `merge-base
   --is-ancestor` then runs there with git's view pinned to that repo: no commondir, grafts,
   shallow file, replace refs, commit-graph or lazy fetch. Whatever a mirror holds can make
-  that fetch fail (the push is refused as "fetch first"), never make the answer wrong. The
+  the check fail and the push be refused (as "fetch first" when the commits can't be had as
+  themselves, or as "non-fast-forward" when, say, a planted shallow file cuts the history
+  short), never make the answer wrong. The
   push itself still goes from the mirror: the proxy pins its one update, and GitHub hashes
   what it receives.
 
