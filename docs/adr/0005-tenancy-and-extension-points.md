@@ -187,11 +187,14 @@ Anthropic are the first implementations, never assumptions in the core:
 - **Search and content tools get an audience filter** (the asker and the reply's
   audience, intersected), and saved sessions are filtered the same way before they're
   reused.
-  - Organization-wide visibility is the first case, and today's public-channels rule
-    already meets it.
-  - Access lists come with the first connector that has them, and that connector can't
-    ship before both filters do.
-  - This needs session redaction or filtering from June (junebuild/june#360 is related).
+- **Neither half holds today**, even for organization-wide material.
+  - The public-channels rule doesn't check every reader:
+    - a channel shared with another organization (Slack Connect) can be listed;
+    - a guest who can't open every listed channel can ask (#145).
+  - Saved sessions keep every turn's tool results. Material from a channel later turned
+    private or unlisted is still reused in later turns, until June supports redaction or
+    filtering (junebuild/june#360).
+  - The first connector with access lists can't ship before both are fixed.
 - **Skills move from `prompts/skills/` to tenant data**, with the shipped ones as seeds.
   `src/prompts.ts` keeps tool prompts (code), not tenant skills.
 - **Open questions before a cell is built**, each a spike:
