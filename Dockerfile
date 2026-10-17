@@ -19,6 +19,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/dist/lorehouse /usr/local/bin/lorehouse
-ENV PORT=3000 LOREHOUSE_DB=/data/lorehouse.db SESSIONS_DB=/data/sessions.db
+# The volume is the data directory: settings.json in it, the tenant's databases in
+# /data/<tenant>/ (src/tenant.ts). An image that set LOREHOUSE_DB and SESSIONS_DB here
+# kept them in /data itself: the first start of this one moves them, by rename.
+ENV PORT=3000 LOREHOUSE_DATA_DIR=/data
 EXPOSE 3000
 CMD ["lorehouse"]

@@ -30,7 +30,9 @@ ETC=/etc/lorehouse
 ENV_FILE=$ETC/lorehouse.env
 UNIT=/etc/systemd/system/lorehouse.service
 TUNNEL_UNIT=/etc/systemd/system/lorehouse-tunnel.service
-MANAGED='LOREHOUSE_DB|SESSIONS_DB|LOREHOUSE_TUNNEL|LOREHOUSE_PUBLIC_URL'
+# LOREHOUSE_DB and SESSIONS_DB were written by earlier versions: a re-run drops them, and
+# the next start moves the databases into the tenant's directory (src/tenant.ts).
+MANAGED='LOREHOUSE_DATA_DIR|LOREHOUSE_DB|SESSIONS_DB|LOREHOUSE_TUNNEL|LOREHOUSE_PUBLIC_URL'
 
 env_src='' tunnel='' public_url='' start=1 changed=''
 while [ $# -gt 0 ]; do
@@ -102,8 +104,7 @@ fi
 {
   grep -v -E "^[[:space:]]*(export[[:space:]]+)?($MANAGED)[[:space:]]*=|^# managed by install.sh" "$src" || true
   echo "# managed by install.sh"
-  echo "LOREHOUSE_DB=$DATA/lorehouse.db"
-  echo "SESSIONS_DB=$DATA/sessions.db"
+  echo "LOREHOUSE_DATA_DIR=$DATA"
   if [ "$tunnel" = quick ]; then echo "LOREHOUSE_TUNNEL=quick"; fi
   if [ -n "$public_url" ]; then echo "LOREHOUSE_PUBLIC_URL=$public_url"; fi
 } > "$tmp/env"
