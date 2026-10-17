@@ -302,6 +302,30 @@ export function upgradeLayout(moves: Move[]): string[] {
   return moved;
 }
 
+// What the next start would do with one database, by upgradeLayout's own rules, without
+// doing it (for the doctor):
+//   pending    still to move
+//   under-way  a move a start began: the next one finishes it (the database at its new
+//              place already, as the same file or with the old path a link to it, and
+//              something left to do)
+//   done       nothing to do (moved, or a new install)
+// `refusal`: why the start would refuse instead.
+export type MovePlan = { state: "pending" | "under-way" | "done"; refusal?: string };
+export function planMove({ from, to }: Move): MovePlan {
+  const main = standing(from, to);
+  if (main === "other") return { state: "done", refusal: otherLink(from, to).message };
+  if (main === "none") return { state: "done" };
+  const sideOther = SIDE_FILES.find((s) => standing(from + s, to + s) === "other");
+  if (sideOther) return { state: main === "file" ? "pending" : "under-way", refusal: otherLink(from + sideOther, to + sideOther).message };
+  if (main === "file") {
+    if (lexists(to) && !sameFile(from, to)) return { state: "pending", refusal: `both ${from} and ${to} exist: keep the one that holds the data (stop the app, move or remove the other), then start again` };
+    return { state: lexists(to) || lexists(linkTemp(from)) ? "under-way" : "pending" };
+  }
+  if (!lexists(to)) return { state: "done", refusal: `${from} is a symlink to ${to}, which doesn't exist: put the database back there (or the link's target back at ${from}), then start again` };
+  const left = SIDE_FILES.some((s) => standing(from + s, to + s) === "file" || lexists(linkTemp(from + s))) || lexists(linkTemp(from));
+  return { state: left ? "under-way" : "done" };
+}
+
 // The databases still to move, for the doctor: those whose old path is a real file.
 export function pendingMoves(moves: Move[]): Move[] {
   return moves.filter((m) => standing(m.from, m.to) === "file");

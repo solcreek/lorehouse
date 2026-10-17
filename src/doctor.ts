@@ -35,7 +35,7 @@ import { pendingPurge, type ChannelPurge } from "./purge";
 import { loadEnv, readSettings } from "./settings";
 import { configToken, slackCall, urlMismatch, type ManagedManifest } from "./setup";
 import { describeEgress, typstRenderer } from "./tools/render-pdf";
-import { pendingMoves, tenantsIn } from "./tenant";
+import { pendingMoves, planMove, tenantsIn } from "./tenant";
 
 export type Level = "ok" | "warn" | "fail" | "info";
 export type Check = { section: string; name: string; level: Level; detail: string };
@@ -303,11 +303,15 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   }
   // An install laid out before tenants: what the next start moves, by link and rename, into the
   // tenant's directory (upgradeLayout).
-  if (moves.length) {
-    const clash = moves.filter((m) => existsSync(m.to));
-    if (clash.length) add("storage", "upgrade", "fail", clash.map((m) => `both ${m.from} and ${m.to} exist`).join("; ") + ": the start refuses until one of each is moved away");
-    else add("storage", "upgrade", "info", `the next start moves ${moves.map((m) => basename(m.from)).join(" and ")} (with their -wal and -shm) from ${tenant.dataDir} into ${tenant.source === "new" ? `${tenant.dataDir}/<id>` : tenant.dir}, leaving a symlink at each old path`);
+  // Judged by upgradeLayout's own rules (planMove): a move a start began is one the next
+  // finishes, and only what the start would refuse fails.
+  const plans = config.db.upgrade.map((m) => ({ m, plan: planMove(m) }));
+  for (const { m, plan } of plans) {
+    if (plan.refusal) add("storage", "upgrade", "fail", `${plan.refusal} (the start refuses until then)`);
+    else if (plan.state === "under-way") add("storage", "upgrade", "info", `${m.from}: a move under way; the next start finishes it`);
   }
+  const toMove = plans.filter(({ plan }) => plan.state === "pending" && !plan.refusal).map(({ m }) => m);
+  if (toMove.length) add("storage", "upgrade", "info", `the next start moves ${toMove.map((m) => basename(m.from)).join(" and ")} (with their -wal and -shm) from ${tenant.dataDir} into ${tenant.source === "new" ? `${tenant.dataDir}/<id>` : tenant.dir}, leaving a symlink at each old path`);
   for (const [key, configured] of [["LOREHOUSE_DB", config.db.lorehouse], ["SESSIONS_DB", config.db.sessions]] as const) {
     // A database still to move is checked where it is now.
     const path = moves.find((m) => m.to === configured)?.from ?? configured;

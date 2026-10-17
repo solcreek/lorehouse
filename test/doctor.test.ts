@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHmac, generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
 import { countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
@@ -487,6 +487,26 @@ describe("the tenant", () => {
 
   // A TENANT_ID with no directory yet, beside another tenant's, is a start on empty data:
   // refused, as the start refuses it, unless TENANT_NEW=1 asks for exactly that.
+  // An old layout whose move a start began and didn't finish: the database linked at its
+  // new place, the symlink not yet over the old path. The start finishes it, so the doctor
+  // says so, not that two copies clash (upgradeLayout's own rule: tenant.ts, planMove).
+  test("a move under way is named as one the next start finishes, never a clash", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      linkSync(`${dir}/lorehouse.db`, `${dir}/acme/lorehouse.db`);
+      symlinkSync("acme/lorehouse.db", `${dir}/lorehouse.db.tenant-link`);
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail")).toEqual([]);
+      expect(upgrade.map((c) => c.detail).join("\n")).toContain(`${dir}/lorehouse.db: a move under way; the next start finishes it`);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
   test("another tenant's directory beside this one's fails; TENANT_NEW=1 makes it a warning", async () => {
     const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
     try {
