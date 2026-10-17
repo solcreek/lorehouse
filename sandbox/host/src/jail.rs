@@ -1,7 +1,7 @@
 //! Every VM runs under Firecracker's jailer: its own uid and gid, chrooted into a
 //! directory that holds only its disk, its kernel and its sockets, and in its own cgroup
 //! with CPU, memory, pids and IO limits. Firecracker's default seccomp filter stays on.
-//! There is no way to run a VM without it (docs/adr/0003-sandbox-host-isolation.md).
+//! There is no way to run a VM without it (docs/adr/0003-sandbox-trust-boundaries.md).
 //!
 //! Layout, per sandbox (`<state>/<id>`):
 //!   rootfs.ext4                               the disk, kept across stops
