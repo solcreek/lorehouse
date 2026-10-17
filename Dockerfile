@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /src/dist/lorehouse /usr/local/bin/lorehouse
 # The volume is the data directory: settings.json in it, the tenant's databases in
 # /data/<tenant>/ (src/tenant.ts). An image that set LOREHOUSE_DB and SESSIONS_DB here
-# kept them in /data itself: the first start of this one moves them, by rename, and
+# kept them in /data itself: the first start of this one moves them (by link and rename), and
 # leaves a symlink at each old path, so rolling back to such an image still works.
 ENV PORT=3000 LOREHOUSE_DATA_DIR=/data
 EXPOSE 3000

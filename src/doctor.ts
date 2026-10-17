@@ -301,7 +301,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     // unless TENANT_NEW=1 says two tenants here are meant.
     if (others.length) add("storage", "other tenants", env.TENANT_NEW === "1" ? "warn" : "fail", `${tenant.dataDir} also holds ${others.join(", ")}, which this install doesn't serve (TENANT_ID=${tenant.id}): unset TENANT_ID, or set it to the one that holds the data` + (env.TENANT_NEW === "1" ? " (TENANT_NEW=1: meant)" : "; TENANT_NEW=1 if both are meant"));
   }
-  // An install laid out before tenants: what the next start moves, by rename, into the
+  // An install laid out before tenants: what the next start moves, by link and rename, into the
   // tenant's directory (upgradeLayout).
   if (moves.length) {
     const clash = moves.filter((m) => existsSync(m.to));

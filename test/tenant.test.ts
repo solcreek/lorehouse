@@ -2,7 +2,7 @@
 // laid out before tenants moved into its tenant's directory on the first start.
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
@@ -155,11 +155,6 @@ describe("an install laid out before tenants upgrades in place", () => {
     const r = Bun.spawnSync(["bun", "-e", `const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(path)}, { readwrite: true, create: false }); console.log(db.query("SELECT COUNT(*) AS n FROM walrows").get().n); db.close();`], { stderr: "inherit" });
     return Number(r.stdout.toString().trim());
   };
-  // What upgradeLayout reports moving for `name` in `d`, from the side files there now.
-  const movedLabel = (d: string, name: string) => {
-    const sides = ["-wal", "-shm", "-journal"].filter((s) => existsSync(join(d, name + s)));
-    return name + (sides.length ? ` (+ ${sides.join(", ")})` : "");
-  };
   // A start, as far as storage goes: the tenant resolved and made, then the upgrade.
   const start = (d: string) => {
     const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
@@ -167,17 +162,22 @@ describe("an install laid out before tenants upgrades in place", () => {
     return { config, moved: upgradeLayout(config.db.upgrade) };
   };
 
-  test("its files move into the tenant's directory, -wal and -shm with them, intact; a second start moves nothing", async () => {
+  test("its files move into the tenant's directory, checkpointed first, intact; a second start moves nothing", async () => {
     const d = await todaysLayout();
     const { config, moved } = start(d);
     const t = config.tenant.dir;
-    expect(moved).toEqual(["lorehouse.db (+ -wal, -shm)", "sessions.db (+ -wal, -shm)"]);
-    const FILES = ["lorehouse.db", "lorehouse.db-shm", "lorehouse.db-wal", "sessions.db", "sessions.db-shm", "sessions.db-wal"];
-    expect(readdirSync(t).sort()).toEqual([...FILES, "tenant.json"]);
+    // The checkpoint emptied each -wal; whether SQLite then removed the side files is its
+    // own business (Linux's does, macOS's keeps them): those left moved too.
+    expect(moved.map((m) => m.split(" ")[0])).toEqual(["lorehouse.db", "sessions.db"]);
+    const dbFiles = (dir: string) => readdirSync(dir).filter((f) => /^(lorehouse|sessions)\.db/.test(f)).sort();
+    expect(dbFiles(t)).toEqual(dbFiles(d));
+    expect(dbFiles(t)).toContain("lorehouse.db");
+    expect(dbFiles(t)).toContain("sessions.db");
+    for (const f of dbFiles(t).filter((f) => f.endsWith("-wal"))) expect([f, statSync(join(t, f)).size]).toEqual([f, 0]);
     // Each old path is now a symlink to the file's new place, relative to the data directory.
-    expect(readdirSync(d).sort()).toEqual([...FILES, config.tenant.id, "settings.json"].sort());
-    for (const f of FILES) expect([f, lstatSync(join(d, f)).isSymbolicLink(), readlinkSync(join(d, f))]).toEqual([f, true, `${config.tenant.id}/${f}`]);
-    // The writes only the WAL held are there: the -wal came along.
+    for (const f of dbFiles(d)) expect([f, lstatSync(join(d, f)).isSymbolicLink(), readlinkSync(join(d, f))]).toEqual([f, true, `${config.tenant.id}/${f}`]);
+    expect(readdirSync(d).filter((f) => !dbFiles(d).includes(f)).sort()).toEqual([config.tenant.id, "settings.json"].sort());
+    // The writes only the WAL held are there: checkpointed into the database before it moved.
     expect(rows(join(t, "lorehouse.db"))).toBe(25);
     expect(rows(join(t, "sessions.db"))).toBe(7);
     const k = openKnowledge(config.db.lorehouse);
@@ -224,20 +224,38 @@ describe("an install laid out before tenants upgrades in place", () => {
     expect(pendingMoves(forward.config.db.upgrade)).toEqual([]);
   });
 
-  test("a start that died between moving a file and linking it finishes on the next: the link made, nothing refused", async () => {
+  test("a start that died between linking a file at its new place and the symlink over the old path finishes: nothing refused", async () => {
     const d = await todaysLayout();
     const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
     prepareTenant(config.tenant);
-    // As moveOne leaves it when it dies after the rename: the temp link beside the old
-    // path, the file already in the tenant's directory.
+    // As moveOne leaves it when it dies there: the temp symlink beside the old path, and
+    // the old path still a real file, one file with the one at the new place.
     symlinkSync(`${config.tenant.id}/lorehouse.db`, join(d, "lorehouse.db.tenant-link"));
-    renameSync(join(d, "lorehouse.db"), config.db.lorehouse);
+    linkSync(join(d, "lorehouse.db"), config.db.lorehouse);
     expect(pendingMoves(config.db.upgrade).map((m) => m.from)).toEqual([join(d, "lorehouse.db"), join(d, "sessions.db")]);
-    expect(upgradeLayout(config.db.upgrade)).toEqual(["lorehouse.db (+ -wal, -shm)", "sessions.db (+ -wal, -shm)"]);
+    expect(upgradeLayout(config.db.upgrade).map((m) => m.split(" ")[0])).toEqual(["lorehouse.db", "sessions.db"]);
     expect(readlinkSync(join(d, "lorehouse.db"))).toBe(`${config.tenant.id}/lorehouse.db`);
     expect(existsSync(join(d, "lorehouse.db.tenant-link"))).toBe(false);
     expect(rows(config.db.lorehouse)).toBe(25);
     expect(upgradeLayout(config.db.upgrade)).toEqual([]);
+  });
+
+  // A start that died in the middle of moving the -wal (the -wal at its new place, the old
+  // path not yet a link), then a rollback: the old version opens <data>/lorehouse.db without
+  // that -wal, writes, and closes cleanly. The next start must never bring the -wal back
+  // beside the database: SQLite would replay those older frames over the rollback's pages.
+  test("a crash mid-move, a rollback's writes, then a start: none of the rollback's writes vanish", async () => {
+    const d = await todaysLayout();
+    const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
+    prepareTenant(config.tenant);
+    const t = config.tenant.dir;
+    symlinkSync(`${config.tenant.id}/lorehouse.db-wal`, join(d, "lorehouse.db-wal.tenant-link"));
+    renameSync(join(d, "lorehouse.db-wal"), join(t, "lorehouse.db-wal"));
+    const rollback = Bun.spawnSync(["bun", "-e", `const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(join(d, "lorehouse.db"))}); db.exec("PRAGMA journal_mode = WAL"); db.exec("CREATE TABLE other (n INTEGER, pad TEXT)"); for (let i = 0; i < 400; i++) db.query("INSERT INTO other VALUES (?, ?)").run(i, "x".repeat(200)); db.close();`], { stderr: "inherit" });
+    expect(rollback.exitCode).toBe(0);
+    upgradeLayout(config.db.upgrade);
+    const read = Bun.spawnSync(["bun", "-e", `const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(config.db.lorehouse)}); let n; try { n = db.query("SELECT COUNT(*) AS n FROM other").get().n; } catch (e) { n = String(e); } console.log(JSON.stringify({ n, ok: db.query("PRAGMA integrity_check").get().integrity_check })); db.close();`], { stderr: "inherit" });
+    expect(JSON.parse(read.stdout.toString())).toEqual({ n: 400, ok: "ok" });
   });
 
   test("an old path that is a symlink to somewhere else is refused, never followed or moved", async () => {
@@ -250,12 +268,16 @@ describe("an install laid out before tenants upgrades in place", () => {
     expect(existsSync(join(d, "elsewhere.db"))).toBe(true);
   });
 
-  test("a start that died part-way (the -wal moved, the database not yet) finishes the move", async () => {
+  test("a start that died part-way (the database moved, its side files not yet) finishes the move", async () => {
     const d = await todaysLayout();
     const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
     prepareTenant(config.tenant);
-    renameSync(join(d, "lorehouse.db-wal"), join(config.tenant.dir, "lorehouse.db-wal"));
-    expect(upgradeLayout(config.db.upgrade)).toEqual(["lorehouse.db (+ -shm)", "sessions.db (+ -wal, -shm)"]);
+    // As linkOver leaves the database, its -wal and -shm still real files at the old place.
+    linkSync(join(d, "lorehouse.db"), config.db.lorehouse);
+    rmSync(join(d, "lorehouse.db"));
+    symlinkSync(`${config.tenant.id}/lorehouse.db`, join(d, "lorehouse.db"));
+    expect(upgradeLayout(config.db.upgrade)).toEqual(["lorehouse.db (+ -wal, -shm)", expect.stringMatching(/^sessions\.db/)]);
+    for (const s of ["-wal", "-shm"]) expect(readlinkSync(join(d, `lorehouse.db${s}`))).toBe(`${config.tenant.id}/lorehouse.db${s}`);
     expect(rows(config.db.lorehouse)).toBe(25);
   });
 
@@ -280,15 +302,14 @@ describe("an install laid out before tenants upgrades in place", () => {
     // Its tenant is kept in the data directory all the same, and found by a later start
     // that unsets LOREHOUSE_DB: that one moves the files.
     expect(tenantsIn(d)).toEqual([config.tenant.id]);
-    const sides = ["-wal", "-shm", "-journal"].flatMap((s) => ["lorehouse.db", "sessions.db"].map((f) => f + s)).filter((f) => existsSync(join(d, f)));
-    const want = [movedLabel(d, "lorehouse.db"), movedLabel(d, "sessions.db")];
     const later = start(d);
     expect(later.config.tenant.id).toBe(config.tenant.id);
-    expect(later.moved).toEqual(want);
-    // Each side file that was there moved with its database, and none appeared from nowhere.
-    for (const f of sides) expect([f, existsSync(join(later.config.tenant.dir, f))]).toEqual([f, true]);
-    for (const f of ["-wal", "-shm", "-journal"].flatMap((s) => ["lorehouse.db", "sessions.db"].map((x) => x + s))) {
-      if (!sides.includes(f)) expect([f, existsSync(join(later.config.tenant.dir, f))]).toEqual([f, false]);
+    // Both databases moved; whichever side files the checkpoint left (SQLite's to decide:
+    // Linux's removes them, macOS's keeps them) moved too, each old path now a link to it,
+    // and nothing real is left at the old place.
+    expect(later.moved.map((m) => m.split(" ")[0])).toEqual(["lorehouse.db", "sessions.db"]);
+    for (const f of readdirSync(d).filter((f) => /^(lorehouse|sessions)\.db/.test(f))) {
+      expect([f, lstatSync(join(d, f)).isSymbolicLink(), existsSync(join(later.config.tenant.dir, f))]).toEqual([f, true, true]);
     }
     expect(rows(later.config.db.lorehouse)).toBe(25);
     expect(rows(later.config.db.sessions)).toBe(7);

@@ -19,8 +19,10 @@
 // reinstalled, or another chat platform is added, and it is known before anything asks Slack.
 //
 // An install laid out as before (<data>/lorehouse.db, <data>/sessions.db) upgrades in place
-// on its first start: each database moves into its tenant's directory by rename(2), its
-// -wal, -shm and -journal before it, then both directories are fsynced. Nothing is copied.
+// on its first start: each database is checkpointed where it is (its -wal emptied), then
+// moves into its tenant's directory by hard link and rename, its -wal, -shm and -journal
+// before it, the old path never missing; then both directories are fsynced. Nothing is
+// copied.
 // Each old path is left a symlink to the file's new place, so a version from before
 // tenants, rolled back to, opens the same database; removing the links is a later,
 // deliberate cleanup. A start that dies part-way finishes the move on the next one; a
@@ -28,7 +30,8 @@
 // it is and never moved.
 
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
 type Env = Record<string, string | undefined>;
@@ -140,8 +143,9 @@ export function prepareTenant(tenant: Tenant): boolean {
   return true;
 }
 
-// A database's files besides itself. Moved before it: until the database itself has moved,
-// the old place is the one to finish from, and a database never arrives without its WAL.
+// A database's files besides itself. Moved after it: SQLite won't open a database whose
+// -wal is a symlink, so the old path's side files stay real files until the database's old
+// path is a symlink (SQLite then uses the side files beside the file it points at).
 const SIDE_FILES = ["-wal", "-shm", "-journal"];
 
 // One database to move from the old layout into the tenant's directory.
@@ -150,9 +154,9 @@ export type Move = { from: string; to: string };
 export class UpgradeError extends Error {}
 
 // Where a file being moved stands, by what is at its old path (never followed):
-//   file   a real file: still to move
-//   moved  a symlink to its place in the tenant's directory: moved (dangling is fine:
-//          SQLite removes a -wal on close, and makes it again beside the target)
+//   file   a real file: still to move, or its move under way (a hard link of it at `to`)
+//   moved  a symlink to its place in the tenant's directory: moved (dangling is fine for a
+//          side file: SQLite removes a -wal on close, and makes it again beside the target)
 //   other  a symlink anywhere else: not ours to touch
 //   none   nothing
 type Standing = "file" | "moved" | "other" | "none";
@@ -174,83 +178,128 @@ const lexists = (p: string) => {
     return false;
   }
 };
-// The link made beside the old path before the rename, then renamed over it: until that
-// last rename, its being there says a move of this file is under way.
-const linkTemp = (from: string) => `${from}.tenant-link`;
-
-// One file: a symlink to its new place made beside it, the file renamed into the tenant's
-// directory, then the symlink renamed onto the old path. The old path is never a missing
-// file except between those two renames, and a start that died there finds the temp link
-// and finishes. Returns whether this start moved it.
-function moveOne(from: string, to: string): boolean {
-  const tmp = linkTemp(from);
-  const now = standing(from, to);
-  if (now === "moved") {
-    rmSync(tmp, { force: true });
+// Two names of one file: what `to` is while a move is under way (link(from, to), not yet
+// the symlink over `from`).
+function sameFile(a: string, b: string): boolean {
+  try {
+    const x = lstatSync(a), y = lstatSync(b);
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch {
     return false;
   }
-  if (now === "other") throw new UpgradeError(`${from} is a symlink, not to ${to}: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
-  if (now === "none") {
-    if (!lexists(tmp)) return false;
-    if (!lexists(to)) {
-      rmSync(tmp, { force: true }); // a link made, nothing renamed: nothing to finish
-      return false;
-    }
-    renameSync(tmp, from); // died between the renames: finish
-    return true;
+}
+// The symlink made beside the old path, then renamed over it once the file has its new name.
+const linkTemp = (from: string) => `${from}.tenant-link`;
+
+// Before anything moves, the database at its old path is checkpointed and its -wal
+// emptied, so it is complete by itself and normally only the database file moves; a -wal
+// that still holds frames afterwards means something else has it open.
+function checkpointAt(path: string): void {
+  let db: Database | undefined;
+  try {
+    db = new Database(path, { readwrite: true, create: false });
+    db.query("SELECT COUNT(*) FROM sqlite_master").get(); // a hot -journal is rolled back here
+    const r = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number } | null;
+    if (r?.busy) throw new UpgradeError(`${path} is in use (its checkpoint was blocked): stop whatever has it open, then start again`);
+  } catch (e) {
+    if (e instanceof UpgradeError) throw e;
+    throw new UpgradeError(`can't checkpoint ${path} before moving it: ${e instanceof Error ? e.message : e}`);
+  } finally {
+    db?.close();
   }
+  const wal = `${path}-wal`;
+  if (existsSync(wal) && statSync(wal).size > 0) throw new UpgradeError(`${wal} still holds frames after a checkpoint: stop whatever has ${path} open, then start again`);
+}
+
+// A side file that is no longer any database's own, renamed aside: never deleted, never
+// used. At the new place, before the database moves: once it is checkpointed at the old
+// path, the database is complete without it, and a -wal there would be replayed over newer
+// pages (a start that died mid-move, then a rollback that wrote without it). At the old
+// path, once the database has moved and the new place has its own: SQLite uses that one.
+function setAside(path: string): string {
+  const aside = `${path}.stale-${Date.now()}`;
+  renameSync(path, aside);
+  return aside;
+}
+
+// One file: a symlink to its new place made beside the old path, a hard link of the file
+// at the new place (unless it is there already: a move under way), then the symlink
+// renamed over the old path. The old path is never missing (a version from before tenants
+// always finds the file there), and nothing is copied. A start that died between the two
+// finds the old path still a real file, the same file as the one at `to`, and finishes.
+function linkOver(from: string, to: string): void {
+  const tmp = linkTemp(from);
   rmSync(tmp, { force: true });
   symlinkSync(relative(dirname(from), to), tmp);
   try {
-    renameSync(from, to);
+    if (!lexists(to)) linkSync(from, to);
   } catch (e) {
     rmSync(tmp, { force: true });
-    if ((e as NodeJS.ErrnoException).code === "EXDEV") throw new UpgradeError(`${from} and ${dirname(to)} are on different filesystems: a rename can't move it, and it is never copied. Move it yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EXDEV") throw new UpgradeError(`${from} and ${dirname(to)} are on different filesystems: it can't be moved by name, and it is never copied. Move it yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
+    if (code === "EPERM" || code === "ENOTSUP") throw new UpgradeError(`${dirname(to)}'s filesystem doesn't take hard links (${code}): move ${from} yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
     throw e;
   }
   renameSync(tmp, from);
-  return true;
 }
 
-// Moves each database still at its old place, with its side files, by rename only, and
-// leaves at each old path a symlink to the file's new place; then fsyncs both directories.
-// The symlinks keep a version from before tenants working: it still names the old paths,
-// and SQLite opens the file a symlink points at (its -wal and -shm go beside that), so a
-// rollback finds the same database, and a later start finds every file moved already.
-// Refuses, moving nothing more, where the tenant's directory already has a file by that
-// name and the old path holds a real one (two copies: an operator decides which is the
-// data), or the rename would cross filesystems (it would be a copy). Returns what moved, as
-// "lorehouse.db (+ -wal, -shm)". Run before either database is opened.
+const otherLink = (from: string, to: string) => new UpgradeError(`${from} is a symlink, not to ${to}: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
+
+// Moves each database still at its old place into the tenant's directory, and leaves at
+// each old path a symlink to the file's new place; then fsyncs both directories:
+//   1. the database is checkpointed at its old path, so its -wal is empty and it is
+//      complete by itself;
+//   2. side files at the new place that aren't the old path's own are set aside;
+//   3. the database moves (linkOver), then its side files.
+// Nothing is copied. The symlinks keep a version from before tenants working: it still
+// names the old paths, and SQLite opens the file a symlink points at (its -wal and -shm go
+// beside that), so a rollback finds the same database, and a later start finds every file
+// moved already. Refuses, moving nothing more, where the tenant's directory already has
+// another database by that name (two copies: an operator decides which is the data), or
+// the move would cross filesystems. Returns what moved, as "lorehouse.db (+ -wal, -shm)",
+// and any stale side file set aside. Run before either database is opened.
 export function upgradeLayout(moves: Move[]): string[] {
   const moved: string[] = [];
   const dirs = new Set<string>();
   for (const { from, to } of moves) {
     const main = standing(from, to);
-    if (main === "moved" && !lexists(linkTemp(from))) continue; // moved already
-    if (main === "none" && !lexists(linkTemp(from))) continue; // a new install
-    if (main === "other") throw new UpgradeError(`${from} is a symlink, not to ${to}: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
-    const files = [...SIDE_FILES, ""];
-    for (const s of files) {
-      if (standing(from + s, to + s) === "file" && lexists(to + s)) {
-        throw new UpgradeError(s
-          ? `both ${from + s} and ${to + s} exist: keep the one that belongs to ${from} (stop the app, move or remove the other), then start again`
-          : `both ${from} and ${to} exist: keep the one that holds the data (stop the app, move or remove the other), then start again`);
+    if (main === "none") continue; // a new install
+    if (main === "other") throw otherLink(from, to);
+    const aside: string[] = [];
+    let itself = false;
+    if (main === "file") {
+      if (lexists(to) && !sameFile(from, to)) throw new UpgradeError(`both ${from} and ${to} exist: keep the one that holds the data (stop the app, move or remove the other), then start again`);
+      checkpointAt(from);
+      mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
+      for (const s of SIDE_FILES) if (lexists(to + s) && !sameFile(from + s, to + s)) aside.push(setAside(to + s));
+      linkOver(from, to);
+      itself = true;
+    } else rmSync(linkTemp(from), { force: true });
+    const sides: string[] = [];
+    for (const s of SIDE_FILES) {
+      const now = standing(from + s, to + s);
+      if (now === "other") throw otherLink(from + s, to + s);
+      if (now !== "file") {
+        rmSync(linkTemp(from + s), { force: true });
+        continue;
+      }
+      if (lexists(to + s) && !sameFile(from + s, to + s)) aside.push(setAside(from + s));
+      else {
+        linkOver(from + s, to + s);
+        sides.push(s);
       }
     }
-    mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
-    const sides = SIDE_FILES.filter((s) => moveOne(from + s, to + s));
-    const itself = moveOne(from, to);
-    dirs.add(dirname(from)).add(dirname(to));
+    if (itself || sides.length || aside.length) dirs.add(dirname(from)).add(dirname(to));
     if (itself || sides.length) moved.push(basename(to) + (sides.length ? ` (+ ${sides.join(", ")})` : ""));
+    for (const x of aside) moved.push(`a stale ${basename(x).replace(/\.stale-\d+$/, "")} set aside as ${x}`);
   }
   for (const dir of dirs) syncDir(dir);
   return moved;
 }
 
-// The databases still to move, for the doctor: those whose old path is a real file, or
-// whose move is under way.
+// The databases still to move, for the doctor: those whose old path is a real file.
 export function pendingMoves(moves: Move[]): Move[] {
-  return moves.filter((m) => standing(m.from, m.to) === "file" || lexists(linkTemp(m.from)));
+  return moves.filter((m) => standing(m.from, m.to) === "file");
 }
 
 // A sandbox id for one thread of this tenant: "<tenant>.<session>", the session's

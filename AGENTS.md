@@ -120,9 +120,10 @@ sandbox ids are `<id>.<session>` (`sandboxIdFor`), every console line starts
 never shares a table with another's: its files are the scope, so ids inside them
 (`slack:<channel>:<ts>`, usage rows, jobs) carry no tenant. Something written to disk goes
 in the tenant's directory; something keyed outside its files (a sandbox host, a queue)
-carries the id. The old layout moves in on start by rename (`upgradeLayout`), before
-either database is opened, leaving a symlink at each old path so a rollback opens the same
-files; a `LOREHOUSE_DB`/`SESSIONS_DB` set explicitly is never moved.
+carries the id. The old layout moves in on start (`upgradeLayout`), before either database
+is opened: checkpointed, then by hard link and rename, leaving a symlink at each old path
+so a rollback opens the same files; a `LOREHOUSE_DB`/`SESSIONS_DB` set explicitly is never
+moved.
 
 **Sandbox (experimental).** Code tools (`src/tools/workspace.ts`, `clone.ts`,
 `pull-request.ts`) are on only with `SANDBOX_RUNNER_TOKEN` (hosts connect *out* to

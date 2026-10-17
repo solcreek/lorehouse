@@ -167,7 +167,7 @@ let
         "PORT=3000"
         # The volume is the data directory: settings.json in it, the tenant's databases in
         # /data/<tenant>/ (src/tenant.ts). Images that set LOREHOUSE_DB and SESSIONS_DB
-        # kept them in /data itself: the first start of this one moves them, by rename, and
+        # kept them in /data itself: the first start of this one moves them (by link and rename), and
         # leaves a symlink at each old path, so rolling back to such an image still works.
         "LOREHOUSE_DATA_DIR=/data"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
