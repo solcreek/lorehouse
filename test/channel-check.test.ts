@@ -132,7 +132,7 @@ describe("lookUpChannel", () => {
 
   test("Slack's answer about a channel is definite; an outage isn't", () => {
     const failed = (error: string) => ({ channel: "C1", public: false as const, reason: "lookup_failed" as const, error });
-    for (const e of ["channel_not_found", "missing_scope", "not_in_channel"]) expect(isDefiniteFailure(failed(e))).toBe(true);
+    for (const e of ["channel_not_found", "missing_scope", "not_in_channel", "Slack didn't say whether it is shared"]) expect(isDefiniteFailure(failed(e))).toBe(true);
     for (const e of ["http_503", "ratelimited", "fatal_error", "no answer in 10 s", "Unable to connect"]) expect(isDefiniteFailure(failed(e))).toBe(false);
     expect(isDefiniteFailure(classifyChannel("C1", PUBLIC))).toBe(false);
   });
@@ -257,6 +257,19 @@ describe("ingest looks channels up", () => {
     expect(ing.isClosed("C1")).toBe(true);
     expect(ing.isClosed("C2")).toBe(true);
     expect(ing.status().channels).toMatchObject({ C1: { closed: "shared" }, C2: { closed: "shared" } });
+  });
+
+  test("an answer that leaves out is_shared (or another field) closes the channel at the recheck, as the start refuses it", async () => {
+    const { api, info } = readingApi({ C1: PUBLIC, C2: PUBLIC });
+    const ing = ingester(api, ["C1", "C2"]);
+    await ing.start();
+    const { is_shared: _s, ...noShared } = PUBLIC as ChannelInfo & { is_shared?: boolean };
+    info.C1 = noShared;
+    const { is_archived: _a, ...noArchived } = PUBLIC as ChannelInfo & { is_archived?: boolean };
+    info.C2 = noArchived;
+    expect(await ing.recheckChannels()).toEqual([]);
+    expect(ing.isClosed("C1")).toBe(true);
+    expect(ing.isClosed("C2")).toBe(true);
   });
 
   // What Slack likely answers for a channel turned private, to a token without groups:read.

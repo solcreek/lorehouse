@@ -61,6 +61,9 @@ export type ChannelVerdict =
 // is_archived and is_shared present and false, shared with no one (see above), and
 // is_channel true (a conversation of a kind this doesn't know is not vouched for).
 // Anything Slack left unsaid fails closed.
+// The start of every verdict on an answer that lacks a field classifyChannel needs.
+const INCOMPLETE = "Slack didn't say";
+
 export function classifyChannel(channel: string, info: ChannelInfo | undefined): ChannelVerdict {
   if (!info || typeof info !== "object") return { channel, public: false, reason: "lookup_failed", error: "Slack's answer had no channel" };
   const name = typeof info.name === "string" && info.name ? info.name : undefined;
@@ -68,22 +71,25 @@ export function classifyChannel(channel: string, info: ChannelInfo | undefined):
   if (info.is_im) return { ...base, public: false, reason: "dm" };
   if (info.is_mpim) return { ...base, public: false, reason: "group_dm" };
   if (info.is_private || info.is_group) return { ...base, public: false, reason: "private" };
-  if (info.is_private !== false) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say whether it is private" };
-  if (info.is_channel !== true) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say it is a channel" };
+  if (info.is_private !== false) return { ...base, public: false, reason: "lookup_failed", error: `${INCOMPLETE} whether it is private` };
+  if (info.is_channel !== true) return { ...base, public: false, reason: "lookup_failed", error: `${INCOMPLETE} it is a channel` };
   if (info.is_archived) return { ...base, public: false, reason: "archived" };
-  if (info.is_archived !== false) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say whether it is archived" };
+  if (info.is_archived !== false) return { ...base, public: false, reason: "lookup_failed", error: `${INCOMPLETE} whether it is archived` };
   if (info.is_ext_shared) return { ...base, public: false, reason: "shared", sharing: "external" };
   if (info.is_pending_ext_shared) return { ...base, public: false, reason: "shared", sharing: "pending_external" };
   if (info.is_org_shared) return { ...base, public: false, reason: "shared", sharing: "org" };
   if (info.is_shared) return { ...base, public: false, reason: "shared", sharing: "other" };
-  if (info.is_shared !== false) return { ...base, public: false, reason: "lookup_failed", error: "Slack didn't say whether it is shared" };
+  if (info.is_shared !== false) return { ...base, public: false, reason: "lookup_failed", error: `${INCOMPLETE} whether it is shared` };
   return { ...base, public: true };
 }
 
 // Errors that are Slack's answer about this channel, as opposed to an outage (http_5xx,
 // ratelimited, fatal_error, no answer): the channel isn't one this token may see as public.
+// An answer that came back but left out what classifyChannel needs (INCOMPLETE) is Slack's
+// answer too, not an outage: a running app closes the channel on it, as the start refuses.
 const DEFINITE = new Set(["channel_not_found", "missing_scope", "not_in_channel", "method_not_supported_for_channel_type"]);
-export const isDefiniteFailure = (v: ChannelVerdict): boolean => !v.public && v.reason === "lookup_failed" && DEFINITE.has(v.error);
+export const isDefiniteFailure = (v: ChannelVerdict): boolean =>
+  !v.public && v.reason === "lookup_failed" && (DEFINITE.has(v.error) || v.error.startsWith(INCOMPLETE));
 
 export const LOOKUP_TIMEOUT_MS = 10_000;
 
