@@ -33,7 +33,7 @@ import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
-import { mayStartTurn, members, refusalText, type Membership } from "./members";
+import { decideTurn, mayStartTurn, members, refusalText, type Membership } from "./members";
 import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, reconcileAsks, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
 import { cachedNames } from "./ingest/slack-users";
 import { pullRequestTool } from "./tools/pull-request";
@@ -247,8 +247,12 @@ export async function createApp(config: Config) {
     respondWhen: (e) => {
       if (!shouldRespond(e)) return false;
       // Fails closed: a sender not looked up, or not a full member, gets one line instead.
+      // The channel is checked again first: the lookup awaited Slack, and an hourly recheck
+      // may have closed the channel meanwhile (decideTurn).
       const verdict = e.user?.id ? memberCheck.peek(e.user.id) : undefined;
-      if (!verdict?.member) {
+      const decision = decideTurn(e, listed, verdict);
+      if (decision === "skip") return false;
+      if (decision === "refuse") {
         refuse(e, verdict);
         return false;
       }

@@ -133,3 +133,12 @@ export function members(api: SlackApi, opts: { now?: () => number; ttlMs?: numbe
     },
   };
 }
+
+// What respondWhen does with an event that may start a turn, decided after the asker's
+// lookup has finished (which awaits Slack): skip it when its channel was closed meanwhile
+// (an hourly recheck found it private or shared, so nothing more is said there), refuse
+// an asker who isn't a full member, else answer. DMs aren't listed channels.
+export function decideTurn(e: { channelId: string; channelType?: string }, listed: { has(channel: string): boolean }, verdict: Membership | undefined): "answer" | "refuse" | "skip" {
+  if (e.channelType !== "im" && !listed.has(e.channelId)) return "skip";
+  return verdict?.member ? "answer" : "refuse";
+}

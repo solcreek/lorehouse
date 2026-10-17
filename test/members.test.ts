@@ -2,7 +2,7 @@
 // workspaces can't open every channel an answer may quote.
 
 import { describe, expect, test } from "bun:test";
-import { classifyUser, mayStartTurn, members, refusalText, type UserInfo } from "../src/members";
+import { classifyUser, decideTurn, mayStartTurn, members, refusalText, type UserInfo } from "../src/members";
 import { SlackApiError, type SlackApi } from "../src/slack-api";
 
 const MEMBER: UserInfo = { id: "U1", team_id: "T1", deleted: false, is_restricted: false, is_ultra_restricted: false };
@@ -124,5 +124,24 @@ describe("members", () => {
     expect(m.peek("U3")).toMatchObject({ member: true });
     await m.check("U1", "T1");
     expect(calls).toEqual(["U1", "U2", "U3", "U1"]);
+  });
+});
+
+describe("decideTurn", () => {
+  const member = { user: "U1", member: true } as const;
+  const guest = { user: "UG1", member: false, reason: "guest" } as const;
+  test("a channel closed while the asker was looked up is skipped: no answer, and no refusal posted there", () => {
+    const open = new Set(["C1"]);
+    const listed = { has: (c: string) => open.has(c) };
+    expect(decideTurn({ channelId: "C1" }, listed, member)).toBe("answer");
+    open.delete("C1"); // an hourly recheck closed it while users.info was pending
+    expect(decideTurn({ channelId: "C1" }, listed, member)).toBe("skip");
+    expect(decideTurn({ channelId: "C1" }, listed, guest)).toBe("skip");
+  });
+  test("a non-member, or no verdict at all, is refused; DMs aren't listed channels", () => {
+    const listed = { has: () => false };
+    expect(decideTurn({ channelId: "D1", channelType: "im" }, listed, member)).toBe("answer");
+    expect(decideTurn({ channelId: "D1", channelType: "im" }, listed, guest)).toBe("refuse");
+    expect(decideTurn({ channelId: "D1", channelType: "im" }, listed, undefined)).toBe("refuse");
   });
 });
