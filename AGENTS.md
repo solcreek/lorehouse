@@ -109,8 +109,19 @@ breaks bare `@here`/`@channel`/`@everyone` too, with an invisible U+2060 after t
 
 **Configuration** (`src/settings.ts`, `src/config.ts`): per key, first non-empty of the
 process env, `LOREHOUSE_ENV_FILE` (default `/etc/lorehouse/lorehouse.env`, written by
-`scripts/install.sh`), then `settings.json` beside the DB (written by `lorehouse setup`
-and the OAuth install).
+`scripts/install.sh`), then `settings.json` in the data directory (written by `lorehouse
+setup` and the OAuth install).
+
+**Tenancy** (`src/tenant.ts`, ADR 0005 §1). A single-tenant install is the case with one
+tenant. Its id (`TENANT_ID`, else the one `<data>/<id>/tenant.json`, else new) goes in
+every path, key, log line and job: the databases default to `<LOREHOUSE_DATA_DIR>/<id>/`,
+sandbox ids are `<id>.<session>` (`sandboxIdFor`), every console line starts
+`tenant=<id>` (`logAsTenant`), and `/status` and the admin API name it. A tenant's content
+never shares a table with another's: its files are the scope, so ids inside them
+(`slack:<channel>:<ts>`, usage rows, jobs) carry no tenant. Something written to disk goes
+in the tenant's directory; something keyed outside its files (a sandbox host, a queue)
+carries the id. The old layout moves in on start by rename (`upgradeLayout`), before
+either database is opened; a `LOREHOUSE_DB`/`SESSIONS_DB` set explicitly is never moved.
 
 **Sandbox (experimental).** Code tools (`src/tools/workspace.ts`, `clone.ts`,
 `pull-request.ts`) are on only with `SANDBOX_RUNNER_TOKEN` (hosts connect *out* to
