@@ -360,19 +360,8 @@ impl Drop for Confined {
 /// files are the previous run's (another uid), or sandboxd's own (a bundle, a new mirror).
 fn own(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    fn walk(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let meta = entry.metadata()?; // doesn't follow a link
-            if meta.uid() != uid || meta.gid() != gid {
-                std::os::unix::fs::lchown(entry.path(), Some(uid), Some(gid))?;
-            }
-            if meta.is_dir() {
-                walk(&entry.path(), uid, gid)?;
-            }
-        }
-        Ok(())
-    }
+    // The mirror's own directory is sandboxd's to name (its parent is root's); what is in it
+    // is a run's, walked through mirrorfs, each entry chowned by name, a link as itself.
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.is_dir() {
         return Err(std::io::Error::other(format!("{} isn't a directory", dir.display())));
@@ -380,7 +369,15 @@ fn own(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     if meta.uid() != uid || meta.gid() != gid {
         std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
     }
-    walk(dir, uid, gid)
+    let mut failed = None;
+    crate::mirrorfs::Mirror::open(dir)?.walk(|_, at, name, st| {
+        if (st.uid != uid || st.gid != gid) && failed.is_none() {
+            if let Err(e) = crate::mirrorfs::chown_at(at, name, uid, gid) {
+                failed = Some(e);
+            }
+        }
+    })?;
+    failed.map_or(Ok(()), Err)
 }
 
 fn cstr(p: &Path) -> Result<CString, String> {

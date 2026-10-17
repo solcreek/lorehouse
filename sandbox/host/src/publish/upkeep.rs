@@ -37,7 +37,8 @@
 //! link sandboxd would write through. (It was the mirror's `sandboxd.json` before: that
 //! file is removed when the mirror's state is next written.)
 
-use super::{expired, has_head, read_in_mirror, remove_mirror, Failure, Publisher, StageRecord};
+use super::{expired, has_head, remove_mirror, Failure, Publisher, StageRecord};
+use crate::mirrorfs::{Kind, Mirror};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -119,26 +120,21 @@ pub struct RealDisk;
 impl Disk for RealDisk {
     fn usage(&self, dir: &Path) -> (u64, u64) {
         // Garbage by the names remove_garbage() goes by, each only where that file lives (a
-        // branch may be called tmp_pack_x).
-        fn walk(top: &Path, place: &Path, sum: &mut (u64, u64)) {
-            let packs = place == top.join("objects").join("pack");
-            for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
-                // DirEntry::metadata doesn't follow a symlink.
-                let Ok(meta) = entry.metadata() else { continue };
-                if meta.is_dir() {
-                    walk(top, &entry.path(), sum);
-                    continue;
-                }
-                sum.0 += meta.len();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_"))) || (place == top && name.starts_with("stage-") && name.ends_with(".bundle")) {
-                    sum.1 += meta.len();
-                }
-            }
-        }
+        // branch may be called tmp_pack_x). Through mirrorfs: a link is counted as itself,
+        // never what it names.
         let mut sum = (0, 0);
-        walk(dir, dir, &mut sum);
+        let Ok(mirror) = Mirror::open(dir) else { return sum };
+        let _ = mirror.walk(|place, _, name, st| {
+            if st.kind == Kind::Dir {
+                return;
+            }
+            sum.0 += st.len;
+            let name = name.to_string_lossy();
+            let packs = place == Path::new("objects/pack");
+            if (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_"))) || (place.as_os_str().is_empty() && name.starts_with("stage-") && name.ends_with(".bundle")) {
+                sum.1 += st.len;
+            }
+        });
         sum
     }
 
@@ -216,9 +212,9 @@ const PACKED_REFS_CAP: u64 = 64 << 20;
 /// sandboxd reads in a mirror"): a refs/stage that is a link, or a packed-refs that isn't a
 /// regular file under its cap, counts nothing. For the status only.
 pub(super) fn count_stage_refs(dir: &Path) -> u64 {
-    let stage = dir.join("refs").join("stage");
-    let loose = if std::fs::symlink_metadata(&stage).is_ok_and(|m| m.is_dir()) { std::fs::read_dir(&stage).map_or(0, |d| d.flatten().count() as u64) } else { 0 };
-    let packed = read_in_mirror(&dir.join("packed-refs"), PACKED_REFS_CAP).map_or(0, |p| p.split(|&b| b == b'\n').filter(|l| l.windows(12).any(|w| w == b" refs/stage/")).count() as u64);
+    let Ok(mirror) = Mirror::open(dir) else { return 0 };
+    let loose = mirror.count("refs/stage").unwrap_or(0);
+    let packed = mirror.read("packed-refs", PACKED_REFS_CAP).map_or(0, |p| p.split(|&b| b == b'\n').filter(|l| l.windows(12).any(|w| w == b" refs/stage/")).count() as u64);
     loose + packed
 }
 
@@ -500,7 +496,8 @@ impl Publisher {
     /// A stage's bundle was read: if it is heavy, the stage is noted, so that what it brought
     /// is collected once it can't be pushed (it failed, was cut off, or expired).
     pub(super) fn mark_heavy(&self, dir: &Path, bundle: &Path, id: &str) {
-        if std::fs::symlink_metadata(bundle).is_ok_and(|m| m.is_file() && m.len() > self.policy.heavy_bundle) {
+        let name = bundle.strip_prefix(dir).ok().and_then(Path::to_str);
+        if name.and_then(|n| Mirror::open(dir).ok()?.stat(n)).is_some_and(|st| st.kind == Kind::File && st.len > self.policy.heavy_bundle) {
             let mut state = read_state(dir).unwrap_or_default();
             state.heavy.push(id.to_string());
             write_state(dir, &state);

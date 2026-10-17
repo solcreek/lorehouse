@@ -34,6 +34,7 @@ pub use upkeep::{Policy, GIB};
 use upkeep::{Disk, RealDisk, Stats};
 
 use crate::gitjail::{self, Confined, GitJail};
+use crate::mirrorfs::{self, Mirror};
 use crate::vm::{self, Manager};
 use crate::vsock;
 use bytes::Bytes;
@@ -621,38 +622,18 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 
 // ── What sandboxd reads in a mirror ────────────────────────────────────────────────────
 //
-// A mirror's contents are written by its git runs, which run as an untrusted uid
-// (gitjail.rs). sandboxd (root, outside any jail) touches a mirror only while no run of it
-// is alive (under the mirror's lock, runs killed whole before it is released), so nothing
-// changes under it, but anything a run left there may be planted: a link anywhere on the
-// host, a FIFO no one writes, a file of any size. So sandboxd, in a mirror:
-// - never follows a link: presence is lstat (has_head), walks use DirEntry's no-follow
-//   metadata and recurse only into real directories (remove_garbage, RealDisk::usage,
-//   gitjail::own), a directory is read only after lstat says it is one;
-// - opens a file only with read_in_mirror: O_NOFOLLOW | O_NONBLOCK, fstat'd to be a
-//   regular file, and read up to a cap;
-// - writes only new files (create_new: the bundle) and removes with unlink (remove_file,
-//   remove_dir_all), neither of which follows a link;
-// - leaves everything else, refs and objects included, to a jailed git run.
+// A mirror is written by its git runs, an untrusted uid (gitjail.rs). sandboxd reads one
+// only through mirrorfs::Mirror: every path resolved under the mirror's root, never leaving
+// it, never through a link (as the file or as a directory on the way), a file opened
+// non-blocking, a regular one only, up to a cap. It writes there only new files
+// (create_new: the bundle, a direct child of the root) and removes them by unlink, which
+// doesn't follow a link; a whole mirror goes with remove_dir_all, which doesn't either. It
+// decides nothing about history from what a mirror holds: a push's fast-forward check runs
+// in a fresh repo (Publisher::follows). Refs and objects are a jailed git run's to read.
 
-/// A file in a mirror, as sandboxd reads one: not through a link, not a FIFO or device
-/// (opened O_NOFOLLOW | O_NONBLOCK, then fstat'd), and at most `cap` bytes. None if it
-/// isn't there, isn't a regular file, or is longer.
-pub(crate) fn read_in_mirror(path: &Path, cap: u64) -> Option<Vec<u8>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
-    let meta = f.metadata().ok()?;
-    if !meta.is_file() || meta.len() > cap {
-        return None;
-    }
-    let mut out = Vec::new();
-    f.take(cap + 1).read_to_end(&mut out).ok()?;
-    (out.len() as u64 <= cap).then_some(out)
-}
-
-/// Whether a mirror has a HEAD (git made it one), without following it if it is a link.
+/// Whether a mirror has a HEAD (git made it one): there as anything, a link included.
 pub(crate) fn has_head(dir: &Path) -> bool {
-    std::fs::symlink_metadata(dir.join("HEAD")).is_ok()
+    Mirror::open(dir).is_ok_and(|m| m.exists("HEAD"))
 }
 
 /// Remove a mirror. Its owner's directory stays: another repo of the same owner may be
@@ -683,28 +664,21 @@ impl Drop for NewMirror<'_> {
 /// matched only where that file lives: a branch may be called `tmp_pack_x` or
 /// `stage-x.bundle`, but no ref name ends in `.lock`. Whether it removed a lock file.
 fn remove_garbage(dir: &Path, now: SystemTime) -> bool {
-    fn walk(top: &Path, place: &Path, now: SystemTime, unlocked: &mut bool) {
-        let packs = place == top.join("objects").join("pack");
-        for entry in std::fs::read_dir(place).into_iter().flatten().flatten() {
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_dir() {
-                walk(top, &entry.path(), now, unlocked);
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let lock = name.ends_with(".lock");
-            let garbage = lock
-                || (packs && (name.starts_with("tmp_pack_") || name.starts_with("tmp_idx_")))
-                || (place == top && name.starts_with("stage-") && name.ends_with(".bundle"));
-            let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > GARBAGE_AGE));
-            if garbage && kind.is_file() && old() && std::fs::remove_file(entry.path()).is_ok() {
-                *unlocked |= lock;
-            }
-        }
-    }
+    let Ok(mirror) = Mirror::open(dir) else { return false };
+    let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let mut unlocked = false;
-    walk(dir, dir, now, &mut unlocked);
+    let _ = mirror.walk(|place, at, name, st| {
+        let packs = place == Path::new("objects/pack");
+        let name_s = name.to_string_lossy();
+        let lock = name_s.ends_with(".lock");
+        let garbage = lock
+            || (packs && (name_s.starts_with("tmp_pack_") || name_s.starts_with("tmp_idx_")))
+            || (place.as_os_str().is_empty() && name_s.starts_with("stage-") && name_s.ends_with(".bundle"));
+        let old = now.saturating_sub(st.mtime) > GARBAGE_AGE.as_secs() as i64;
+        if garbage && st.kind == mirrorfs::Kind::File && old && mirrorfs::unlink_at(at, name).is_ok() {
+            unlocked |= lock;
+        }
+    });
     unlocked
 }
 
@@ -1619,6 +1593,27 @@ mod tests {
         std::fs::create_dir_all(outside.join("stage")).unwrap();
         std::fs::write(outside.join("stage/a"), b"").unwrap();
         std::fs::write(outside.join("packed"), format!("{} refs/stage/x\n", "1".repeat(40)).repeat(3)).unwrap();
+        // A link as a directory on the way (refs -> a host directory holding stage/): its
+        // stage refs aren't the mirror's, and nothing under it is read.
+        let refs = s.root.join("refs-kept");
+        std::fs::rename(dir.join("refs"), &refs).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("refs")).unwrap();
+        assert_eq!(upkeep::count_stage_refs(&dir), 0, "counted through a linked refs/");
+        std::fs::remove_file(dir.join("refs")).unwrap();
+        std::fs::rename(&refs, dir.join("refs")).unwrap();
+        // objects -> a host directory with a large file and git-garbage names, old: not
+        // measured as the mirror's, not removed as its garbage.
+        std::fs::create_dir_all(outside.join("pack")).unwrap();
+        std::fs::File::create(outside.join("pack/tmp_pack_host")).unwrap().set_len(8 << 20).unwrap();
+        age(&outside.join("pack/tmp_pack_host"), GARBAGE_AGE.as_secs() + 60);
+        let objects = s.root.join("objects-kept");
+        std::fs::rename(dir.join("objects"), &objects).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("objects")).unwrap();
+        assert!(RealDisk.usage(&dir).0 < 1 << 20, "measured through a linked objects/");
+        remove_garbage(&dir, SystemTime::now());
+        assert!(outside.join("pack/tmp_pack_host").exists(), "removed a host file through a linked objects/");
+        std::fs::remove_file(dir.join("objects")).unwrap();
+        std::fs::rename(&objects, dir.join("objects")).unwrap();
         std::fs::create_dir_all(dir.join("refs")).unwrap();
         let _ = std::fs::remove_dir_all(dir.join("refs/stage"));
         std::os::unix::fs::symlink(outside.join("stage"), dir.join("refs/stage")).unwrap();
@@ -1636,7 +1631,7 @@ mod tests {
         // Nor a file past its cap: a packed-refs of more than 64 MiB isn't read.
         std::fs::remove_file(dir.join("packed-refs")).unwrap();
         std::fs::File::create(dir.join("packed-refs")).unwrap().set_len(65 << 20).unwrap();
-        assert_eq!(read_in_mirror(&dir.join("packed-refs"), 64 << 20), None);
+        assert_eq!(Mirror::open(&dir).unwrap().read("packed-refs", 64 << 20), None);
         // HEAD as a link (to nothing) is a mirror's HEAD all the same; nothing follows it.
         std::fs::remove_file(dir.join("packed-refs")).unwrap();
         std::fs::remove_file(dir.join("HEAD")).unwrap();

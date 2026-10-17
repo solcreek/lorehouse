@@ -22,6 +22,7 @@ mod child;
 mod config;
 mod gitjail;
 mod jail;
+mod mirrorfs;
 mod net;
 mod pidfd;
 mod publish;
