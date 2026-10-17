@@ -697,10 +697,10 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
       const key = { session: "s", turn: "1.1", card: "pr:x" };
       return { listeners, store, click, emit, key };
     };
-    test("two clicks let through at once: the one June applied is recorded, not the last one asked", () => {
+    test("two clicks let through at once: the one June applied is recorded, not the last one asked", async () => {
       const w = watched();
-      expect(w.click("U2")).toBe(true);
-      expect(w.click("U3")).toBe(true); // asked too, but its resume loses
+      expect(await w.click("U2")).toBe(true);
+      expect(await w.click("U3")).toBe(true); // asked too, but its resume loses
       expect(w.store.count()).toBe(0); // nothing until June applies an answer
       w.emit({ type: "input.resolved", inputId: "pr:x", outcome: "answered", by: "U2" });
       expect(w.store.decide(w.key, "anyone", "U1").approver).toBe("U2");
@@ -843,14 +843,26 @@ describe("open_pull_request — who may approve (PR_APPROVER)", () => {
     expect(store.count()).toBe(0);
   });
 
-  test("the gate refuses another policy, and a card that names no turn", () => {
+  test("an approver must be a full member of the workspace; a failed lookup refuses (#145)", async () => {
+    const store = approvalStore(openKnowledge(":memory:"));
+    const scope = { requester: "U1", turn: "1.1" };
+    const click = (isMember: (u: string) => Promise<boolean>, by = "U2") =>
+      approverGate("anyone", store, () => undefined, isMember)({ policy: APPROVER_POLICY, scope, by, agent: "a", session: "s", request: { id: "pr:x", prompt: "" } });
+    expect(await click(async (u) => u !== "UG1", "UG1")).toBe(false); // a guest
+    expect(await click(async () => { throw new Error("users.info timed out"); })).toBe(false);
+    expect(store.count()).toBe(0);
+    expect(await click(async () => true)).toBe(true);
+    expect(store.count()).toBe(1);
+  });
+
+  test("the gate refuses another policy, and a card that names no turn", async () => {
     const store = approvalStore(openKnowledge(":memory:"));
     const gate = approverGate("anyone", store, () => undefined);
     const ask = (policy: string, scope: unknown) => gate({ policy, scope, by: "U2", agent: "a", session: "s", request: { id: "pr:x", prompt: "" } });
-    expect(ask("something-else", { requester: "U1", turn: "1.1" })).toBe(false);
-    expect(ask(APPROVER_POLICY, { requester: "U1" })).toBe(false);
+    expect(await ask("something-else", { requester: "U1", turn: "1.1" })).toBe(false);
+    expect(await ask(APPROVER_POLICY, { requester: "U1" })).toBe(false);
     expect(store.count()).toBe(0);
-    expect(ask(APPROVER_POLICY, { requester: "U1", turn: "1.1" })).toBe(true);
+    expect(await ask(APPROVER_POLICY, { requester: "U1", turn: "1.1" })).toBe(true);
     expect(store.count()).toBe(1);
   });
 });

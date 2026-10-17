@@ -16,7 +16,8 @@
 //
 // `accept` is synchronous, so it can't ask Slack (conversations.info) whether a channel
 // is private. It doesn't need to: the start asks for every listed channel and refuses to
-// start while any is private, archived or can't be looked up (channel-check.ts, #86), and
+// start while any is private, archived, shared with another workspace (Slack Connect, #145)
+// or can't be looked up (channel-check.ts, #86), and
 // ingest asks again hourly; a channel that turned private since is taken out of the
 // allowlist handed in here (app.ts), so its events are refused from then on. What the
 // payload itself says:
@@ -25,6 +26,8 @@
 //     for them.
 //   • reaction events carry neither channel_type nor `channel`: the reacted-to message's
 //     channel is `item.channel`.
+//
+// Who may be answered, past this gate, is members.ts's: full members of the workspace only.
 
 type SlackEnvelope = {
   type?: string;

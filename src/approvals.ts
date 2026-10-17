@@ -106,9 +106,14 @@ export type ParkedSession = {
 // when it applies the answer, before the turn runs on. The record then lasts until the turn
 // ends, however it ends, or the turn parks again on another card. Without a session to watch
 // (a test), the click itself is recorded.
-export function approverGate(rule: PrApprover, store: ApprovalStore, sessionOf: (session: string) => ParkedSession | undefined): AuthorizeAnswer {
-  return ({ policy, scope, by, session, request }) => {
+//
+// `isMember`, when given, is asked last: an approval writes to GitHub, so whoever clicks must
+// be a full member of the workspace, as the members gate requires of an asker (members.ts,
+// #145). It fails closed: a lookup that fails refuses the click.
+export function approverGate(rule: PrApprover, store: ApprovalStore, sessionOf: (session: string) => ParkedSession | undefined, isMember?: (user: string) => Promise<boolean>): AuthorizeAnswer {
+  return async ({ policy, scope, by, session, request }) => {
     if (policy !== APPROVER_POLICY || !mayApprove(rule, by, scope)) return false;
+    if (isMember && !(await isMember(by!).catch(() => false))) return false;
     const turn = (scope as Partial<CardScope> | undefined)?.turn;
     if (typeof turn !== "string" || turn === "") return false; // every card this version posts names its turn
     const key = { session, turn, card: request.id };

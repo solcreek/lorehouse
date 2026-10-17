@@ -1,15 +1,25 @@
 {
   "_channels": {
-    "C1": { "name": "general", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false },
-    "C2": { "name": "random", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false },
-    "C7": { "name": "board-only", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": true, "is_archived": false },
-    "C8": { "name": "old-launch", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": true },
-    "G1": { "name": "secret-merger", "is_channel": false, "is_group": true, "is_im": false, "is_mpim": false, "is_private": true, "is_archived": false }
+    "C1": { "name": "general", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_shared": false, "is_ext_shared": false, "is_org_shared": false, "is_pending_ext_shared": false },
+    "C2": { "name": "random", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_shared": false, "is_ext_shared": false, "is_org_shared": false, "is_pending_ext_shared": false },
+    "C7": { "name": "board-only", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": true, "is_archived": false, "is_shared": false, "is_ext_shared": false, "is_org_shared": false, "is_pending_ext_shared": false },
+    "C8": { "name": "old-launch", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": true, "is_shared": false, "is_ext_shared": false, "is_org_shared": false, "is_pending_ext_shared": false },
+    "G1": { "name": "secret-merger", "is_channel": false, "is_group": true, "is_im": false, "is_mpim": false, "is_private": true, "is_archived": false, "is_shared": false, "is_ext_shared": false, "is_org_shared": false, "is_pending_ext_shared": false },
+    "C3": { "name": "acme-partners", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_shared": true, "is_ext_shared": true, "is_org_shared": false, "is_pending_ext_shared": false },
+    "C4": { "name": "grid-all-hands", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_shared": true, "is_ext_shared": false, "is_org_shared": true, "is_pending_ext_shared": false },
+    "C5": { "name": "vendor-invite", "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false, "is_private": false, "is_archived": false, "is_shared": false, "is_ext_shared": false, "is_org_shared": false, "is_pending_ext_shared": true }
   },
   "_users": {
-    "U2": { "name": "wendy.w", "profile": { "display_name": "Wendy", "real_name": "Wendy Wu" } },
-    "U3": { "name": "omar", "profile": { "display_name": "", "real_name": "Omar Ortiz" } },
-    "U4": { "name": "kai", "profile": { "display_name": "Kai" } }
+    "U1": { "team_id": "T1", "is_restricted": false, "is_ultra_restricted": false },
+    "U2": { "name": "wendy.w", "profile": { "display_name": "Wendy", "real_name": "Wendy Wu" }, "team_id": "T1", "is_restricted": false, "is_ultra_restricted": false },
+    "U3": { "name": "omar", "profile": { "display_name": "", "real_name": "Omar Ortiz" }, "team_id": "T1", "is_restricted": false, "is_ultra_restricted": false },
+    "U4": { "name": "kai", "profile": { "display_name": "Kai" }, "team_id": "T1", "is_restricted": false, "is_ultra_restricted": false },
+    "U5": { "team_id": "T1", "is_restricted": false, "is_ultra_restricted": false },
+    "U6": { "team_id": "T1", "is_restricted": false, "is_ultra_restricted": false },
+    "U7": { "team_id": "T1", "is_restricted": false, "is_ultra_restricted": false },
+    "UG1": { "team_id": "T1", "is_restricted": true, "is_ultra_restricted": false },
+    "UG2": { "team_id": "T1", "is_restricted": true, "is_ultra_restricted": true },
+    "UX1": { "team_id": "T9", "is_restricted": false, "is_ultra_restricted": false }
   },
   "C1": [
     { "ts": "1790000001.000100", "user": "U2", "text": "Heads up: the quarterly wombat review moves to Thursdays starting next month" },

@@ -56,8 +56,10 @@
 // Env: PORT (8900), TTFT_MS (300) delay before the first event, TOKENS (80),
 //      TOKEN_DELAY_MS (15) between text deltas, SLACK_FIXTURES (JSON file:
 //      { "<channel>": [message, …] }, roots and replies together; "_users": users.info
-//      answers; "_channels": conversations.info answers, { "<channel>": {name, is_private,
-//      is_archived, …} }, and a channel not there is channel_not_found).
+//      answers, names and whether a full member ({team_id, is_restricted,
+//      is_ultra_restricted}), and a user not there is user_not_found; "_channels":
+//      conversations.info answers, { "<channel>": {name, is_private, is_archived,
+//      is_shared, is_ext_shared, …} }, and a channel not there is channel_not_found).
 //
 // conversations.info, as Slack likely answers the app's token (channels:read, no
 // groups:read): a public channel's info; for a private channel or group DM, missing_scope

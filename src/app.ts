@@ -33,6 +33,7 @@ import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { adminRoutes } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
+import { decideTurn, mayStartTurn, members, refusalText, type Membership } from "./members";
 import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, reconcileAsks, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
 import { cachedNames } from "./ingest/slack-users";
 import { pullRequestTool } from "./tools/pull-request";
@@ -148,7 +149,21 @@ export async function createApp(config: Config) {
   tally(() => approvals.prune());
   timers.push(setInterval(() => tally(() => approvals.prune()), 86_400_000).unref());
   let runtime: Awaited<ReturnType<typeof createNativeRuntime>> | undefined;
-  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session));
+  // An approver must be a full member of the workspace, like an asker (#145). The workspace
+  // is the bot token's: the ingester's auth.test when it ran, else asked here on the first
+  // click (an install with no listed channels, or an auth.test that failed at start) and
+  // kept once known. A refused click is logged with why. memberCheck is defined below; a
+  // click only comes once the app is serving, after it is.
+  let workspace: string | undefined;
+  const workspaceTeam = async (): Promise<string | undefined> => {
+    workspace ??= ingester?.ownTeamId ?? (await slackReads.call<{ team_id?: string }>("auth.test").catch(() => undefined))?.team_id;
+    return workspace;
+  };
+  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session), async (user) => {
+    const m = await memberCheck.check(user, await workspaceTeam());
+    if (!m.member) console.error(`approvals: a click by ${user} was refused: not a full member of the workspace (${m.reason}${m.reason === "lookup_failed" ? `: ${m.error}` : ""})`);
+    return m.member;
+  });
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
   const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
@@ -180,8 +195,8 @@ export async function createApp(config: Config) {
   // to the thread after the reply.
   if (config.pdf) tools.push(renderPdfTool(typstRenderer(config.pdfFonts)));
 
-  // Where the agent works: the listed channels, less any ingest found private or archived
-  // since the start (refused from then on; see ingest/slack.ts).
+  // Where the agent works: the listed channels, less any ingest found private, archived or
+  // shared since the start (refused from then on; see ingest/slack.ts).
   const listed = { has: (channel: string) => config.agent.channels.has(channel) && !ingester?.isClosed(channel) };
 
   const dm = config.agent.dm;
@@ -189,6 +204,20 @@ export async function createApp(config: Config) {
     e.kind === "app_mention" ||
     (dm === "answer" && e.channelType === "im") ||
     isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread));
+  // Only full members of the workspace are answered (members.ts, #145): a guest, or someone
+  // from another workspace, can't open every channel an answer may quote. The sender of an
+  // event that may start a turn is looked up (users.info, cached) in resolveIdentity, which
+  // June awaits before respondWhen; respondWhen then reads the verdict. Mentions, follow-ups
+  // and DMs all pass through it; reactions never start a turn. No principal is pinned: the
+  // hook is used only to look the sender up before the turn is decided.
+  const memberCheck = members(slackReads);
+  const refuse = (e: SlackNormalizedEvent, verdict: Membership | undefined) => {
+    const v: Membership = verdict ?? { user: e.user?.id ?? "", member: false, reason: "lookup_failed", error: "not looked up" };
+    if (v.member) return;
+    console.log(`members: not answered: ${v.reason === "lookup_failed" ? `couldn't check the sender (${v.error})` : `the sender is ${v.reason === "guest" ? "a guest" : v.reason === "external" ? "from another workspace" : "deactivated"}`}`);
+    const threadId = e.channelType === "im" ? e.threadId : (e.threadId ?? e.ts);
+    void slack.post!({ channelId: e.channelId, threadId }, refusalText(v)).catch((err) => console.error("members: posting the refusal:", err));
+  };
   // A 👍/👎 on one of the agent's replies is feedback, recorded and never answered, and
   // kept under a keyed hash of the person, never their Slack id (usage.ts). Without the
   // agent's own id no reaction can count, and usage would read as if nobody reacted: say
@@ -220,14 +249,29 @@ export async function createApp(config: Config) {
     // (see threads.ts); with DM_MODE=answer, DMs too. Those arrive as `message` events
     // like every channel message: respondWhen keeps the rest to knowledge.
     respondTo: ["app_mention", "message"],
+    // Looks up who sent an event that may start a turn, before respondWhen (see members.ts).
+    resolveIdentity: async (id) => {
+      if (id.userId && mayStartTurn(id, dm === "answer")) await memberCheck.check(id.userId, id.teamId);
+      return undefined;
+    },
     respondWhen: (e) => {
-      const respond = shouldRespond(e);
+      if (!shouldRespond(e)) return false;
+      // Fails closed: a sender not looked up, or not a full member, gets one line instead.
+      // The channel is checked again first: the lookup awaited Slack, and an hourly recheck
+      // may have closed the channel meanwhile (decideTurn).
+      const verdict = e.user?.id ? memberCheck.peek(e.user.id) : undefined;
+      const decision = decideTurn(e, listed, verdict);
+      if (decision === "skip") return false;
+      if (decision === "refuse") {
+        refuse(e, verdict);
+        return false;
+      }
       // An ask records where; who, only if the install opted in and the channel was told
       // (usage.ts). A recorded asker's name is cached now, so reading usage never asks Slack.
       const user = told.has(e.channelId) ? e.user?.id : undefined;
-      if (respond && e.channelType !== "im") tally(() => recordAsk(knowledge, { channel: e.channelId, ts: e.ts, threadTs: e.threadId ?? e.ts, user }));
-      if (respond && user) void ingester?.names([user]).catch(() => undefined);
-      return respond;
+      if (e.channelType !== "im") tally(() => recordAsk(knowledge, { channel: e.channelId, ts: e.ts, threadTs: e.threadId ?? e.ts, user }));
+      if (user) void ingester?.names([user]).catch(() => undefined);
+      return true;
     },
     // A mention asks the agent into its thread. Reactions are observed only: they are not
     // in respondTo, so none starts a turn.

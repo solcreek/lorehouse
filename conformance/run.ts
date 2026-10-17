@@ -1071,6 +1071,58 @@ const scenarios: Scenario[] = [
       return s.modelCalls || s.slackCalls ? `ran anyway: ${JSON.stringify(s)}` : null;
     },
   },
+  // Only full members of the workspace are answered (#145): a guest, or someone from
+  // another workspace, can't open every channel an answer may quote. Slack's users.info says
+  // which: in the fixtures UG1 is a multi-channel guest, UG2 a single-channel one, UX1 from
+  // workspace T9, and U404 no one Slack knows (user_not_found: fails closed).
+  {
+    name: "answers only full members: a guest's mention or follow-up, someone from another workspace, or a sender Slack doesn't know gets one line in the thread, with no search or model call",
+    run: async () => {
+      const thread = await mentionAndWait("where is the wombat review"); // a member's: the thread is joined
+      await reset();
+      const asks = (await usage()).asks;
+      const at = (user: string, team = "T1") => {
+        const ts = `${1996000000 + ++seq}.000100`;
+        return { ts, event: { type: "app_mention", user, team, text: `<@UBOT> [q${seq}] when is the quarterly wombat review`, ts, event_ts: ts, channel: ALLOWED } };
+      };
+      const guest = at("UG1"), outsider = at("UX1", "T9"), unknown = at("U404");
+      for (const m of [guest, outsider, unknown]) await sendEvent(m.event);
+      await threadReply(thread, "and which floor is that on?", { user: "UG2" }); // a guest's follow-up
+      const GUEST = "I only answer full members of this workspace: my answers draw on every channel I read, and not all of them are open to you as a guest.";
+      const want: [string, string][] = [
+        [guest.ts, GUEST],
+        [outsider.ts, "I only answer full members of this workspace: my answers draw on every channel I read, and not all of them are open to you."],
+        [unknown.ts, "I couldn't check that you're a full member of this workspace, so I can't answer right now; try again in a minute."],
+        [thread, GUEST],
+      ];
+      const posts = await until(async () => { const p = (await stats()).posts; return p.length >= want.length ? p : undefined; }, 5000);
+      if (!posts) return `posts ${JSON.stringify((await stats()).posts)}, want ${want.length} one-line refusals`;
+      for (const [threadTs, text] of want) {
+        const got = posts.filter((p) => p.channel === ALLOWED && p.thread_ts === threadTs);
+        if (got.length !== 1 || got[0]!.text !== text) return `in thread ${threadTs}: ${JSON.stringify(got)}, want one post ${JSON.stringify(text)}`;
+      }
+      await Bun.sleep(500);
+      const s = await stats();
+      if (s.modelCalls || s.byMethod["chat.startStream"]) return `answered anyway: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}`;
+      if (s.posts.length !== want.length) return `posted ${s.posts.length}×, want ${want.length}`;
+      if ((await usage()).asks !== asks) return "a refused question was counted as an ask";
+      // A member is still answered.
+      const a = await ask("when is the quarterly wombat review");
+      return a.cite === WOMBAT_THREAD ? null : `a member got ${JSON.stringify(a.text.slice(0, 120))}, want a cite of ${WOMBAT_THREAD}`;
+    },
+  },
+  {
+    name: "DM_MODE=answer: a guest's DM gets one line instead of an answer, with no search or model call",
+    run: () => inMode({ DM_MODE: "answer" }, async () => {
+      await reset();
+      await directMessage(`[q${++seq}] when does the quarterly wombat review happen`, { user: "UG1" });
+      const posts = await until(async () => { const p = (await stats()).posts; return p.length ? p : undefined; }, 5000);
+      if (posts?.length !== 1 || posts[0]!.channel !== "D1" || !posts[0]!.text.startsWith("I only answer full members of this workspace")) return `posts ${JSON.stringify(posts)}, want one refusal in D1`;
+      await Bun.sleep(500);
+      const s = await stats();
+      return s.modelCalls || s.byMethod["chat.startStream"] ? `answered anyway: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}` : null;
+    }),
+  },
   {
     name: "stays silent on a mention outside the channel allowlist",
     run: async () => {
@@ -1153,6 +1205,30 @@ const scenarios: Scenario[] = [
       }
     },
   },
+  // A public channel shared beyond the workspace has readers who can't open the other
+  // listed channels: refused like a private one (#145).
+  {
+    name: "refuses to start with a channel shared beyond the workspace in AGENT_CHANNELS (Slack Connect, a pending invitation, Enterprise Grid), naming each and why",
+    run: async () => {
+      const db = freshDb();
+      await stopApp();
+      try {
+        const r = await refusedStart({ AGENT_CHANNELS: `${ALLOWED},C3,C4,C5`, LOREHOUSE_DB: db });
+        if (typeof r === "string") return r;
+        for (const want of [
+          "C3 (#acme-partners) is shared with another organization (Slack Connect), so its readers include people who can't open the other listed channels",
+          "C4 (#grid-all-hands) is shared with other workspaces of this Enterprise Grid organization",
+          "C5 (#vendor-invite) has a pending Slack Connect invitation",
+        ]) {
+          if (!r.stderr.includes(want)) return `stderr doesn't say "${want}": ${r.stderr.slice(0, 600)}`;
+        }
+        return r.stderr.includes(`${ALLOWED} (#general)`) ? `stderr names the public ${ALLOWED} too: ${r.stderr.slice(0, 400)}` : null;
+      } finally {
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
   {
     name: "starts when every listed channel is public, after looking each one up",
     run: async () => {
@@ -1177,7 +1253,7 @@ const scenarios: Scenario[] = [
     name: "a listed channel turned private while running is closed at the next recheck: a mention there gets no reply and no model call; the other channel still answers",
     run: async () => {
       const db = freshDb();
-      const PUBLIC_C2 = { name: "random", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false };
+      const PUBLIC_C2 = { name: "random", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false, is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false };
       await stopApp();
       try {
         await startApp({ AGENT_CHANNELS: `${ALLOWED},${REMOVED}`, LOREHOUSE_DB: db, INGEST_CHANNEL_RECHECK_MS: "300" });
@@ -1192,6 +1268,31 @@ const scenarios: Scenario[] = [
         if (asked) return `answered in the closed channel: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}`;
         const a = await ask("when is the quarterly wombat review");
         return a.cite === WOMBAT_THREAD ? null : `${ALLOWED} answered ${JSON.stringify(a.text.slice(0, 120))}, want a cite of ${WOMBAT_THREAD}`;
+      } finally {
+        await post("/fixtures/channel", { channel: REMOVED, info: PUBLIC_C2 });
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
+    name: "a listed channel shared with another organization while running (Slack Connect) is closed at the next recheck, as one turned private: a mention there gets no reply",
+    run: async () => {
+      const db = freshDb();
+      const PUBLIC_C2 = { name: "random", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false, is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false };
+      await stopApp();
+      try {
+        await startApp({ AGENT_CHANNELS: `${ALLOWED},${REMOVED}`, LOREHOUSE_DB: db, INGEST_CHANNEL_RECHECK_MS: "300" });
+        await post("/fixtures/channel", { channel: REMOVED, info: { ...PUBLIC_C2, is_shared: true, is_ext_shared: true } });
+        const closed = await until(async () => (await status()).knowledge.channels[REMOVED]?.closed, 5000);
+        if (closed !== "shared") return `${REMOVED} closed as ${JSON.stringify(closed)}, want "shared": ${JSON.stringify((await status()).knowledge.channels)}`;
+        await reset();
+        await sendEvent(mention(REMOVED));
+        await Bun.sleep(1500);
+        const s = await stats();
+        const asked = s.modelCalls || s.byMethod["chat.startStream"] || s.byMethod["chat.postMessage"];
+        return asked ? `answered in the shared channel: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}` : null;
       } finally {
         await post("/fixtures/channel", { channel: REMOVED, info: PUBLIC_C2 });
         await stopApp();
@@ -1473,6 +1574,32 @@ const scenarios: Scenario[] = [
           const done = await until(async () => (await stats()).updates.find((u) => u.ts === card.prompt.ts && u.text.includes("[pr:")));
           if (!done) return `approved by someone else, the turn never finished: responses ${JSON.stringify((await stats()).responses)}`;
           if (!done.text.includes(`${card.nonce} [pr:opened:https://github.com/acme/widgets/pull/7]`)) return `the turn ended with ${done.text.slice(0, 160)}, want the opened pull request`;
+          return openedBy(runner, "Wendy (Wendy Wu)");
+        } finally {
+          await runner.stop();
+        }
+      });
+    },
+  },
+  {
+    // #145: whoever approves must be a full member of the workspace, under any rule. Even
+    // with PR_APPROVER=anyone, a guest's Approve and Deny are refused and nothing is pushed;
+    // a member's Approve then opens it.
+    name: "PR_APPROVER=anyone: a guest's Approve and Deny are refused and nothing is pushed; a member's Approve opens it",
+    run: () => {
+      const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github`, PR_APPROVER: "anyone" };
+      return inMode(env, async () => {
+        const runner = pollRunner(APP, RUNNER_TOKEN, "r-guest-approver");
+        try {
+          await Bun.sleep(200); // the first poll registers the runner
+          await reset();
+          const card = await prCard("scout/conformance-guest-approver");
+          if (typeof card === "string") return card;
+          const refused = await refusedFor("UG1", "a guest", card, runner);
+          if (refused) return refused;
+          await click("U2", card, "Approve");
+          const done = await until(async () => (await stats()).updates.find((u) => u.ts === card.prompt.ts && u.text.includes("[pr:")));
+          if (!done) return `approved by a member after the guest, the turn never finished: responses ${JSON.stringify((await stats()).responses)}`;
           return openedBy(runner, "Wendy (Wendy Wu)");
         } finally {
           await runner.stop();
