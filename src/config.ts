@@ -41,9 +41,15 @@ export type Config = {
   slack: { signingSecret: string; botToken: string; apiUrl?: string; botUserId?: string };
   anthropic: { apiKey: string; baseUrl?: string; model: string };
   agent: { name?: string; coAuthor?: string; channels: Set<string>; dm: DmMode };
+  // Whose data this is and where it lives (TENANT_ID, LOREHOUSE_DATA_DIR; tenant.ts, ADR
+  // 0005 §1): the tenant's files are in <dataDir>/<id>/.
+  tenant: Tenant;
   // Lorehouse's own database (knowledge, migrations) — separate from the framework's
-  // session store on purpose. The session store defaults to a file beside it (sessionsDbFor).
-  db: { lorehouse: string; sessions: string; knowledgeSeed?: string };
+  // session store on purpose. Unset, both are files in the tenant's directory; a
+  // LOREHOUSE_DB set is used where it is, with the session store beside it (sessionsDbFor).
+  // `upgrade`: where each database in the tenant's directory was before tenants, to move it
+  // from on start (upgradeLayout); empty for a database set explicitly.
+  db: { lorehouse: string; sessions: string; knowledgeSeed?: string; upgrade: Move[] };
   // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
   // recheckMs: how often listed channels are looked up again for one turned private (0 = never).
   ingest: { backfillDays: number; refreshDays: number; debounceMs: number; recheckMs: number };
@@ -84,9 +90,10 @@ export type GithubCredentials = { kind: "app"; appId: string; privateKey: string
 import { closeSync, openSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { normalizePem } from "./github-auth";
+import { dataDirOf, resolveTenant, type Move, type Tenant } from "./tenant";
 
-// Where the framework's sessions live when SESSIONS_DB is unset: sessions.db beside
-// LOREHOUSE_DB, so a turn parked on an Approve, or a durable automation, survives a
+// Where the framework's sessions live when SESSIONS_DB is unset and LOREHOUSE_DB is set:
+// sessions.db beside LOREHOUSE_DB, so a turn parked on an Approve, or a durable automation, survives a
 // restart (ADR 0002 §8). Lorehouse's own data in memory means a throwaway instance (a
 // test): its sessions stay in memory too.
 export function sessionsDbFor(lorehouseDb: string): string {
@@ -140,7 +147,9 @@ export class ConfigError extends Error {
   }
 }
 
-export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
+// `tenantResolved`: the tenant already resolved from this environment (server.ts does it
+// first, so a throwaway one keeps its id); unset, it is resolved here.
+export function loadConfig(env: Record<string, string | undefined> = process.env, tenantResolved?: Tenant): Config {
   const missing: string[] = [];
   const need = (key: string) => {
     const v = env[key];
@@ -178,6 +187,17 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     else missing.push(`FILE_STORE (one of ${FILE_STORES.join(", ")}, got "${raw}")`);
     return "memory";
   };
+  // The tenant (tenant.ts): TENANT_ID, or the one found in the data directory, or a new
+  // one the first start keeps. Its directory holds the databases unless they are set.
+  const resolved = tenantResolved ?? resolveTenant(env);
+  if ("problem" in resolved) missing.push(resolved.problem);
+  const tenant: Tenant = "problem" in resolved ? { id: "", source: "configured", dataDir: dataDirOf(env), dir: dataDirOf(env) } : resolved;
+  const explicitDb = env.LOREHOUSE_DB || undefined;
+  const lorehouseDb = explicitDb ?? join(tenant.dir, "lorehouse.db");
+  const sessionsDb = env.SESSIONS_DB || (explicitDb ? sessionsDbFor(explicitDb) : join(tenant.dir, "sessions.db"));
+  const upgrade: Move[] = [];
+  if (!explicitDb) upgrade.push({ from: join(tenant.dataDir, "lorehouse.db"), to: lorehouseDb });
+  if (!explicitDb && !env.SESSIONS_DB) upgrade.push({ from: join(tenant.dataDir, "sessions.db"), to: sessionsDb });
   const config: Config = {
     port: Number(env.PORT ?? 3000),
     slack: {
@@ -197,10 +217,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       channels: new Set((env.AGENT_CHANNELS ?? "").split(",").map((s) => s.trim()).filter(Boolean)),
       dm: dmMode(env.DM_MODE),
     },
+    tenant,
     db: {
-      lorehouse: env.LOREHOUSE_DB || "lorehouse.db",
-      sessions: env.SESSIONS_DB || sessionsDbFor(env.LOREHOUSE_DB || "lorehouse.db"),
+      lorehouse: lorehouseDb,
+      sessions: sessionsDb,
       knowledgeSeed: env.KNOWLEDGE_SEED || undefined,
+      upgrade,
     },
     ingest: {
       backfillDays: nonNegative("INGEST_BACKFILL_DAYS", 90),

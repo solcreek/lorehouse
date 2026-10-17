@@ -51,7 +51,8 @@ describe("secrets written into a checkout are gitignored", () => {
   });
 
   test("env files, private keys and SQLite side files", () => {
-    for (const path of [".env", ".env.local", ".env.production", ".dev.vars", "lorehouse.env", "app.private-key.pem", "live.db", "live.db-wal", "live.db-shm", "live.db-journal"]) {
+    // A tenant's directory made in the checkout (src/tenant.ts) holds only these.
+    for (const path of [".env", ".env.local", ".env.production", ".dev.vars", "lorehouse.env", "app.private-key.pem", "live.db", "live.db-wal", "live.db-shm", "live.db-journal", "t-abc/tenant.json", "t-abc/tenant.json.0123456789ab.tmp", "t-abc/lorehouse.db-wal"]) {
       expect([path, ignored(path)]).toEqual([path, true]);
     }
   });

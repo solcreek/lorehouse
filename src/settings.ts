@@ -3,7 +3,7 @@
 //   1. the process environment
 //   2. the install's settings file, LOREHOUSE_ENV_FILE (default /etc/lorehouse/lorehouse.env),
 //      written by install.sh and edited by people
-//   3. settings.json beside the database, written by the app itself: `lorehouse setup` and
+//   3. settings.json in the data directory (beside the database before tenants), written by the app itself: `lorehouse setup` and
 //      the Slack install put the Slack app's credentials and the bot token there, so nobody
 //      copies a secret by hand
 //
@@ -12,7 +12,8 @@
 
 import { randomBytes } from "node:crypto";
 import { closeSync, constants, existsSync, fchownSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import { dataDirOf } from "./tenant";
 
 export type Env = Record<string, string | undefined>;
 
@@ -67,8 +68,10 @@ function readEnvFile(path: string): Record<string, string> {
   }
 }
 
+// In the install's data directory (tenant.ts), outside any tenant's: it holds the install's
+// own settings, and is read before the tenant is known.
 export function settingsPath(env: Env): string {
-  return env.LOREHOUSE_SETTINGS || join(dirname(resolve(env.LOREHOUSE_DB || "lorehouse.db")), "settings.json");
+  return env.LOREHOUSE_SETTINGS || join(dataDirOf(env), "settings.json");
 }
 
 // Opened with O_NOFOLLOW: as root, a symlink planted here must not read another file in.

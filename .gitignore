@@ -15,6 +15,10 @@ dist/
 lorehouse.env
 settings.json
 settings.json.*.tmp
+# A tenant's directory (src/tenant.ts), made beside the databases in the working directory
+# by default: its databases are ignored above, and this is the rest of it.
+tenant.json
+tenant.json.*.tmp
 !/.claude/settings.json
 *.pem
 

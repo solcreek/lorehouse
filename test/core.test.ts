@@ -259,11 +259,13 @@ describe("config", () => {
     expect(() => loadConfig({ ...base, GITHUB_APP_ID: "123", GITHUB_APP_PRIVATE_KEY: pem })).toThrow(/GitHub credentials are set, but no sandbox/);
   });
 
-  test("defaults: port 3000, claude-opus-5, sessions beside the database, empty channel allowlist", () => {
+  test("defaults: port 3000, claude-opus-5, both databases in the tenant's directory, empty channel allowlist", () => {
     const c = loadConfig(base);
     expect(c.port).toBe(3000);
     expect(c.anthropic.model).toBe("claude-opus-5");
-    expect(c.db).toMatchObject({ lorehouse: "lorehouse.db", sessions: "sessions.db" });
+    // No tenant yet in the working directory: a new one, its directory under it.
+    expect(c.tenant).toMatchObject({ source: "new", dataDir: process.cwd(), dir: join(process.cwd(), c.tenant.id) });
+    expect(c.db).toMatchObject({ lorehouse: join(c.tenant.dir, "lorehouse.db"), sessions: join(c.tenant.dir, "sessions.db") });
     expect(c.agent.channels.size).toBe(0);
     expect(c.agent.dm).toBe("redirect");
   });

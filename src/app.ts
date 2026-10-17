@@ -42,6 +42,7 @@ import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
+import { prepareTenant, tenantsIn, upgradeLayout } from "./tenant";
 
 // How each tool call shows up on the reply's task timeline in Slack.
 const TASK_LABELS: Record<string, string> = {
@@ -72,6 +73,16 @@ export async function createApp(config: Config) {
   // database is opened or purged, and before anything listens. A ConfigError names each.
   const slackReads = slackApi({ token: config.slack.botToken, apiUrl: config.slack.apiUrl });
   await assertPublicChannels(slackReads, config.agent.channels);
+
+  // The tenant's directory, and its files moved into it from where they were before
+  // tenants (tenant.ts): before either database is opened. A start that dies part-way
+  // finishes the move on the next one; once moved, nothing moves again.
+  const tenant = config.tenant;
+  if (prepareTenant(tenant)) console.log(`lorehouse: tenant ${tenant.id} is new: its files go in ${tenant.dir}`);
+  const moved = upgradeLayout(config.db.upgrade);
+  if (moved.length) console.log(`lorehouse: storage: moved ${moved.join(", ")} from ${tenant.dataDir} into ${tenant.dir}, tenant ${tenant.id}'s directory`);
+  const others = tenant.source === "throwaway" ? [] : tenantsIn(tenant.dataDir).filter((id) => id !== tenant.id);
+  if (others.length) console.warn(`lorehouse: storage: ${tenant.dataDir} also holds tenant ${others.join(", ")}, not served here (TENANT_ID=${tenant.id})`);
 
   const knowledge = openKnowledge(config.db.lorehouse);
   // Both files exist from here on, so this compares the files themselves, not their names.
