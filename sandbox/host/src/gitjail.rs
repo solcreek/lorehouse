@@ -789,6 +789,15 @@ pub(crate) mod tests {
         std::fs::write(outside.join("dir/inner"), b"host").unwrap();
         std::os::unix::fs::symlink(outside.join("file"), mirror.join("link-to-file")).unwrap();
         std::os::unix::fs::symlink(outside.join("dir"), mirror.join("objects/link-to-dir")).unwrap();
+        // Ubuntu's AppArmor lets newuidmap map the ids but denies a user namespace its
+        // capabilities: nothing to check there.
+        let probe = top.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        if std::os::unix::fs::lchown(&probe, Some(1), Some(1)).is_err_and(|e| e.raw_os_error() == Some(libc::EPERM)) {
+            eprintln!("skipped: this user namespace may not chown");
+            std::fs::remove_dir_all(&top).unwrap();
+            return;
+        }
         own(&mirror, 1, 1).unwrap();
         let ids = |p: &Path| {
             let m = std::fs::symlink_metadata(p).unwrap();
