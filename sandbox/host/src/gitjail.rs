@@ -70,6 +70,8 @@ struct Pool {
 pub struct GitJail {
     /// git, canonical: the absolute path that is inside a run's root and the same there.
     git: PathBuf,
+    /// find, likewise: what empties a dropped mirror (remover).
+    find: PathBuf,
     /// An empty directory a run's tmpfs root is mounted on (in its own namespace).
     mountpoint: PathBuf,
     entries: Vec<Entry>,
@@ -154,6 +156,7 @@ impl GitJail {
         if !inside(&real) {
             return Err(format!("git is {} ({}), outside what its isolated runs see (/usr, /nix/store)", git.display(), real.display()));
         }
+        let find = crate::jail::resolve(Path::new("find")).and_then(|f| std::fs::canonicalize(f).ok()).filter(|f| inside(f)).ok_or("find isn't on PATH under /usr: a dropped mirror is emptied with it, in a jailed run")?;
         let devices = DEVICES.iter().map(|d| Path::new("/dev").join(d)).filter(|p| std::fs::metadata(p).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_char_device(&m.file_type()))).collect();
         let mountpoint = state_dir.join(".git-root");
         std::fs::create_dir_all(&mountpoint).map_err(|e| format!("{}: {e}", mountpoint.display()))?;
@@ -162,13 +165,27 @@ impl GitJail {
         }
         // The path that passed the check above is the one runs exec: a link to it (on PATH)
         // isn't inside a run's root.
-        Ok(GitJail { git: real, mountpoint, entries, devices, cgroups: None, uids: None, mem_max: 0 })
+        Ok(GitJail { git: real, find, mountpoint, entries, devices, cgroups: None, uids: None, mem_max: 0 })
     }
 
     /// A command for one isolated run of git in `dir` (the caller adds the arguments,
     /// environment and pipes), and what holds the run's uid, cgroup and namespaces until
     /// it is dropped. Waits for a free uid.
     pub async fn command(self: &Arc<Self>, dir: &Path, net: Net) -> Result<(tokio::process::Command, Confined), String> {
+        self.run_for(dir, net, false).await
+    }
+
+    /// A command that empties `dir`, a dropped mirror, in a jailed run like git's: `find
+    /// /repo -mindepth 1 -delete` (the caller adds the arguments), as a leased uid, in its own
+    /// cgroup, seeing nothing but `dir` and /usr. Unlike git's, the tree isn't chowned to it
+    /// first (sandboxd never walks a dropped tree): the run keeps CAP_DAC_OVERRIDE and
+    /// CAP_FOWNER, which over what it sees (that tree; the rest is read-only or a tmpfs of
+    /// its own) is only the power to delete it.
+    pub async fn remover(self: &Arc<Self>, dir: &Path) -> Result<(tokio::process::Command, Confined), String> {
+        self.run_for(dir, Net::Off, true).await
+    }
+
+    async fn run_for(self: &Arc<Self>, dir: &Path, net: Net, remove: bool) -> Result<(tokio::process::Command, Confined), String> {
         let lease = match &self.uids {
             Some(pool) => {
                 pool.available.acquire().await.map_err(|e| format!("git uids: {e}"))?.forget();
@@ -185,7 +202,7 @@ impl GitJail {
         };
         let uid = lease.as_ref().map(|l| l.uid);
         let mut confined = Confined { lease, cgroup: None, net: None };
-        if let Some(uid) = uid {
+        if let Some(uid) = uid.filter(|_| !remove) {
             own(dir, uid, uid).map_err(|e| format!("giving the mirror to its run's uid: {e}"))?;
         }
         if let Some(parent) = &self.cgroups {
@@ -208,8 +225,9 @@ impl GitJail {
                 (None, Some((path, false)))
             }
         };
-        let plan = self.plan(dir, uid, confined.cgroup.as_deref(), netns, remote.as_ref().map(|(p, w)| (p.as_path(), *w)))?;
-        let mut cmd = crate::child::command(&self.git);
+        let mut plan = self.plan(dir, uid, confined.cgroup.as_deref(), netns, remote.as_ref().map(|(p, w)| (p.as_path(), *w)))?;
+        plan.keep_delete = remove;
+        let mut cmd = crate::child::command(if remove { &self.find } else { &self.git });
         // SAFETY: Plan::enter makes only async-signal-safe system calls on memory prepared
         // before the fork, as pre_exec requires.
         unsafe {
@@ -220,7 +238,7 @@ impl GitJail {
 
     #[cfg(not(target_os = "linux"))]
     fn plan(&self, _: &Path, _: Option<u32>, _: Option<&Path>, _: Option<RawFd>, _: Option<(&Path, bool)>) -> Result<Plan, String> {
-        let _ = (&self.mountpoint, &self.entries, &self.devices, SAFE_CONFIG);
+        let _ = (&self.mountpoint, &self.entries, &self.devices, &self.find, SAFE_CONFIG);
         Err("git isolation is Linux only".into())
     }
 
@@ -288,6 +306,7 @@ impl GitJail {
             ops,
             netns,
             uid,
+            keep_delete: false,
         })
     }
 
@@ -559,6 +578,9 @@ struct Plan {
     netns: Option<RawFd>,
     /// None only in a test run in a user namespace, where only uid 0 is mapped.
     uid: Option<u32>,
+    /// The remover's run (GitJail::remover): CAP_DAC_OVERRIDE and CAP_FOWNER kept, as
+    /// ambient capabilities, through the uid change and the exec.
+    keep_delete: bool,
 }
 
 // Steps, for the error a failed setup returns (step << 16 | errno): explain() reads it.
@@ -647,20 +669,65 @@ impl Plan {
             ok(libc::mount(null(), c"/".as_ptr(), null(), ro, null()) as _, 10)?;
             ok(libc::chdir(c"/repo".as_ptr()) as _, 11)?;
             libc::umask(umask);
+            if self.keep_delete {
+                ok(libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) as _, STEP_CAPS)?;
+            }
             if let Some(uid) = self.uid {
                 ok(libc::setgroups(0, null()) as _, 12)?;
                 ok(libc::setresgid(uid, uid, uid) as _, 13)?;
                 ok(libc::setresuid(uid, uid, uid) as _, 14)?;
             }
         }
+        if self.keep_delete {
+            return keep_only_delete().map_err(|_| fail(STEP_CAPS));
+        }
         crate::jail::drop_capabilities().map_err(|_| fail(STEP_CAPS))
     }
+}
+
+/// For the remover, between fork and exec: of all capabilities only CAP_DAC_OVERRIDE and
+/// CAP_FOWNER, permitted, effective, inheritable and ambient (so they survive the exec of
+/// a file with none, as a non-root uid), and no_new_privs.
+#[cfg(target_os = "linux")]
+fn keep_only_delete() -> std::io::Result<()> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const CAP_DAC_OVERRIDE: u32 = 1;
+    const CAP_FOWNER: u32 = 3;
+    let mask = (1 << CAP_DAC_OVERRIDE) | (1 << CAP_FOWNER);
+    let mut header = Header { version: 0x2008_0522, pid: 0 };
+    let data = [Data { effective: mask, permitted: mask, inheritable: mask }, Data { effective: 0, permitted: 0, inheritable: 0 }];
+    // SAFETY: plain system calls on this process, capset's version-3 layout.
+    unsafe {
+        if libc::syscall(libc::SYS_capset, &mut header as *mut Header, data.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for cap in [CAP_DAC_OVERRIDE, CAP_FOWNER] {
+            if libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, cap as libc::c_ulong, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
 impl Plan {
     fn enter(&self) -> std::io::Result<()> {
-        let _ = (&self.cgroup_procs, &self.root, &self.ops, self.netns, self.uid);
+        let _ = (&self.cgroup_procs, &self.root, &self.ops, self.netns, self.uid, self.keep_delete);
         Err(std::io::Error::other("git isolation is Linux only"))
     }
 }
@@ -775,6 +842,57 @@ pub(crate) mod tests {
     #[test]
     fn a_mirror_is_given_to_the_runs_uid_without_following_links() {
         in_userns("gitjail::tests::own_in_userns", true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dropped_tree_is_emptied_by_a_jailed_run_never_by_sandboxd() {
+        in_userns("gitjail::tests::remover_in_userns", true);
+    }
+
+    /// The remover, as root in a user namespace with ids 1..65536 mapped: its run is a leased
+    /// uid (100) that owns nothing of the tree, which belongs to ids 5 and 6, with a
+    /// directory no one may read and a sticky one; a link to a host file is deleted as a
+    /// link. The tree is emptied and the host file stays.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "run by a_dropped_tree_is_emptied_by_a_jailed_run_never_by_sandboxd, in a user namespace"]
+    async fn remover_in_userns() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(unsafe { libc::geteuid() }, 0, "root in the user namespace");
+        let top = std::env::temp_dir().join(format!("gitjail-remover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let (tree, host) = (top.join("drop/x"), top.join("host"));
+        std::fs::create_dir_all(tree.join("objects/locked")).unwrap();
+        std::fs::create_dir_all(tree.join("refs/sticky")).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("keep"), b"host").unwrap();
+        std::fs::write(tree.join("objects/locked/a"), b"a").unwrap();
+        std::fs::write(tree.join("refs/sticky/b"), b"b").unwrap();
+        std::os::unix::fs::symlink(host.join("keep"), tree.join("link")).unwrap();
+        let probe = top.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        if std::os::unix::fs::lchown(&probe, Some(5), Some(5)).is_err() {
+            eprintln!("skipped: this user namespace may not chown");
+            std::fs::remove_dir_all(&top).unwrap();
+            return;
+        }
+        for p in ["", "objects", "objects/locked", "objects/locked/a", "refs", "refs/sticky", "link"] {
+            std::os::unix::fs::lchown(tree.join(p), Some(5), Some(5)).unwrap();
+        }
+        std::os::unix::fs::lchown(tree.join("refs/sticky/b"), Some(6), Some(6)).unwrap();
+        std::fs::set_permissions(tree.join("refs/sticky"), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::set_permissions(tree.join("objects/locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut jail = GitJail::unprivileged(&top.join("state")).unwrap();
+        jail.uids = Some(Pool { free: Mutex::new(vec![100]), available: tokio::sync::Semaphore::new(1) });
+        let jail = Arc::new(jail);
+        let (mut cmd, confined) = jail.remover(&tree).await.unwrap();
+        let out = cmd.args([REPO, "-mindepth", "1", "-delete"]).output().await.unwrap();
+        drop(confined);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::read_dir(&tree).unwrap().count(), 0, "the tree wasn't emptied");
+        assert_eq!(std::fs::read(host.join("keep")).unwrap(), b"host");
+        std::fs::remove_dir_all(&top).unwrap();
     }
 
     /// own() as root, giving a mirror to id 1: every entry, links included, becomes id 1's,

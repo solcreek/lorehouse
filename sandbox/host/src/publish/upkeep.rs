@@ -590,11 +590,35 @@ impl Publisher {
         true
     }
 
+    /// Empty and remove what was dropped (`<mirrors>/.drop`): each tree emptied by a jailed
+    /// run (Git::empty), then its now-empty directory removed by sandboxd (one rmdir). One
+    /// that can't be emptied yet stays for the next pass.
+    pub(super) async fn empty_graveyard(&self) {
+        let graveyard = self.mirrors.join(super::GRAVEYARD);
+        for entry in std::fs::read_dir(&graveyard).into_iter().flatten().flatten() {
+            let tree = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = std::fs::remove_file(&tree);
+                continue;
+            }
+            match self.git.empty(&tree, self.policy.gc_deadline).await {
+                Ok(()) => {
+                    if let Err(e) = std::fs::remove_dir(&tree) {
+                        eprintln!("sandboxd: a dropped tree {}: {e}; tried again at the next pass", tree.display());
+                    }
+                }
+                Err(e) => eprintln!("sandboxd: emptying a dropped tree {}: {e}; tried again at the next pass", tree.display()),
+            }
+        }
+    }
+
     /// Every mirror on disk measured, for the quotas: run at start, before any job is taken
     /// (the first upkeep pass may take minutes to reach them all, a gc at a time).
     pub fn inventory(&self) {
         // A fast-forward check's repo a previous sandboxd left (killed mid-push).
-        let _ = std::fs::remove_dir_all(self.mirrors.join(".check"));
+        for left in std::fs::read_dir(self.mirrors.join(".check")).into_iter().flatten().flatten() {
+            super::bury(&left.path(), &self.mirrors.join(super::GRAVEYARD));
+        }
         for dir in self.mirror_dirs() {
             if has_head(&dir) {
                 let _ = self.measure(&dir);
@@ -606,6 +630,7 @@ impl Publisher {
     /// free (a busy one is skipped, never waited for): retention, the housekeeping (prune),
     /// what heavy stages left, the daily gc; then every mirror is measured for the status.
     pub async fn maintain(&self) {
+        self.empty_graveyard().await;
         let live = self.live_repos();
         let dirs = self.mirror_dirs();
         for dir in &dirs {

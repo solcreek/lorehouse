@@ -312,6 +312,39 @@ impl Git {
         Ok(Running { child, group, _confined: confined, _proxy: proxy, grant })
     }
 
+    /// Empty `dir`, a dropped tree, in a jailed run (GitJail::remover): sandboxd never walks
+    /// a tree a run wrote. Unisolated (tests), as the test's user.
+    async fn empty(&self, dir: &Path, limit: Duration) -> Result<(), String> {
+        let Some(jail) = &self.jail else {
+            return std::fs::remove_dir_all(dir).and_then(|()| std::fs::create_dir(dir)).map_err(|e| e.to_string());
+        };
+        let (mut cmd, confined) = jail.remover(dir).await?;
+        cmd.args([gitjail::REPO, "-mindepth", "1", "-delete"]);
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true).process_group(0);
+        let child = cmd.spawn().map_err(|e| gitjail::explain(&e))?;
+        let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+        let mut run = Running { child, group, _confined: Some(confined), _proxy: None, grant: None };
+        let err = run.child.stderr.take();
+        let errors = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            if let Some(e) = err {
+                let _ = e.take(STDERR_CAP).read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let status = match tokio::time::timeout(limit, run.wait()).await {
+            Err(_) => return Err(format!("find took over {} s", limit.as_secs())),
+            Ok(s) => s.map_err(|e| format!("find: {e}"))?,
+        };
+        drop(run);
+        let stderr = errors.await.unwrap_or_default();
+        if !status.success() {
+            return Err(format!("find: {}", tail(&stderr)));
+        }
+        Ok(())
+    }
+
     /// Whether a mirror has never been fetched into: not there, or no refs (a first fetch that
     /// failed or was cut off, by a sandboxd that then stopped). New only when git said so: a
     /// for-each-ref that couldn't run or failed says nothing about the mirror, and a failed
@@ -609,11 +642,29 @@ impl Drop for TempFile {
 }
 
 /// A directory removed (whole) when this is dropped.
-struct TempDir(PathBuf);
+/// A directory a run wrote (a check's repo), dropped with this: moved to the graveyard,
+/// never walked by sandboxd.
+struct TempDir(PathBuf, PathBuf);
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        bury(&self.0, &self.1);
+    }
+}
+
+/// Where dropped trees wait for a jailed run to empty them: `<mirrors>/.drop`.
+const GRAVEYARD: &str = ".drop";
+
+/// Move a tree a run wrote (a mirror, a check's repo) into `graveyard`, one rename, O(1):
+/// sandboxd never walks it to delete it. A jailed run empties it later
+/// (Publisher::empty_graveyard). Nothing there: nothing to do.
+fn bury(tree: &Path, graveyard: &Path) {
+    let to = graveyard.join(new_stage_id_at(unix_secs()).unwrap_or_else(|_| format!("{}-{}", unix_secs(), std::process::id())));
+    let moved = std::fs::create_dir_all(graveyard).and_then(|()| std::fs::rename(tree, &to));
+    match moved {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("sandboxd: ALERT: couldn't move {} out of use ({e}); it stays where it is", tree.display()),
     }
 }
 
@@ -641,7 +692,10 @@ pub(crate) fn has_head(dir: &Path) -> bool {
 /// Remove a mirror. Its owner's directory stays: another repo of the same owner may be
 /// creating its mirror in it, under its own lock.
 fn remove_mirror(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
+    // A mirror's directory is `<mirrors>/<owner>/<name>.git`.
+    if let Some(mirrors) = dir.parent().and_then(Path::parent) {
+        bury(dir, &mirrors.join(GRAVEYARD));
+    }
     // Its upkeep state goes with it: a new mirror of the repo starts afresh.
     let _ = std::fs::remove_file(upkeep::state_path(dir));
 }
@@ -1101,7 +1155,7 @@ impl Publisher {
         std::fs::create_dir_all(check.parent().unwrap_or(&self.mirrors)).map_err(|e| format!("the check's repo: {e}"))?;
         std::fs::create_dir(&check).map_err(|e| format!("the check's repo: {e}"))?;
         // Removed however this ends.
-        let _check = TempDir(check.clone());
+        let _check = TempDir(check.clone(), self.mirrors.join(GRAVEYARD));
         let pinned = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
         let git = |args: Vec<String>, net: Net<'static>| {
             let check = check.clone();
@@ -1614,6 +1668,14 @@ mod tests {
         assert!(err.1.contains("couldn't be trusted") && err.1.contains("was dropped"), "{err:?}");
         assert!(!has_head(&s.dir()), "the mirror is still there");
         assert_eq!(s.publisher.status()["anomalies"], 1);
+        // Moved whole into the graveyard (one rename), then emptied and removed by the
+        // upkeep, never walked where it was.
+        let graveyard = s.publisher.mirrors.join(GRAVEYARD);
+        let buried: Vec<_> = std::fs::read_dir(&graveyard).unwrap().flatten().collect();
+        assert_eq!(buried.len(), 1, "{buried:?}");
+        assert!(buried[0].path().join("HEAD").exists(), "the mirror wasn't moved whole");
+        s.publisher.maintain().await;
+        assert_eq!(std::fs::read_dir(&graveyard).unwrap().count(), 0, "the graveyard wasn't emptied");
         // Fetched again on the next stage.
         *s.disk.anomalous.lock().unwrap() = None;
         s.stage_all(request("scout/an"), || {}).await.unwrap();

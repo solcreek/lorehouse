@@ -52,7 +52,7 @@ fn root_keeps_only_the_capabilities_it_uses() {
     // the VM's uid. Firecracker itself ends with none.
     assert_eq!(
         words("CapabilityBoundingSet"),
-        set(&["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL"])
+        set(&["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL", "CAP_FOWNER"])
     );
     assert_eq!(one("NoNewPrivileges"), "yes");
 }

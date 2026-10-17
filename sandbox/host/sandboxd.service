@@ -42,8 +42,10 @@ TimeoutStopSec=120
 # pivot_root, SYS_CHROOT, MKNOD for /dev/kvm and /dev/net/tun in it, CHOWN), then drops
 # to the VM's uid (SETUID, SETGID). sandboxd reaches into a jail, owned by that uid, for
 # the vsock and to clean up (DAC_OVERRIDE), and signals the jailed VMM (KILL). The VMM
-# itself ends with no capability at all.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_KILL
+# itself ends with no capability at all. FOWNER: the jailed run that empties a dropped
+# mirror keeps it, with DAC_OVERRIDE, to delete a tree another uid wrote (sticky
+# directories included); it sees nothing else to use them on (src/gitjail.rs, remover).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_KILL CAP_FOWNER
 # The jailer drops privileges with setuid(2), which NoNewPrivileges doesn't stop.
 NoNewPrivileges=yes
 # Each VM gets its own cgroup (CPU, memory, pids, IO limits) under this unit's, and
