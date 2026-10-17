@@ -23,7 +23,7 @@
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CHART_PNG, MIRRORS, pollRunner, wsRunner } from "./fake-runner";
@@ -453,13 +453,20 @@ const scenarios: Scenario[] = [
     run: async () => {
       const db = freshDb();
       const dir = dirname(db);
-      const tenantLayout = { LOREHOUSE_DB: "", LOREHOUSE_DATA_DIR: dir, LOREHOUSE_ENV_FILE: join(dir, "lorehouse.env"), LOREHOUSE_SETTINGS: join(dir, "settings.json") };
+      // LOREHOUSE_SETTINGS unset (empty): the app finds settings.json in the data directory
+      // by itself, where it was before tenants.
+      const tenantLayout = { LOREHOUSE_DB: "", LOREHOUSE_DATA_DIR: dir, LOREHOUSE_ENV_FILE: join(dir, "lorehouse.env"), LOREHOUSE_SETTINGS: "" };
+      // A value only settings.json provides (the environment leaves PR_APPROVER unset), and
+      // /status shows: read where the install kept it, before the move and after.
+      writeFileSync(join(dir, "settings.json"), JSON.stringify({ env: { PR_APPROVER: "anyone" } }));
+      const approver = async () => ((await status()) as Status & { pullRequestApprover?: string }).pullRequestApprover;
       const joined = async () => JSON.stringify((await admin("/api/v1/threads?limit=200")).threads ?? []);
       try {
         await stopApp();
         await startApp({ LOREHOUSE_DB: db });
         const ts = await mentionAndWait("where is the wombat review");
         const before = (await status()) as Status & { tenant?: string };
+        if ((await approver()) !== "anyone") return `before: pullRequestApprover ${await approver()}, want "anyone" from ${join(dir, "settings.json")}`;
         if (!(await joined()).includes(ts)) return `before: the thread ${ts} isn't listed as joined`;
         if (!existsSync(db) || !existsSync(join(dir, "sessions.db"))) return "before: the databases aren't where LOREHOUSE_DB put them";
         for (let start = 1; start <= 2; start++) {
@@ -475,7 +482,8 @@ const scenarios: Scenario[] = [
             const old = lstatSync(join(dir, f), { throwIfNoEntry: false });
             if (!old?.isSymbolicLink() || resolve(dir, readlinkSync(join(dir, f))) !== join(at, f)) return `start ${start}: ${join(dir, f)} isn't a symlink to ${join(at, f)}`;
           }
-          if (!existsSync(join(dir, "settings.json")) && existsSync(join(at, "settings.json"))) return `start ${start}: settings.json moved into the tenant's directory`;
+          if (!lstatSync(join(dir, "settings.json"), { throwIfNoEntry: false })?.isFile() || existsSync(join(at, "settings.json"))) return `start ${start}: settings.json isn't a file in the data directory alone`;
+          if ((await approver()) !== "anyone") return `start ${start}: pullRequestApprover ${await approver()}, want "anyone": settings.json in the data directory wasn't read`;
           if (!(await joined()).includes(ts)) return `start ${start}: the thread the agent was asked into before the move is gone: ${(await joined()).slice(0, 200)}`;
           if (s.knowledge.documents !== before.knowledge.documents) return `start ${start}: ${s.knowledge.documents} documents, want ${before.knowledge.documents}`;
         }
