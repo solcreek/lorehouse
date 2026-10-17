@@ -2,7 +2,6 @@
 // laid out before tenants moved into its tenant's directory on the first start.
 
 import { describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -132,13 +131,18 @@ describe("an install laid out before tenants upgrades in place", () => {
     expect(holds(join(d, "lorehouse.db"), "onlyinthewal")).toBe(false);
     return d;
   }
+  // Read in a process of its own, as the next start would: this one then never holds
+  // SQLite state for a file a later step renames. Its close may checkpoint the WAL and
+  // remove the side files (Linux's SQLite does), so what a later start moves is whatever is
+  // there then (movedLabel).
   const rows = (path: string) => {
-    const db = new Database(path, { readwrite: true, create: false });
-    try {
-      return (db.query("SELECT COUNT(*) AS n FROM walrows").get() as { n: number }).n;
-    } finally {
-      db.close();
-    }
+    const r = Bun.spawnSync(["bun", "-e", `const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(path)}, { readwrite: true, create: false }); console.log(db.query("SELECT COUNT(*) AS n FROM walrows").get().n); db.close();`], { stderr: "inherit" });
+    return Number(r.stdout.toString().trim());
+  };
+  // What upgradeLayout reports moving for `name` in `d`, from the side files there now.
+  const movedLabel = (d: string, name: string) => {
+    const sides = ["-wal", "-shm", "-journal"].filter((s) => existsSync(join(d, name + s)));
+    return name + (sides.length ? ` (+ ${sides.join(", ")})` : "");
   };
   // A start, as far as storage goes: the tenant resolved and made, then the upgrade.
   const start = (d: string) => {
@@ -198,9 +202,18 @@ describe("an install laid out before tenants upgrades in place", () => {
     // Its tenant is kept in the data directory all the same, and found by a later start
     // that unsets LOREHOUSE_DB: that one moves the files.
     expect(tenantsIn(d)).toEqual([config.tenant.id]);
+    const sides = ["-wal", "-shm", "-journal"].flatMap((s) => ["lorehouse.db", "sessions.db"].map((f) => f + s)).filter((f) => existsSync(join(d, f)));
+    const want = [movedLabel(d, "lorehouse.db"), movedLabel(d, "sessions.db")];
     const later = start(d);
     expect(later.config.tenant.id).toBe(config.tenant.id);
-    expect(later.moved).toEqual(["lorehouse.db (+ -wal, -shm)", "sessions.db (+ -wal, -shm)"]);
+    expect(later.moved).toEqual(want);
+    // Each side file that was there moved with its database, and none appeared from nowhere.
+    for (const f of sides) expect([f, existsSync(join(later.config.tenant.dir, f))]).toEqual([f, true]);
+    for (const f of ["-wal", "-shm", "-journal"].flatMap((s) => ["lorehouse.db", "sessions.db"].map((x) => x + s))) {
+      if (!sides.includes(f)) expect([f, existsSync(join(later.config.tenant.dir, f))]).toEqual([f, false]);
+    }
+    expect(rows(later.config.db.lorehouse)).toBe(25);
+    expect(rows(later.config.db.sessions)).toBe(7);
   });
 });
 
