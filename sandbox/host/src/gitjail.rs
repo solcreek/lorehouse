@@ -38,6 +38,9 @@ use std::time::Duration;
 pub const GIT_UIDS: u32 = 32;
 /// Where the mirror is, as the run sees it.
 pub const REPO: &str = "/repo";
+/// What the remover's find is given (GitJail::remover): every entry under the tree, deepest
+/// first, deleted as itself (a link never followed).
+pub const REMOVE_ARGS: [&str; 4] = [REPO, "-mindepth", "1", "-delete"];
 /// The run's global git config when a file:// remote is bound in (testing): it names that
 /// repo safe, and holds nothing else.
 pub const SAFE_CONFIG: &str = "/etc/safe.gitconfig";
@@ -940,11 +943,19 @@ pub(crate) mod tests {
         // Hosts that forbid unprivileged user namespaces (Ubuntu's AppArmor default), or
         // have no subuids for --map-auto: the inner test never started.
         if stderr.starts_with("unshare:") {
-            eprintln!("skipped: {}", stderr.trim());
+            eprintln!("NOTE: {test} skipped: {}", stderr.trim());
+            assert!(std::env::var_os("SANDBOXD_REQUIRE_USERNS").is_none(), "{test} skipped, but SANDBOXD_REQUIRE_USERNS is set: {}", stderr.trim());
             return;
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+        // The inner test can still skip (a user namespace without capabilities, as on
+        // Ubuntu's runners): said aloud, and a failure where SANDBOXD_REQUIRE_USERNS is set
+        // (starship), so a host that can run it never passes it silently.
+        if let Some(line) = stdout.lines().chain(stderr.lines()).find(|l| l.starts_with("skipped:")) {
+            eprintln!("NOTE: {test} skipped inside its user namespace: {line}");
+            assert!(std::env::var_os("SANDBOXD_REQUIRE_USERNS").is_none(), "{test} skipped, but SANDBOXD_REQUIRE_USERNS is set: {line}");
+        }
     }
 
     /// A git on PATH that is a link into /usr (a /opt/bin/git, a Nix profile's): the run
@@ -1015,8 +1026,10 @@ pub(crate) mod tests {
 
     /// The remover, as root in a user namespace with ids 1..65536 mapped: its run is a leased
     /// uid (100) that owns nothing of the tree, which belongs to ids 5 and 6, with a
-    /// directory no one may read and a sticky one; a link to a host file is deleted as a
-    /// link. The tree is emptied and the host file stays.
+    /// directory no one may read and a sticky one. Its links point at what the run does see,
+    /// /usr/lib and /etc/ld.so.cache (read-only there: a remover that followed one would
+    /// fail on it), and at a host file it doesn't. The tree is emptied, every link as a link,
+    /// and the run had exactly CAP_DAC_OVERRIDE and CAP_FOWNER, as seen from outside it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "run by a_dropped_tree_is_emptied_by_a_jailed_run_never_by_sandboxd, in a user namespace"]
@@ -1033,6 +1046,8 @@ pub(crate) mod tests {
         std::fs::write(tree.join("objects/locked/a"), b"a").unwrap();
         std::fs::write(tree.join("refs/sticky/b"), b"b").unwrap();
         std::os::unix::fs::symlink(host.join("keep"), tree.join("link")).unwrap();
+        std::os::unix::fs::symlink("/usr/lib", tree.join("usr-link")).unwrap();
+        std::os::unix::fs::symlink("/etc/ld.so.cache", tree.join("objects/cache-link")).unwrap();
         let probe = top.join("probe");
         std::fs::write(&probe, b"").unwrap();
         if std::os::unix::fs::lchown(&probe, Some(5), Some(5)).is_err() {
@@ -1040,15 +1055,37 @@ pub(crate) mod tests {
             std::fs::remove_dir_all(&top).unwrap();
             return;
         }
-        for p in ["", "objects", "objects/locked", "objects/locked/a", "refs", "refs/sticky", "link"] {
+        for p in ["", "objects", "objects/locked", "objects/locked/a", "refs", "refs/sticky", "link", "usr-link", "objects/cache-link"] {
             std::os::unix::fs::lchown(tree.join(p), Some(5), Some(5)).unwrap();
         }
         std::os::unix::fs::lchown(tree.join("refs/sticky/b"), Some(6), Some(6)).unwrap();
         std::fs::set_permissions(tree.join("refs/sticky"), std::fs::Permissions::from_mode(0o1777)).unwrap();
         std::fs::set_permissions(tree.join("objects/locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
         let jail = with_uids(&top.join("state"), vec![100]);
+        // Its capabilities, read from outside while it waits (there is no /proc inside).
         let (mut cmd, confined) = jail.remover(&tree, Default::default()).await.unwrap();
-        let out = cmd.args([REPO, "-mindepth", "1", "-delete"]).output().await.unwrap();
+        let mut waiting = cmd.args([REPO, "-maxdepth", "0", "-exec", "sleep", "2", ";"]).spawn().unwrap();
+        let mut caps = None;
+        for _ in 0..300 {
+            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+                let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else { continue };
+                let field = |k: &str| status.lines().find_map(|l| l.strip_prefix(k)).map(|v| v.trim().to_string()).unwrap_or_default();
+                if field("Uid:").starts_with("100\t") {
+                    caps = Some((field("CapEff:"), field("CapPrm:"), field("CapAmb:"), field("NoNewPrivs:")));
+                }
+            }
+            if caps.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        waiting.wait().await.unwrap();
+        drop(confined);
+        let mask = "000000000000000a".to_string(); // CAP_DAC_OVERRIDE (1) | CAP_FOWNER (3)
+        assert_eq!(caps, Some((mask.clone(), mask.clone(), mask, "1".to_string())), "the remover's capabilities");
+        // The removal itself, as Git::empty runs it.
+        let (mut cmd, confined) = jail.remover(&tree, Default::default()).await.unwrap();
+        let out = cmd.args(REMOVE_ARGS).output().await.unwrap();
         drop(confined);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(std::fs::read_dir(&tree).unwrap().count(), 0, "the tree wasn't emptied");

@@ -336,7 +336,7 @@ impl Git {
         };
         let stuck = Stuck::default();
         let (mut cmd, confined) = jail.remover(dir, stuck.clone()).await?;
-        cmd.args([gitjail::REPO, "-mindepth", "1", "-delete"]);
+        cmd.args(gitjail::REMOVE_ARGS);
         cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true).process_group(0);
         let child = cmd.spawn().map_err(|e| gitjail::explain(&e))?;
         let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
