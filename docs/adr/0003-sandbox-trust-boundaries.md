@@ -113,6 +113,14 @@ around sandboxd. So:
     RESOLVE_NO_SYMLINKS`, or a component-by-component `O_NOFOLLOW` walk), regular files
     only, never waiting on one, up to a cap. It doesn't list the files that are dangerous;
     it never reads outside the mirror or as git would;
+  - **a mirror is a cache of GitHub: host traversal of it is bounded, and any anomaly
+    drops it.** A walk streams entries, holds one open directory per level, and stops at
+    caps on entries, depth and bytes; past a cap, or on any error on the way, the mirror
+    isn't trusted in part, it is dropped (and fetched again when next needed), and the job
+    that found it fails. Dropping is one rename into a graveyard; a jailed run empties the
+    tree later, so sandboxd never walks a run's tree to delete it. A run whose cgroup
+    can't be emptied is treated the same way: its trees are taken out of use at once, its
+    job fails, and its uid waits until its cgroup is found empty;
   - **its own network namespace**, empty. A run that fetches or pushes gets one whose only
     address is a listener sandboxd serves; sandboxd forwards that repo's upload-pack or
     receive-pack, and nothing else, to GitHub (`publish/remote.rs`);
