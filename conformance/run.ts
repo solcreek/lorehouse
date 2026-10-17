@@ -1582,6 +1582,32 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    // #145: whoever approves must be a full member of the workspace, under any rule. Even
+    // with PR_APPROVER=anyone, a guest's Approve and Deny are refused and nothing is pushed;
+    // a member's Approve then opens it.
+    name: "PR_APPROVER=anyone: a guest's Approve and Deny are refused and nothing is pushed; a member's Approve opens it",
+    run: () => {
+      const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github`, PR_APPROVER: "anyone" };
+      return inMode(env, async () => {
+        const runner = pollRunner(APP, RUNNER_TOKEN, "r-guest-approver");
+        try {
+          await Bun.sleep(200); // the first poll registers the runner
+          await reset();
+          const card = await prCard("scout/conformance-guest-approver");
+          if (typeof card === "string") return card;
+          const refused = await refusedFor("UG1", "a guest", card, runner);
+          if (refused) return refused;
+          await click("U2", card, "Approve");
+          const done = await until(async () => (await stats()).updates.find((u) => u.ts === card.prompt.ts && u.text.includes("[pr:")));
+          if (!done) return `approved by a member after the guest, the turn never finished: responses ${JSON.stringify((await stats()).responses)}`;
+          return openedBy(runner, "Wendy (Wendy Wu)");
+        } finally {
+          await runner.stop();
+        }
+      });
+    },
+  },
+  {
     // ADR 0002 §6: an install can require a second person. The requester's clicks change
     // nothing (they alone are told why), the card stays for someone else, and nothing is
     // pushed until someone else approves.
