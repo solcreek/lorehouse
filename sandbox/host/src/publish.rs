@@ -1378,7 +1378,7 @@ mod tests {
         let git = Git::new(Some(jail.clone()), "file:///nonexistent");
         git.run(&s.dir(), &["-c", "alias.escape=!setsid sleep 300 </dev/null >/dev/null 2>&1 & echo started", "escape"], GIT_LOCAL).await.unwrap();
         let left = git_uid_processes(BASE);
-        assert!(left.is_empty(), "{} processes of git's uids left after the run", left.len());
+        assert!(left.is_empty(), "a process of git's uids was left after the run");
         let cgroups_left: Vec<_> = std::fs::read_dir(&cgroups).unwrap().flatten().filter(|e| e.file_type().unwrap().is_dir()).map(|e| e.file_name()).collect();
         assert!(cgroups_left.is_empty(), "{cgroups_left:?}");
         // Two runs at once never share a uid.
