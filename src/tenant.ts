@@ -274,7 +274,12 @@ export function upgradeLayout(moves: Move[]): string[] {
       for (const s of SIDE_FILES) if (lexists(to + s) && !sameFile(from + s, to + s)) aside.push(setAside(to + s));
       linkOver(from, to);
       itself = true;
-    } else rmSync(linkTemp(from), { force: true });
+    } else {
+      // The database's own link left dangling (its file gone, by hand or a bad restore):
+      // opening it would make an empty database there, silently.
+      if (!lexists(to)) throw new UpgradeError(`${from} is a symlink to ${to}, which doesn't exist: put the database back there (or the link's target back at ${from}), then start again`);
+      rmSync(linkTemp(from), { force: true });
+    }
     const sides: string[] = [];
     for (const s of SIDE_FILES) {
       const now = standing(from + s, to + s);

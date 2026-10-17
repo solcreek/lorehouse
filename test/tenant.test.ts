@@ -258,6 +258,19 @@ describe("an install laid out before tenants upgrades in place", () => {
     expect(JSON.parse(read.stdout.toString())).toEqual({ n: 400, ok: "ok" });
   });
 
+  // The database's own link left dangling (its file gone from the tenant's directory, by
+  // hand or a bad restore): starting would make an empty database there, silently.
+  test("a database whose old path is a link to a file that isn't there is refused, naming both", async () => {
+    const d = await todaysLayout();
+    const { config } = start(d);
+    for (const f of readdirSync(config.tenant.dir).filter((f) => f.startsWith("lorehouse.db"))) rmSync(join(config.tenant.dir, f));
+    expect(() => upgradeLayout(config.db.upgrade)).toThrow(UpgradeError);
+    expect(() => upgradeLayout(config.db.upgrade)).toThrow(`${join(d, "lorehouse.db")} is a symlink to ${config.db.lorehouse}, which doesn't exist`);
+    expect(existsSync(config.db.lorehouse)).toBe(false);
+    // A side file's link left dangling is normal: SQLite removes a -wal on close.
+    expect(upgradeLayout(config.db.upgrade.filter((m) => m.to !== config.db.lorehouse))).toEqual([]);
+  });
+
   test("an old path that is a symlink to somewhere else is refused, never followed or moved", async () => {
     const d = await todaysLayout();
     const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
