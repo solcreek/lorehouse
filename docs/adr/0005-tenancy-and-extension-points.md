@@ -126,8 +126,25 @@ Anthropic are the first implementations, never assumptions in the core:
     them.
   - Document ids are `<source>:<source-scoped id>`.
   - **Visibility is per document.** A source either says a document is visible to the
-    whole organization (today's rule), or carries its access list. Search filters by the
-    asker's identity on that source.
+    whole organization (today's rule), or carries its access list.
+  - **What may reach the model is what everyone who will read the answer may see.** That
+    is the intersection of the asker's access and the reply's audience, not the asker's
+    access alone. Otherwise a person allowed to read a restricted document could have it
+    summarized into a thread the whole organization reads.
+    - The chat surface's contract says who the audience of a conversation is, and the
+      knowledge source's says who may see a document.
+    - Search and every tool that returns content filter by that intersection *before*
+      anything is passed to the model.
+    - A conversation the whole organization can read uses only material visible to the
+      whole organization.
+    - Restricted material is used only where the audience is known and every member of
+      it is authorized, as in a direct message with its asker.
+    - When the audience can't be determined, restricted material is excluded.
+  - **Session context follows the same rule.** A session's saved turns, tool results
+    included, may hold material retrieved for an earlier audience. Before they're reused,
+    for a later turn, another participant, or a changed audience, they're filtered by the
+    current audience, or the session starts without them. A thread's audience can grow;
+    what was fine to say to fewer people isn't automatically fine to repeat to more.
   - Chat history is one source. Docs, wikis, tickets, email and code are others.
 - **Model provider.** Covers the provider and model per tenant and per profile.
   - Anthropic's API, cloud providers' hosted endpoints (Bedrock, Vertex, Azure), and
@@ -161,8 +178,14 @@ Anthropic are the first implementations, never assumptions in the core:
 - **Code that says Slack moves behind the chat-surface contract:** `src/policy.ts`,
   `src/threads.ts`, `src/slack-guard.ts`, `src/ingest/slack.ts`, the `slack:` ids. The
   `slack:` ids stay valid as one source's ids.
-- **Search gets an access filter.** Organization-wide visibility is the first case.
-  Access lists come with the first connector that has them.
+- **Search and content tools get an audience filter** (the asker and the reply's
+  audience, intersected), and saved sessions are filtered the same way before they're
+  reused.
+  - Organization-wide visibility is the first case, and today's public-channels rule
+    already meets it.
+  - Access lists come with the first connector that has them, and that connector can't
+    ship before both filters do.
+  - This needs session redaction or filtering from June (junebuild/june#360 is related).
 - **Skills move from `prompts/skills/` to tenant data**, with the shipped ones as seeds.
   `src/prompts.ts` keeps tool prompts (code), not tenant skills.
 - **Open questions before a cell is built**, each a spike:
