@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config";
 import { closeKnowledge, countDocuments, openKnowledge } from "../src/knowledge";
 import { settingsPath } from "../src/settings";
-import { logAsTenant, newTenantId, pendingMoves, prepareTenant, resolveTenant, tenantsIn, upgradeLayout, UpgradeError, validTenantId, type Tenant } from "../src/tenant";
+import { logAsTenant, newTenantId, pendingMoves, prepareTenant, resolveTenant, sandboxIdFor, SANDBOX_ID_MAX, tenantsIn, upgradeLayout, UpgradeError, validTenantId, type Tenant } from "../src/tenant";
 
 const base = { SLACK_SIGNING_SECRET: "s", SLACK_BOT_TOKEN: "t", ANTHROPIC_API_KEY: "k" };
 const dir = () => mkdtempSync(join(tmpdir(), "lorehouse-tenant-"));
@@ -18,6 +18,8 @@ const tenantOf = (env: Record<string, string>): Tenant => {
   if ("problem" in t) throw new Error(t.problem);
   return t;
 };
+// sandboxd's own rule (sandbox/host/src/vm.rs, valid_id).
+const sandboxdTakes = (id: string) => id.length > 0 && id.length <= 128 && /^[A-Za-z0-9_.-]+$/.test(id) && !id.startsWith(".");
 
 describe("tenant ids", () => {
   test("safe as one path segment and inside a sandbox id: lowercase letters, digits, inner hyphens, at most 32", () => {
@@ -199,6 +201,24 @@ describe("an install laid out before tenants upgrades in place", () => {
     const later = start(d);
     expect(later.config.tenant.id).toBe(config.tenant.id);
     expect(later.moved).toEqual(["lorehouse.db (+ -wal, -shm)", "sessions.db (+ -wal, -shm)"]);
+  });
+});
+
+describe("sandbox ids", () => {
+  test("<tenant>.<session>, as sandboxd takes them", () => {
+    expect(sandboxIdFor("t-abc", "slack:C1:1790000001.000100")).toBe("t-abc.slack_C1_1790000001.000100");
+    expect(sandboxdTakes(sandboxIdFor("t-abc", "slack:C1:1790000001.000100"))).toBe(true);
+    // Two tenants' same thread never share one.
+    expect(sandboxIdFor("acme", "slack:C1:1.1")).not.toBe(sandboxIdFor("globex", "slack:C1:1.1"));
+  });
+
+  test("a long session is cut to sandboxd's 128 characters, with a hash so two never collide", () => {
+    const a = sandboxIdFor("x".repeat(32), `slack:C1:${"9".repeat(200)}a`);
+    const b = sandboxIdFor("x".repeat(32), `slack:C1:${"9".repeat(200)}b`);
+    expect(a.length).toBe(SANDBOX_ID_MAX);
+    expect(sandboxdTakes(a) && sandboxdTakes(b)).toBe(true);
+    expect(a).not.toBe(b);
+    expect(a.startsWith(`${"x".repeat(32)}.slack_C1_`)).toBe(true);
   });
 });
 

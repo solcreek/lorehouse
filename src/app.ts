@@ -42,7 +42,7 @@ import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
-import { prepareTenant, tenantsIn, upgradeLayout } from "./tenant";
+import { prepareTenant, sandboxIdFor, tenantsIn, upgradeLayout } from "./tenant";
 
 // How each tool call shows up on the reply's task timeline in Slack.
 const TASK_LABELS: Record<string, string> = {
@@ -180,8 +180,9 @@ export async function createApp(config: Config) {
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
   if (config.sandbox) {
     const sb = config.sandbox;
-    // One sandbox per thread, keyed off the session (never model input).
-    const sandboxId = (ctx: ToolContext) => ctx.sessionId.replace(/[^\w.-]/g, "_");
+    // One sandbox per thread, keyed off the tenant and the session (never model input):
+    // "<tenant>.<session>", so two tenants' threads never share an id on a host (tenant.ts).
+    const sandboxId = (ctx: ToolContext) => sandboxIdFor(tenant.id, ctx.sessionId);
     const sandboxFor = sb.mode === "runners"
       ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx))
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });

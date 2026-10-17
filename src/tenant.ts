@@ -23,7 +23,7 @@
 // A start that dies part-way finishes the move on the next one; a second start moves
 // nothing. A LOREHOUSE_DB or SESSIONS_DB an operator set is used where it is and never moved.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { closeSync, constants, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -169,6 +169,18 @@ export function upgradeLayout(moves: Move[]): string[] {
 // The databases still to move, for the doctor: those whose old file exists.
 export function pendingMoves(moves: Move[]): Move[] {
   return moves.filter((m) => existsSync(m.from) && statSync(m.from).isFile());
+}
+
+// A sandbox id for one thread of this tenant: "<tenant>.<session>", the session's
+// characters outside [A-Za-z0-9_.-] as "_". The tenant has no dot, so the first dot ends
+// it. Past sandboxd's 128 characters the session part is cut and a hash of the whole
+// session added, so two long sessions never share a sandbox.
+export const SANDBOX_ID_MAX = 128;
+export function sandboxIdFor(tenant: string, sessionId: string): string {
+  const id = `${tenant}.${sessionId.replace(/[^\w.-]/g, "_")}`;
+  if (id.length <= SANDBOX_ID_MAX) return id;
+  const hash = createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
+  return `${id.slice(0, SANDBOX_ID_MAX - hash.length - 1)}-${hash}`;
 }
 
 // Every line the process logs starts with its tenant: console.log, info, warn, error and

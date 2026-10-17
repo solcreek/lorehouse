@@ -1,7 +1,7 @@
 # sandboxd
 
 The sandbox host: one Firecracker microVM per sandbox id (Lorehouse uses one per Slack
-thread). Rust. Work reaches it one of two ways:
+thread, `<tenant>.<thread>`: [docs/sandbox-runners.md](../docs/sandbox-runners.md)). Rust. Work reaches it one of two ways:
 
 - **Runner** (the usual one): it connects out to Lorehouse over WebSocket or long poll
   and asks for work, like a CI runner, so it holds no open port and the sandbox API is

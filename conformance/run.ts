@@ -1484,7 +1484,11 @@ const scenarios: Scenario[] = [
       try {
         const a = await ask("[exec] echo hi");
         if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
-        if (!/^slack_C1_\d+\.\d+$/.test(runner.jobs[0]?.sandbox ?? "")) return `the job's sandbox ${runner.jobs[0]?.sandbox}, want one per thread (slack_C1_<ts>)`;
+        // One per thread, and the tenant's: "<tenant>.<thread>", so two tenants' threads
+        // never share a sandbox on one host (ADR 0005 §1).
+        const tenant = ((await status()) as Status & { tenant?: string }).tenant;
+        const sandbox = runner.jobs[0]?.sandbox ?? "";
+        if (!sandbox.startsWith(`${tenant}.`) || !/^slack_C1_\d+\.\d+$/.test(sandbox.slice(`${tenant}.`.length))) return `the job's sandbox ${sandbox}, want one per thread of this tenant (${tenant}.slack_C1_<ts>)`;
         const listed = (await status() as unknown as { runners?: { runner: string; transport: string; online: boolean; mirrors?: unknown }[] }).runners;
         // The runner's mirrors block, as it sent it.
         return listed?.some((r) => r.runner === "r-ws" && r.transport === "ws" && r.online && JSON.stringify(r.mirrors) === JSON.stringify(MIRRORS)) ? null : `/status runners ${JSON.stringify(listed)}`;
