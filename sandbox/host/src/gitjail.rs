@@ -467,16 +467,18 @@ impl Drop for Confined {
 /// Move a tree a run wrote (a mirror, a check's repo) into `graveyard`, one rename, O(1):
 /// sandboxd never walks it to delete it. A jailed run empties it later
 /// (Publisher::empty_graveyard). Nothing there: nothing to do.
-pub(crate) fn bury(tree: &Path, graveyard: &Path) {
+pub(crate) fn bury(tree: &Path, graveyard: &Path) -> Option<PathBuf> {
     let mut id = [0u8; 16];
     let random = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut id));
     let name = if random.is_ok() { id.iter().map(|b| format!("{b:02x}")).collect::<String>() } else { format!("{}", std::process::id()) };
-    let moved = std::fs::create_dir_all(graveyard).and_then(|()| std::fs::rename(tree, graveyard.join(name)));
+    let to = graveyard.join(name);
+    let moved = std::fs::create_dir_all(graveyard).and_then(|()| std::fs::rename(tree, &to));
     match moved {
-        Ok(()) => {}
+        Ok(()) => return Some(to),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => eprintln!("sandboxd: ALERT: couldn't move {} out of use ({e}); it stays where it is", tree.display()),
     }
+    None
 }
 
 /// Make `dir` and everything in it owned by `uid` and `gid` (a run's are the same id),

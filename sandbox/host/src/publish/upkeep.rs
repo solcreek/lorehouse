@@ -257,6 +257,9 @@ pub(super) struct Stats {
     refresh_timeouts: u64,
     /// Mirrors dropped for an anomaly in their traversal (mirrorfs).
     anomalies: u64,
+    /// Trees in the graveyard not emptied yet, with the bytes each was last measured at
+    /// (0 when unknown): they still take their space, so they count in total().
+    buried: HashMap<PathBuf, u64>,
     fs_unknown_logged: bool,
 }
 
@@ -371,7 +374,10 @@ impl Publisher {
 
     /// Remove a mirror (its lock held) and forget it.
     pub(super) fn drop_mirror(&self, dir: &Path) {
-        remove_mirror(dir);
+        let bytes = self.stats().mirrors.get(dir).map_or(0, |m| m.bytes);
+        if let Some(tree) = remove_mirror(dir) {
+            self.stats().buried.insert(tree, bytes);
+        }
         self.forget(dir);
     }
 
@@ -380,7 +386,8 @@ impl Publisher {
     }
 
     fn total(&self) -> u64 {
-        self.stats().mirrors.values().map(|m| m.bytes).sum()
+        let st = self.stats();
+        st.mirrors.values().map(|m| m.bytes).sum::<u64>() + st.buried.values().sum::<u64>()
     }
 
     /// Whether the mirrors, with `extra` bytes more, fit, and the filesystem keeps its floor
@@ -409,7 +416,7 @@ impl Publisher {
     /// never `keep`, one a live stage record names, or one whose lock is held (it is never
     /// waited for: the caller holds `keep`'s). Until the mirrors, with `extra` bytes more, use at
     /// most EVICT_TO_PCT of mirrors_max and the filesystem keeps its floor, or none is left.
-    fn evict(&self, keep: &Path, extra: u64) {
+    async fn evict(&self, keep: &Path, extra: u64) {
         let now = self.now();
         let live = self.live_repos();
         let mut idle: Vec<(u64, PathBuf)> = self.stats().mirrors.iter().filter(|(d, m)| d.as_path() != keep && now.saturating_sub(m.last_used) > self.policy.evict_idle.as_secs()).map(|(d, m)| (m.last_used, d.clone())).collect();
@@ -430,20 +437,29 @@ impl Publisher {
             if now.saturating_sub(used) <= self.policy.evict_idle.as_secs() || self.live_repos().contains(&repo_of(&dir)) {
                 continue;
             }
-            remove_mirror(&dir);
-            self.forget(&dir);
+            self.drop_mirror(&dir);
             self.stats().evicted += 1;
             eprintln!("sandboxd: dropped the mirror of {} to make room (idle {} h)", repo_of(&dir), now.saturating_sub(last_used) / 3600);
+            // Its space is only free once the tree is emptied: now, before room is looked at
+            // again, or every idle mirror would go for no change.
+            self.empty_graveyard().await;
         }
     }
 
     /// Room for `extra` bytes more, evicting if needed; else a 507 that says why. `need` is
     /// what the message says this mirror needs.
-    fn make_room(&self, dir: &Path, owner: &str, name: &str, extra: u64, need: u64) -> Result<(), Failure> {
+    async fn make_room(&self, dir: &Path, owner: &str, name: &str, extra: u64, need: u64) -> Result<(), Failure> {
         if self.room(extra).is_ok() {
             return Ok(());
         }
-        self.evict(dir, extra);
+        // What was dropped but not emptied yet still takes its space: freed first.
+        if !self.stats().buried.is_empty() {
+            self.empty_graveyard().await;
+            if self.room(extra).is_ok() {
+                return Ok(());
+            }
+        }
+        self.evict(dir, extra).await;
         let short = match self.room(extra) {
             Ok(()) => return Ok(()),
             Err(short) => short,
@@ -475,8 +491,7 @@ impl Publisher {
     /// push needs the mirror; the first stage after no record does, removes it).
     fn over_cap(&self, dir: &Path, owner: &str, name: &str, bytes: u64) -> Failure {
         if !self.live_repos().contains(&repo_of(dir)) {
-            remove_mirror(dir);
-            self.forget(dir);
+            self.drop_mirror(dir);
         }
         self.stats().refused_for_space += 1;
         (507, format!("the mirror of {owner}/{name} is {} GiB, over the {} GiB a repo may use on this sandbox host: nothing was staged. An operator can raise SANDBOXD_MIRROR_MAX_GIB.", gib(bytes), gib(self.policy.mirror_max)))
@@ -485,9 +500,9 @@ impl Publisher {
     /// Before a stage's refresh, under the mirror's lock: the mirror as last measured is
     /// within its cap, and there is room for it. A `new` one (never fetched into: is_new)
     /// counts at mirror_max, and is admitted under `new_mirrors`.
-    pub(super) fn admit(&self, dir: &Path, owner: &str, name: &str, new: bool) -> Result<(), Failure> {
+    pub(super) async fn admit(&self, dir: &Path, owner: &str, name: &str, new: bool) -> Result<(), Failure> {
         if new {
-            return self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max);
+            return self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max).await;
         }
         let mut known = self.stats().mirrors.get(dir).map(|m| m.bytes);
         if known.is_none() && has_head(dir) {
@@ -496,19 +511,19 @@ impl Publisher {
         }
         match known {
             Some(bytes) if bytes > self.policy.mirror_max => Err(self.over_cap(dir, owner, name, bytes)),
-            Some(bytes) => self.make_room(dir, owner, name, 0, bytes),
-            None => self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max),
+            Some(bytes) => self.make_room(dir, owner, name, 0, bytes).await,
+            None => self.make_room(dir, owner, name, self.policy.mirror_max, self.policy.mirror_max).await,
         }
     }
 
     /// After a fetch into the mirror (the refresh, a bundle), under its lock: measured; over
     /// its cap, it is removed; either way, refused when there is no room.
-    pub(super) fn check_size(&self, dir: &Path, owner: &str, name: &str) -> Result<(), Failure> {
+    pub(super) async fn check_size(&self, dir: &Path, owner: &str, name: &str) -> Result<(), Failure> {
         let bytes = self.measure(dir)?;
         if bytes > self.policy.mirror_max {
             return Err(self.over_cap(dir, owner, name, bytes));
         }
-        self.make_room(dir, owner, name, 0, bytes)
+        self.make_room(dir, owner, name, 0, bytes).await
     }
 
     /// A refresh failed: counted if it ran out of time, forgotten if the mirror is gone, and
@@ -602,11 +617,12 @@ impl Publisher {
                 continue;
             }
             match self.git.empty(&tree, self.policy.gc_deadline).await {
-                Ok(()) => {
-                    if let Err(e) = std::fs::remove_dir(&tree) {
-                        eprintln!("sandboxd: a dropped tree {}: {e}; tried again at the next pass", tree.display());
+                Ok(()) => match std::fs::remove_dir(&tree) {
+                    Ok(()) => {
+                        self.stats().buried.remove(&tree);
                     }
-                }
+                    Err(e) => eprintln!("sandboxd: a dropped tree {}: {e}; tried again at the next pass", tree.display()),
+                },
                 Err(e) => eprintln!("sandboxd: emptying a dropped tree {}: {e}; tried again at the next pass", tree.display()),
             }
         }
@@ -645,8 +661,7 @@ impl Publisher {
             // Looked at again under its lock, as evict() does: a stage of it may have written
             // its record since the pass began.
             if idle > self.policy.retention.as_secs() && !live.contains(&repo_of(dir)) && !self.live_repos().contains(&repo_of(dir)) {
-                remove_mirror(dir);
-                self.forget(dir);
+                self.drop_mirror(dir);
                 self.stats().evicted += 1;
                 eprintln!("sandboxd: dropped the mirror of {}: no stage in {} days", repo_of(dir), idle / 86_400);
                 continue;
@@ -691,6 +706,8 @@ impl Publisher {
             "refusedForSpace": st.refused_for_space,
             "refreshTimeouts": st.refresh_timeouts,
             "anomalies": st.anomalies,
+            "graveyardTrees": std::fs::read_dir(self.mirrors.join(super::GRAVEYARD)).map_or(0, |d| d.count()),
+            "graveyardBytes": st.buried.values().sum::<u64>(),
         })
     }
 }

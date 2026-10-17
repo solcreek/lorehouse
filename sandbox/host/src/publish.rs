@@ -701,13 +701,12 @@ pub(crate) fn has_head(dir: &Path) -> bool {
 
 /// Remove a mirror. Its owner's directory stays: another repo of the same owner may be
 /// creating its mirror in it, under its own lock.
-fn remove_mirror(dir: &Path) {
+fn remove_mirror(dir: &Path) -> Option<PathBuf> {
     // A mirror's directory is `<mirrors>/<owner>/<name>.git`.
-    if let Some(mirrors) = dir.parent().and_then(Path::parent) {
-        gitjail::bury(dir, &mirrors.join(GRAVEYARD));
-    }
+    let buried = dir.parent().and_then(Path::parent).and_then(|mirrors| gitjail::bury(dir, &mirrors.join(GRAVEYARD)));
     // Its upkeep state goes with it: a new mirror of the repo starts afresh.
     let _ = std::fs::remove_file(upkeep::state_path(dir));
+    buried
 }
 
 /// A mirror whose first fetch hasn't completed, removed when this is dropped unless it was
@@ -928,12 +927,12 @@ impl Publisher {
         // A new mirror is admitted, fetched and measured one at a time, so the next one is
         // admitted against what the last one measured, not against the same room.
         let first = if new { Some(self.new_mirrors.lock().await) } else { None };
-        self.admit(&dir, &req.owner, &req.name, new)?;
+        self.admit(&dir, &req.owner, &req.name, new).await?;
         if let Err(e) = self.update_mirror(&dir, &req.owner, &req.name, req.token.as_deref()).await {
             self.refresh_failed(&dir, &e);
             return Err((502, format!("updating the mirror of {}/{} from GitHub: {e}", req.owner, req.name)));
         }
-        if let Err(e) = self.check_size(&dir, &req.owner, &req.name) {
+        if let Err(e) = self.check_size(&dir, &req.owner, &req.name).await {
             // A mirror just made for this stage doesn't stay to hold space it had no room for.
             if new {
                 self.drop_mirror(&dir);
@@ -967,7 +966,7 @@ impl Publisher {
         if bundle.starts_with(dir) {
             let _ = std::fs::remove_file(bundle);
         }
-        if let Err(e) = self.check_size(dir, &req.owner, &req.name) {
+        if let Err(e) = self.check_size(dir, &req.owner, &req.name).await {
             let _ = self.git.run(dir, &["update-ref", "-d", &format!("refs/stage/{id}")], GIT_LOCAL).await;
             return Err(e);
         }
@@ -1939,7 +1938,11 @@ mod tests {
         on_measure: Mutex<Option<(String, Hook)>>,
         /// This mirror's walk is an anomaly (as mirrorfs finds one past a cap).
         anomalous: Mutex<Option<String>>,
+        /// The filesystem as this says, when set (over `fs`).
+        fs_fn: Mutex<Option<FsFn>>,
     }
+
+    type FsFn = Box<dyn Fn() -> Option<(u64, u64)> + Send>;
 
     type Hook = Box<dyn FnOnce() + Send>;
 
@@ -1962,6 +1965,9 @@ mod tests {
             }
         }
         fn fs(&self, _: &Path) -> Option<(u64, u64)> {
+            if let Some(f) = self.fs_fn.lock().unwrap().as_ref() {
+                return f();
+            }
             *self.fs.lock().unwrap()
         }
     }
@@ -2924,7 +2930,7 @@ mod tests {
         restarted.disk = s.disk.clone();
         restarted.inventory();
         // 3 GiB used, and a new mirror counts at 4: over the 6.
-        let err = restarted.admit(&restarted.mirror("acme", "widgets"), "acme", "widgets", true).unwrap_err();
+        let err = restarted.admit(&restarted.mirror("acme", "widgets"), "acme", "widgets", true).await.unwrap_err();
         assert!(err.0 == 507 && err.1.contains("mirrors use 3 of 6 GiB"), "{err:?}");
     }
 
@@ -3035,6 +3041,46 @@ mod tests {
         assert_eq!((exists("gadgets"), exists("gizmos"), exists("gears")), (false, false, true));
         let status = s.publisher.status();
         assert_eq!((status["count"].as_u64(), status["evicted"].as_u64(), status["refusedForSpace"].as_u64()), (Some(2), Some(2), Some(1)));
+    }
+
+    /// Bytes of the files under `dir`, as a filesystem would count them (tests).
+    fn du(dir: &Path) -> u64 {
+        std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => du(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        }).sum()
+    }
+
+    #[tokio::test]
+    async fn eviction_under_the_floor_frees_the_space_it_counts_on_and_stops_once_there_is_room() {
+        // The filesystem's free space as it really changes: 10 MiB less what is under the
+        // mirrors, the graveyard included (a buried mirror still takes its space).
+        let mut s = scratch("floorevict");
+        s.publisher.policy.mirror_max = 1 << 20;
+        s.publisher.policy.free_min_pct = 0;
+        s.publisher.policy.free_min = 4 << 20;
+        sh(&s.root, "git clone -q --bare acme/gadgets.git acme/gizmos.git && git clone -q --bare acme/gadgets.git acme/gears.git");
+        sh(&s.vm, "echo t > t && git add t && git commit -qm t");
+        for name in ["gadgets", "gizmos", "gears"] {
+            s.stage_all(on(name, "main", "scout/t"), || {}).await.unwrap();
+            // 2 MiB that git doesn't know of, as a pack would be.
+            std::fs::write(s.publisher.mirror("acme", name).join("objects/ballast"), vec![0u8; 2 << 20]).unwrap();
+            s.advance(3600);
+        }
+        let mirrors = s.publisher.mirrors.clone();
+        *s.disk.fs_fn.lock().unwrap() = Some(Box::new(move || Some(((10u64 << 20).saturating_sub(du(&mirrors)), 100 << 20))));
+        for name in ["gadgets", "gizmos", "gears"] {
+            s.publisher.measure(&s.publisher.mirror("acme", name)).unwrap();
+        }
+        // A day later all are idle. The new mirror needs its cap (1 MiB) above the 4 MiB
+        // floor: one mirror freed (2 MiB) is enough, so only the least recently used goes.
+        s.advance(86_400);
+        s.stage_all(request("scout/t"), || {}).await.unwrap();
+        let exists = |name: &str| s.publisher.mirror("acme", name).exists();
+        assert_eq!((exists("gadgets"), exists("gizmos"), exists("gears")), (false, true, true), "evicted more than it needed");
+        let status = s.publisher.status();
+        assert_eq!((status["evicted"].as_u64(), status["refusedForSpace"].as_u64(), status["graveyardTrees"].as_u64()), (Some(1), Some(0), Some(0)), "{status}");
     }
 
     #[tokio::test]
@@ -3160,7 +3206,7 @@ mod tests {
             serde_json::json!({
                 "count": 1, "bytes": GIB, "maxBytes": 24 * GIB, "perMirrorMaxBytes": 4 * GIB, "fsFreeBytes": 300 * GIB,
                 "garbageBytes": 0, "stageRefs": 1, "records": 1, "largest": { "repo": "acme/widgets", "bytes": GIB },
-                "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0, "anomalies": 0,
+                "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0, "anomalies": 0, "graveyardTrees": 0, "graveyardBytes": 0,
             })
         );
     }
