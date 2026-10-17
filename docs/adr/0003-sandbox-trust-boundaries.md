@@ -95,25 +95,46 @@ writable, so sandboxd, or any child that keeps its capabilities (`ip`, `nft`), c
 make a namespace of its own and remount `/` writable (`sandbox/host/README.md`,
 "Hardening"). The boundary this layer adds is between a VM and sandboxd. It isn't
 around sandboxd. So:
-- **Every child that reads what a VM produced runs with no capabilities and
-  `no_new_privs`.** Today that's `git`, which verifies a VM's bundles in the publishing
-  mirror (`publish.rs`, `jail::drop_capabilities`). That keeps the jailer's privileges
-  out of a git bug reached through a VM's objects, and nothing more. **Treat such a bug as
-  a compromise of sandboxd.** git still runs as uid 0, in the host's mount and network
-  namespaces, so among other things it can:
-  - read every root-owned file on the host, the runner token included (a credential, or
-    `sandboxd.env`);
-  - reach the network on any run;
-  - read the tokens in the environment of any other git running at the same time;
-  - write the delegated cgroup tree.
+- **Every child that reads what a VM produced runs isolated from sandboxd.** Today that's
+  `git`, which verifies a VM's bundles in the publishing mirror, describes them, pushes
+  them and collects the mirror (`publish.rs`, `gitjail.rs`, #143). Each run of it gets:
+  - **its own uid and gid**, leased from a reserved range (`SANDBOXD_GIT_UID_BASE` + 0..31)
+    for that one run: not 0, not a VM's, and refused at start if any of them is a user or
+    group. Two runs at once never share one, so neither can signal, trace or read the
+    other, and none can signal sandboxd or a VM;
+  - **its own mount namespace**: an empty root holding `/usr` read-only (git's binaries
+    and libraries), a few pseudo-devices, a private `/tmp`, and the one mirror it works on,
+    chowned to the run's uid. No `/etc/lorehouse`, no `/run/credentials`, no `/proc`,
+    `/sys` or cgroup tree, no other mirror, no sandbox. sandboxd keeps nothing of its own
+    in a mirror and writes there only new files, never through a link the run could plant;
+  - **its own network namespace**, empty. A run that fetches or pushes gets one whose only
+    address is a listener sandboxd serves; sandboxd forwards that repo's upload-pack or
+    receive-pack, and nothing else, to GitHub (`publish/remote.rs`);
+  - **its own cgroup** (`git/u<uid>`, beside `vms/`), killed whole when the run is over, so a
+    process that left git's process group doesn't outlive it or wait for a later run;
+  - **no capabilities, `no_new_privs`** and no core dumps.
 
-  The list is not exhaustive and isn't meant to be: the rule is the equivalence, and the
-  fix is to change where git runs. #143
-  makes it a separate, unprivileged process: its own uid, one repo's mirror, no view of
-  `/etc/lorehouse` or the credentials, network and a token only for a push. Git parsing
-  untrusted packfiles is a real attack surface, so #143 comes before any production host.
-- **Any new child that parses guest output runs the way #143 runs git** (until then, with
-  no capabilities and `no_new_privs`, and counted as sandboxd if it's compromised). The
+  It fails closed: sandboxd runs one probe through all of it at start and doesn't start
+  without it, and no setting runs git unisolated.
+
+  **The push token never reaches git.** sandboxd adds it to the requests it forwards, so no
+  git process holds a token, in argv, its environment, a file or its memory. That is
+  stronger than either option #143 offered (verifying first in an unprivileged step, or
+  pushing from a mirror no VM object touched), and needed: a push packs the VM's objects
+  again, so a git holding the token would parse guest objects with it. A push run may send
+  only one update, `<old> <staged sha> refs/heads/<branch>`: `<old>` is where sandboxd itself
+  read the branch at GitHub, after checking in an isolated, offline run that the staged
+  commit follows it. Anything else (another branch, a forced update, push options) is
+  refused before it is forwarded. A fetch gets the stage's read token on the same terms,
+  which the VM holds anyway (layer 1's exception).
+
+  What a git bug reached through a VM's objects still gets: the one mirror of that run, to
+  read and write (and so the facts the next stage of that repo shows, which the commit id
+  an approval binds keeps honest), the run's CPU and memory, and for a fetch or push run,
+  that one repo's upload-pack or receive-pack at GitHub through sandboxd's checks. Not the
+  host's files, other mirrors, the sandboxes, the cgroup tree, other runs, sandboxd, the
+  network, or any token.
+- **Any new child that parses guest output runs the way git does** (`gitjail.rs`). The
   other children keep the capabilities they need.
 - Follow-ups: drop capabilities from every child that doesn't need them, and
   `ProtectControlGroups=private` (systemd 257+) once the jail's cgroup paths are checked
@@ -218,7 +239,7 @@ As of 2026-10-16, on main:
 | confined sandboxd, credentials | 3 | **done** (#101). The unit works on systemd 255 since #135 |
 | internet-only network rules, IPv6, anti-spoof | 3 | **done** (#105). Gaps in #106 |
 | egress proxy over vsock | 3 | not started (#110, now with this channel) |
-| git that reads VM objects runs isolated from sandboxd | 3 | not started (#143). Today git is capability-less root, which counts as sandboxd if compromised |
+| git that reads VM objects runs isolated from sandboxd | 3 | **done** (#143): a uid per run, one mirror in view, no network but through sandboxd's proxy, a cgroup per run; no token ever reaches git |
 | host `nested=0`, CPU template, startup check | 4 | not started |
 | a host that meets layer 4 | 4 | none yet: the first purpose-built host is the next infrastructure step. The lab (`sandbox/lab`) is a disposable L1 for testing |
 | tenant isolation | 5 | not started. A single tenant until then |
