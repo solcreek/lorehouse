@@ -68,7 +68,7 @@ struct Pool {
 }
 
 pub struct GitJail {
-    /// git, as an absolute path that is the same inside a run.
+    /// git, canonical: the absolute path that is inside a run's root and the same there.
     git: PathBuf,
     /// An empty directory a run's tmpfs root is mounted on (in its own namespace).
     mountpoint: PathBuf,
@@ -120,7 +120,12 @@ impl GitJail {
     /// the part of prepare() that finds git and what a run sees of the host.
     pub fn unprivileged(state_dir: &Path) -> Result<GitJail, String> {
         let git = crate::jail::resolve(Path::new("git")).ok_or("git isn't on PATH: publishing needs it")?;
-        let real = std::fs::canonicalize(&git).map_err(|e| format!("{}: {e}", git.display()))?;
+        GitJail::with_git(state_dir, &git)
+    }
+
+    /// unprivileged(), with git at `git`.
+    fn with_git(state_dir: &Path, git: &Path) -> Result<GitJail, String> {
+        let real = std::fs::canonicalize(git).map_err(|e| format!("{}: {e}", git.display()))?;
         let mut entries = Vec::new();
         if !std::fs::metadata("/usr").is_ok_and(|m| m.is_dir()) {
             return Err("no /usr: publishing's git runs with /usr read-only and nothing else of the host".into());
@@ -152,7 +157,9 @@ impl GitJail {
         if !std::fs::symlink_metadata(&mountpoint).is_ok_and(|m| m.is_dir()) {
             return Err(format!("{} isn't a directory", mountpoint.display()));
         }
-        Ok(GitJail { git, mountpoint, entries, devices, cgroups: None, uids: None, mem_max: 0 })
+        // The path that passed the check above is the one runs exec: a link to it (on PATH)
+        // isn't inside a run's root.
+        Ok(GitJail { git: real, mountpoint, entries, devices, cgroups: None, uids: None, mem_max: 0 })
     }
 
     /// A command for one isolated run of git in `dir` (the caller adds the arguments,
@@ -721,6 +728,40 @@ pub(crate) mod tests {
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+    }
+
+    /// A git on PATH that is a link into /usr (a /opt/bin/git, a Nix profile's): the run
+    /// execs where it leads, which is inside the run's root; the link itself isn't.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linked_git_on_path_is_run_by_where_it_leads() {
+        let Some(real) = crate::jail::resolve(Path::new("git")).and_then(|g| std::fs::canonicalize(g).ok()).filter(|g| g.starts_with("/usr")) else {
+            eprintln!("skipped: no git under /usr here");
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("gitjail-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.join("bin/git")).unwrap();
+        let jail = GitJail::with_git(&tmp.join("state"), &tmp.join("bin/git")).unwrap();
+        assert_eq!(jail.git, real);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        in_userns("gitjail::tests::linked_git_in_userns", false);
+    }
+
+    /// The probe run, with git found through a link outside what the run sees.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "run by a_linked_git_on_path_is_run_by_where_it_leads, in a user namespace"]
+    async fn linked_git_in_userns() {
+        let tmp = std::env::temp_dir().join(format!("gitjail-link-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("bin")).unwrap();
+        let real = std::fs::canonicalize(crate::jail::resolve(Path::new("git")).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.join("bin/git")).unwrap();
+        let jail = Arc::new(GitJail::with_git(&tmp.join("state"), &tmp.join("bin/git")).unwrap());
+        let version = jail.probe(&tmp.join("probe")).await;
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(version.as_deref().is_ok_and(|v| v.starts_with("git version")), "{version:?}");
     }
 
     #[cfg(target_os = "linux")]
