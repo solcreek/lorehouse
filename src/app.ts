@@ -149,11 +149,21 @@ export async function createApp(config: Config) {
   tally(() => approvals.prune());
   timers.push(setInterval(() => tally(() => approvals.prune()), 86_400_000).unref());
   let runtime: Awaited<ReturnType<typeof createNativeRuntime>> | undefined;
-  // An approver must be a full member of the workspace, like an asker (#145). memberCheck
-  // and the ingester are set up below; a click only comes later, once both exist.
-  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session), async (user) =>
-    (await memberCheck.check(user, ingester?.ownTeamId)).member,
-  );
+  // An approver must be a full member of the workspace, like an asker (#145). The workspace
+  // is the bot token's: the ingester's auth.test when it ran, else asked here on the first
+  // click (an install with no listed channels, or an auth.test that failed at start) and
+  // kept once known. A refused click is logged with why. memberCheck is defined below; a
+  // click only comes once the app is serving, after it is.
+  let workspace: string | undefined;
+  const workspaceTeam = async (): Promise<string | undefined> => {
+    workspace ??= ingester?.ownTeamId ?? (await slackReads.call<{ team_id?: string }>("auth.test").catch(() => undefined))?.team_id;
+    return workspace;
+  };
+  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session), async (user) => {
+    const m = await memberCheck.check(user, await workspaceTeam());
+    if (!m.member) console.error(`approvals: a click by ${user} was refused: not a full member of the workspace (${m.reason}${m.reason === "lookup_failed" ? `: ${m.error}` : ""})`);
+    return m.member;
+  });
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
   const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
