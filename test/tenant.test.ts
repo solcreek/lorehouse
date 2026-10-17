@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config";
 import { closeKnowledge, countDocuments, openKnowledge } from "../src/knowledge";
 import { settingsPath } from "../src/settings";
-import { logAsTenant, newTenantId, pendingMoves, prepareTenant, resolveTenant, sandboxIdFor, SANDBOX_ID_MAX, tenantsIn, upgradeLayout, UpgradeError, validTenantId, type Tenant } from "../src/tenant";
+import { logAsTenant, newTenantId, pendingMoves, planMove, prepareTenant, resolveTenant, sandboxIdFor, SANDBOX_ID_MAX, tenantsIn, upgradeLayout, UpgradeError, validTenantId, type Tenant } from "../src/tenant";
 
 const base = { SLACK_SIGNING_SECRET: "s", SLACK_BOT_TOKEN: "t", ANTHROPIC_API_KEY: "k" };
 const dir = () => mkdtempSync(join(tmpdir(), "lorehouse-tenant-"));
@@ -269,6 +269,18 @@ describe("an install laid out before tenants upgrades in place", () => {
     expect(existsSync(config.db.lorehouse)).toBe(false);
     // A side file's link left dangling is normal: SQLite removes a -wal on close.
     expect(upgradeLayout(config.db.upgrade.filter((m) => m.to !== config.db.lorehouse))).toEqual([]);
+  });
+
+  test("planMove names the side files the start sets aside, and the start sets aside those", async () => {
+    const d = await todaysLayout();
+    const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
+    prepareTenant(config.tenant);
+    writeFileSync(`${config.db.lorehouse}-journal`, "stale");
+    const [m] = config.db.upgrade;
+    expect(planMove(m!)).toEqual({ state: "pending", setAside: [`${config.db.lorehouse}-journal`] });
+    const moved = upgradeLayout(config.db.upgrade);
+    expect(moved.filter((x) => x.startsWith("a stale"))).toEqual([expect.stringContaining(`a stale lorehouse.db-journal set aside as ${config.db.lorehouse}-journal.stale-`)]);
+    expect(existsSync(`${config.db.lorehouse}-journal`)).toBe(false);
   });
 
   test("an old path that is a symlink to somewhere else is refused, never followed or moved", async () => {

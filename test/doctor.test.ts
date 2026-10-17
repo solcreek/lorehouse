@@ -507,6 +507,26 @@ describe("the tenant", () => {
     }
   });
 
+  // A -wal, -shm or -journal at the new place that isn't the database's own: the start sets
+  // it aside rather than let SQLite replay it (upgradeLayout), and the doctor says which.
+  test("a side file in both places is named: the next start sets the stale one aside", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      for (const s of ["-wal", "-journal"]) writeFileSync(`${dir}/acme/lorehouse.db${s}`, "stale");
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail")).toEqual([]);
+      expect(upgrade.filter((c) => c.level === "warn").map((c) => c.detail)).toEqual([
+        `the next start sets aside ${dir}/acme/lorehouse.db-wal and ${dir}/acme/lorehouse.db-journal (renamed .stale-<time>): side files that aren't ${dir}/lorehouse.db's own, never replayed`,
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
   test("another tenant's directory beside this one's fails; TENANT_NEW=1 makes it a warning", async () => {
     const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
     try {

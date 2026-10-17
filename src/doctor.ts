@@ -309,6 +309,9 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   for (const { m, plan } of plans) {
     if (plan.refusal) add("storage", "upgrade", "fail", `${plan.refusal} (the start refuses until then)`);
     else if (plan.state === "under-way") add("storage", "upgrade", "info", `${m.from}: a move under way; the next start finishes it`);
+    // A -wal, -shm or -journal in both places: the start renames the one that isn't the
+    // database's own aside rather than let SQLite replay it.
+    if (!plan.refusal && plan.setAside) add("storage", "upgrade", "warn", `the next start sets aside ${plan.setAside.join(" and ")} (renamed .stale-<time>): side files that aren't ${m.from}'s own, never replayed`);
   }
   const toMove = plans.filter(({ plan }) => plan.state === "pending" && !plan.refusal).map(({ m }) => m);
   if (toMove.length) add("storage", "upgrade", "info", `the next start moves ${toMove.map((m) => basename(m.from)).join(" and ")} (with their -wal and -shm) from ${tenant.dataDir} into ${tenant.source === "new" ? `${tenant.dataDir}/<id>` : tenant.dir}, leaving a symlink at each old path`);

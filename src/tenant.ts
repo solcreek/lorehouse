@@ -309,8 +309,11 @@ export function upgradeLayout(moves: Move[]): string[] {
 //              place already, as the same file or with the old path a link to it, and
 //              something left to do)
 //   done       nothing to do (moved, or a new install)
-// `refusal`: why the start would refuse instead.
-export type MovePlan = { state: "pending" | "under-way" | "done"; refusal?: string };
+// `refusal`: why the start would refuse instead. `setAside`: the side files it would rename
+// aside (setAside): at the new place, those that aren't the old path's own, while the
+// database is still to move; at the old place, those whose new place has its own, once the
+// database has moved.
+export type MovePlan = { state: "pending" | "under-way" | "done"; refusal?: string; setAside?: string[] };
 export function planMove({ from, to }: Move): MovePlan {
   const main = standing(from, to);
   if (main === "other") return { state: "done", refusal: otherLink(from, to).message };
@@ -319,11 +322,13 @@ export function planMove({ from, to }: Move): MovePlan {
   if (sideOther) return { state: main === "file" ? "pending" : "under-way", refusal: otherLink(from + sideOther, to + sideOther).message };
   if (main === "file") {
     if (lexists(to) && !sameFile(from, to)) return { state: "pending", refusal: `both ${from} and ${to} exist: keep the one that holds the data (stop the app, move or remove the other), then start again` };
-    return { state: lexists(to) || lexists(linkTemp(from)) ? "under-way" : "pending" };
+    const aside = SIDE_FILES.filter((s) => lexists(to + s) && !sameFile(from + s, to + s)).map((s) => to + s);
+    return { state: lexists(to) || lexists(linkTemp(from)) ? "under-way" : "pending", ...(aside.length ? { setAside: aside } : {}) };
   }
   if (!lexists(to)) return { state: "done", refusal: `${from} is a symlink to ${to}, which doesn't exist: put the database back there (or the link's target back at ${from}), then start again` };
   const left = SIDE_FILES.some((s) => standing(from + s, to + s) === "file" || lexists(linkTemp(from + s))) || lexists(linkTemp(from));
-  return { state: left ? "under-way" : "done" };
+  const aside = SIDE_FILES.filter((s) => standing(from + s, to + s) === "file" && lexists(to + s) && !sameFile(from + s, to + s)).map((s) => from + s);
+  return { state: left ? "under-way" : "done", ...(aside.length ? { setAside: aside } : {}) };
 }
 
 // The databases still to move, for the doctor: those whose old path is a real file.
