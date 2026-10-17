@@ -565,6 +565,8 @@ impl Publisher {
     /// Every mirror on disk measured, for the quotas: run at start, before any job is taken
     /// (the first upkeep pass may take minutes to reach them all, a gc at a time).
     pub fn inventory(&self) {
+        // A fast-forward check's repo a previous sandboxd left (killed mid-push).
+        let _ = std::fs::remove_dir_all(self.mirrors.join(".check"));
         for dir in self.mirror_dirs() {
             if has_head(&dir) {
                 self.measure(&dir);

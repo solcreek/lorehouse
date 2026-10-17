@@ -205,6 +205,9 @@ enum Net<'a> {
     Fetch { owner: &'a str, name: &'a str, token: Option<&'a str> },
     /// The repo's receive-pack, for exactly one update, with the write token.
     Push { owner: &'a str, name: &'a str, token: &'a str, old: &'a str, new: &'a str, refname: &'a str },
+    /// A mirror, read-only, as a file:// remote: what a fresh repo fetches its commits from
+    /// (Publisher::follows). No network.
+    Source(&'a Path),
 }
 
 /// Runs publishing's git commands: each isolated from sandboxd (gitjail.rs), with the
@@ -226,10 +229,14 @@ impl Git {
     }
 
     /// Start one git command in `dir`, in the guarded environment (git_command).
-    async fn spawn(&self, dir: &Path, args: &[&str], net: Net<'_>) -> Result<Running, String> {
-        let (mut url, mut netns, mut bind, mut proxy, mut grant) = (None, None, None, None, None);
+    async fn spawn(&self, dir: &Path, args: &[&str], net: Net<'_>, pinned: bool) -> Result<Running, String> {
+        let (mut url, mut netns, mut bind, mut proxy, mut grant, mut source) = (None, None, None, None, None, None);
         match (&net, &self.remote) {
             (Net::Off, _) => {}
+            (Net::Source(mirror), _) => {
+                url = Some(format!("file://{}", mirror.display()));
+                source = Some(mirror.to_path_buf());
+            }
             (Net::Fetch { owner, name, .. } | Net::Push { owner, name, .. }, Remote::File(base)) => {
                 let repo = base.join(owner).join(format!("{name}.git"));
                 url = Some(format!("file://{}", repo.display()));
@@ -239,7 +246,7 @@ impl Git {
                 let g = match &net {
                     Net::Push { token, old, new, refname, .. } => Grant::new(owner, name, Some(token), Access::Push { old: old.to_string(), new: new.to_string(), refname: refname.to_string() }),
                     Net::Fetch { token, .. } => Grant::new(owner, name, *token, Access::Fetch),
-                    Net::Off => unreachable!(),
+                    Net::Off | Net::Source(_) => unreachable!(),
                 };
                 // Isolated, the listener is the only thing in the run's network namespace.
                 let (fd, listener) = if self.jail.is_some() {
@@ -257,15 +264,16 @@ impl Git {
         }
         let mut owned: Vec<String> = Vec::with_capacity(args.len());
         for a in args {
-            owned.push(if *a == REMOTE { url.clone().ok_or("git: a remote with no network for it")? } else { a.to_string() });
+            owned.push(if a.contains(REMOTE) { a.replace(REMOTE, url.as_deref().ok_or("git: a remote with no network for it")?) } else { a.to_string() });
         }
         let bound = bind.is_some();
         let (mut cmd, confined) = match &self.jail {
             Some(jail) => {
-                let net = match (netns, bind) {
-                    (Some(fd), _) => gitjail::Net::Proxied(fd),
-                    (None, Some((repo, writable))) => gitjail::Net::Dir(repo, writable),
-                    (None, None) => gitjail::Net::Off,
+                let net = match (netns, bind, source) {
+                    (Some(fd), _, _) => gitjail::Net::Proxied(fd),
+                    (None, Some((repo, writable)), _) => gitjail::Net::Dir(repo, writable),
+                    (None, None, Some(mirror)) => gitjail::Net::Source(mirror),
+                    (None, None, None) => gitjail::Net::Off,
                 };
                 let (cmd, confined) = jail.command(dir, net).await?;
                 // A path in the mirror (a stage's bundle) is under /repo there.
@@ -287,7 +295,7 @@ impl Git {
         // Isolated, a file:// remote (testing) belongs to another uid than the run's: the
         // run's own global config, which names only that repo safe (gitjail::SAFE_CONFIG).
         let global = if confined.is_some() && bound { gitjail::SAFE_CONFIG } else { "/dev/null" };
-        git_command(&mut cmd, home, &owned, global);
+        git_command(&mut cmd, home, &owned, global, pinned);
         if confined.is_none() {
             // Unisolated (tests): still no capabilities.
             #[cfg(target_os = "linux")]
@@ -317,7 +325,13 @@ impl Git {
     /// One git command, in `dir`, reaching what `net` allows; its stdout, which must fit
     /// OUTPUT_CAP.
     async fn run_net(&self, dir: &Path, args: &[&str], net: Net<'_>, limit: Duration) -> Result<String, String> {
-        match self.capped(dir, args, net, limit, OUTPUT_CAP).await? {
+        self.run_with(dir, args, net, false, limit).await
+    }
+
+    /// run_net(), and with `pinned`, git's view of the repo pinned to `dir` itself
+    /// (git_command): what a fresh repo's runs use.
+    async fn run_with(&self, dir: &Path, args: &[&str], net: Net<'_>, pinned: bool, limit: Duration) -> Result<String, String> {
+        match self.capped_with(dir, args, net, pinned, limit, OUTPUT_CAP).await? {
             (out, false) => Ok(out),
             (_, true) => Err(format!("git {}: more than {OUTPUT_CAP} bytes of output", args[0])),
         }
@@ -326,9 +340,13 @@ impl Git {
     /// One git command, in `dir`; at most `cap` bytes of its stdout, and whether there was
     /// more (the command is stopped there, never read to the end).
     async fn capped(&self, dir: &Path, args: &[&str], net: Net<'_>, limit: Duration, cap: usize) -> Result<(String, bool), String> {
+        self.capped_with(dir, args, net, false, limit, cap).await
+    }
+
+    async fn capped_with(&self, dir: &Path, args: &[&str], net: Net<'_>, pinned: bool, limit: Duration, cap: usize) -> Result<(String, bool), String> {
         use tokio::io::AsyncReadExt;
         let work = async {
-            let mut child = self.spawn(dir, args, net).await?;
+            let mut child = self.spawn(dir, args, net, pinned).await?;
             let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
                 return Err("git: no pipes".to_string());
             };
@@ -367,9 +385,13 @@ impl Git {
     /// One git command with no network, in `dir`, for its answer alone: whether it
     /// succeeded, or None if it couldn't run or didn't finish within GIT_LOCAL.
     async fn says(&self, dir: &Path, args: &[&str]) -> Option<bool> {
+        self.says_with(dir, args, false).await
+    }
+
+    async fn says_with(&self, dir: &Path, args: &[&str], pinned: bool) -> Option<bool> {
         let work = async {
             use tokio::io::AsyncReadExt;
-            let mut child = self.spawn(dir, args, Net::Off).await.ok()?;
+            let mut child = self.spawn(dir, args, Net::Off, pinned).await.ok()?;
             // Read and dropped, up to a cap: a pipe closed instead would kill a git that
             // writes a warning (SIGPIPE), and its answer would read as "no".
             let drain = |pipe: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>| {
@@ -395,7 +417,7 @@ impl Git {
         use sha2::{Digest, Sha256};
         use tokio::io::AsyncReadExt;
         let work = async {
-            let mut child = self.spawn(dir, args, Net::Off).await?;
+            let mut child = self.spawn(dir, args, Net::Off, false).await?;
             let (Some(mut stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
                 return Err("git: no pipes".to_string());
             };
@@ -431,7 +453,7 @@ impl Git {
 /// objects, no hooks, fsck on fetch, no automatic maintenance, no credential helper;
 /// stdout and stderr piped. No token: the remote is reached through sandboxd (remote.rs),
 /// which adds it.
-fn git_command(cmd: &mut Command, home: &Path, args: &[String], global_config: &str) {
+fn git_command(cmd: &mut Command, home: &Path, args: &[String], global_config: &str, pinned: bool) {
     use std::process::Stdio;
     cmd.args(args);
     cmd.env("HOME", home)
@@ -440,7 +462,7 @@ fn git_command(cmd: &mut Command, home: &Path, args: &[String], global_config: &
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1");
-    let config: [(&str, &str); 10] = [
+    let mut config: Vec<(&str, &str)> = vec![
         ("core.hooksPath", "/dev/null"),
         ("fetch.fsckObjects", "true"),
         ("transfer.fsckObjects", "true"),
@@ -461,6 +483,12 @@ fn git_command(cmd: &mut Command, home: &Path, args: &[String], global_config: &
         // the request chunked. The proxy reads at most this much anyway (remote.rs).
         ("http.postBuffer", remote::MAX_PUSH_REQUEST_STR),
     ];
+    if pinned {
+        // git's view of the repo is `home` itself, with nothing that rewrites history: no
+        // commondir, grafts, shallow file, replace refs, commit-graph or lazy fetch.
+        cmd.env("GIT_DIR", home).env("GIT_COMMON_DIR", home).env("GIT_GRAFT_FILE", "/dev/null").env("GIT_SHALLOW_FILE", "/dev/null").env("GIT_NO_LAZY_FETCH", "1");
+        config.extend([("core.commitGraph", "false"), ("core.useReplaceRefs", "false"), ("core.multiPackIndex", "false")]);
+    }
     cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
     for (i, (k, v)) in config.iter().enumerate() {
         cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
@@ -577,6 +605,15 @@ impl Drop for TempFile {
     }
 }
 
+/// A directory removed (whole) when this is dropped.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Sync a directory, so the entries just created, renamed or removed in it survive a crash.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
@@ -611,26 +648,6 @@ pub(crate) fn read_in_mirror(path: &Path, cap: u64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     f.take(cap + 1).read_to_end(&mut out).ok()?;
     (out.len() as u64 <= cap).then_some(out)
-}
-
-/// What in a mirror would make git see another history than its commits' own, if any:
-/// grafts, a shallow file, alternates, or replace refs (loose or packed). Read as sandboxd
-/// reads a mirror (no links followed, packed-refs capped; one it can't read counts).
-pub(crate) fn rewritten_history(dir: &Path) -> Option<&'static str> {
-    for file in ["info/grafts", "shallow", "objects/info/alternates", "objects/info/http-alternates", "refs/replace"] {
-        if std::fs::symlink_metadata(dir.join(file)).is_ok() {
-            return Some(file);
-        }
-    }
-    let packed = dir.join("packed-refs");
-    if std::fs::symlink_metadata(&packed).is_ok() {
-        match read_in_mirror(&packed, 64 << 20) {
-            None => return Some("an unreadable packed-refs"),
-            Some(p) if p.windows(14).any(|w| w == b" refs/replace/") => return Some("packed replace refs"),
-            Some(_) => {}
-        }
-    }
-    None
 }
 
 /// Whether a mirror has a HEAD (git made it one), without following it if it is a link.
@@ -1095,6 +1112,54 @@ impl Publisher {
         Ok(Pushed { sha: record.sha, branch: record.branch })
     }
 
+    /// Whether `sha` follows `old` (a fast-forward of `refname`), decided where no earlier run
+    /// could have written: a bare repo made for this check alone, under `<mirrors>/.check`.
+    /// One run fetches into it, from the mirror (read-only), the commits of both and nothing
+    /// else (`--filter=tree:0`) with fsck on: every commit is re-hashed as it comes in, so a
+    /// commit the mirror stores under another's id doesn't come in as that id. Then the
+    /// check runs there with git's view pinned to that repo (git_command): no commondir,
+    /// grafts, shallow file, replace refs, alternates of the mirror's, commit-graph or lazy
+    /// fetch. Whatever the mirror holds can make the fetch fail, never the answer wrong.
+    async fn follows(&self, dir: &Path, refname: &str, old: &str, sha: &str) -> Result<(), String> {
+        let check = self.mirrors.join(".check").join(new_stage_id_at(self.now())?);
+        std::fs::create_dir_all(check.parent().unwrap_or(&self.mirrors)).map_err(|e| format!("the check's repo: {e}"))?;
+        std::fs::create_dir(&check).map_err(|e| format!("the check's repo: {e}"))?;
+        // Removed however this ends.
+        let _check = TempDir(check.clone());
+        let pinned = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let git = |args: Vec<String>, net: Net<'static>| {
+            let check = check.clone();
+            async move {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                self.git.run_with(&check, &args, net, true, GIT_LOCAL).await
+            }
+        };
+        git(pinned(&["init", "-q", "--bare"]), Net::Off).await?;
+        for (k, v) in [("core.repositoryformatversion", "1"), ("extensions.partialClone", "mirror"), ("remote.mirror.promisor", "true")] {
+            git(pinned(&["config", k, v]), Net::Off).await?;
+        }
+        let upload = "git -c uploadpack.allowFilter=true -c uploadpack.allowAnySHA1InWant=true upload-pack";
+        let fetched = self
+            .git
+            .run_with(
+                &check,
+                &["-c", &format!("remote.mirror.url={REMOTE}"), "-c", &format!("remote.mirror.uploadpack={upload}"), "fetch", "-q", "--no-tags", "--filter=tree:0", "mirror", &format!("{old}:refs/check/old"), &format!("{sha}:refs/check/new")],
+                Net::Source(dir),
+                true,
+                GIT_LOCAL,
+            )
+            .await;
+        if let Err(e) = fetched {
+            return Err(format!("[rejected] {refname} (fetch first): the branch is at {old}, which couldn't be read from the stage's mirror as itself: {e}"));
+        }
+        match self.git.says_with(&check, &["merge-base", "--is-ancestor", old, sha], true).await {
+            Some(true) => {}
+            Some(false) => return Err(format!("[rejected] {refname} (non-fast-forward): the branch is at {old}, which {sha} doesn't follow")),
+            None => return Err("checking the push is a fast-forward: git didn't answer".into()),
+        }
+        Ok(())
+    }
+
     /// The push itself, as a git run that never sees the token. To an HTTP remote, sandboxd
     /// first reads where the branch is there and checks the push is a fast-forward from it;
     /// the run may then send only that one update (remote.rs). A file:// remote (tests) is
@@ -1112,27 +1177,8 @@ impl Publisher {
                     None => zero,
                     Some(old) if !commit_id(&old) => return Err(format!("the remote says {refname} is at {old:?}, not a commit id")),
                     Some(old) => {
-                        // Never forced: what the branch is at must be in the mirror, and an
-                        // ancestor of what is pushed. A git that couldn't answer refuses too.
-                        // The mirror is an earlier run's to write: one that rewrites history
-                        // for git (grafts, shallow, replace refs, alternates) is refused, and
-                        // the check reads the commits themselves, not a commit-graph.
-                        if let Some(what) = rewritten_history(dir) {
-                            // Only a git run could have put it there: the mirror goes.
-                            self.drop_mirror(dir);
-                            return Err(format!("the mirror's history isn't the commits' own ({what}): nothing was pushed, and the mirror was dropped; stage again"));
-                        }
-                        let off = ["-c", "core.commitGraph=false", "-c", "core.useReplaceRefs=false"];
-                        match self.git.says(dir, &[&off[..], &["cat-file", "-e", &format!("{old}^{{commit}}")]].concat()).await {
-                            Some(true) => {}
-                            Some(false) => return Err(format!("[rejected] {refname} (fetch first): the branch is at {old}, which the stage doesn't have")),
-                            None => return Err("checking the branch's commit: git didn't answer".into()),
-                        }
-                        match self.git.says(dir, &[&off[..], &["merge-base", "--is-ancestor", &old, sha]].concat()).await {
-                            Some(true) => {}
-                            Some(false) => return Err(format!("[rejected] {refname} (non-fast-forward): the branch is at {old}, which {sha} doesn't follow")),
-                            None => return Err("checking the push is a fast-forward: git didn't answer".into()),
-                        }
+                        // Never forced: decided in a fresh repo, not in the mirror.
+                        self.follows(dir, &refname, &old, sha).await?;
                         old
                     }
                 }
@@ -1358,6 +1404,12 @@ mod tests {
         assert_eq!(s.remote("scout/iso2").as_deref(), Some(staged.sha.as_str()));
         let seen = seen.lock().unwrap().join("\n");
         assert!(seen.contains(&format!("POST /acme/widgets.git/git-receive-pack auth={}", basic("tok-only-for-the-proxy"))), "{seen}");
+        // A fast-forward of a branch that exists: decided in a fresh repo the run fetches
+        // into from the mirror (bound read-only), isolated too.
+        sh(&s.vm, "echo iso3 > iso3 && git add iso3 && git commit -qm iso3");
+        let staged = s.stage_all(request("scout/iso2"), || {}).await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/iso2")).await.unwrap();
+        assert_eq!(s.remote("scout/iso2").as_deref(), Some(staged.sha.as_str()));
     }
 
     /// The processes whose real uid is in git's range: (pid, uid).
@@ -1599,40 +1651,42 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_mirror_whose_history_was_rewritten_is_never_pushed_from_over_the_branch() {
-        // The branch moved on at GitHub to a commit the staged one doesn't follow; a mirror
-        // that grafts it under the staged commit would pass the fast-forward check, and the
-        // push would replace the branch.
+        // The branch moved on at GitHub to a commit the staged one doesn't follow. Whatever an
+        // earlier run planted in the mirror to make it look like a fast-forward, the check (in
+        // a fresh repo, with the commits re-hashed) refuses it, for one of its two reasons, and
+        // the branch stays where it is.
         let mut s = scratch("grafted");
         let (url, _seen, _server) = smart_http(s.root.clone()).await;
         s.publisher.git = Git::new(None, &url);
         let staged_head = sh(&s.vm, "echo g > g && git add g && git commit -qm g && git rev-parse HEAD");
-        let staged = s.stage("scout/g").await.unwrap();
-        let theirs = sh(&s.root, "git clone -q acme/widgets.git other && cd other && echo o > o && git add o && git -c user.name=x -c user.email=x@x commit -qm o && git push -q origin HEAD:refs/heads/scout/g && git rev-parse HEAD");
-        s.publisher.refresh(&s.dir(), "acme", "widgets", None).await.unwrap();
+        s.stage("scout/g").await.unwrap();
+        let theirs = sh(&s.root, "git clone -q -b main acme/widgets.git other && cd other && echo o > o && git add o && git -c user.name=x -c user.email=x@x commit -qm o && git push -q origin HEAD:refs/heads/scout/g && git rev-parse HEAD");
         let dir = s.dir();
-        for (name, plant) in [
-            ("info/grafts", format!("std:info/grafts:{staged_head} {theirs}\n")),
-            ("shallow", format!("std:shallow:{theirs}\n")),
-            ("objects/info/alternates", "std:objects/info/alternates:/nonexistent\n".to_string()),
-            ("refs/replace", format!("git:replace -f {staged_head} {theirs}")),
-        ] {
-            let stage = if name == "info/grafts" { staged.stage.clone() } else { s.stage("scout/g").await.unwrap().stage };
-            match plant.split_once(':').unwrap() {
-                ("std", rest) => {
-                    let (file, content) = rest.split_once(':').unwrap();
-                    std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
-                    std::fs::write(dir.join(file), content).unwrap();
-                }
-                (_, cmd) => drop(sh(&dir, &format!("git {cmd}"))),
+        let plants = [
+            ("grafts", format!("mkdir -p info && echo '{staged_head} {theirs}' > info/grafts"), "rm -f info/grafts"),
+            // git reads objects, refs and grafts from commondir's target.
+            ("commondir and grafts", format!("mkdir sub && cp -r objects refs sub/ && (cp packed-refs sub/ 2>/dev/null || true) && mkdir -p sub/info && echo '{staged_head} {theirs}' > sub/info/grafts && echo sub > commondir"), "rm -rf sub commondir"),
+            ("shallow", format!("echo {theirs} > shallow"), "rm -f shallow"),
+            ("alternates", "mkdir -p objects/info && echo /nonexistent > objects/info/alternates".to_string(), "rm -f objects/info/alternates"),
+            ("replace refs", format!("git replace -f {staged_head} {theirs}"), "rm -rf refs/replace"),
+        ];
+        for (what, plant, undo) in plants {
+            let staged = s.stage("scout/g").await.unwrap();
+            sh(&dir, &plant);
+            let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/g")).await.unwrap_err();
+            if dir.exists() {
+                sh(&dir, undo);
             }
-            let mut req = s.push(&staged, "scout/g");
-            req.stage = stage;
-            let err = s.publisher.push(SANDBOX, req).await.unwrap_err();
-            assert!(err.0 == 409 || err.0 == 502, "{name}: {err:?}");
-            assert_eq!(s.remote("scout/g").as_deref(), Some(theirs.as_str()), "{name}: the branch was replaced");
-            let _ = std::fs::remove_file(dir.join(name));
-            let _ = std::fs::remove_dir_all(dir.join(name));
+            assert_eq!(err.0, 409, "{what}: {err:?}");
+            assert!(err.1.contains("(non-fast-forward)") || err.1.contains("couldn't be read from the stage's mirror as itself"), "{what}: {err:?}");
+            assert_eq!(s.remote("scout/g").as_deref(), Some(theirs.as_str()), "{what}: the branch was replaced");
         }
+        // And a real fast-forward goes through the same check: theirs, then a commit on it.
+        sh(&s.vm, "git fetch -q origin && git reset -q --hard origin/scout/g && echo f > f && git add f && git commit -qm f");
+        let staged = s.stage("scout/g").await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/g")).await.unwrap();
+        assert_eq!(s.remote("scout/g").as_deref(), Some(staged.sha.as_str()));
+        assert!(!s.publisher.mirrors.join(".check").exists() || std::fs::read_dir(s.publisher.mirrors.join(".check")).unwrap().next().is_none(), "a check's repo was left");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

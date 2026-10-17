@@ -97,6 +97,9 @@ pub enum Net {
     /// A file:// remote's repository (testing without GitHub): bound at its own path,
     /// writable for a push. No network.
     Dir(PathBuf, bool),
+    /// A mirror another run wrote, bound read-only at its own path and given to this run's
+    /// uid, for a fresh repo in `dir` to fetch from (publish.rs, Publisher::follows).
+    Source(PathBuf),
 }
 
 impl GitJail {
@@ -198,6 +201,12 @@ impl GitJail {
                 (Some(raw), None)
             }
             Net::Dir(path, writable) => (None, Some((path, writable))),
+            Net::Source(path) => {
+                if let Some(uid) = uid {
+                    own(&path, uid, uid).map_err(|e| format!("giving the source mirror to its run's uid: {e}"))?;
+                }
+                (None, Some((path, false)))
+            }
         };
         let plan = self.plan(dir, uid, confined.cgroup.as_deref(), netns, remote.as_ref().map(|(p, w)| (p.as_path(), *w)))?;
         let mut cmd = crate::child::command(&self.git);
