@@ -62,24 +62,27 @@ means a migration of identifiers.
 - hands the event to that tenant's data plane, which may be starting up at the time.
 
 **The edge acknowledges an event only after it is durable.** Before answering the
-platform, the edge appends the event to that tenant's **inbox**: a queue held by the
-control plane, of events the edge can't read back.
-- **Sealed to a key the edge doesn't hold.** Each tenant has an inbox key pair. The edge
-  holds only the public half, and each event is sealed to it (public-key encryption). The
-  private half stays with the tenant's data plane, under that tenant's KMS key (ADR 0004).
-  The edge can write a tenant's inbox but never decrypt it. It never touches the data key
-  that encrypts the tenant's files.
-- **Taken by the data plane, which connects out.** Like a sandbox runner, the data plane
-  takes its events over an outbound connection. A stopped data plane loses nothing: its
-  events wait until it starts. A deployment in a tenant's own cloud account needs no way
-  in from the control plane.
-- **Kept briefly.** An event stays until its data plane has taken and acknowledged it, and
-  at most a bounded time (24 h), after which it is dropped and counted.
+platform, the edge appends the event to that tenant's **inbox**: a short-lived queue in
+the control plane, kept apart per tenant.
+- **Encrypted at rest** under the control plane's own key, like any of its storage.
+- **Taken by the data plane over an outbound connection,** as a sandbox runner takes
+  work. A stopped data plane loses nothing: its events wait until it starts. A deployment
+  in a tenant's own cloud account needs no way in from the control plane.
+- **Deleted once taken**, and kept at most a bounded time (24 h) otherwise, after which an
+  event is dropped and counted.
 
-So the control plane holds tenants' content only as ciphertext it can't open. Its registry
-holds none at all. An edge that restarts after acknowledging loses nothing. A data plane
-that is stopped or cold therefore never misses a platform's deadline, so an idle
-tenant's compute can scale to zero.
+The edge necessarily sees an event in the clear while it verifies and routes it. The
+inbox adds no reader beyond the edge itself.
+
+**What the control plane never holds is a tenant's data key.** It can't open a tenant's
+files, and nothing it stores outlives the brief inbox. **Everything that works on
+content happens only in the tenant's data plane**, which opens the tenant's files with
+the tenant's key: indexing, search, embeddings, assembling context, and the model call.
+Embeddings and indexes are stored in the tenant's files like the rest of its content.
+
+An edge that restarts after acknowledging loses nothing. A data plane that is stopped or
+cold therefore never misses a platform's deadline, so an idle tenant's compute can scale
+to zero.
 
 Delivery from the inbox to the data plane is **at least once, with an idempotency key**.
 Redelivery, which every platform above does, never produces a second answer.
