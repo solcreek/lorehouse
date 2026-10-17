@@ -100,8 +100,16 @@ make a namespace of its own and remount `/` writable (`sandbox/host/README.md`,
 around sandboxd. So:
 - **Every child that reads what a VM produced runs with no capabilities and
   `no_new_privs`.** Today that's `git`, which verifies a VM's bundles in the publishing
-  mirror (`publish.rs`, `jail::drop_capabilities`). A git bug reached through a bundle
-  gets root's file ownership in the state directory, not the jailer's privileges.
+  mirror (`publish.rs`, `jail::drop_capabilities`). That keeps the jailer's privileges
+  out of a git bug reached through a VM's objects, but git is still uid 0. Such a bug
+  can still reach:
+  - every file uid 0 owns in the state directory, including every sandbox's disk and
+    every mirror;
+  - the delegated cgroup tree, so it can kill or resize any VM;
+  - sandboxd, which it can signal;
+  - during a push, that request's GitHub write token and the network.
+
+  Running git as an unprivileged uid scoped to one mirror closes this: #143.
 - **Any new child that parses guest output follows the same rule.** The other children
   keep the capabilities they need.
 - Follow-ups: drop capabilities from every child that doesn't need them, and
