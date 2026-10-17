@@ -196,6 +196,17 @@ const REVIEW_CAP: usize = 1 << 20;
 /// The most of a git command's stderr that is kept.
 const STDERR_CAP: u64 = 64 << 10;
 
+/// Set when a run's cgroup couldn't be emptied once it was over (gitjail::Confined).
+type Stuck = Arc<std::sync::atomic::AtomicBool>;
+
+/// A job whose run couldn't be stopped fails: its trees were taken out of use.
+fn stopped(stuck: &Stuck) -> Result<(), String> {
+    if stuck.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("a git run's processes couldn't be stopped (its cgroup didn't empty): the mirror was taken out of use and nothing was staged or pushed; stage again".into());
+    }
+    Ok(())
+}
+
 /// Stands for the remote's URL in a git command's arguments: the run puts its own there
 /// (the proxy's, or a file:// remote's).
 const REMOTE: &str = "\u{0}remote";
@@ -232,7 +243,7 @@ impl Git {
     }
 
     /// Start one git command in `dir`, in the guarded environment (git_command).
-    async fn spawn(&self, dir: &Path, args: &[&str], net: Net<'_>, pinned: bool) -> Result<Running, String> {
+    async fn spawn(&self, dir: &Path, args: &[&str], net: Net<'_>, pinned: bool, stuck: &Stuck) -> Result<Running, String> {
         let (mut url, mut netns, mut bind, mut proxy, mut grant, mut source) = (None, None, None, None, None, None);
         match (&net, &self.remote) {
             (Net::Off, _) => {}
@@ -278,7 +289,7 @@ impl Git {
                     (None, None, Some(mirror)) => gitjail::Net::Source(mirror),
                     (None, None, None) => gitjail::Net::Off,
                 };
-                let (cmd, confined) = jail.command(dir, net).await?;
+                let (cmd, confined) = jail.command(dir, net, stuck.clone()).await?;
                 // A path in the mirror (a stage's bundle) is under /repo there.
                 let prefix = format!("{}/", dir.display());
                 for a in owned.iter_mut() {
@@ -318,7 +329,8 @@ impl Git {
         let Some(jail) = &self.jail else {
             return std::fs::remove_dir_all(dir).and_then(|()| std::fs::create_dir(dir)).map_err(|e| e.to_string());
         };
-        let (mut cmd, confined) = jail.remover(dir).await?;
+        let stuck = Stuck::default();
+        let (mut cmd, confined) = jail.remover(dir, stuck.clone()).await?;
         cmd.args([gitjail::REPO, "-mindepth", "1", "-delete"]);
         cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true).process_group(0);
         let child = cmd.spawn().map_err(|e| gitjail::explain(&e))?;
@@ -339,6 +351,7 @@ impl Git {
         };
         drop(run);
         let stderr = errors.await.unwrap_or_default();
+        stopped(&stuck)?;
         if !status.success() {
             return Err(format!("find: {}", tail(&stderr)));
         }
@@ -381,8 +394,9 @@ impl Git {
 
     async fn capped_with(&self, dir: &Path, args: &[&str], net: Net<'_>, pinned: bool, limit: Duration, cap: usize) -> Result<(String, bool), String> {
         use tokio::io::AsyncReadExt;
+        let stuck = Stuck::default();
         let work = async {
-            let mut child = self.spawn(dir, args, net, pinned).await?;
+            let mut child = self.spawn(dir, args, net, pinned, &stuck).await?;
             let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
                 return Err("git: no pipes".to_string());
             };
@@ -412,10 +426,12 @@ impl Git {
             }
             Ok((String::from_utf8_lossy(&out).into_owned(), false))
         };
-        match tokio::time::timeout(limit, work).await {
+        let done = match tokio::time::timeout(limit, work).await {
             Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
             Ok(r) => r,
-        }
+        };
+        stopped(&stuck)?;
+        done
     }
 
     /// One git command with no network, in `dir`, for its answer alone: whether it
@@ -425,9 +441,10 @@ impl Git {
     }
 
     async fn says_with(&self, dir: &Path, args: &[&str], pinned: bool) -> Option<bool> {
+        let stuck = Stuck::default();
         let work = async {
             use tokio::io::AsyncReadExt;
-            let mut child = self.spawn(dir, args, Net::Off, pinned).await.ok()?;
+            let mut child = self.spawn(dir, args, Net::Off, pinned, &stuck).await.ok()?;
             // Read and dropped, up to a cap: a pipe closed instead would kill a git that
             // writes a warning (SIGPIPE), and its answer would read as "no".
             let drain = |pipe: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>| {
@@ -444,16 +461,19 @@ impl Git {
             err.abort();
             status
         };
-        tokio::time::timeout(GIT_LOCAL, work).await.ok().flatten()
+        let answer = tokio::time::timeout(GIT_LOCAL, work).await.ok().flatten();
+        stopped(&stuck).ok()?;
+        answer
     }
 
     /// One git command with no network, in `dir`: the SHA-256 (hex) of all of its stdout,
     /// however long, read as it comes and never kept.
     async fn sha256(&self, dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
+        let stuck = Stuck::default();
         use sha2::{Digest, Sha256};
         use tokio::io::AsyncReadExt;
         let work = async {
-            let mut child = self.spawn(dir, args, Net::Off, false).await?;
+            let mut child = self.spawn(dir, args, Net::Off, false, &stuck).await?;
             let (Some(mut stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
                 return Err("git: no pipes".to_string());
             };
@@ -478,10 +498,12 @@ impl Git {
             }
             Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
         };
-        match tokio::time::timeout(limit, work).await {
+        let done = match tokio::time::timeout(limit, work).await {
             Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
             Ok(r) => r,
-        }
+        };
+        stopped(&stuck)?;
+        done
     }
 }
 
@@ -648,25 +670,13 @@ struct TempDir(PathBuf, PathBuf);
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        bury(&self.0, &self.1);
+        gitjail::bury(&self.0, &self.1);
     }
 }
 
 /// Where dropped trees wait for a jailed run to empty them: `<mirrors>/.drop`.
 const GRAVEYARD: &str = ".drop";
 
-/// Move a tree a run wrote (a mirror, a check's repo) into `graveyard`, one rename, O(1):
-/// sandboxd never walks it to delete it. A jailed run empties it later
-/// (Publisher::empty_graveyard). Nothing there: nothing to do.
-fn bury(tree: &Path, graveyard: &Path) {
-    let to = graveyard.join(new_stage_id_at(unix_secs()).unwrap_or_else(|_| format!("{}-{}", unix_secs(), std::process::id())));
-    let moved = std::fs::create_dir_all(graveyard).and_then(|()| std::fs::rename(tree, &to));
-    match moved {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("sandboxd: ALERT: couldn't move {} out of use ({e}); it stays where it is", tree.display()),
-    }
-}
 
 /// Sync a directory, so the entries just created, renamed or removed in it survive a crash.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
@@ -694,7 +704,7 @@ pub(crate) fn has_head(dir: &Path) -> bool {
 fn remove_mirror(dir: &Path) {
     // A mirror's directory is `<mirrors>/<owner>/<name>.git`.
     if let Some(mirrors) = dir.parent().and_then(Path::parent) {
-        bury(dir, &mirrors.join(GRAVEYARD));
+        gitjail::bury(dir, &mirrors.join(GRAVEYARD));
     }
     // Its upkeep state goes with it: a new mirror of the repo starts afresh.
     let _ = std::fs::remove_file(upkeep::state_path(dir));
@@ -823,6 +833,7 @@ impl Publisher {
     /// A publisher whose git runs isolated in `jail` (gitjail.rs): the only kind there is
     /// outside tests.
     pub fn new(mirrors: PathBuf, remote_base: String, jail: Arc<GitJail>) -> Publisher {
+        jail.set_graveyard(mirrors.join(GRAVEYARD));
         Publisher::with_git(mirrors, Git::new(Some(jail), &remote_base))
     }
 
@@ -1457,6 +1468,51 @@ mod tests {
         let staged = s.stage_all(request("scout/iso2"), || {}).await.unwrap();
         s.publisher.push(SANDBOX, s.push(&staged, "scout/iso2")).await.unwrap();
         assert_eq!(s.remote("scout/iso2").as_deref(), Some(staged.sha.as_str()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_run_that_cant_be_stopped_takes_its_mirror_out_of_use_and_holds_its_uid() {
+        crate::gitjail::tests::in_userns("publish::tests::stuck_run_in_userns", true);
+    }
+
+    /// A run whose cgroup doesn't empty (a kill made to fail): the job fails, the mirror is
+    /// moved out of use at once, and the run's uid isn't leased again until the cgroup is
+    /// found empty; then all goes on.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run by a_run_that_cant_be_stopped_takes_its_mirror_out_of_use_and_holds_its_uid, in a user namespace"]
+    async fn stuck_run_in_userns() {
+        let mut s = scratch("stuck");
+        let probe = s.root.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        if std::os::unix::fs::lchown(&probe, Some(100), Some(100)).is_err() {
+            eprintln!("skipped: this user namespace may not chown");
+            return;
+        }
+        sh(&s.root, "chmod -R a+rwX acme && chmod a+rx .");
+        let jail = crate::gitjail::tests::with_uids(&s.root.join("state"), vec![100]);
+        jail.set_graveyard(s.publisher.mirrors.join(GRAVEYARD));
+        s.publisher.git = Git::new(Some(jail.clone()), &format!("file://{}", s.root.display()));
+        sh(&s.vm, "echo st > st && git add st && git commit -qm st");
+        s.stage_all(request("scout/st"), || {}).await.unwrap();
+        assert_eq!(jail.free_uids(), 1);
+        jail.fail_kills(true);
+        // The run itself succeeded, but its processes couldn't be stopped: it fails.
+        let err = s.publisher.git.run(&s.dir(), &["for-each-ref"], GIT_LOCAL).await.unwrap_err();
+        assert!(err.contains("couldn't be stopped") && err.contains("taken out of use"), "{err}");
+        // So does a stage, at once, while its uid is held.
+        let err = s.stage_all(request("scout/st"), || {}).await.unwrap_err();
+        assert!(err.1.contains("couldn't be stopped"), "{err:?}");
+        assert!(!has_head(&s.dir()), "the mirror is still in use");
+        // The mirror in the graveyard, whole (a new, empty one the failed refresh made too).
+        let buried: Vec<_> = std::fs::read_dir(s.publisher.mirrors.join(GRAVEYARD)).unwrap().flatten().map(|e| e.path()).collect();
+        assert!(buried.iter().any(|b| b.join("HEAD").exists()), "{buried:?}");
+        assert_eq!(jail.free_uids(), 0, "the stuck run's uid was given out again");
+        // Its cgroup found empty again: the uid is free, and the next stage fetches afresh.
+        jail.fail_kills(false);
+        s.stage_all(request("scout/st"), || {}).await.unwrap();
+        assert_eq!(jail.free_uids(), 1);
     }
 
     /// The processes whose real uid is in git's range: (pid, uid).

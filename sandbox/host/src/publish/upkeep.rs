@@ -617,7 +617,7 @@ impl Publisher {
     pub fn inventory(&self) {
         // A fast-forward check's repo a previous sandboxd left (killed mid-push).
         for left in std::fs::read_dir(self.mirrors.join(".check")).into_iter().flatten().flatten() {
-            super::bury(&left.path(), &self.mirrors.join(super::GRAVEYARD));
+            crate::gitjail::bury(&left.path(), &self.mirrors.join(super::GRAVEYARD));
         }
         for dir in self.mirror_dirs() {
             if has_head(&dir) {

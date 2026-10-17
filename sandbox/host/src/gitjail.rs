@@ -82,6 +82,15 @@ pub struct GitJail {
     uids: Option<Pool>,
     /// Each run's memory.max, in bytes (SANDBOXD_GIT_MEM_MIB); unused without cgroups.
     mem_max: u64,
+    /// Where a run's trees go when the run can't be stopped (Publisher::new sets it:
+    /// `<mirrors>/.drop`).
+    graveyard: std::sync::OnceLock<PathBuf>,
+    /// Runs whose cgroup didn't empty: their uid, and their cgroup, killed again before
+    /// each new run; the uid is free again only once that succeeds.
+    stuck: Mutex<Vec<(u32, Option<PathBuf>)>>,
+    /// Tests only: every run's cgroup fails to empty.
+    #[cfg(test)]
+    fail_kills: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for GitJail {
@@ -165,14 +174,52 @@ impl GitJail {
         }
         // The path that passed the check above is the one runs exec: a link to it (on PATH)
         // isn't inside a run's root.
-        Ok(GitJail { git: real, find, mountpoint, entries, devices, cgroups: None, uids: None, mem_max: 0 })
+        Ok(GitJail {
+            git: real,
+            find,
+            mountpoint,
+            entries,
+            devices,
+            cgroups: None,
+            uids: None,
+            mem_max: 0,
+            graveyard: Default::default(),
+            stuck: Mutex::default(),
+            #[cfg(test)]
+            fail_kills: Default::default(),
+        })
+    }
+
+    /// Where a run's trees go if the run can't be stopped (`<mirrors>/.drop`).
+    pub fn set_graveyard(&self, graveyard: PathBuf) {
+        let _ = self.graveyard.set(graveyard);
+    }
+
+    /// Kill again what runs left that didn't stop; each uid whose cgroup is empty now is
+    /// free again.
+    fn reap_stuck(&self) {
+        let mut stuck = self.stuck.lock().unwrap_or_else(|e| e.into_inner());
+        stuck.retain(|(uid, cgroup)| {
+            #[cfg(test)]
+            if self.fail_kills.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            if cgroup.as_deref().is_some_and(|c| kill_cgroup(c).is_err()) {
+                return true;
+            }
+            if let Some(pool) = &self.uids {
+                pool.free.lock().unwrap_or_else(|e| e.into_inner()).push(*uid);
+                pool.available.add_permits(1);
+            }
+            false
+        });
     }
 
     /// A command for one isolated run of git in `dir` (the caller adds the arguments,
     /// environment and pipes), and what holds the run's uid, cgroup and namespaces until
     /// it is dropped. Waits for a free uid.
-    pub async fn command(self: &Arc<Self>, dir: &Path, net: Net) -> Result<(tokio::process::Command, Confined), String> {
-        self.run_for(dir, net, false).await
+    pub async fn command(self: &Arc<Self>, dir: &Path, net: Net, stuck: Arc<std::sync::atomic::AtomicBool>) -> Result<(tokio::process::Command, Confined), String> {
+        self.run_for(dir, net, false, stuck).await
     }
 
     /// A command that empties `dir`, a dropped mirror, in a jailed run like git's: `find
@@ -181,14 +228,28 @@ impl GitJail {
     /// first (sandboxd never walks a dropped tree): the run keeps CAP_DAC_OVERRIDE and
     /// CAP_FOWNER, which over what it sees (that tree; the rest is read-only or a tmpfs of
     /// its own) is only the power to delete it.
-    pub async fn remover(self: &Arc<Self>, dir: &Path) -> Result<(tokio::process::Command, Confined), String> {
-        self.run_for(dir, Net::Off, true).await
+    pub async fn remover(self: &Arc<Self>, dir: &Path, stuck: Arc<std::sync::atomic::AtomicBool>) -> Result<(tokio::process::Command, Confined), String> {
+        self.run_for(dir, Net::Off, true, stuck).await
     }
 
-    async fn run_for(self: &Arc<Self>, dir: &Path, net: Net, remove: bool) -> Result<(tokio::process::Command, Confined), String> {
+    /// `stuck` is set if, once dropped, the run's cgroup can't be emptied: then the run's
+    /// trees have been moved out of use and the job must fail.
+    async fn run_for(self: &Arc<Self>, dir: &Path, net: Net, remove: bool, stuck: Arc<std::sync::atomic::AtomicBool>) -> Result<(tokio::process::Command, Confined), String> {
+        self.reap_stuck();
         let lease = match &self.uids {
             Some(pool) => {
-                pool.available.acquire().await.map_err(|e| format!("git uids: {e}"))?.forget();
+                // None free while runs that couldn't be stopped hold some: refused at once
+                // rather than waited for (they may never be free).
+                match pool.available.try_acquire() {
+                    Ok(permit) => permit.forget(),
+                    Err(_) => {
+                        let held = self.stuck.lock().unwrap_or_else(|e| e.into_inner()).len();
+                        if held > 0 {
+                            return Err(format!("no git uid is free: {held} runs couldn't be stopped (their cgroups didn't empty), and their uids are held until they do"));
+                        }
+                        pool.available.acquire().await.map_err(|e| format!("git uids: {e}"))?.forget();
+                    }
+                }
                 let uid = pool.free.lock().unwrap_or_else(|e| e.into_inner()).pop();
                 match uid {
                     Some(uid) => Some(Lease { jail: self.clone(), uid }),
@@ -201,7 +262,7 @@ impl GitJail {
             None => None,
         };
         let uid = lease.as_ref().map(|l| l.uid);
-        let mut confined = Confined { lease, cgroup: None, net: None };
+        let mut confined = Confined { lease, cgroup: None, net: None, trees: vec![dir.to_path_buf()], stuck, jail: self.clone() };
         if let Some(uid) = uid.filter(|_| !remove) {
             own(dir, uid, uid).map_err(|e| format!("giving the mirror to its run's uid: {e}"))?;
         }
@@ -219,6 +280,7 @@ impl GitJail {
             }
             Net::Dir(path, writable) => (None, Some((path, writable))),
             Net::Source(path) => {
+                confined.trees.push(path.clone());
                 if let Some(uid) = uid {
                     own(&path, uid, uid).map_err(|e| format!("giving the source mirror to its run's uid: {e}"))?;
                 }
@@ -314,7 +376,7 @@ impl GitJail {
     /// that can't isolate git doesn't start (fail closed).
     pub async fn probe(self: &Arc<Self>, scratch: &Path) -> Result<String, String> {
         std::fs::create_dir_all(scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
-        let (mut cmd, confined) = self.command(scratch, Net::Off).await?;
+        let (mut cmd, confined) = self.command(scratch, Net::Off, Default::default()).await?;
         cmd.arg("version").stdin(std::process::Stdio::null());
         let out = cmd.output().await.map_err(|e| explain(&e));
         drop(confined);
@@ -351,26 +413,62 @@ pub struct Confined {
     lease: Option<Lease>,
     cgroup: Option<PathBuf>,
     net: Option<OwnedFd>,
+    /// What the run could write: its mirror (or check repo), and a source mirror it read.
+    trees: Vec<PathBuf>,
+    stuck: Arc<std::sync::atomic::AtomicBool>,
+    jail: Arc<GitJail>,
 }
 
 impl Drop for Confined {
+    /// Fail closed when the run can't be stopped: its processes may still be writing what
+    /// it could write. Its trees are moved out of use at once (into the graveyard: no
+    /// further run or host read of them), its uid isn't used again until its cgroup is
+    /// found empty (reap_stuck), and the job that ran it fails (`stuck`).
     fn drop(&mut self) {
-        let emptied = match &self.cgroup {
-            Some(c) => match kill_cgroup(c) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("sandboxd: ALERT: git's cgroup {}: {e}; its uid isn't used again", c.display());
-                    false
-                }
-            },
-            None => true,
+        #[allow(unused_mut)]
+        let mut emptied = match &self.cgroup {
+            Some(c) => kill_cgroup(c).map_err(|e| format!("git's cgroup {}: {e}", c.display())),
+            None => Ok(()),
         };
+        #[cfg(test)]
+        if self.jail.fail_kills.load(std::sync::atomic::Ordering::SeqCst) {
+            emptied = Err("a kill that failed, as a test asked".into());
+        }
         self.net = None;
-        if let Some(lease) = self.lease.take() {
-            if emptied {
-                lease.release();
+        match emptied {
+            Ok(()) => {
+                if let Some(lease) = self.lease.take() {
+                    lease.release();
+                }
+            }
+            Err(e) => {
+                eprintln!("sandboxd: ALERT: {e}; the run's trees are taken out of use and its uid held until its cgroup is empty");
+                self.stuck.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(graveyard) = self.jail.graveyard.get() {
+                    for tree in &self.trees {
+                        bury(tree, graveyard);
+                    }
+                }
+                if let Some(lease) = self.lease.take() {
+                    self.jail.stuck.lock().unwrap_or_else(|e| e.into_inner()).push((lease.uid, self.cgroup.clone()));
+                }
             }
         }
+    }
+}
+
+/// Move a tree a run wrote (a mirror, a check's repo) into `graveyard`, one rename, O(1):
+/// sandboxd never walks it to delete it. A jailed run empties it later
+/// (Publisher::empty_graveyard). Nothing there: nothing to do.
+pub(crate) fn bury(tree: &Path, graveyard: &Path) {
+    let mut id = [0u8; 16];
+    let random = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut id));
+    let name = if random.is_ok() { id.iter().map(|b| format!("{b:02x}")).collect::<String>() } else { format!("{}", std::process::id()) };
+    let moved = std::fs::create_dir_all(graveyard).and_then(|()| std::fs::rename(tree, graveyard.join(name)));
+    match moved {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("sandboxd: ALERT: couldn't move {} out of use ({e}); it stays where it is", tree.display()),
     }
 }
 
@@ -844,6 +942,23 @@ pub(crate) mod tests {
         in_userns("gitjail::tests::own_in_userns", true);
     }
 
+    /// A jail for tests in a user namespace with subuids: these uids, no cgroups.
+    pub(crate) fn with_uids(state: &Path, uids: Vec<u32>) -> Arc<GitJail> {
+        let mut jail = GitJail::unprivileged(state).unwrap();
+        let n = uids.len();
+        jail.uids = Some(Pool { free: Mutex::new(uids), available: tokio::sync::Semaphore::new(n) });
+        Arc::new(jail)
+    }
+
+    impl GitJail {
+        pub(crate) fn fail_kills(&self, on: bool) {
+            self.fail_kills.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub(crate) fn free_uids(&self) -> usize {
+            self.uids.as_ref().map_or(0, |p| p.free.lock().unwrap().len())
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_dropped_tree_is_emptied_by_a_jailed_run_never_by_sandboxd() {
@@ -883,10 +998,8 @@ pub(crate) mod tests {
         std::os::unix::fs::lchown(tree.join("refs/sticky/b"), Some(6), Some(6)).unwrap();
         std::fs::set_permissions(tree.join("refs/sticky"), std::fs::Permissions::from_mode(0o1777)).unwrap();
         std::fs::set_permissions(tree.join("objects/locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
-        let mut jail = GitJail::unprivileged(&top.join("state")).unwrap();
-        jail.uids = Some(Pool { free: Mutex::new(vec![100]), available: tokio::sync::Semaphore::new(1) });
-        let jail = Arc::new(jail);
-        let (mut cmd, confined) = jail.remover(&tree).await.unwrap();
+        let jail = with_uids(&top.join("state"), vec![100]);
+        let (mut cmd, confined) = jail.remover(&tree, Default::default()).await.unwrap();
         let out = cmd.args([REPO, "-mindepth", "1", "-delete"]).output().await.unwrap();
         drop(confined);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
