@@ -119,6 +119,23 @@ Lorehouse: the profile type, the knowledge store and ingest, the sandbox and its
 runners, credentials, the public-channel policy, identity and attribution, the
 conformance suite.
 
+**Human actions: the mechanism in June, the rule in Lorehouse.**
+- **June supplies the mechanism**:
+  - receiving and verifying every inbound human action (starting a turn, a follow-up, a
+    DM, answering a parked input such as Approve or Deny, and their equivalents on other
+    chat surfaces), and attesting who did it, organization included;
+  - rendering approval cards in each surface's own idiom, with first answer wins, and
+    expiry;
+  - one hook through which every such action passes before it takes effect.
+- **Lorehouse supplies the rule, once**, through that hook: who may act (a full member of
+  the organization), who may approve (`PR_APPROVER`), and what an approval is bound to (the
+  exact diff). Every action type passes the same rule, so a new one can't bypass it, and
+  it fails closed.
+- Until June has the single hook (junebuild/june#397), Lorehouse applies the same rule in
+  each of June's hooks that exists (`resolveIdentity` / `respondWhen` for turns,
+  `authorizeAnswer` for answers). A new kind of action isn't enabled until it passes the
+  rule.
+
 Gaps found on the way are filed against June rather than worked around for good. Known
 now: `accept` is synchronous, so it can't look up whether a channel is private
 (`src/policy.ts`). The `AnthropicClient` cast in `src/app.ts` is a dev.49 workaround for
