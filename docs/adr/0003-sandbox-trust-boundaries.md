@@ -106,11 +106,14 @@ around sandboxd. So:
     and libraries), a few pseudo-devices, a private `/tmp`, and the one mirror it works on,
     chowned to the run's uid. No `/etc/lorehouse`, no `/run/credentials`, no `/proc`,
     `/sys` or cgroup tree, no other mirror, no sandbox. sandboxd keeps nothing of its own
-    in a mirror and writes there only new files, never through a link the run could plant;
+    in a mirror, writes there only new files, and reads there without following a link,
+    waiting on a FIFO or reading past a cap: whatever a run leaves is planted;
   - **its own network namespace**, empty. A run that fetches or pushes gets one whose only
     address is a listener sandboxd serves; sandboxd forwards that repo's upload-pack or
     receive-pack, and nothing else, to GitHub (`publish/remote.rs`);
-  - **its own cgroup** (`git/u<uid>`, beside `vms/`), killed whole when the run is over, so a
+  - **its own IPC namespace**, so no IPC object outlives the run for a later one;
+  - **its own cgroup** (`git/u<uid>`, beside `vms/`), with a pids and a memory limit (no
+    swap; at the limit the run alone is killed), killed whole when the run is over, so a
     process that left git's process group doesn't outlive it or wait for a later run;
   - **no capabilities, `no_new_privs`** and no core dumps.
 
@@ -141,10 +144,11 @@ around sandboxd. So:
 
   What a git bug reached through a VM's objects still gets: the one mirror of that run, to
   read and write (and so the facts the next stage of that repo shows, which the commit id
-  an approval binds keeps honest), the run's CPU and memory, and for a fetch or push run,
-  that one repo's upload-pack or receive-pack at GitHub through sandboxd's checks. Not the
-  host's files, other mirrors, the sandboxes, the cgroup tree, other runs, sandboxd, the
-  network, or any token.
+  an approval binds keeps honest), the run's CPU and its memory up to its limit, and for a
+  fetch or push run, that one repo's upload-pack or receive-pack at GitHub through
+  sandboxd's checks, on at most 4 connections and within the bytes all runs' requests may
+  hold in sandboxd at once. Not the host's files, other mirrors, the sandboxes, the cgroup
+  tree, other runs, sandboxd, the network, or any token.
 - **Any new child that parses guest output runs the way git does** (`gitjail.rs`). The
   other children keep the capabilities they need.
 - Follow-ups: drop capabilities from every child that doesn't need them, and
