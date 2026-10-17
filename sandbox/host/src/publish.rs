@@ -214,13 +214,15 @@ pub struct Git {
     jail: Option<Arc<GitJail>>,
     remote: Remote,
     client: reqwest::Client,
+    /// What every run's proxy may hold of requests' bodies at once (remote.rs).
+    budget: Arc<remote::Budget>,
 }
 
 impl Git {
     fn new(jail: Option<Arc<GitJail>>, remote_base: &str) -> Git {
         // No redirects: a run's requests go to its repo at the remote, nowhere else.
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(30)).build().unwrap_or_default();
-        Git { jail, remote: Remote::new(remote_base), client }
+        Git { jail, remote: Remote::new(remote_base), client, budget: remote::Budget::new(remote::BODY_BUDGET) }
     }
 
     /// Start one git command in `dir`, in the guarded environment (git_command).
@@ -248,7 +250,7 @@ impl Git {
                 };
                 let addr = listener.local_addr().map_err(|e| format!("git's proxy: {e}"))?;
                 url = Some(format!("http://{addr}/{owner}/{name}.git"));
-                proxy = Some(remote::serve(listener, self.client.clone(), base.clone(), g.clone()).map_err(|e| format!("git's proxy: {e}"))?);
+                proxy = Some(remote::serve(listener, self.client.clone(), base.clone(), g.clone(), self.budget.clone()).map_err(|e| format!("git's proxy: {e}"))?);
                 netns = fd;
                 grant = Some(g);
             }

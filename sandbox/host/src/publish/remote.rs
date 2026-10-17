@@ -115,10 +115,64 @@ impl Drop for Proxy {
     }
 }
 
-/// Serve `listener` (in the run's network namespace) for one run.
-pub fn serve(listener: std::net::TcpListener, client: reqwest::Client, base: String, grant: Arc<Grant>) -> std::io::Result<Proxy> {
+/// The most connections one run may have open to its proxy at once (git uses one or two;
+/// HTTP/1.1 serves one request at a time on each). One more is closed at once, not queued.
+pub const MAX_CONNECTIONS: usize = 4;
+/// What all runs' requests may hold in sandboxd's memory at once, as they are read: two
+/// pushes of the largest size. A request that would take more is refused (503).
+pub const BODY_BUDGET: usize = 2 * MAX_PUSH_REQUEST;
+
+/// Bytes of requests' bodies in sandboxd's memory, shared by every run's proxy.
+pub struct Budget {
+    limit: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+impl Budget {
+    pub fn new(limit: usize) -> Arc<Budget> {
+        Arc::new(Budget { limit, used: Default::default() })
+    }
+}
+
+/// Some of the budget, given back when dropped.
+struct Held {
+    budget: Arc<Budget>,
+    bytes: usize,
+}
+
+impl Held {
+    /// `n` more bytes, if the budget has them.
+    fn take(&mut self, n: usize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let used = &self.budget.used;
+        let mut now = used.load(SeqCst);
+        loop {
+            match now.checked_add(n).filter(|t| *t <= self.budget.limit) {
+                None => return false,
+                Some(next) => match used.compare_exchange(now, next, SeqCst, SeqCst) {
+                    Ok(_) => {
+                        self.bytes += n;
+                        return true;
+                    }
+                    Err(seen) => now = seen,
+                },
+            }
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Serve `listener` (in the run's network namespace) for one run: at most MAX_CONNECTIONS
+/// at once, its requests' bodies held within `budget`.
+pub fn serve(listener: std::net::TcpListener, client: reqwest::Client, base: String, grant: Arc<Grant>, budget: Arc<Budget>) -> std::io::Result<Proxy> {
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+    let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let task = tokio::spawn(async move {
         // Owned here, so aborting this task drops (aborts) every connection.
         let mut conns = tokio::task::JoinSet::new();
@@ -126,11 +180,17 @@ pub fn serve(listener: std::net::TcpListener, client: reqwest::Client, base: Str
             tokio::select! {
                 accepted = listener.accept() => {
                     let Ok((stream, _)) = accepted else { break };
-                    let (client, base, grant) = (client.clone(), base.clone(), grant.clone());
+                    // Over the limit: closed now (dropped), never queued.
+                    let Ok(slot) = open.clone().try_acquire_owned() else {
+                        *grant.refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("more than {MAX_CONNECTIONS} connections at once"));
+                        continue;
+                    };
+                    let (client, base, grant, budget) = (client.clone(), base.clone(), grant.clone(), budget.clone());
                     conns.spawn(async move {
+                        let _slot = slot;
                         let service = hyper::service::service_fn(move |req| {
-                            let (client, base, grant) = (client.clone(), base.clone(), grant.clone());
-                            async move { Ok::<_, std::convert::Infallible>(forward(req, &client, &base, &grant).await) }
+                            let (client, base, grant, budget) = (client.clone(), base.clone(), grant.clone(), budget.clone());
+                            async move { Ok::<_, std::convert::Infallible>(forward(req, &client, &base, &grant, &budget).await) }
                         });
                         let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
                     });
@@ -143,7 +203,7 @@ pub fn serve(listener: std::net::TcpListener, client: reqwest::Client, base: Str
 }
 
 /// One request of git's: checked against the grant, then forwarded with the token.
-async fn forward(req: Request<hyper::body::Incoming>, client: &reqwest::Client, base: &str, grant: &Grant) -> Response<axum::body::Body> {
+async fn forward(req: Request<hyper::body::Incoming>, client: &reqwest::Client, base: &str, grant: &Grant, budget: &Arc<Budget>) -> Response<axum::body::Body> {
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(String::from);
     let method = req.method().clone();
@@ -172,10 +232,26 @@ async fn forward(req: Request<hyper::body::Incoming>, client: &reqwest::Client, 
         }
     }
     let limit = if push { MAX_PUSH_REQUEST } else { MAX_FETCH_REQUEST };
-    let body = match http_body_util::Limited::new(req.into_body(), limit).collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) => return grant.refuse(413, format!("the request: {e} (at most {limit} bytes)")),
-    };
+    // Read as it comes, each part taken from the shared budget first; held until the
+    // request has been forwarded.
+    let mut held = Held { budget: budget.clone(), bytes: 0 };
+    let mut incoming = req.into_body();
+    let mut buf = Vec::new();
+    while let Some(frame) = incoming.frame().await {
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => return grant.refuse(400, format!("the request: {e}")),
+        };
+        let Some(data) = frame.data_ref() else { continue };
+        if buf.len() + data.len() > limit {
+            return grant.refuse(413, format!("the request: over {limit} bytes"));
+        }
+        if !held.take(data.len()) {
+            return grant.refuse(503, format!("the requests in flight already hold sandboxd's {} bytes", budget.limit));
+        }
+        buf.extend_from_slice(data);
+    }
+    let body = Bytes::from(buf);
     if let (&Method::POST, Access::Push { old, new, refname }) = (&method, &grant.access) {
         if let Err(e) = check_push(&body, old, new, refname) {
             return grant.refuse(403, e);
@@ -363,6 +439,63 @@ mod tests {
         empty.extend(b"0000");
         assert_eq!(advertised_id(&empty, "refs/heads/main"), Ok(None));
         assert!(advertised_id(b"00", "refs/heads/main").is_err());
+    }
+
+    /// An upstream that answers every request with 200 and counts them, and a proxy for a
+    /// fetch of acme/widgets in front of it, holding at most `budget` bytes.
+    async fn proxy_with(budget: usize) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>, Proxy, Arc<Grant>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { "ok" }
+        });
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", up.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(up, app).await.unwrap() });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let grant = Grant::new("acme", "widgets", None, Access::Fetch);
+        let proxy = serve(listener, reqwest::Client::new(), base, grant.clone(), Budget::new(budget)).unwrap();
+        (addr, hits, proxy, grant)
+    }
+
+    #[tokio::test]
+    async fn a_run_gets_a_few_connections_and_more_are_closed_not_queued() {
+        use tokio::io::AsyncReadExt;
+        let (addr, _hits, _proxy, grant) = proxy_with(BODY_BUDGET).await;
+        let mut open = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            open.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        // One more: accepted by the kernel, then closed by the proxy at once.
+        let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), extra.read(&mut buf)).await;
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the connection over the limit stayed open: {read:?}");
+        assert!(grant.refused().is_some_and(|r| r.contains("connections")), "{:?}", grant.refused());
+        // Those within the limit are still served; one closed frees a place.
+        drop(open.pop());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let ok = reqwest::get(format!("http://{addr}/acme/widgets.git/info/refs?service=git-upload-pack")).await.unwrap();
+        assert_eq!(ok.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn requests_bodies_are_held_within_a_shared_budget_and_one_past_it_is_refused() {
+        let (addr, hits, _proxy, grant) = proxy_with(1 << 20).await;
+        let url = format!("http://{addr}/acme/widgets.git/git-upload-pack");
+        // Within the budget (and the request's own limit): forwarded.
+        let small = reqwest::Client::new().post(&url).body(vec![b'0'; 512 << 10]).send().await.unwrap();
+        assert_eq!(small.status(), 200);
+        // Past what all requests may hold at once: refused before it is all read, never
+        // forwarded, and the budget is whole again after.
+        let big = reqwest::Client::new().post(&url).body(vec![b'0'; 2 << 20]).send().await;
+        assert!(big.as_ref().map_or(true, |r| r.status() == 503), "{big:?}");
+        assert!(grant.refused().is_some_and(|r| r.contains("in flight")), "{:?}", grant.refused());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let again = reqwest::Client::new().post(&url).body(vec![b'0'; 512 << 10]).send().await.unwrap();
+        assert_eq!(again.status(), 200);
     }
 
     #[test]
