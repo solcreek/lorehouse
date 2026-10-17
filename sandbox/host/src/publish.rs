@@ -349,28 +349,31 @@ impl Git {
             return std::fs::remove_dir_all(dir).and_then(|()| std::fs::create_dir(dir)).map_err(|e| e.to_string());
         };
         let stuck = Stuck::default();
-        let (mut cmd, confined) = jail.remover(dir, stuck.clone()).await?;
-        cmd.args(gitjail::REMOVE_ARGS);
-        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true).process_group(0);
-        let child = cmd.spawn().map_err(|e| gitjail::explain(&e))?;
-        let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
-        let mut run = Running { child, group, _confined: Some(confined), _proxy: None, grant: None };
-        let err = run.child.stderr.take();
-        let errors = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            if let Some(e) = err {
-                let _ = e.take(STDERR_CAP).read_to_end(&mut buf).await;
-            }
-            buf
-        });
-        let status = match tokio::time::timeout(limit, run.wait()).await {
-            Err(_) => return Err(format!("find took over {} s", limit.as_secs())),
-            Ok(s) => s.map_err(|e| format!("find: {e}"))?,
+        // All of it under the limit, the wait for a free uid included: a pool that never
+        // frees must not hold the upkeep, or a stage evicting to make room.
+        let work = async {
+            let (mut cmd, confined) = jail.remover(dir, stuck.clone()).await?;
+            cmd.args(gitjail::REMOVE_ARGS);
+            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true).process_group(0);
+            let child = cmd.spawn().map_err(|e| gitjail::explain(&e))?;
+            let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+            let mut run = Running { child, group, _confined: Some(confined), _proxy: None, grant: None };
+            let err = run.child.stderr.take();
+            let errors = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(e) = err {
+                    let _ = e.take(STDERR_CAP).read_to_end(&mut buf).await;
+                }
+                buf
+            });
+            let status = run.wait().await.map_err(|e| format!("find: {e}"))?;
+            drop(run);
+            Ok::<_, String>((status, errors.await.unwrap_or_default()))
         };
-        drop(run);
-        let stderr = errors.await.unwrap_or_default();
+        let done = tokio::time::timeout(limit, work).await;
         stopped(&stuck)?;
+        let (status, stderr) = done.map_err(|_| format!("emptying it took over {} s (a free uid included)", limit.as_secs_f64()))??;
         if !status.success() {
             return Err(format!("find: {}", tail(&stderr)));
         }
@@ -1591,6 +1594,42 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(400), "it didn't wait for the busy uid");
         busy.await.unwrap().unwrap();
         jail.keep_stuck(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn emptying_a_dropped_tree_waits_for_a_uid_only_within_its_limit() {
+        crate::gitjail::tests::in_userns("publish::tests::empty_waits_in_userns", true);
+    }
+
+    /// The one uid busy for 5 s: emptying a tree with a 300 ms limit gives up after about
+    /// that, rather than waiting for the uid (a pool that never frees would hold the upkeep).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "run by emptying_a_dropped_tree_waits_for_a_uid_only_within_its_limit, in a user namespace"]
+    async fn empty_waits_in_userns() {
+        let s = scratch("emptywait");
+        let probe = s.root.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        if std::os::unix::fs::lchown(&probe, Some(100), Some(100)).is_err() {
+            eprintln!("skipped: this user namespace may not chown");
+            return;
+        }
+        let jail = crate::gitjail::tests::with_uids(&s.root.join("state"), vec![100]);
+        let git = Arc::new(Git::new(Some(jail), "file:///nonexistent"));
+        let (busy_dir, tree) = (s.root.join("busy"), s.root.join("tree"));
+        std::fs::create_dir_all(&busy_dir).unwrap();
+        std::fs::create_dir_all(tree.join("x")).unwrap();
+        let busy = {
+            let git = git.clone();
+            tokio::spawn(async move { git.run(&busy_dir, &["-c", "alias.wait=!sleep 5", "wait"], GIT_LOCAL).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let emptied = git.empty(&tree, Duration::from_millis(300)).await;
+        assert!(emptied.is_err(), "{emptied:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "it waited {:?} for a uid past its limit", started.elapsed());
+        busy.await.unwrap().unwrap();
     }
 
     /// The processes whose real uid is in git's range: (pid, uid).
