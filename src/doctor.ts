@@ -296,7 +296,10 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   if (tenant.source !== "throwaway") {
     add("storage", "data directory", "info", `${tenant.dataDir}: settings.json, and the tenant's files in ${tenant.source === "new" ? "<id>/" : `${tenant.id}/`}` + (env.LOREHOUSE_DB ? ` (LOREHOUSE_DB is set: the databases stay where it says)` : ""));
     const others = tenantsIn(tenant.dataDir).filter((id) => id !== tenant.id);
-    if (others.length) add("storage", "other tenants", "warn", `${tenant.dataDir} also holds ${others.join(", ")}, which this install doesn't serve (TENANT_ID=${tenant.id}): unset TENANT_ID, or set it to the one that holds the data`);
+    // A start refuses a new TENANT_ID beside another tenant (configuration, above); one
+    // that has its directory already, beside another, is still a problem to look at,
+    // unless TENANT_NEW=1 says two tenants here are meant.
+    if (others.length) add("storage", "other tenants", env.TENANT_NEW === "1" ? "warn" : "fail", `${tenant.dataDir} also holds ${others.join(", ")}, which this install doesn't serve (TENANT_ID=${tenant.id}): unset TENANT_ID, or set it to the one that holds the data` + (env.TENANT_NEW === "1" ? " (TENANT_NEW=1: meant)" : "; TENANT_NEW=1 if both are meant"));
   }
   // An install laid out before tenants: what the next start moves, by rename, into the
   // tenant's directory (upgradeLayout).

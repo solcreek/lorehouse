@@ -485,14 +485,22 @@ describe("the tenant", () => {
     }
   });
 
-  test("another tenant's directory beside this one's warns", async () => {
+  // A TENANT_ID with no directory yet, beside another tenant's, is a start on empty data:
+  // refused, as the start refuses it, unless TENANT_NEW=1 asks for exactly that.
+  test("another tenant's directory beside this one's fails; TENANT_NEW=1 makes it a warning", async () => {
     const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
     try {
       mkdirSync(`${dir}/globex`);
       writeFileSync(`${dir}/globex/tenant.json`, JSON.stringify({ id: "globex" }));
-      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
-      expect(find(checks, "other tenants")[0]).toMatchObject({ level: "warn", detail: expect.stringContaining(`${dir} also holds globex`) });
+      const refused = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
+      expect(refused.filter((c) => c.level === "fail").map((c) => c.detail)).toEqual([expect.stringContaining("TENANT_ID (acme has no directory in")]);
+      const allowed = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme", TENANT_NEW: "1" });
+      expect(find(allowed, "other tenants")[0]).toMatchObject({ level: "warn", detail: expect.stringContaining(`${dir} also holds globex`) });
       expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir }), "tenant")[0]?.detail).toBe(`globex (named by ${dir}/globex/tenant.json)`);
+      // Once acme has its directory, the other one is still a problem to look at.
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "other tenants")[0]).toMatchObject({ level: "fail", detail: expect.stringContaining(`${dir} also holds globex`) });
     } finally {
       rmSync(dir, { recursive: true });
     }

@@ -58,6 +58,22 @@ describe("tenant ids", () => {
     expect(tenantOf({ LOREHOUSE_DATA_DIR: d, TENANT_ID: "t-second" }).source).toBe("configured");
   });
 
+  // A TENANT_ID changed on an install whose data is in another tenant's directory would
+  // start on empty data, quietly: refused, unless TENANT_NEW=1 says that is the point.
+  test("a TENANT_ID with no directory yet, beside another tenant's, is refused unless TENANT_NEW=1", () => {
+    const d = dir();
+    const old = tenantOf({ LOREHOUSE_DATA_DIR: d });
+    prepareTenant(old);
+    expect(resolveTenant({ LOREHOUSE_DATA_DIR: d, TENANT_ID: "acme" })).toEqual({ problem: `TENANT_ID (acme has no directory in ${d} yet, and ${d} holds tenant ${old.id}: unset TENANT_ID to serve ${old.id}, or set TENANT_NEW=1 to start acme, empty, beside it)` });
+    expect(() => loadConfig({ ...base, LOREHOUSE_DATA_DIR: d, TENANT_ID: "acme" })).toThrow(/TENANT_ID \(acme has no directory/);
+    expect(tenantOf({ LOREHOUSE_DATA_DIR: d, TENANT_ID: "acme", TENANT_NEW: "1" }).source).toBe("configured");
+    expect(tenantOf({ LOREHOUSE_DATA_DIR: d, TENANT_ID: old.id }).source).toBe("configured");
+    expect(() => loadConfig({ ...base, LOREHOUSE_DATA_DIR: d, TENANT_ID: "acme", TENANT_NEW: "yes" })).toThrow(/TENANT_NEW \(1 to start/);
+    // Once made, it is that tenant's directory: no override needed again.
+    prepareTenant(tenantOf({ LOREHOUSE_DATA_DIR: d, TENANT_ID: "acme", TENANT_NEW: "1" }));
+    expect(tenantOf({ LOREHOUSE_DATA_DIR: d, TENANT_ID: "acme" }).source).toBe("configured");
+  });
+
   test("LOREHOUSE_DB in memory: an id for this process, nothing kept", () => {
     const t = tenantOf({ LOREHOUSE_DB: ":memory:" });
     expect(t.source).toBe("throwaway");

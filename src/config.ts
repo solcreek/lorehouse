@@ -244,6 +244,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // rather than let a LOREHOUSE_DB named sessions.db, or a link to it, quietly share it.
   if (config.db.sessions !== ":memory:" && sameFile(config.db.sessions, config.db.lorehouse)) missing.push(`SESSIONS_DB (must be a different file from LOREHOUSE_DB, got "${config.db.sessions}" for both)`);
   if (![undefined, "", "0", "1"].includes(env.PDF_REPLIES)) missing.push(`PDF_REPLIES (1 for PDF replies, or unset; got "${env.PDF_REPLIES}")`);
+  if (![undefined, "", "0", "1"].includes(env.TENANT_NEW)) missing.push(`TENANT_NEW (1 to start a new tenant beside another's, or unset; got "${env.TENANT_NEW}")`);
   if (![undefined, "", "0", "1"].includes(env.USAGE_RECORD_PEOPLE)) missing.push(`USAGE_RECORD_PEOPLE (1 to record who asks, or unset; got "${env.USAGE_RECORD_PEOPLE}")`);
   // The admin token reads what people wrote: long, and never the status token, which is
   // the one handed to monitors.

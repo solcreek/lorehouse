@@ -12,7 +12,8 @@
 // <data> is LOREHOUSE_DATA_DIR, by default the directory LOREHOUSE_DB names (the working
 // directory when that is unset too): where settings.json and the databases were before.
 //
-// The tenant id is TENANT_ID when set. Otherwise it is the one tenant directory found in
+// The tenant id is TENANT_ID when set; one with no directory yet, in a data directory that
+// holds another tenant's, is refused unless TENANT_NEW=1. Otherwise it is the one tenant directory found in
 // <data>, and with none, a new id is made at the first start and kept as that directory's
 // tenant.json. It is not derived from Slack: it stays the same when the Slack app is
 // reinstalled, or another chat platform is added, and it is known before anything asks Slack.
@@ -87,7 +88,16 @@ export function resolveTenant(env: Env): Tenant | { problem: string } {
   const dataDir = dataDirOf(env);
   const at = (id: string, source: TenantSource): Tenant => ({ id, source, dataDir, dir: join(dataDir, id) });
   if (env.TENANT_ID) {
-    return validTenantId(env.TENANT_ID) ? at(env.TENANT_ID, "configured") : { problem: `TENANT_ID (${TENANT_ID_RULE}; got ${JSON.stringify(env.TENANT_ID)})` };
+    const id = env.TENANT_ID;
+    if (!validTenantId(id)) return { problem: `TENANT_ID (${TENANT_ID_RULE}; got ${JSON.stringify(id)})` };
+    // A TENANT_ID new to a data directory that holds another tenant would start on empty
+    // data beside it, quietly (a TENANT_ID changed on an install that made its own id):
+    // refused, unless TENANT_NEW=1 asks for a new tenant there.
+    const others = env.LOREHOUSE_DB === ":memory:" || existsSync(join(dataDir, id, MARKER)) ? [] : tenantsIn(dataDir).filter((t) => t !== id);
+    if (others.length && env.TENANT_NEW !== "1") {
+      return { problem: `TENANT_ID (${id} has no directory in ${dataDir} yet, and ${dataDir} holds tenant ${others.join(", ")}: unset TENANT_ID to serve ${others.length === 1 ? others[0] : "one of them"}, or set TENANT_NEW=1 to start ${id}, empty, beside it)` };
+    }
+    return at(id, "configured");
   }
   if (env.LOREHOUSE_DB === ":memory:") return at(newTenantId(), "throwaway");
   const found = tenantsIn(dataDir);

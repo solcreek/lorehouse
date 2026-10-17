@@ -417,7 +417,7 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "TENANT_ID names the tenant /status reports; one that isn't 1–32 lowercase letters, digits or inner hyphens is refused at start",
+    name: "TENANT_ID names the tenant /status reports; one that isn't 1–32 lowercase letters, digits or inner hyphens, or a new one beside another tenant's data, is refused at start",
     run: async () => {
       const r = await withFreshDb(async () => {
         const t = ((await status()) as Status & { tenant?: unknown }).tenant;
@@ -431,6 +431,11 @@ const scenarios: Scenario[] = [
           if (typeof refused === "string") return `TENANT_ID=${bad}: ${refused}`;
           if (!refused.stderr.includes("TENANT_ID (")) return `TENANT_ID=${bad}: stderr doesn't name TENANT_ID: ${refused.stderr.slice(0, 300)}`;
         }
+        // A valid TENANT_ID new to a data directory holding another tenant's data (the
+        // usual app's) would start on empty data: refused, naming the way to ask for it.
+        const fresh = await refusedStart({ TENANT_ID: "acme-2" });
+        if (typeof fresh === "string") return `TENANT_ID=acme-2 beside the usual tenant: ${fresh}`;
+        if (!fresh.stderr.includes("acme-2 has no directory") || !fresh.stderr.includes("TENANT_NEW=1")) return `TENANT_ID=acme-2 beside the usual tenant: stderr ${fresh.stderr.slice(0, 300)}`;
         return null;
       } finally {
         await startApp();
@@ -1831,6 +1836,7 @@ function appEnv(extraEnv: Record<string, string>): Record<string, string | undef
     FILE_STORE: "",
     // The tenant from the data directory LOREHOUSE_DB names, never this shell's or the .env's.
     TENANT_ID: "",
+    TENANT_NEW: "",
     LOREHOUSE_DATA_DIR: "",
     ...extraEnv,
   };
