@@ -231,10 +231,12 @@ impl GitJail {
 
     /// A command that empties `dir`, a dropped mirror, in a jailed run like git's: `find
     /// /repo -mindepth 1 -delete` (the caller adds the arguments), as a leased uid, in its own
-    /// cgroup, seeing nothing but `dir` and /usr. Unlike git's, the tree isn't chowned to it
-    /// first (sandboxd never walks a dropped tree): the run keeps CAP_DAC_OVERRIDE and
-    /// CAP_FOWNER, which over what it sees (that tree; the rest is read-only or a tmpfs of
-    /// its own) is only the power to delete it.
+    /// cgroup. Unlike git's, the tree isn't chowned to it first (sandboxd never walks a
+    /// dropped tree): the run keeps CAP_DAC_OVERRIDE and CAP_FOWNER. What it sees: that tree
+    /// at /repo (writable), /usr, the merged-usr links and /etc/ld.so.cache (read-only bind
+    /// mounts, which the capabilities don't make writable), a /tmp tmpfs of its own and an
+    /// empty /dev: no device node of the host's (plan_for). So the capabilities reach only
+    /// the tree it deletes.
     pub async fn remover(self: &Arc<Self>, dir: &Path, stuck: Arc<std::sync::atomic::AtomicBool>) -> Result<(tokio::process::Command, Confined), String> {
         self.run_for(dir, Net::Off, true, stuck).await
     }
@@ -303,8 +305,7 @@ impl GitJail {
                 (None, Some((path, false)))
             }
         };
-        let mut plan = self.plan(dir, uid, confined.cgroup.as_deref(), netns, remote.as_ref().map(|(p, w)| (p.as_path(), *w)))?;
-        plan.keep_delete = remove;
+        let plan = self.plan_for(dir, uid, confined.cgroup.as_deref(), netns, remote.as_ref().map(|(p, w)| (p.as_path(), *w)), remove)?;
         let mut cmd = crate::child::command(if remove { &self.find } else { &self.git });
         // SAFETY: Plan::enter makes only async-signal-safe system calls on memory prepared
         // before the fork, as pre_exec requires.
@@ -314,8 +315,17 @@ impl GitJail {
         Ok((cmd, confined))
     }
 
+    /// A git run's plan, or the remover's: no device nodes at all (`find -delete` opens
+    /// none, and with its capabilities it could change the host's), and its capabilities
+    /// kept.
+    fn plan_for(&self, dir: &Path, uid: Option<u32>, cgroup: Option<&Path>, netns: Option<RawFd>, remote: Option<(&Path, bool)>, remove: bool) -> Result<Plan, String> {
+        let mut plan = self.plan(dir, uid, cgroup, netns, remote, !remove)?;
+        plan.keep_delete = remove;
+        Ok(plan)
+    }
+
     #[cfg(not(target_os = "linux"))]
-    fn plan(&self, _: &Path, _: Option<u32>, _: Option<&Path>, _: Option<RawFd>, _: Option<(&Path, bool)>) -> Result<Plan, String> {
+    fn plan(&self, _: &Path, _: Option<u32>, _: Option<&Path>, _: Option<RawFd>, _: Option<(&Path, bool)>, _: bool) -> Result<Plan, String> {
         let _ = (&self.mountpoint, &self.entries, &self.devices, &self.find, SAFE_CONFIG);
         Err("git isolation is Linux only".into())
     }
@@ -323,7 +333,7 @@ impl GitJail {
     /// Everything a run's setup does, prepared here (paths, flags) so the child only makes
     /// system calls.
     #[cfg(target_os = "linux")]
-    fn plan(&self, dir: &Path, uid: Option<u32>, cgroup: Option<&Path>, netns: Option<RawFd>, remote: Option<(&Path, bool)>) -> Result<Plan, String> {
+    fn plan(&self, dir: &Path, uid: Option<u32>, cgroup: Option<&Path>, netns: Option<RawFd>, remote: Option<(&Path, bool)>, devices: bool) -> Result<Plan, String> {
         let root = self.mountpoint.clone();
         let at = |p: &Path| root.join(p.strip_prefix("/").unwrap_or(p));
         let mut ops = vec![Op::mount(Some(OsStr::new("tmpfs")), &root, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, Some("mode=0755,size=1m"))?];
@@ -356,7 +366,7 @@ impl GitJail {
             }
         }
         mkdirs(&mut ops, Path::new("/dev"))?;
-        for dev in &self.devices {
+        for dev in self.devices.iter().filter(|_| devices) {
             ops.push(Op::Touch(cstr(&at(dev))?));
             ops.push(Op::mount(Some(dev.as_os_str()), &at(dev), None, libc::MS_BIND, None)?);
         }
@@ -1100,7 +1110,7 @@ pub(crate) mod tests {
         }
         let tmp = std::env::temp_dir().join(format!("gitjail-plan-{}", std::process::id()));
         let jail = GitJail::unprivileged(&tmp).unwrap();
-        let plan = jail.plan(Path::new("/var/lib/x/.mirrors/acme/w.git"), Some(1_900_100_000), Some(Path::new("/sys/fs/cgroup/s/git/u1")), None, None).unwrap();
+        let plan = jail.plan(Path::new("/var/lib/x/.mirrors/acme/w.git"), Some(1_900_100_000), Some(Path::new("/sys/fs/cgroup/s/git/u1")), None, None, true).unwrap();
         let root = jail.mountpoint.to_string_lossy().into_owned();
         let mut sources = Vec::new();
         let mut targets = Vec::new();
@@ -1128,6 +1138,12 @@ pub(crate) mod tests {
         assert_eq!(plan.cgroup_procs.as_deref().map(|c| c.to_string_lossy().into_owned()).as_deref(), Some("/sys/fs/cgroup/s/git/u1/cgroup.procs"));
         // No network namespace given: the run makes an empty one.
         assert!(plan.netns.is_none());
+        // The remover's run gets no device node of the host's, and keeps its capabilities.
+        let remover = jail.plan_for(Path::new("/var/lib/x/.mirrors/.drop/t"), Some(1_900_100_000), None, None, None, true).unwrap();
+        let devices: Vec<String> = remover.ops.iter().filter_map(|op| match op { Op::Mount { src: Some(s), .. } if s.to_string_lossy().starts_with("/dev") => Some(s.to_string_lossy().into_owned()), _ => None }).collect();
+        assert!(devices.is_empty(), "{devices:?}");
+        assert!(remover.keep_delete);
+        assert!(!plan.keep_delete);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
