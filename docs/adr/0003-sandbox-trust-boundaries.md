@@ -9,24 +9,21 @@ host as a boundary, the egress channel #110 needs, and isolation between tenants
 
 sandboxd (`sandbox/host`) runs model-written code in one Firecracker microVM per
 sandbox (one per Slack thread today). The 2026-10-12 version of this ADR decided how a
-VM is contained on its host: the jailer, a confined daemon, and the network rules. Four
-days of building on it showed that it was right about what it covered, but it covered
-too little:
+VM is contained on its host: the jailer, a confined daemon, and the network rules. It
+was right about what it covered, but it covered too little:
 
 - **No trust model for the guest.** Whether guestd's inputs are a vulnerability was argued
   per review finding. CodeQL flagged path and command injection in guestd, and #141
   proposes storing job ownership in guestd. Both need a stated rule about what the guest
   may be trusted with.
-- **An unmet precondition.** The old text said "the sandbox host should run nothing else
-  of value", but starship, the one production host, is a shared development machine. It
-  runs other agents with password-less sudo, Docker, and the runner token. Nothing said
-  whether that is allowed.
+- **An unstated host requirement.** The old text said "the sandbox host should run
+  nothing else of value", but it never made that a requirement, nor said which hosts are
+  acceptable.
 - **Planned work crosses its rules.** #110's egress proxy needs a path from the guest to
   something on the host, which the network rules forbid. A hosted, multi-tenant
   Lorehouse needs isolation between tenants, which it never mentioned.
-- **Hardware-level controls were missing.** Nested virtualization (enabled on starship,
-  `kvm_amd nested=1`, 2026-10-16), the CPU features exposed to guests, and SMT existed
-  only in issues and chat.
+- **Hardware-level controls were missing.** Nested virtualization on the host, the CPU
+  features exposed to guests, and SMT weren't decided anywhere.
 
 Facts this ADR relies on:
 - A KVM guest-to-host escape was confirmed through Vercel's sandbox bounty on
@@ -110,12 +107,11 @@ around sandboxd. So:
   - read the tokens in the environment of any other git running at the same time;
   - write the delegated cgroup tree.
 
-  Listing exactly what it reaches has proven unreliable: three reviews of this paragraph
-  each found more. The fix is to change where git runs, not to describe it better. #143
+  The list is not exhaustive and isn't meant to be: the rule is the equivalence, and the
+  fix is to change where git runs. #143
   makes it a separate, unprivileged process: its own uid, one repo's mirror, no view of
   `/etc/lorehouse` or the credentials, network and a token only for a push. Git parsing
-  untrusted packfiles is a real attack surface, so #143 comes before hosting anyone else,
-  and soon on starship.
+  untrusted packfiles is a real attack surface, so #143 comes before any production host.
 - **Any new child that parses guest output runs the way #143 runs git** (until then, with
   no capabilities and `no_new_privs`, and counted as sandboxd if it's compromised). The
   other children keep the capabilities they need.
@@ -186,13 +182,10 @@ Two kinds of host meet this:
   L1 that holds only the runner token and can be deleted. Measured on GCE: 2.4 s cold
   boot.
 
-**starship is the one exception, and only for the maintainer's own use.** It's a shared
-development machine, so it fails this layer. It may keep serving the maintainer's own
-workspace, on these terms:
-- The trade is written down here.
-- `nested=0` and the CPU template are still required on it.
-- It never serves a second tenant.
-- Moving off it is the plan, not a someday.
+**Production sandbox hosts are machines Lorehouse deploys for this alone.** They are
+clean bare metal or cloud VMs, built for Lorehouse with security and isolation in mind,
+and nothing else. A shared machine (a development box, a CI host) is never a production
+sandbox host, whatever it's hardened with.
 
 ### Layer 5: tenants never share what they can affect
 
@@ -226,8 +219,8 @@ As of 2026-10-16, on main:
 | internet-only network rules, IPv6, anti-spoof | 3 | **done** (#105). Gaps in #106 |
 | egress proxy over vsock | 3 | not started (#110, now with this channel) |
 | git that reads VM objects runs isolated from sandboxd | 3 | not started (#143). Today git is capability-less root, which counts as sandboxd if compromised |
-| host `nested=0`, CPU template, startup check | 4 | not started. starship has `nested=1` (2026-10-16) |
-| a host that meets layer 4 | 4 | none in production yet. The lab (`sandbox/lab`) is a disposable L1 for testing |
+| host `nested=0`, CPU template, startup check | 4 | not started |
+| a host that meets layer 4 | 4 | none yet: the first purpose-built host is the next infrastructure step. The lab (`sandbox/lab`) is a disposable L1 for testing |
 | tenant isolation | 5 | not started. A single tenant until then |
 
 ## Consequences
@@ -245,10 +238,10 @@ As of 2026-10-16, on main:
 - **New work for layer 4:**
   - a sandboxd startup check for `nested`;
   - a CPU template in `vm.rs`;
-  - setting `kvm_amd nested=0` on starship, in a maintenance window, once the maintainer
-    confirms nothing else there needs nested virtualization.
-- **Hosting for others needs layer 4 and layer 5 complete**, a dedicated or disposable
-  host, and a written decision to move off starship.
+  - a purpose-built host, provisioned from code, that meets every bullet above. Its
+    image or playbook sets `nested=0`, SMT, and nothing but sandboxd.
+- **Production needs a purpose-built host meeting layer 4.** Hosting for more than one
+  tenant also needs layer 5.
 - **Relationship to other ADRs.** This ADR depends on ADR 0004 (where secrets live) and
   states its sandbox half. ADR 0002's "rules no profile can change" includes layers 1–3:
   a profile can request resources and egress within an install's maxima, never a
