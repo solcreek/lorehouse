@@ -52,7 +52,7 @@ sandboxes on the runner with the most free room.
 
 ```json
 { "type": "status", "runner": "starship", "capacity": 4, "running": 1, "version": "0.1.0",
-  "sandboxes": ["slack_C1_1790000001.000100"], "jobs": ["j_…"], "received": ["j_…"],
+  "sandboxes": ["acme.slack_C1_1790000001.000100"], "jobs": ["j_…"], "received": ["j_…"],
   "session": "18f3a…-2c41", "started": 1790000000000 }
 ```
 
@@ -81,11 +81,17 @@ A **job** is one request to the sandbox's guest agent, the removal of a sandbox,
 publishing step (`stage`, `push`; see [Publishing](#publishing)):
 
 ```json
-{ "id": "j_…", "sandbox": "slack_C1_1790000001.000100", "op": "guest",
+{ "id": "j_…", "sandbox": "acme.slack_C1_1790000001.000100", "op": "guest",
   "method": "POST", "path": "/exec", "bodyBase64": "…", "timeoutMs": 600000,
   "deadlineMs": 659000 }
 { "id": "j_…", "sandbox": "…", "op": "destroy", "timeoutMs": …, "deadlineMs": … }
 ```
+
+A sandbox id is `<tenant>.<thread>`: the tenant's id (`acme` here; `src/tenant.ts`), a
+dot, then the thread's session id with every character outside `[A-Za-z0-9_.-]` as `_`.
+A tenant id has no dot, so the first dot ends it, and two tenants' threads never share an
+id on one host (ADR 0005 §1). It is at most 128 characters, sandboxd's limit: a longer
+session is cut and a hash of it added.
 
 `timeoutMs` is the command's own limit. `deadlineMs` is how long Lorehouse will still wait
 for the result, as of handing the job out. It is relative, so the clocks needn't agree.

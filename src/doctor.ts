@@ -16,14 +16,15 @@
 //   anthropic      the API key, and that ANTHROPIC_MODEL exists
 //   github         the App's key and permissions, or the token (code tools only)
 //   sandbox        the direct sandbox host answers (code tools only)
-//   storage        where the SQLite files go
+//   storage        the tenant, the data directory, where the SQLite files go, and what the
+//                  next start moves into the tenant's directory
 //   deployment     with --url: /healthz, the signing secret, the admin API, and /status
 //
 // Exit code: 0 when nothing failed (warnings allowed), 1 when something did.
 
 import { Database } from "bun:sqlite";
 import { accessSync, constants, existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { createHmac } from "node:crypto";
 import manifest from "../slack/manifest.yaml";
 import { ConfigError, isLoopbackUrl as isLoopback, loadConfig, type Config } from "./config";
@@ -34,6 +35,7 @@ import { pendingPurge, type ChannelPurge } from "./purge";
 import { loadEnv, readSettings } from "./settings";
 import { configToken, slackCall, urlMismatch, type ManagedManifest } from "./setup";
 import { describeEgress, typstRenderer } from "./tools/render-pdf";
+import { pendingMoves, planMove, tenantsIn } from "./tenant";
 
 export type Level = "ok" | "warn" | "fail" | "info";
 export type Check = { section: string; name: string; level: Level; detail: string };
@@ -195,7 +197,9 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   }
   // What the next start would purge for channels no longer listed (purge.ts): counted
   // from the database, read-only, so it can be put back on the list before it happens.
-  const purge = pendingPurgeIn(config.db.lorehouse, config.agent.channels);
+  // A database the next start moves into the tenant's directory is read where it is now.
+  const moves = pendingMoves(config.db.upgrade);
+  const purge = pendingPurgeIn(moves.find((m) => m.to === config.db.lorehouse)?.from ?? config.db.lorehouse, config.agent.channels);
   if (typeof purge === "string") add("channels", "purge on start", "info", purge);
   else if (purge.length) {
     const docs = (k: number) => `${k} document${k === 1 ? "" : "s"}`;
@@ -280,7 +284,52 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   }
 
   // ── storage ──
-  for (const [key, path] of [["LOREHOUSE_DB", config.db.lorehouse], ["SESSIONS_DB", config.db.sessions]] as const) {
+  // The tenant (tenant.ts): its id is in every path, sandbox id and log line.
+  const { tenant } = config;
+  const kept = `${tenant.dir}/tenant.json`;
+  add("storage", "tenant", "info", {
+    configured: `${tenant.id} (TENANT_ID)`,
+    found: `${tenant.id} (named by ${kept})`,
+    new: `none yet: the first start makes one and keeps it in ${tenant.dataDir}/<id>/tenant.json`,
+    throwaway: `${tenant.id}, for this process only: LOREHOUSE_DB is in memory`,
+  }[tenant.source]);
+  if (tenant.source !== "throwaway") {
+    add("storage", "data directory", "info", `${tenant.dataDir}: settings.json, and the tenant's files in ${tenant.source === "new" ? "<id>/" : `${tenant.id}/`}` + (env.LOREHOUSE_DB ? ` (LOREHOUSE_DB is set: the databases stay where it says)` : ""));
+    const others = tenantsIn(tenant.dataDir).filter((id) => id !== tenant.id);
+    // A start refuses a new TENANT_ID beside another tenant (a configuration failure,
+    // above) unless TENANT_NEW=1; once the tenant has its own directory it starts, without
+    // TENANT_NEW, and the other directory is a warning here too.
+    if (others.length) add("storage", "other tenants", "warn", `${tenant.dataDir} also holds ${others.join(", ")}, which this install doesn't serve (TENANT_ID=${tenant.id}): if that is where the data is, unset TENANT_ID, or set it to that one`);
+  }
+  // An install laid out before tenants: what the next start moves, by link and rename, into the
+  // tenant's directory (upgradeLayout).
+  // Judged by upgradeLayout's own rules (planMove): a move a start began is one the next
+  // finishes, and only what the start would refuse fails.
+  const plans = config.db.upgrade.map((m) => ({ m, plan: planMove(m) }));
+  for (const { m, plan } of plans) {
+    if (plan.refusal) add("storage", "upgrade", "fail", `${plan.refusal} (the start refuses until then)`);
+    else if (plan.state === "under-way") add("storage", "upgrade", "info", `${m.from}: a move under way; the next start finishes it`);
+    // A -wal, -shm or -journal in both places: the start renames the one that isn't the
+    // database's own aside rather than let SQLite replay it.
+    if (!plan.refusal && plan.setAside) add("storage", "upgrade", "warn", `the next start sets aside ${plan.setAside.join(" and ")} (renamed .stale-<time>): side files that aren't ${m.from}'s own, never replayed`);
+  }
+  // The move writes in the tenant's directory (a hard link of each file), or in the data
+  // directory where that is made: a destination the start can't write fails the start.
+  const writable = (p: string) => { try { accessSync(p, constants.W_OK | constants.X_OK); return true; } catch { return false; } };
+  const into = new Map<string, string[]>();
+  for (const { m, plan } of plans) {
+    if (plan.refusal || plan.state === "done") continue;
+    const dest = existsSync(dirname(m.to)) ? dirname(m.to) : tenant.dataDir;
+    into.set(dest, [...(into.get(dest) ?? []), m.from]);
+  }
+  for (const [dest, froms] of into) {
+    if (!writable(dest)) add("storage", "upgrade", "fail", `${dest} must be writable and enterable: the next start moves ${froms.join(" and ")} into it`);
+  }
+  const toMove = plans.filter(({ plan }) => plan.state === "pending" && !plan.refusal).map(({ m }) => m);
+  if (toMove.length) add("storage", "upgrade", "info", `the next start moves ${toMove.map((m) => basename(m.from)).join(" and ")} (with their -wal and -shm) from ${tenant.dataDir} into ${tenant.source === "new" ? `${tenant.dataDir}/<id>` : tenant.dir}, leaving a symlink at each old path`);
+  for (const [key, configured] of [["LOREHOUSE_DB", config.db.lorehouse], ["SESSIONS_DB", config.db.sessions]] as const) {
+    // A database still to move is checked where it is now.
+    const path = moves.find((m) => m.to === configured)?.from ?? configured;
     if (path === ":memory:") {
       // Unset, SESSIONS_DB is a file beside LOREHOUSE_DB: sessions in memory are either
       // asked for, or follow a LOREHOUSE_DB in memory.
@@ -295,12 +344,13 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     // SQLite reads and writes the database, and in WAL mode (knowledge.ts) creates -wal
     // and -shm files beside it: the directory must be enterable and writable too.
     const full = resolve(path);
-    const dir = dirname(full);
+    // The tenant's directory is made on the first start, in the data directory.
+    const dir = dirname(full) === tenant.dir && !existsSync(tenant.dir) ? tenant.dataDir : dirname(full);
     const may = (p: string, mode: number) => { try { accessSync(p, mode); return true; } catch { return false; } };
     if (!existsSync(dir)) add("storage", key, "fail", `${dir} doesn't exist`);
     else if (!may(dir, constants.W_OK | constants.X_OK)) add("storage", key, "fail", `${dir} must be writable and enterable: SQLite keeps its -wal and -shm files there`);
     else if (existsSync(full) && !may(full, constants.R_OK | constants.W_OK)) add("storage", key, "fail", `${full} must be readable and writable`);
-    else add("storage", key, "ok", existsSync(full) ? full : `${full} (created on first start)`);
+    else add("storage", key, "ok", path !== configured ? `${full} (moves to ${configured} on the next start)` : existsSync(full) ? full : `${full} (created on first start)`);
   }
 
   // ── deployment ──
@@ -377,6 +427,12 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   else if (k.state === "ready") add("deployment", "knowledge", "ok", `ready, ${k.documents} threads indexed`);
   else add("deployment", "knowledge", "info", `${k.state ?? "unknown"}, ${k.documents ?? 0} threads so far`);
   if (status.agent && status.agent !== identity.name) add("deployment", "agent", "warn", `the running app is @${status.agent}, this environment @${identity.name}: is this the same deployment?`);
+  // Only a tenant this environment has (TENANT_ID, or its directory found) can be compared.
+  if (typeof status.tenant === "string") {
+    const mine = tenant.source === "configured" || tenant.source === "found" ? tenant.id : undefined;
+    if (mine && status.tenant !== mine) add("deployment", "tenant", "warn", `the running app serves tenant ${status.tenant}, this environment ${mine}: is this the same deployment?`);
+    else add("deployment", "tenant", "ok", status.tenant);
+  }
   if (sandbox?.mode === "runners") {
     const online = (Array.isArray(status.runners) ? status.runners : []).filter((r) => r?.online);
     if (!online.length) add("deployment", "runners", "fail", "no sandbox runner is connected: code tools will fail (sandbox/host/README.md)");
@@ -405,6 +461,7 @@ function pendingPurgeIn(path: string, listed: ReadonlySet<string>): ChannelPurge
 
 type RunningStatus = {
   agent?: string;
+  tenant?: string;
   knowledge?: { state?: string; documents?: number; error?: string };
   runners?: { runner: string; transport: string; online: boolean; capacity: number; running: number }[];
 };

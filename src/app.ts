@@ -42,6 +42,7 @@ import { cloneTool } from "./tools/clone";
 import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
+import { prepareTenant, sandboxIdFor, tenantsIn, upgradeLayout } from "./tenant";
 
 // How each tool call shows up on the reply's task timeline in Slack.
 const TASK_LABELS: Record<string, string> = {
@@ -72,6 +73,16 @@ export async function createApp(config: Config) {
   // database is opened or purged, and before anything listens. A ConfigError names each.
   const slackReads = slackApi({ token: config.slack.botToken, apiUrl: config.slack.apiUrl });
   await assertPublicChannels(slackReads, config.agent.channels);
+
+  // The tenant's directory, and its files moved into it from where they were before
+  // tenants (tenant.ts): before either database is opened. A start that dies part-way
+  // finishes the move on the next one; once moved, nothing moves again.
+  const tenant = config.tenant;
+  if (prepareTenant(tenant)) console.log(`lorehouse: tenant ${tenant.id} is new: its files go in ${tenant.dir}`);
+  const moved = upgradeLayout(config.db.upgrade);
+  if (moved.length) console.log(`lorehouse: storage: moved ${moved.join(", ")} from ${tenant.dataDir} into ${tenant.dir}, tenant ${tenant.id}'s directory, leaving a symlink at each old path (an older version opens the same files)`);
+  const others = tenant.source === "throwaway" ? [] : tenantsIn(tenant.dataDir).filter((id) => id !== tenant.id);
+  if (others.length) console.warn(`lorehouse: storage: ${tenant.dataDir} also holds tenant ${others.join(", ")}, not served here (TENANT_ID=${tenant.id})`);
 
   const knowledge = openKnowledge(config.db.lorehouse);
   // Both files exist from here on, so this compares the files themselves, not their names.
@@ -169,8 +180,9 @@ export async function createApp(config: Config) {
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
   if (config.sandbox) {
     const sb = config.sandbox;
-    // One sandbox per thread, keyed off the session (never model input).
-    const sandboxId = (ctx: ToolContext) => ctx.sessionId.replace(/[^\w.-]/g, "_");
+    // One sandbox per thread, keyed off the tenant and the session (never model input):
+    // "<tenant>.<session>", so two tenants' threads never share an id on a host (tenant.ts).
+    const sandboxId = (ctx: ToolContext) => sandboxIdFor(tenant.id, ctx.sessionId);
     const sandboxFor = sb.mode === "runners"
       ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx))
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
@@ -345,6 +357,7 @@ export async function createApp(config: Config) {
   // The read-only admin API (/api/v1), behind ADMIN_TOKEN.
   const admin = adminRoutes({
     db: knowledge,
+    tenant: tenant.id,
     token: config.adminToken,
     ingest: () => ingester?.status(),
     sandbox: config.sandbox?.mode ?? "off",
@@ -383,6 +396,10 @@ export async function createApp(config: Config) {
         if (refusal) return refusal;
         return Response.json({
           agent: identity.name,
+          // Whose data this is, and the install's data directory: the tenant's files are in
+          // <dataDir>/<tenant>/ unless LOREHOUSE_DB or SESSIONS_DB name others.
+          tenant: tenant.id,
+          dataDir: tenant.dataDir,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
           // Whether usage records who asks: a setting, not anyone's data.
           recordsWhoAsks: recordPeople,

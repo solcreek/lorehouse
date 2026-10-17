@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHmac, generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
 import { countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
@@ -445,11 +445,180 @@ describe("storage", () => {
   });
 });
 
+// The tenant and the data directory (tenant.ts), and what the next start moves: reported,
+// never done (the doctor only reads).
+describe("the tenant", () => {
+  const unset = { LOREHOUSE_DB: undefined, SESSIONS_DB: undefined };
+  test("none yet: the first start makes one; the databases are checked in the data directory", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir });
+      expect(find(checks, "tenant")[0]).toMatchObject({ level: "info", detail: `none yet: the first start makes one and keeps it in ${dir}/<id>/tenant.json` });
+      expect(find(checks, "data directory")[0]?.detail).toBe(`${dir}: settings.json, and the tenant's files in <id>/`);
+      expect(find(checks, "LOREHOUSE_DB")[0]?.level).toBe("ok");
+      expect(readdirSync(dir)).toEqual([]); // nothing made
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  test("an install laid out before tenants: the next start's move is named, and nothing moves", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      upsertDocument(db, { docId: "slack:C9:1.1", kind: "slack_thread", source: "https://x/p1", title: "#c9", text: "gone soon" });
+      db.close();
+      writeFileSync(`${dir}/sessions.db`, "");
+      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
+      expect(find(checks, "tenant")[0]?.detail).toBe("acme (TENANT_ID)");
+      expect(find(checks, "upgrade")[0]).toMatchObject({ level: "info", detail: `the next start moves lorehouse.db and sessions.db (with their -wal and -shm) from ${dir} into ${dir}/acme, leaving a symlink at each old path` });
+      expect(find(checks, "LOREHOUSE_DB")[0]?.detail).toBe(`${dir}/lorehouse.db (moves to ${dir}/acme/lorehouse.db on the next start)`);
+      // What a start would purge is read from where the database is now.
+      expect(find(checks, "purge on start")[0]?.detail).toContain("C9 (1 document)");
+      expect(readdirSync(dir).filter((f) => !/-(wal|shm)$/.test(f)).sort()).toEqual(["lorehouse.db", "sessions.db"]);
+      // Both places holding one: the start would refuse, and so does the doctor.
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/lorehouse.db`, "");
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade")[0]).toMatchObject({ level: "fail", detail: expect.stringContaining(`both ${dir}/lorehouse.db and ${dir}/acme/lorehouse.db exist`) });
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // A TENANT_ID with no directory yet, beside another tenant's, is a start on empty data:
+  // refused, as the start refuses it, unless TENANT_NEW=1 asks for exactly that.
+  // An old layout whose move a start began and didn't finish: the database linked at its
+  // new place, the symlink not yet over the old path. The start finishes it, so the doctor
+  // says so, not that two copies clash (upgradeLayout's own rule: tenant.ts, planMove).
+  test("a move under way is named as one the next start finishes, never a clash", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      linkSync(`${dir}/lorehouse.db`, `${dir}/acme/lorehouse.db`);
+      symlinkSync("acme/lorehouse.db", `${dir}/lorehouse.db.tenant-link`);
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail")).toEqual([]);
+      expect(upgrade.map((c) => c.detail).join("\n")).toContain(`${dir}/lorehouse.db: a move under way; the next start finishes it`);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // A -wal, -shm or -journal at the new place that isn't the database's own: the start sets
+  // it aside rather than let SQLite replay it (upgradeLayout), and the doctor says which.
+  test("a side file at the old place that links elsewhere fails, as the start refuses it, and nothing moves", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      writeFileSync(`${dir}/elsewhere-wal`, "");
+      rmSync(`${dir}/lorehouse.db-wal`, { force: true });
+      symlinkSync("elsewhere-wal", `${dir}/lorehouse.db-wal`);
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail").map((c) => c.detail)).toEqual([`${dir}/lorehouse.db-wal is a symlink, not to ${dir}/acme/lorehouse.db-wal: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is (the start refuses until then)`]);
+      expect(readdirSync(`${dir}/acme`)).toEqual(["tenant.json"]);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // The old layout's files are the first tenant's: a second one never moves them, so the
+  // doctor reports no upgrade for it (the start's own rule: ownsLegacyLayout).
+  test("a second tenant beside the first: no upgrade of the first's files, and nothing fails over its links", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "globex", TENANT_NEW: "1" });
+      expect(find(checks, "upgrade")).toEqual([]);
+      expect(find(checks, "LOREHOUSE_DB")[0]?.detail).toBe(`${dir}/globex/lorehouse.db (created on first start)`);
+      expect(checks.filter((c) => c.section === "storage" && c.level === "fail")).toEqual([]);
+      // As the first tenant, the same files are its to move.
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade").map((c) => c.level)).toEqual(["info"]);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  test("a side file in both places is named: the next start sets the stale one aside", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      for (const s of ["-wal", "-journal"]) writeFileSync(`${dir}/acme/lorehouse.db${s}`, "stale");
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail")).toEqual([]);
+      expect(upgrade.filter((c) => c.level === "warn").map((c) => c.detail)).toEqual([
+        `the next start sets aside ${dir}/acme/lorehouse.db-wal and ${dir}/acme/lorehouse.db-journal (renamed .stale-<time>): side files that aren't ${dir}/lorehouse.db's own, never replayed`,
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // The move writes in the tenant's directory (a hard link, a symlink beside the old path):
+  // a destination the start can't write fails the start, so it fails here.
+  test("a move into a tenant directory that can't be written fails, naming it", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      chmodSync(`${dir}/acme`, 0o500);
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail").map((c) => c.detail)).toEqual([`${dir}/acme must be writable and enterable: the next start moves ${dir}/lorehouse.db into it`]);
+      chmodSync(`${dir}/acme`, 0o700);
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade").filter((c) => c.level === "fail")).toEqual([]);
+    } finally {
+      chmodSync(`${dir}/acme`, 0o700);
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  test("a new TENANT_ID beside another tenant's directory fails, as the start refuses it; with TENANT_NEW=1, or once it has its own directory, a warning", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      mkdirSync(`${dir}/globex`);
+      writeFileSync(`${dir}/globex/tenant.json`, JSON.stringify({ id: "globex" }));
+      const refused = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
+      expect(refused.filter((c) => c.level === "fail").map((c) => c.detail)).toEqual([expect.stringContaining("TENANT_ID (acme has no directory in")]);
+      const allowed = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme", TENANT_NEW: "1" });
+      expect(find(allowed, "other tenants")[0]).toMatchObject({ level: "warn", detail: expect.stringContaining(`${dir} also holds globex`) });
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir }), "tenant")[0]?.detail).toBe(`globex (named by ${dir}/globex/tenant.json)`);
+      // Once acme has its own directory, the start takes it without TENANT_NEW, and so does
+      // the doctor: the other tenant's directory is a warning, not a failure.
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      const later = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
+      expect(find(later, "other tenants")[0]).toMatchObject({ level: "warn", detail: expect.stringContaining(`${dir} also holds globex`) });
+      expect(later.filter((c) => c.section === "storage" && c.level === "fail")).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+});
+
 describe("the running deployment (--url)", () => {
   test("a running app with the same secrets passes, and reports what it knows", async () => {
     const checks = await run({}, {}, "https://app.test");
     expect(levels(checks.filter((c) => c.section === "deployment"))).toEqual(new Set(["ok", "info"]));
     expect(find(checks, "knowledge")[0]?.detail).toBe("ready, 12 threads indexed");
+  });
+
+  test("the running app's tenant is named, and one that isn't this environment's warns", async () => {
+    const status = (tenant: string) => ({ app: { status: { agent: "scout", tenant, knowledge: { state: "ready", documents: 1 } } } });
+    expect(find(await run({ TENANT_ID: "acme" }, status("acme"), "https://app.test"), "tenant").at(-1)).toMatchObject({ section: "deployment", level: "ok", detail: "acme" });
+    expect(find(await run({ TENANT_ID: "acme" }, status("globex"), "https://app.test"), "tenant").at(-1)).toMatchObject({ section: "deployment", level: "warn", detail: expect.stringContaining("serves tenant globex, this environment acme") });
   });
 
   test("a different signing secret on the running app fails", async () => {

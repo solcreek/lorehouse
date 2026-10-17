@@ -2,6 +2,7 @@ import { createApp } from "./app";
 import { ConfigError, loadConfig } from "./config";
 import { doctorMain } from "./doctor";
 import { loadEnv } from "./settings";
+import { logAsTenant, prepareTenant, resolveTenant } from "./tenant";
 import { announceUrl, configToken, publicUrl, serveSetupMode, SETUP_PROVIDES, setupMain } from "./setup";
 
 // `lorehouse` serves; `lorehouse setup` creates and installs the Slack app; `lorehouse
@@ -19,9 +20,17 @@ usage: lorehouse             serve (settings: the environment, /etc/lorehouse/lo
 }
 
 const { env, settingsPath } = loadEnv();
+// The tenant first (tenant.ts): every line logged from here on starts with its id, in setup
+// mode too, and a new install's tenant directory is made now, so the id stays the same from
+// this start on. An invalid TENANT_ID is left to loadConfig to report.
+const tenant = resolveTenant(env);
+if (!("problem" in tenant)) {
+  logAsTenant(tenant.id);
+  if (prepareTenant(tenant)) console.log(`lorehouse: tenant ${tenant.id} is new: its files go in ${tenant.dir}`);
+}
 let config;
 try {
-  config = loadConfig(env);
+  config = loadConfig(env, "problem" in tenant ? undefined : tenant);
 } catch (e) {
   if (!(e instanceof ConfigError)) throw e;
   // Missing settings that `lorehouse setup` provides are a state to finish, not a crash:

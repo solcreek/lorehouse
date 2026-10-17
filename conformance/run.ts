@@ -9,20 +9,21 @@
 // The app is configured with env: PORT, SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
 // SLACK_API_URL, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_CHANNELS, KNOWLEDGE_SEED,
 // LOREHOUSE_DB, INGEST_BACKFILL_DAYS, INGEST_REFRESH_DAYS, INGEST_DEBOUNCE_MS,
-// STATUS_TOKEN, ADMIN_TOKEN, LOREHOUSE_ENV_FILE (a missing file, so no installed settings
+// STATUS_TOKEN, ADMIN_TOKEN, TENANT_ID and LOREHOUSE_DATA_DIR (empty: unset, except in the
+// scenarios about them), LOREHOUSE_ENV_FILE (a missing file, so no installed settings
 // leak in), LOREHOUSE_SETTINGS (settings.json beside LOREHOUSE_DB), and per scenario DM_MODE, INGEST_CHANNEL_RECHECK_MS, SANDBOX_RUNNER_TOKEN, GITHUB_TOKEN,
 // PR_APPROVER and GITHUB_API_URL (GitHub's REST API, mocked). SESSIONS_DB is never set: the app
 // keeps its sessions in a file beside LOREHOUSE_DB, so they survive a restart. It must answer GET /healthz (open)
 // once listening, and GET /status with { knowledge: { state: "ready", … } } once its Slack
 // backfill is done, but only to `Authorization: Bearer <STATUS_TOKEN>` (401 otherwise;
-// 404 when STATUS_TOKEN is unset). The admin API under /api/v1 (docs/admin-api.md) answers
+// 404 when STATUS_TOKEN is unset), naming its tenant and data directory. The admin API under /api/v1 (docs/admin-api.md) answers
 // only to ADMIN_TOKEN, the same way. On SIGTERM it must exit 0 within 5 s (one during
 // start-up: once the start is through, without serving), and a deleted message's text
 // must not stay in LOREHOUSE_DB's files (the -wal included).
 
 import { $ } from "bun";
 import { createHmac } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CHART_PNG, MIRRORS, pollRunner, wsRunner } from "./fake-runner";
@@ -117,6 +118,8 @@ const APP = `http://localhost:${APP_PORT}`;
 // Runner mode: sandbox hosts connect in (docs/sandbox-runners.md).
 const RUNNER_TOKEN = "conformance-runner-token-000000000000";
 const RUNNER_ENV = { SANDBOX_RUNNER_TOKEN: RUNNER_TOKEN, GITHUB_TOKEN: "conformance-github" };
+// A tenant id (src/tenant.ts): what /status may name.
+const TENANT_ID = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 const statusAs = (auth?: string) => fetch(`http://localhost:${APP_PORT}/status`, { headers: auth ? { authorization: auth } : {} });
 const status = async () => (await (await statusAs(`Bearer ${STATUS_TOKEN}`)).json()) as Status;
 // The admin API (docs/admin-api.md): message text, behind its own token.
@@ -392,6 +395,104 @@ const scenarios: Scenario[] = [
       if (ok.status !== 200) return `the right token: got ${ok.status}, want 200`;
       const health = await fetch(`http://localhost:${APP_PORT}/healthz`);
       return health.status === 200 ? null : `/healthz: got ${health.status}, want 200`;
+    },
+  },
+  {
+    // ADR 0005 §1: the tenant id is in every key, path and log line, and /status names it
+    // with the install's data directory. LOREHOUSE_DB is set here, so the data directory is
+    // the one it names; the tenant is kept there (<dataDir>/<tenant>/tenant.json), and the
+    // same one comes back after a restart.
+    name: "GET /status names the tenant and the data directory, the same across a restart; the admin API names it too",
+    run: async () => {
+      const s = (await status()) as Status & { tenant?: unknown; dataDir?: unknown };
+      if (typeof s.tenant !== "string" || !TENANT_ID.test(s.tenant)) return `/status tenant ${JSON.stringify(s.tenant)}, want an id like ${TENANT_ID}`;
+      if (s.dataDir !== resolve(dirname(DB))) return `/status dataDir ${JSON.stringify(s.dataDir)}, want ${resolve(dirname(DB))}`;
+      if (!existsSync(join(dirname(DB), s.tenant, "tenant.json"))) return `no ${s.tenant}/tenant.json in the data directory`;
+      const docs = await admin("/api/v1/documents?limit=1");
+      if (docs.tenant !== s.tenant) return `the admin API's tenant ${JSON.stringify(docs.tenant)}, /status's ${s.tenant}`;
+      await stopApp();
+      await startApp();
+      const again = ((await status()) as Status & { tenant?: unknown }).tenant;
+      return again === s.tenant ? null : `after a restart, tenant ${JSON.stringify(again)}, want ${s.tenant}`;
+    },
+  },
+  {
+    name: "TENANT_ID names the tenant /status reports; one that isn't 1–32 lowercase letters, digits or inner hyphens, or a new one beside another tenant's data, is refused at start",
+    run: async () => {
+      const r = await withFreshDb(async () => {
+        const t = ((await status()) as Status & { tenant?: unknown }).tenant;
+        return t === "acme-1" ? null : `/status tenant ${JSON.stringify(t)}, want "acme-1"`;
+      }, { TENANT_ID: "acme-1" });
+      if (r) return r;
+      await stopApp();
+      try {
+        for (const bad of ["../etc", "Acme", "a.b"]) {
+          const refused = await refusedStart({ TENANT_ID: bad });
+          if (typeof refused === "string") return `TENANT_ID=${bad}: ${refused}`;
+          if (!refused.stderr.includes("TENANT_ID (")) return `TENANT_ID=${bad}: stderr doesn't name TENANT_ID: ${refused.stderr.slice(0, 300)}`;
+        }
+        // A valid TENANT_ID new to a data directory holding another tenant's data (the
+        // usual app's) would start on empty data: refused, naming the way to ask for it.
+        const fresh = await refusedStart({ TENANT_ID: "acme-2" });
+        if (typeof fresh === "string") return `TENANT_ID=acme-2 beside the usual tenant: ${fresh}`;
+        if (!fresh.stderr.includes("acme-2 has no directory") || !fresh.stderr.includes("TENANT_NEW=1")) return `TENANT_ID=acme-2 beside the usual tenant: stderr ${fresh.stderr.slice(0, 300)}`;
+        return null;
+      } finally {
+        await startApp();
+      }
+    },
+  },
+  {
+    // An install laid out before tenants (the databases in the data directory, as
+    // LOREHOUSE_DB named them) started with LOREHOUSE_DB unset and LOREHOUSE_DATA_DIR set:
+    // the first start moves both databases into the tenant's directory, by rename, leaving a
+    // symlink at each old path, and what they held comes along (a thread the agent was
+    // asked into is the agent's own record, never rebuilt from Slack); a second start moves
+    // nothing.
+    name: "an install laid out before tenants moves into its tenant's directory on the first start, once, with what it holds",
+    run: async () => {
+      const db = freshDb();
+      const dir = dirname(db);
+      // LOREHOUSE_SETTINGS unset (empty): the app finds settings.json in the data directory
+      // by itself, where it was before tenants.
+      const tenantLayout = { LOREHOUSE_DB: "", LOREHOUSE_DATA_DIR: dir, LOREHOUSE_ENV_FILE: join(dir, "lorehouse.env"), LOREHOUSE_SETTINGS: "" };
+      // A value only settings.json provides (the environment leaves PR_APPROVER unset), and
+      // /status shows: read where the install kept it, before the move and after.
+      writeFileSync(join(dir, "settings.json"), JSON.stringify({ env: { PR_APPROVER: "anyone" } }));
+      const approver = async () => ((await status()) as Status & { pullRequestApprover?: string }).pullRequestApprover;
+      const joined = async () => JSON.stringify((await admin("/api/v1/threads?limit=200")).threads ?? []);
+      try {
+        await stopApp();
+        await startApp({ LOREHOUSE_DB: db });
+        const ts = await mentionAndWait("where is the wombat review");
+        const before = (await status()) as Status & { tenant?: string };
+        if ((await approver()) !== "anyone") return `before: pullRequestApprover ${await approver()}, want "anyone" from ${join(dir, "settings.json")}`;
+        if (!(await joined()).includes(ts)) return `before: the thread ${ts} isn't listed as joined`;
+        if (!existsSync(db) || !existsSync(join(dir, "sessions.db"))) return "before: the databases aren't where LOREHOUSE_DB put them";
+        for (let start = 1; start <= 2; start++) {
+          await stopApp();
+          await startApp(tenantLayout);
+          const s = (await status()) as Status & { tenant?: string; dataDir?: string };
+          const at = join(dir, before.tenant ?? "");
+          if (s.tenant !== before.tenant) return `start ${start}: tenant ${s.tenant}, want ${before.tenant} (the one kept in the data directory)`;
+          if (s.dataDir !== resolve(dir)) return `start ${start}: dataDir ${s.dataDir}, want ${resolve(dir)}`;
+          for (const f of ["lorehouse.db", "sessions.db"]) {
+            // Moved, and the old path left a symlink to it, so an older version still opens it.
+            if (!lstatSync(join(at, f), { throwIfNoEntry: false })?.isFile()) return `start ${start}: no ${f} in ${at}`;
+            const old = lstatSync(join(dir, f), { throwIfNoEntry: false });
+            if (!old?.isSymbolicLink() || resolve(dir, readlinkSync(join(dir, f))) !== join(at, f)) return `start ${start}: ${join(dir, f)} isn't a symlink to ${join(at, f)}`;
+          }
+          if (!lstatSync(join(dir, "settings.json"), { throwIfNoEntry: false })?.isFile() || existsSync(join(at, "settings.json"))) return `start ${start}: settings.json isn't a file in the data directory alone`;
+          if ((await approver()) !== "anyone") return `start ${start}: pullRequestApprover ${await approver()}, want "anyone": settings.json in the data directory wasn't read`;
+          if (!(await joined()).includes(ts)) return `start ${start}: the thread the agent was asked into before the move is gone: ${(await joined()).slice(0, 200)}`;
+          if (s.knowledge.documents !== before.knowledge.documents) return `start ${start}: ${s.knowledge.documents} documents, want ${before.knowledge.documents}`;
+        }
+        return null;
+      } finally {
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
     },
   },
   {
@@ -1399,7 +1500,11 @@ const scenarios: Scenario[] = [
       try {
         const a = await ask("[exec] echo hi");
         if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
-        if (!/^slack_C1_\d+\.\d+$/.test(runner.jobs[0]?.sandbox ?? "")) return `the job's sandbox ${runner.jobs[0]?.sandbox}, want one per thread (slack_C1_<ts>)`;
+        // One per thread, and the tenant's: "<tenant>.<thread>", so two tenants' threads
+        // never share a sandbox on one host (ADR 0005 §1).
+        const tenant = ((await status()) as Status & { tenant?: string }).tenant;
+        const sandbox = runner.jobs[0]?.sandbox ?? "";
+        if (!sandbox.startsWith(`${tenant}.`) || !/^slack_C1_\d+\.\d+$/.test(sandbox.slice(`${tenant}.`.length))) return `the job's sandbox ${sandbox}, want one per thread of this tenant (${tenant}.slack_C1_<ts>)`;
         const listed = (await status() as unknown as { runners?: { runner: string; transport: string; online: boolean; mirrors?: unknown }[] }).runners;
         // The runner's mirrors block, as it sent it.
         return listed?.some((r) => r.runner === "r-ws" && r.transport === "ws" && r.online && JSON.stringify(r.mirrors) === JSON.stringify(MIRRORS)) ? null : `/status runners ${JSON.stringify(listed)}`;
@@ -1737,6 +1842,10 @@ function appEnv(extraEnv: Record<string, string>): Record<string, string | undef
     PDF_REPLIES: "",
     PDF_FONTS: "",
     FILE_STORE: "",
+    // The tenant from the data directory LOREHOUSE_DB names, never this shell's or the .env's.
+    TENANT_ID: "",
+    TENANT_NEW: "",
+    LOREHOUSE_DATA_DIR: "",
     ...extraEnv,
   };
 }
