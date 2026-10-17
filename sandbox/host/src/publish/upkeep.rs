@@ -688,6 +688,8 @@ impl Publisher {
     /// measured, never the disk now. Counters are since sandboxd started.
     pub fn status(&self) -> serde_json::Value {
         let now = self.now();
+        // Uids of git runs that couldn't be stopped, held until their cgroup empties.
+        let held = self.git.held();
         let st = self.stats();
         let largest = st.mirrors.iter().max_by_key(|(_, m)| m.bytes).map(|(d, m)| serde_json::json!({ "repo": repo_of(d), "bytes": m.bytes }));
         serde_json::json!({
@@ -708,6 +710,8 @@ impl Publisher {
             "anomalies": st.anomalies,
             "graveyardTrees": std::fs::read_dir(self.mirrors.join(super::GRAVEYARD)).map_or(0, |d| d.count()),
             "graveyardBytes": st.buried.values().sum::<u64>(),
+            "gitUidsHeld": held.0,
+            "gitUidsHeldSince": held.1,
         })
     }
 }

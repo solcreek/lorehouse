@@ -323,6 +323,11 @@ impl Git {
         Ok(Running { child, group, _confined: confined, _proxy: proxy, grant })
     }
 
+    /// Uids held by runs that couldn't be stopped, and since when the oldest (gitjail).
+    pub(super) fn held(&self) -> (usize, Option<u64>) {
+        self.jail.as_ref().map_or((0, None), |j| j.held())
+    }
+
     /// Empty `dir`, a dropped tree, in a jailed run (GitJail::remover): sandboxd never walks
     /// a tree a run wrote. Unisolated (tests), as the test's user.
     async fn empty(&self, dir: &Path, limit: Duration) -> Result<(), String> {
@@ -1522,6 +1527,56 @@ mod tests {
         let err = s.publisher.git.run(&s.dir(), &["for-each-ref"], GIT_LOCAL).await.unwrap_err();
         assert!(err.contains("deep") && err.contains("taken out of use"), "{err}");
         assert!(!has_head(&s.dir()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_one_uid_held_a_run_waits_for_another_to_free_rather_than_failing() {
+        crate::gitjail::tests::in_userns("publish::tests::held_uid_in_userns", true);
+    }
+
+    /// Two uids: one held by a run that couldn't be stopped, the other busy. A third run
+    /// waits for the busy one rather than being refused (only with every uid held is it
+    /// refused at once), and the status says one is held, and since when.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "run by with_one_uid_held_a_run_waits_for_another_to_free_rather_than_failing, in a user namespace"]
+    async fn held_uid_in_userns() {
+        let mut s = scratch("helduid");
+        let probe = s.root.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        if std::os::unix::fs::lchown(&probe, Some(100), Some(100)).is_err() {
+            eprintln!("skipped: this user namespace may not chown");
+            return;
+        }
+        let jail = crate::gitjail::tests::with_uids(&s.root.join("state"), vec![100, 101]);
+        jail.set_graveyard(s.publisher.mirrors.join(GRAVEYARD));
+        s.publisher.git = Git::new(Some(jail.clone()), &format!("file://{}", s.root.display()));
+        let (a, b, c) = (s.root.join("a"), s.root.join("b"), s.root.join("c"));
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // One run that can't be stopped, and stays held.
+        jail.fail_kills(true);
+        s.publisher.git.run(&a, &["version"], GIT_LOCAL).await.unwrap_err();
+        jail.fail_kills(false);
+        jail.keep_stuck(true);
+        let status = s.publisher.status();
+        assert_eq!(status["gitUidsHeld"], 1, "{status}");
+        assert!(status["gitUidsHeldSince"].as_u64().is_some(), "{status}");
+        // The other uid busy for a second; a run meanwhile waits for it.
+        let git = Arc::new(Git::new(Some(jail.clone()), "file:///nonexistent"));
+        let busy = {
+            let git = git.clone();
+            tokio::spawn(async move { git.run(&b, &["-c", "alias.wait=!sleep 1", "wait"], GIT_LOCAL).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let waited = git.run(&c, &["version"], GIT_LOCAL).await;
+        assert!(waited.is_ok(), "refused instead of waiting: {waited:?}");
+        assert!(started.elapsed() >= Duration::from_millis(400), "it didn't wait for the busy uid");
+        busy.await.unwrap().unwrap();
+        jail.keep_stuck(false);
     }
 
     /// The processes whose real uid is in git's range: (pid, uid).
@@ -3206,7 +3261,7 @@ mod tests {
             serde_json::json!({
                 "count": 1, "bytes": GIB, "maxBytes": 24 * GIB, "perMirrorMaxBytes": 4 * GIB, "fsFreeBytes": 300 * GIB,
                 "garbageBytes": 0, "stageRefs": 1, "records": 1, "largest": { "repo": "acme/widgets", "bytes": GIB },
-                "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0, "anomalies": 0, "graveyardTrees": 0, "graveyardBytes": 0,
+                "oldestIdleSecs": 60, "lastGc": null, "evicted": 0, "refusedForSpace": 0, "refreshTimeouts": 0, "anomalies": 0, "graveyardTrees": 0, "graveyardBytes": 0, "gitUidsHeld": 0, "gitUidsHeldSince": null,
             })
         );
     }

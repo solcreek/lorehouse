@@ -63,6 +63,8 @@ enum Entry {
 
 /// The uids runs are leased.
 struct Pool {
+    /// How many uids there are.
+    size: usize,
     free: Mutex<Vec<u32>>,
     available: tokio::sync::Semaphore,
 }
@@ -87,10 +89,13 @@ pub struct GitJail {
     graveyard: std::sync::OnceLock<PathBuf>,
     /// Runs whose cgroup didn't empty: their uid, and their cgroup, killed again before
     /// each new run; the uid is free again only once that succeeds.
-    stuck: Mutex<Vec<(u32, Option<PathBuf>)>>,
+    stuck: Mutex<Vec<Held>>,
     /// Tests only: every run's cgroup fails to empty.
     #[cfg(test)]
     fail_kills: std::sync::atomic::AtomicBool,
+    /// Tests only: what is held stays held.
+    #[cfg(test)]
+    keep_stuck: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for GitJail {
@@ -126,7 +131,7 @@ impl GitJail {
         clear_cgroups(&cgroups, mem_max)?;
         jail.cgroups = Some(cgroups);
         jail.mem_max = mem_max;
-        jail.uids = Some(Pool { free: Mutex::new((uid_base..uid_base + GIT_UIDS).rev().collect()), available: tokio::sync::Semaphore::new(GIT_UIDS as usize) });
+        jail.uids = Some(Pool { size: GIT_UIDS as usize, free: Mutex::new((uid_base..uid_base + GIT_UIDS).rev().collect()), available: tokio::sync::Semaphore::new(GIT_UIDS as usize) });
         Ok(jail)
     }
 
@@ -187,6 +192,8 @@ impl GitJail {
             stuck: Mutex::default(),
             #[cfg(test)]
             fail_kills: Default::default(),
+            #[cfg(test)]
+            keep_stuck: Default::default(),
         })
     }
 
@@ -199,9 +206,9 @@ impl GitJail {
     /// free again.
     fn reap_stuck(&self) {
         let mut stuck = self.stuck.lock().unwrap_or_else(|e| e.into_inner());
-        stuck.retain(|(uid, cgroup)| {
+        stuck.retain(|Held { uid, cgroup, .. }| {
             #[cfg(test)]
-            if self.fail_kills.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.fail_kills.load(std::sync::atomic::Ordering::SeqCst) || self.keep_stuck.load(std::sync::atomic::Ordering::SeqCst) {
                 return true;
             }
             if cgroup.as_deref().is_some_and(|c| kill_cgroup(c).is_err()) {
@@ -243,8 +250,10 @@ impl GitJail {
                 match pool.available.try_acquire() {
                     Ok(permit) => permit.forget(),
                     Err(_) => {
+                        // Refused at once only when every uid is held: otherwise one that is
+                        // busy now frees up, and is waited for.
                         let held = self.stuck.lock().unwrap_or_else(|e| e.into_inner()).len();
-                        if held > 0 {
+                        if held >= pool.size {
                             return Err(format!("no git uid is free: {held} runs couldn't be stopped (their cgroups didn't empty), and their uids are held until they do"));
                         }
                         pool.available.acquire().await.map_err(|e| format!("git uids: {e}"))?.forget();
@@ -412,6 +421,22 @@ impl Lease {
     }
 }
 
+/// A run that couldn't be stopped: its uid, its cgroup (killed again before each new run),
+/// and since when (unix seconds).
+struct Held {
+    uid: u32,
+    cgroup: Option<PathBuf>,
+    since: u64,
+}
+
+impl GitJail {
+    /// How many uids are held by runs that couldn't be stopped, and since when the oldest.
+    pub fn held(&self) -> (usize, Option<u64>) {
+        let stuck = self.stuck.lock().unwrap_or_else(|e| e.into_inner());
+        (stuck.len(), stuck.iter().map(|h| h.since).min())
+    }
+}
+
 /// What one run holds: its uid, its cgroup, its network namespace. Dropped (after the run's
 /// process group has been stopped and its leader reaped), the cgroup is killed whole and
 /// removed, and only then is the uid free for another run. Blocks the thread for that while:
@@ -457,7 +482,8 @@ impl Drop for Confined {
                     }
                 }
                 if let Some(lease) = self.lease.take() {
-                    self.jail.stuck.lock().unwrap_or_else(|e| e.into_inner()).push((lease.uid, self.cgroup.clone()));
+                    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                    self.jail.stuck.lock().unwrap_or_else(|e| e.into_inner()).push(Held { uid: lease.uid, cgroup: self.cgroup.clone(), since });
                 }
             }
         }
@@ -955,13 +981,16 @@ pub(crate) mod tests {
     pub(crate) fn with_uids(state: &Path, uids: Vec<u32>) -> Arc<GitJail> {
         let mut jail = GitJail::unprivileged(state).unwrap();
         let n = uids.len();
-        jail.uids = Some(Pool { free: Mutex::new(uids), available: tokio::sync::Semaphore::new(n) });
+        jail.uids = Some(Pool { size: n, free: Mutex::new(uids), available: tokio::sync::Semaphore::new(n) });
         Arc::new(jail)
     }
 
     impl GitJail {
         pub(crate) fn fail_kills(&self, on: bool) {
             self.fail_kills.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub(crate) fn keep_stuck(&self, on: bool) {
+            self.keep_stuck.store(on, std::sync::atomic::Ordering::SeqCst);
         }
         pub(crate) fn free_uids(&self) -> usize {
             self.uids.as_ref().map_or(0, |p| p.free.lock().unwrap().len())
