@@ -101,17 +101,24 @@ around sandboxd. So:
 - **Every child that reads what a VM produced runs with no capabilities and
   `no_new_privs`.** Today that's `git`, which verifies a VM's bundles in the publishing
   mirror (`publish.rs`, `jail::drop_capabilities`). That keeps the jailer's privileges
-  out of a git bug reached through a VM's objects, but git is still uid 0. Such a bug
-  can still reach:
-  - every file uid 0 owns in the state directory, including every sandbox's disk and
-    every mirror;
-  - the delegated cgroup tree, so it can kill or resize any VM;
-  - sandboxd, which it can signal;
-  - during a push, that request's GitHub write token and the network.
+  out of a git bug reached through a VM's objects, and nothing more. **Treat such a bug as
+  a compromise of sandboxd.** git still runs as uid 0, in the host's mount and network
+  namespaces, so among other things it can:
+  - read every root-owned file on the host, the runner token included (a credential, or
+    `sandboxd.env`);
+  - reach the network on any run;
+  - read the tokens in the environment of any other git running at the same time;
+  - write the delegated cgroup tree.
 
-  Running git as an unprivileged uid scoped to one mirror closes this: #143.
-- **Any new child that parses guest output follows the same rule.** The other children
-  keep the capabilities they need.
+  Listing exactly what it reaches has proven unreliable: three reviews of this paragraph
+  each found more. The fix is to change where git runs, not to describe it better. #143
+  makes it a separate, unprivileged process: its own uid, one repo's mirror, no view of
+  `/etc/lorehouse` or the credentials, network and a token only for a push. Git parsing
+  untrusted packfiles is a real attack surface, so #143 comes before hosting anyone else,
+  and soon on starship.
+- **Any new child that parses guest output runs the way #143 runs git** (until then, with
+  no capabilities and `no_new_privs`, and counted as sandboxd if it's compromised). The
+  other children keep the capabilities they need.
 - Follow-ups: drop capabilities from every child that doesn't need them, and
   `ProtectControlGroups=private` (systemd 257+) once the jail's cgroup paths are checked
   under a cgroup namespace.
@@ -218,6 +225,7 @@ As of 2026-10-16, on main:
 | confined sandboxd, credentials | 3 | **done** (#101). The unit works on systemd 255 since #135 |
 | internet-only network rules, IPv6, anti-spoof | 3 | **done** (#105). Gaps in #106 |
 | egress proxy over vsock | 3 | not started (#110, now with this channel) |
+| git that reads VM objects runs isolated from sandboxd | 3 | not started (#143). Today git is capability-less root, which counts as sandboxd if compromised |
 | host `nested=0`, CPU template, startup check | 4 | not started. starship has `nested=1` (2026-10-16) |
 | a host that meets layer 4 | 4 | none in production yet. The lab (`sandbox/lab`) is a disposable L1 for testing |
 | tenant isolation | 5 | not started. A single tenant until then |
