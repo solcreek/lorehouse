@@ -46,6 +46,12 @@ export function jobStore(db: Database) {
     record(session: string, job: string, startedBy: string | null, now = new Date()): boolean {
       return db.query("INSERT OR IGNORE INTO sandbox_jobs (session, job, started_by, started_at) VALUES (?, ?, ?, ?)").run(session, job, startedBy, now.toISOString()).changes > 0;
     },
+    // guestd confirmed this call began a new run of the id (created: true): it is this
+    // starter's, whatever an older row says. An older row is a run the guest no longer has,
+    // as when the thread's sandbox was destroyed and made again with the same id.
+    claim(session: string, job: string, startedBy: string | null, now = new Date()): void {
+      db.query("INSERT INTO sandbox_jobs (session, job, started_by, started_at) VALUES (?, ?, ?, ?) ON CONFLICT (session, job) DO UPDATE SET started_by = excluded.started_by, started_at = excluded.started_at").run(session, job, startedBy, now.toISOString());
+    },
     forget(session: string, job: string): void {
       db.query("DELETE FROM sandbox_jobs WHERE session = ? AND job = ?").run(session, job);
     },
@@ -166,6 +172,7 @@ export function jobTools(sandboxFor: SandboxFor, opts: { store: JobStore; author
             if (wrote && err instanceof JobCallError && err.status >= 400 && err.status < 500) store.forget(ctx.sessionId, input.id);
             throw err;
           }
+          if (j.created === true) store.claim(ctx.sessionId, input.id, speakerOf(ctx));
           return { ...view(j), started: j.created === false ? "this id was already started: this is that job, not a second copy" : "started" };
         }),
     },

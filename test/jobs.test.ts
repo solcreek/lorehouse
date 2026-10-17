@@ -78,6 +78,20 @@ describe("workspace_job_start", () => {
     expect(store.get("slack:C1:1790000000.000100", "bench-1")?.startedBy).toBe("U1");
   });
 
+  test("after the sandbox is made again, a new run of an old id is its new starter's", async () => {
+    // The thread's sandbox was destroyed: guestd has no record of bench-1 and starts it anew
+    // (created: true), while the ownership row from the first run is still here.
+    const { run, store } = tools();
+    await run("workspace_job_start", { id: "bench-1", command: "make bench" }, ctxFor("U1"));
+    const fresh = tools({ sb: fakeJobs().sb });
+    const session = "slack:C1:1790000000.000100";
+    fresh.store.record(session, "bench-1", "U1"); // the stale row
+    await fresh.run("workspace_job_start", { id: "bench-1", command: "make bench" }, ctxFor("U2"));
+    expect(fresh.store.get(session, "bench-1")?.startedBy).toBe("U2");
+    expect((await fresh.run("workspace_job_cancel", { id: "bench-1" }, ctxFor("U2"))).state).toBe("cancelled");
+    expect(store.get(session, "bench-1")?.startedBy).toBe("U1");
+  });
+
   test("who started it is kept when the start's answer is lost, and taken back when guestd refused it", async () => {
     const failing = (err: Error) => ({ jobs: { start: async () => { throw err; }, cancel: async (id: string) => job({ id, state: "cancelled" }) } }) as unknown as Sandbox;
     // The start may have run in the guest: the row stays, and the starter still owns the job.
