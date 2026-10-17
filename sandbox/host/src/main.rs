@@ -221,7 +221,7 @@ async fn main() {
     };
     // Publishing's git runs isolated from sandboxd (gitjail.rs), or not at all: a host that
     // can't set that up, as a probe run shows, doesn't start.
-    let git_jail = match gitjail::GitJail::prepare(&cfg.state_dir, jail::git_cgroups(&host), cfg.jail.git_uid_base) {
+    let git_jail = match gitjail::GitJail::prepare(&cfg.state_dir, jail::git_cgroups(&host), cfg.jail.git_uid_base, (cfg.jail.git_mem_mib as u64) << 20) {
         Ok(j) => Arc::new(j),
         Err(e) => {
             eprintln!("sandboxd: {e}");

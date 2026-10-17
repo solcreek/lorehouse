@@ -94,6 +94,9 @@ pub struct JailConfig {
     /// own per run (gitjail.rs). These must belong to no user or group either, and not be
     /// a VM's.
     pub git_uid_base: u32,
+    /// Each run of publishing's git may use this much memory (its cgroup's memory.max, no
+    /// swap); past it the run alone is killed.
+    pub git_mem_mib: u32,
     /// A VM's cgroup memory limit is its guest RAM plus this.
     pub mem_headroom_mib: u32,
 }
@@ -103,6 +106,9 @@ pub struct JailConfig {
 pub const DEFAULT_JAIL_UID_BASE: u64 = 1_900_000_000;
 /// Past the VMs' default range (64 at most), for the same reasons.
 pub const DEFAULT_GIT_UID_BASE: u64 = 1_900_100_000;
+/// A run of publishing's git: a diff or a pack of a bundle (at most 96 MiB) and a gc of a
+/// mirror (at most SANDBOXD_MIRROR_MAX_GIB, 4 GiB by default) fit in this.
+pub const DEFAULT_GIT_MEM_MIB: u64 = 2048;
 
 /// Seconds between checks of the nftables table: how long a flushed table can leave
 /// running guests unfiltered. A check is one `nft list table`.
@@ -245,6 +251,7 @@ impl Config {
         let retention_days = num("SANDBOXD_MIRROR_RETENTION_DAYS", d.retention.as_secs() / 86_400);
         let uid_base = num("SANDBOXD_JAIL_UID_BASE", DEFAULT_JAIL_UID_BASE);
         let git_uid_base = num("SANDBOXD_GIT_UID_BASE", DEFAULT_GIT_UID_BASE);
+        let git_mem = num("SANDBOXD_GIT_MEM_MIB", DEFAULT_GIT_MEM_MIB);
         let headroom = num("SANDBOXD_VM_MEM_HEADROOM_MIB", 512);
         let net_check = num("SANDBOXD_NET_CHECK_SECS", DEFAULT_NET_CHECK_SECS);
         let dl = Limits::default();
@@ -285,6 +292,9 @@ impl Config {
         if !(65_536..=2_000_000_000).contains(&uid_base) {
             problems.push("SANDBOXD_JAIL_UID_BASE must be 65536..=2000000000 (above every real user, below 2^31 with room for 64 VMs)".into());
         }
+        if !(256..=65_536).contains(&git_mem) {
+            problems.push("SANDBOXD_GIT_MEM_MIB must be 256..=65536".into());
+        }
         let git_uids = crate::gitjail::GIT_UIDS as u64;
         if !(65_536..=2_000_000_000).contains(&git_uid_base) {
             problems.push(format!("SANDBOXD_GIT_UID_BASE must be 65536..=2000000000 (above every real user, below 2^31 with room for {git_uids} runs of git)"));
@@ -324,6 +334,7 @@ impl Config {
             firecracker: var("SANDBOXD_FIRECRACKER").unwrap_or_else(|| "firecracker".into()).into(),
             uid_base: uid_base as u32,
             git_uid_base: git_uid_base as u32,
+            git_mem_mib: git_mem as u32,
             mem_headroom_mib: headroom as u32,
         };
         if !problems.is_empty() {
@@ -452,7 +463,7 @@ mod tests {
 
         // The jail: always on, its binaries from PATH, uids far above real users.
         let jail = Config::from_env().unwrap().jail;
-        assert_eq!(jail, super::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, git_uid_base: 1_900_100_000, mem_headroom_mib: 512 });
+        assert_eq!(jail, super::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, git_uid_base: 1_900_100_000, git_mem_mib: 2048, mem_headroom_mib: 512 });
         std::env::set_var("SANDBOXD_JAILER", "/opt/fc/jailer");
         std::env::set_var("SANDBOXD_JAIL_UID_BASE", "3000000");
         let set = Config::from_env().unwrap().jail;
@@ -465,6 +476,14 @@ mod tests {
         std::env::set_var("SANDBOXD_GIT_UID_BASE", "3000004");
         assert_eq!(Config::from_env().unwrap().jail.git_uid_base, 3_000_004);
         std::env::remove_var("SANDBOXD_GIT_UID_BASE");
+        // git's memory: 2 GiB a run by default, a setting within bounds.
+        std::env::set_var("SANDBOXD_GIT_MEM_MIB", "4096");
+        assert_eq!(Config::from_env().unwrap().jail.git_mem_mib, 4096);
+        for v in ["0", "255", "65537", "x"] {
+            std::env::set_var("SANDBOXD_GIT_MEM_MIB", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_GIT_MEM_MIB"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_GIT_MEM_MIB");
         for (k, v) in [("SANDBOXD_JAIL_UID_BASE", "1000"), ("SANDBOXD_JAIL_UID_BASE", "4294967200"), ("SANDBOXD_VM_MEM_HEADROOM_MIB", "0")] {
             std::env::set_var(k, v);
             assert!(Config::from_env().unwrap_err().contains(k), "{k}={v}");

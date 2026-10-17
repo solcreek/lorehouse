@@ -36,7 +36,8 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// with controllers enabled (cgroup v2: a cgroup with processes can't delegate them).
 const SUPERVISOR: &str = "supervisor";
 const VMS: &str = "vms";
-/// Beside the VMs: one cgroup per run of publishing's git (gitjail.rs), with a pids limit.
+/// Beside the VMs: one cgroup per run of publishing's git (gitjail.rs), with pids and
+/// memory limits.
 const GIT: &str = "git";
 
 /// What the jail needs at run time, resolved and checked once at start.
@@ -379,7 +380,7 @@ pub(crate) async fn setup_cgroups() -> Result<String, String> {
     write(vms.join("cgroup.subtree_control"), enable)?;
     let git = dir.join(GIT);
     let _ = std::fs::create_dir(&git);
-    write(git.join("cgroup.subtree_control"), "+pids".to_string())?;
+    write(git.join("cgroup.subtree_control"), "+pids +memory".to_string())?;
     // The limits the jailer writes must exist here, or every boot would fail on them.
     // io.weight, for one, needs the kernel's iocost or BFQ.
     for (file, _) in cgroup_limits(1, 128, 64) {

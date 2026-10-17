@@ -76,6 +76,8 @@ pub struct GitJail {
     cgroups: Option<PathBuf>,
     /// None only in tests run unprivileged (in a user namespace, as root there).
     uids: Option<Pool>,
+    /// Each run's memory.max, in bytes (SANDBOXD_GIT_MEM_MIB); unused without cgroups.
+    mem_max: u64,
 }
 
 impl std::fmt::Debug for GitJail {
@@ -99,14 +101,15 @@ impl GitJail {
     /// Everything a run needs, checked once at start: git, what of the host goes into a run,
     /// the cgroup the runs go under (created by jail::setup_cgroups), and the uids, which
     /// must belong to no user or group. Any problem refuses the start.
-    pub fn prepare(state_dir: &Path, cgroups: PathBuf, uid_base: u32) -> Result<GitJail, String> {
+    pub fn prepare(state_dir: &Path, cgroups: PathBuf, uid_base: u32, mem_max: u64) -> Result<GitJail, String> {
         let taken = crate::jail::taken_ids(uid_base, GIT_UIDS as usize)?;
         if !taken.is_empty() {
             return Err(format!("SANDBOXD_GIT_UID_BASE: the ids publishing's git would run as, {taken:?}, belong to existing users or groups; pick a free range of {GIT_UIDS}"));
         }
         let mut jail = GitJail::unprivileged(state_dir)?;
-        clear_cgroups(&cgroups)?;
+        clear_cgroups(&cgroups, mem_max)?;
         jail.cgroups = Some(cgroups);
+        jail.mem_max = mem_max;
         jail.uids = Some(Pool { free: Mutex::new((uid_base..uid_base + GIT_UIDS).rev().collect()), available: tokio::sync::Semaphore::new(GIT_UIDS as usize) });
         Ok(jail)
     }
@@ -147,7 +150,7 @@ impl GitJail {
         if !std::fs::symlink_metadata(&mountpoint).is_ok_and(|m| m.is_dir()) {
             return Err(format!("{} isn't a directory", mountpoint.display()));
         }
-        Ok(GitJail { git, mountpoint, entries, devices, cgroups: None, uids: None })
+        Ok(GitJail { git, mountpoint, entries, devices, cgroups: None, uids: None, mem_max: 0 })
     }
 
     /// A command for one isolated run of git in `dir` (the caller adds the arguments,
@@ -175,7 +178,7 @@ impl GitJail {
         }
         if let Some(parent) = &self.cgroups {
             let cgroup = parent.join(format!("u{}", uid.unwrap_or(0)));
-            make_cgroup(&cgroup)?;
+            make_cgroup(&cgroup, self.mem_max)?;
             confined.cgroup = Some(cgroup);
         }
         let (netns, remote) = match net {
@@ -391,13 +394,27 @@ fn kept_flags(path: &Path) -> libc::c_ulong {
 }
 
 /// A run's cgroup, new: one a crashed run left with the same name is killed and reused.
-fn make_cgroup(path: &Path) -> Result<(), String> {
+/// Its limits: tasks, and memory (`mem_max` bytes, no swap). At the memory limit the
+/// kernel's OOM killer acts inside the run only, and kills all of it (memory.oom.group),
+/// never sandboxd or a VM.
+fn make_cgroup(path: &Path, mem_max: u64) -> Result<(), String> {
     match std::fs::create_dir(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => kill_cgroup(path).and_then(|()| std::fs::create_dir(path).map_err(|e| e.to_string())).map_err(|e| format!("git's cgroup {}: {e}", path.display()))?,
         Err(e) => return Err(format!("git's cgroup {}: {e}", path.display())),
     }
-    std::fs::write(path.join("pids.max"), PIDS_MAX.to_string()).map_err(|e| format!("{}/pids.max: {e}", path.display()))
+    let write = |file: &str, value: String| std::fs::write(path.join(file), value).map_err(|e| format!("{}/{file}: {e}", path.display()));
+    write("pids.max", PIDS_MAX.to_string())?;
+    write("memory.max", mem_max.to_string())?;
+    write("memory.oom.group", "1".into())?;
+    // Absent where the kernel doesn't account swap per cgroup (then there is no swap limit
+    // to set); written wherever it is there.
+    if let Err(e) = write("memory.swap.max", "0".into()) {
+        if path.join("memory.swap.max").exists() {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Kill everything in a cgroup (cgroup.kill: SIGKILL to every process, those that left
@@ -431,16 +448,17 @@ fn kill_cgroup(path: &Path) -> Result<(), String> {
 
 /// At start: what a previous sandboxd's runs left under `<unit>/git` killed and removed,
 /// and the per-run cgroups checked to have what a run needs (cgroup.kill: Linux 5.14).
-fn clear_cgroups(parent: &Path) -> Result<(), String> {
+fn clear_cgroups(parent: &Path, mem_max: u64) -> Result<(), String> {
     for entry in std::fs::read_dir(parent).map_err(|e| format!("git's cgroup {}: {e}", parent.display()))?.flatten() {
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             kill_cgroup(&entry.path()).map_err(|e| format!("a previous run's git cgroup {}: {e}", entry.path().display()))?;
         }
     }
     let probe = parent.join("probe");
-    make_cgroup(&probe)?;
+    let made = make_cgroup(&probe, mem_max);
     let has_kill = probe.join("cgroup.kill").exists();
     let _ = std::fs::remove_dir(&probe);
+    made?;
     if !has_kill {
         return Err("this kernel has no cgroup.kill (Linux 5.14+): a git run couldn't be killed whole".into());
     }
@@ -648,6 +666,22 @@ pub fn explain(e: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runs_cgroup_caps_its_memory_with_no_swap_and_is_killed_whole_on_oom() {
+        // A plain directory standing in for the cgroup: what make_cgroup writes there.
+        let dir = std::env::temp_dir().join(format!("gitjail-cg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = dir.join("u1");
+        make_cgroup(&run, 1536 << 20).unwrap();
+        let read = |f: &str| std::fs::read_to_string(run.join(f)).unwrap();
+        assert_eq!(read("pids.max"), PIDS_MAX.to_string());
+        assert_eq!(read("memory.max"), (1536u64 << 20).to_string());
+        assert_eq!(read("memory.swap.max"), "0");
+        assert_eq!(read("memory.oom.group"), "1");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_setup_error_names_its_step() {

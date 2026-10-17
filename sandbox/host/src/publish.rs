@@ -1314,7 +1314,7 @@ mod tests {
         let vms = crate::jail::setup_cgroups().await.expect("a delegated cgroup (systemd-run --scope -p Delegate=yes)");
         let cgroups = Path::new("/sys/fs/cgroup").join(vms.strip_suffix("/vms").unwrap()).join("git");
         let mut s = scratch("asroot");
-        let jail = Arc::new(GitJail::prepare(&s.root.join("state"), cgroups.clone(), BASE).unwrap());
+        let jail = Arc::new(GitJail::prepare(&s.root.join("state"), cgroups.clone(), BASE, 1536 << 20).unwrap());
         // The file:// "GitHub" is the test's, so any uid may write it.
         sh(&s.root, "chmod -R a+rwX acme && chmod a+rx .");
         s.publisher.git = Git::new(Some(jail.clone()), &format!("file://{}", s.root.display()));
@@ -1353,6 +1353,10 @@ mod tests {
         let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
         eprintln!("cgroup {}", cgroup.trim());
         assert!(cgroup.trim().ends_with(&format!("/git/u{uid}")), "{cgroup}");
+        let run_cgroup = Path::new("/sys/fs/cgroup").join(cgroup.trim().trim_start_matches("0::/"));
+        let limit = |f: &str| std::fs::read_to_string(run_cgroup.join(f)).unwrap_or_default().trim().to_string();
+        eprintln!("memory.max {} memory.swap.max {} memory.oom.group {} pids.max {}", limit("memory.max"), limit("memory.swap.max"), limit("memory.oom.group"), limit("pids.max"));
+        assert_eq!((limit("memory.max"), limit("memory.oom.group")), ((1536u64 << 20).to_string(), "1".to_string()));
         // Under sandboxd.service's confinement (no CAP_SYS_PTRACE) another uid's namespaces
         // and root can't be looked into at all; as plain root they can.
         if std::fs::read_link(format!("/proc/{pid}/ns/mnt")).is_err() {
