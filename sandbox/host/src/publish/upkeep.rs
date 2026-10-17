@@ -32,12 +32,12 @@
 //!   each fetch, so a lag of one pass can't let a mirror grow without bound.
 //!
 //! What a mirror was last used for is kept beside the mirrors, in
-//! `<mirrors>/.upkeep/<owner>/<name>.json`, not in the mirror, which git writes: whatever
-//! a git that a VM's objects compromised can write must neither set its mirror's own
-//! retention nor plant a link sandboxd would write through. (It was the mirror's
-//! `sandboxd.json` before: that file is removed when the mirror's state is next written.)
+//! `<mirrors>/.upkeep/<owner>/<name>.json`, not in the mirror: a mirror is writable by the
+//! uid its git runs as (gitjail.rs), which must neither set its own retention nor plant a
+//! link sandboxd would write through. (It was the mirror's `sandboxd.json` before: that
+//! file is removed when the mirror's state is next written.)
 
-use super::{expired, git, remove_mirror, Failure, Publisher, StageRecord};
+use super::{expired, remove_mirror, Failure, Publisher, StageRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -540,7 +540,7 @@ impl Publisher {
         }
         let before = self.disk.usage(dir).0;
         let started = Instant::now();
-        let done = git(dir, &["gc", "--quiet", "--prune=now"], None, self.policy.gc_deadline).await;
+        let done = self.git.run(dir, &["gc", "--quiet", "--prune=now"], self.policy.gc_deadline).await;
         let ms = started.elapsed().as_millis() as u64;
         let reclaimed = before.saturating_sub(self.disk.usage(dir).0);
         if let Err(e) = &done {

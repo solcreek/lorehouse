@@ -88,8 +88,8 @@ fn only_kvm_and_tun_are_reachable() {
         set(&["/dev/kvm rwm", "/dev/net/tun rwm", "/dev/userfaultfd m", "/dev/urandom m"])
     );
     assert_eq!(words("RestrictAddressFamilies"), set(&["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"]));
-    // The jailer's mount namespace only.
-    assert_eq!(one("RestrictNamespaces"), "mnt");
+    // The jailer's mount namespace, and git's mount and network namespaces (gitjail.rs).
+    assert_eq!(words("RestrictNamespaces"), set(&["mnt", "net"]));
 }
 
 #[test]

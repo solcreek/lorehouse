@@ -36,6 +36,8 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// with controllers enabled (cgroup v2: a cgroup with processes can't delegate them).
 const SUPERVISOR: &str = "supervisor";
 const VMS: &str = "vms";
+/// Beside the VMs: one cgroup per run of publishing's git (gitjail.rs), with a pids limit.
+const GIT: &str = "git";
 
 /// What the jail needs at run time, resolved and checked once at start.
 #[derive(Clone, Debug)]
@@ -242,7 +244,7 @@ pub fn jailed_vmm(args: &[String], proc_cgroup: &str, cgroup_parent: &str) -> Op
 }
 
 /// `name` as found on PATH, or `path` itself when it has a slash.
-fn resolve(name_or_path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve(name_or_path: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let executable = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
     if name_or_path.components().count() > 1 {
@@ -263,7 +265,7 @@ async fn version(bin: &Path) -> Result<String, String> {
 
 /// Users or groups that already own an id the jail would use: a VM must never run as
 /// someone who exists. A lookup that fails (an NSS backend down) is an error, not "free".
-fn taken_ids(base: u32, count: usize) -> Result<Vec<u32>, String> {
+pub(crate) fn taken_ids(base: u32, count: usize) -> Result<Vec<u32>, String> {
     let mut taken = Vec::new();
     for id in base..base + count as u32 {
         if id_taken(id, Db::Passwd)? || id_taken(id, Db::Group)? {
@@ -349,7 +351,7 @@ fn getxattr(path: &Path, name: &str) -> Option<Vec<u8>> {
 /// the VMs go under `<own>/vms`, both with the controllers the limits use. The cgroup
 /// must have been delegated (sandboxd.service has Delegate=yes); anything else is
 /// refused, so sandboxd never writes into a cgroup tree that isn't its own.
-async fn setup_cgroups() -> Result<String, String> {
+pub(crate) async fn setup_cgroups() -> Result<String, String> {
     let own = parse_cgroup(&tokio::fs::read_to_string("/proc/self/cgroup").await.map_err(|e| format!("/proc/self/cgroup: {e}"))?)
         .ok_or("no cgroup v2 in /proc/self/cgroup: the jail needs the unified hierarchy")?;
     // Started again inside the supervisor cgroup (not the usual way): its parent is ours.
@@ -375,6 +377,9 @@ async fn setup_cgroups() -> Result<String, String> {
     let vms = dir.join(VMS);
     let _ = std::fs::create_dir(&vms);
     write(vms.join("cgroup.subtree_control"), enable)?;
+    let git = dir.join(GIT);
+    let _ = std::fs::create_dir(&git);
+    write(git.join("cgroup.subtree_control"), "+pids".to_string())?;
     // The limits the jailer writes must exist here, or every boot would fail on them.
     // io.weight, for one, needs the kernel's iocost or BFQ.
     for (file, _) in cgroup_limits(1, 128, 64) {
@@ -412,8 +417,16 @@ pub async fn prepare(cfg: &Config) -> Result<Host, String> {
     Ok(Host { jailer, firecracker, exec_name, cgroup_parent, uid_base: cfg.jail.uid_base, mem_headroom_mib: cfg.jail.mem_headroom_mib })
 }
 
+/// Where each run of publishing's git gets its cgroup (gitjail.rs): `<own>/git`, beside the
+/// VMs' `<own>/vms`, absolute.
+pub fn git_cgroups(host: &Host) -> PathBuf {
+    let own = host.cgroup_parent.strip_suffix(&format!("/{VMS}")).unwrap_or(&host.cgroup_parent);
+    Path::new(CGROUP_ROOT).join(own).join(GIT)
+}
+
 /// For a child that needs none of sandboxd's privileges (git, which reads what a VM hands
-/// over), between fork and exec (`Command::pre_exec`): no capabilities, and none regained
+/// over: gitjail.rs calls this last, once it has its own uid), between fork and exec
+/// (`Command::pre_exec`): no capabilities, and none regained
 /// at exec. sandboxd is root with the jailer's capabilities (CAP_SYS_ADMIN,
 /// CAP_DAC_OVERRIDE, CAP_SETUID, …), and a child inherits them; a bug such a child hits
 /// on a VM's data would hold them all. Root's execve fills the permitted set from the
@@ -513,6 +526,8 @@ pub mod tests {
         assert_eq!(b.root(), Path::new("/var/lib/lorehouse-sandboxes/slack_C1_1.2/jail/firecracker/lorehouse-3/root"));
         assert_eq!(b.uds(), b.root().join("vsock.sock"));
         assert_eq!(b.cgroup(), Path::new("/sys/fs/cgroup/system.slice/sandboxd.service/vms/lorehouse-3"));
+        // Publishing's git gets its cgroups beside the VMs', never under vms/.
+        assert_eq!(git_cgroups(&h), Path::new("/sys/fs/cgroup/system.slice/sandboxd.service/git"));
         // The jailer's id rule: alphanumerics and hyphens, ≤ 64, for every slot there is.
         let id = jail_id(63);
         assert!(id.len() <= 64 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'), "{id}");

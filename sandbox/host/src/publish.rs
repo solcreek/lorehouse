@@ -15,8 +15,10 @@
 //! being collected); they authorize nothing.
 //!
 //! Every git command here runs with no user or system config, no prompts, no replace objects,
-//! no hooks and no maintenance of git's own. A token travels as an HTTP header in the
-//! command's environment, never in argv or a file.
+//! no hooks and no maintenance of git's own, and isolated from sandboxd (gitjail.rs): its
+//! own uid, a mount namespace holding only its mirror and git's binaries, no network, its
+//! own cgroup. A command that talks to the remote reaches it only through sandboxd, which
+//! adds the token (remote.rs): no git ever holds one, in argv, its environment or a file.
 //!
 //! A mirror is only ever written by one job at a time, under its lock: a stage, a push, and
 //! the housekeeping after either (prune). Git's automatic maintenance is off, because it runs
@@ -24,14 +26,16 @@
 //! leave a `refs/stage/<id>` pointing at a pack it had removed, after which every fetch into
 //! the mirror failed (#76).
 
+mod remote;
 mod upkeep;
 
+use remote::{Access, Grant, Remote};
 pub use upkeep::{Policy, GIB};
 use upkeep::{Disk, RealDisk, Stats};
 
+use crate::gitjail::{self, Confined, GitJail};
 use crate::vm::{self, Manager};
 use crate::vsock;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::Bytes;
 use hyper::Method;
 use serde::{Deserialize, Serialize};
@@ -130,8 +134,9 @@ pub type Failure = (u16, String);
 
 pub struct Publisher {
     mirrors: PathBuf,
-    /// https://github.com in production; a file:// directory in tests.
-    remote_base: String,
+    /// Runs every git command, isolated; its remote is https://github.com in production, a
+    /// file:// directory in tests.
+    git: Git,
     /// REVIEW_CAP; smaller in tests.
     review_cap: usize,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
@@ -188,152 +193,263 @@ const REVIEW_CAP: usize = 1 << 20;
 /// The most of a git command's stderr that is kept.
 const STDERR_CAP: u64 = 64 << 10;
 
-/// One git command, in `dir`, in the guarded environment; its stdout, which must fit
-/// OUTPUT_CAP.
-async fn git(dir: &Path, args: &[&str], token: Option<&str>, limit: Duration) -> Result<String, String> {
-    match git_capped(dir, args, token, limit, OUTPUT_CAP).await? {
-        (out, false) => Ok(out),
-        (_, true) => Err(format!("git {}: more than {OUTPUT_CAP} bytes of output", args[0])),
-    }
+/// Stands for the remote's URL in a git command's arguments: the run puts its own there
+/// (the proxy's, or a file:// remote's).
+const REMOTE: &str = "\u{0}remote";
+
+/// What a git command may reach of the remote.
+enum Net<'a> {
+    /// Nothing: no network at all.
+    Off,
+    /// The repo's upload-pack, with a read token (or none, for a public repo).
+    Fetch { owner: &'a str, name: &'a str, token: Option<&'a str> },
+    /// The repo's receive-pack, for exactly one update, with the write token.
+    Push { owner: &'a str, name: &'a str, token: &'a str, old: &'a str, new: &'a str, refname: &'a str },
 }
 
-/// One git command, in `dir`, in the guarded environment; at most `cap` bytes of its stdout,
-/// and whether there was more (the command is stopped there, never read to the end).
-async fn git_capped(dir: &Path, args: &[&str], token: Option<&str>, limit: Duration, cap: usize) -> Result<(String, bool), String> {
-    use tokio::io::AsyncReadExt;
-    let mut cmd = git_command(dir, args, token);
-    let work = async {
-        let mut child = Running::spawn(&mut cmd).map_err(|e| format!("git: {e}"))?;
-        let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
-            return Err("git: no pipes".to_string());
-        };
-        // stderr on its own task, so a command stopped for too much stdout isn't left
-        // blocked on it; past STDERR_CAP the pipe closes.
-        let errors = tokio::spawn(async move {
-            let mut err = Vec::new();
-            let _ = stderr.take(STDERR_CAP).read_to_end(&mut err).await;
-            err
-        });
-        let mut out = Vec::new();
-        stdout.take(cap as u64 + 1).read_to_end(&mut out).await.map_err(|e| format!("git {}: {e}", args[0]))?;
-        if out.len() > cap {
-            child.stop();
-            errors.abort();
-            let mut cut = cap;
-            while cut > 0 && (out[cut] & 0xC0) == 0x80 {
-                cut -= 1;
+/// Runs publishing's git commands: each isolated from sandboxd (gitjail.rs), with the
+/// remote reached through sandboxd (remote.rs). Only tests run git unisolated, as their
+/// own user: a build without cfg(test) can't make a Git without a GitJail.
+pub struct Git {
+    jail: Option<Arc<GitJail>>,
+    remote: Remote,
+    client: reqwest::Client,
+}
+
+impl Git {
+    fn new(jail: Option<Arc<GitJail>>, remote_base: &str) -> Git {
+        // No redirects: a run's requests go to its repo at the remote, nowhere else.
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(30)).build().unwrap_or_default();
+        Git { jail, remote: Remote::new(remote_base), client }
+    }
+
+    /// Start one git command in `dir`, in the guarded environment (git_command).
+    async fn spawn(&self, dir: &Path, args: &[&str], net: Net<'_>) -> Result<Running, String> {
+        let (mut url, mut netns, mut bind, mut proxy, mut grant) = (None, None, None, None, None);
+        match (&net, &self.remote) {
+            (Net::Off, _) => {}
+            (Net::Fetch { owner, name, .. } | Net::Push { owner, name, .. }, Remote::File(base)) => {
+                let repo = base.join(owner).join(format!("{name}.git"));
+                url = Some(format!("file://{}", repo.display()));
+                bind = Some((repo, matches!(net, Net::Push { .. })));
             }
-            out.truncate(cut);
-            return Ok((String::from_utf8_lossy(&out).into_owned(), true));
-        }
-        let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
-        let err = errors.await.unwrap_or_default();
-        if !status.success() {
-            return Err(format!("git {}: {}", args[0], tail(&err)));
-        }
-        Ok((String::from_utf8_lossy(&out).into_owned(), false))
-    };
-    match tokio::time::timeout(limit, work).await {
-        Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
-        Ok(r) => r,
-    }
-}
-
-/// One git command, in `dir`, in the guarded environment, for its answer alone: whether it
-/// succeeded, or None if it couldn't run or didn't finish within GIT_LOCAL.
-async fn git_says(dir: &Path, args: &[&str]) -> Option<bool> {
-    let mut cmd = git_command(dir, args, None);
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let mut child = Running::spawn(&mut cmd).ok()?;
-    match tokio::time::timeout(GIT_LOCAL, child.wait()).await {
-        Ok(Ok(status)) => Some(status.success()),
-        _ => None,
-    }
-}
-
-/// One git command, in `dir`, in the guarded environment: the SHA-256 (hex) of all of its
-/// stdout, however long, read as it comes and never kept.
-async fn git_sha256(dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    use tokio::io::AsyncReadExt;
-    let mut cmd = git_command(dir, args, None);
-    let work = async {
-        let mut child = Running::spawn(&mut cmd).map_err(|e| format!("git: {e}"))?;
-        let (Some(mut stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
-            return Err("git: no pipes".to_string());
-        };
-        let errors = tokio::spawn(async move {
-            let mut err = Vec::new();
-            let _ = stderr.take(STDERR_CAP).read_to_end(&mut err).await;
-            err
-        });
-        let mut hash = Sha256::new();
-        let mut buf = vec![0u8; 64 << 10];
-        loop {
-            let n = stdout.read(&mut buf).await.map_err(|e| format!("git {}: {e}", args[0]))?;
-            if n == 0 {
-                break;
+            (Net::Fetch { owner, name, .. } | Net::Push { owner, name, .. }, Remote::Http(base)) => {
+                let g = match &net {
+                    Net::Push { token, old, new, refname, .. } => Grant::new(owner, name, Some(token), Access::Push { old: old.to_string(), new: new.to_string(), refname: refname.to_string() }),
+                    Net::Fetch { token, .. } => Grant::new(owner, name, *token, Access::Fetch),
+                    Net::Off => unreachable!(),
+                };
+                // Isolated, the listener is the only thing in the run's network namespace.
+                let (fd, listener) = if self.jail.is_some() {
+                    let (fd, l) = gitjail::proxied_netns().map_err(|e| format!("isolating git (its network): {e}"))?;
+                    (Some(fd), l)
+                } else {
+                    (None, std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("git's proxy: {e}"))?)
+                };
+                let addr = listener.local_addr().map_err(|e| format!("git's proxy: {e}"))?;
+                url = Some(format!("http://{addr}/{owner}/{name}.git"));
+                proxy = Some(remote::serve(listener, self.client.clone(), base.clone(), g.clone()).map_err(|e| format!("git's proxy: {e}"))?);
+                netns = fd;
+                grant = Some(g);
             }
-            hash.update(&buf[..n]);
         }
-        let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
-        let err = errors.await.unwrap_or_default();
-        if !status.success() {
-            return Err(format!("git {}: {}", args[0], tail(&err)));
+        let mut owned: Vec<String> = Vec::with_capacity(args.len());
+        for a in args {
+            owned.push(if *a == REMOTE { url.clone().ok_or("git: a remote with no network for it")? } else { a.to_string() });
         }
-        Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
-    };
-    match tokio::time::timeout(limit, work).await {
-        Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
-        Ok(r) => r,
+        let bound = bind.is_some();
+        let (mut cmd, confined) = match &self.jail {
+            Some(jail) => {
+                let net = match (netns, bind) {
+                    (Some(fd), _) => gitjail::Net::Proxied(fd),
+                    (None, Some((repo, writable))) => gitjail::Net::Dir(repo, writable),
+                    (None, None) => gitjail::Net::Off,
+                };
+                let (cmd, confined) = jail.command(dir, net).await?;
+                // A path in the mirror (a stage's bundle) is under /repo there.
+                let prefix = format!("{}/", dir.display());
+                for a in owned.iter_mut() {
+                    if let Some(rest) = a.strip_prefix(&prefix) {
+                        *a = format!("{}/{rest}", gitjail::REPO);
+                    }
+                }
+                (cmd, Some(confined))
+            }
+            None => {
+                let mut cmd = crate::child::command("git");
+                cmd.arg("-C").arg(dir);
+                (cmd, None)
+            }
+        };
+        let home = if confined.is_some() { Path::new(gitjail::REPO) } else { dir };
+        // Isolated, a file:// remote (testing) belongs to another uid than the run's: the
+        // run's own global config, which names only that repo safe (gitjail::SAFE_CONFIG).
+        let global = if confined.is_some() && bound { gitjail::SAFE_CONFIG } else { "/dev/null" };
+        git_command(&mut cmd, home, &owned, global);
+        if confined.is_none() {
+            // Unisolated (tests): still no capabilities.
+            #[cfg(target_os = "linux")]
+            // SAFETY: drop_capabilities only makes async-signal-safe syscalls.
+            unsafe {
+                cmd.pre_exec(crate::jail::drop_capabilities);
+            }
+        }
+        let child = cmd.spawn().map_err(|e| gitjail::explain(&e))?;
+        let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+        Ok(Running { child, group, _confined: confined, _proxy: proxy, grant })
+    }
+
+    /// Whether a mirror has never been fetched into: not there, or no refs (a first fetch that
+    /// failed or was cut off, by a sandboxd that then stopped). New only when git said so: a
+    /// for-each-ref that couldn't run or failed says nothing about the mirror, and a failed
+    /// refresh mustn't remove one that has been fetched.
+    async fn is_new(&self, dir: &Path) -> bool {
+        !dir.join("HEAD").exists() || matches!(self.run(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty())
+    }
+
+    /// One git command with no network, in `dir`; its stdout, which must fit OUTPUT_CAP.
+    async fn run(&self, dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
+        self.run_net(dir, args, Net::Off, limit).await
+    }
+
+    /// One git command, in `dir`, reaching what `net` allows; its stdout, which must fit
+    /// OUTPUT_CAP.
+    async fn run_net(&self, dir: &Path, args: &[&str], net: Net<'_>, limit: Duration) -> Result<String, String> {
+        match self.capped(dir, args, net, limit, OUTPUT_CAP).await? {
+            (out, false) => Ok(out),
+            (_, true) => Err(format!("git {}: more than {OUTPUT_CAP} bytes of output", args[0])),
+        }
+    }
+
+    /// One git command, in `dir`; at most `cap` bytes of its stdout, and whether there was
+    /// more (the command is stopped there, never read to the end).
+    async fn capped(&self, dir: &Path, args: &[&str], net: Net<'_>, limit: Duration, cap: usize) -> Result<(String, bool), String> {
+        use tokio::io::AsyncReadExt;
+        let work = async {
+            let mut child = self.spawn(dir, args, net).await?;
+            let (Some(stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
+                return Err("git: no pipes".to_string());
+            };
+            // stderr on its own task, so a command stopped for too much stdout isn't left
+            // blocked on it; past STDERR_CAP the pipe closes.
+            let errors = tokio::spawn(async move {
+                let mut err = Vec::new();
+                let _ = stderr.take(STDERR_CAP).read_to_end(&mut err).await;
+                err
+            });
+            let mut out = Vec::new();
+            stdout.take(cap as u64 + 1).read_to_end(&mut out).await.map_err(|e| format!("git {}: {e}", args[0]))?;
+            if out.len() > cap {
+                child.stop();
+                errors.abort();
+                let mut cut = cap;
+                while cut > 0 && (out[cut] & 0xC0) == 0x80 {
+                    cut -= 1;
+                }
+                out.truncate(cut);
+                return Ok((String::from_utf8_lossy(&out).into_owned(), true));
+            }
+            let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+            let err = errors.await.unwrap_or_default();
+            if !status.success() {
+                return Err(child.failed(args[0], &err));
+            }
+            Ok((String::from_utf8_lossy(&out).into_owned(), false))
+        };
+        match tokio::time::timeout(limit, work).await {
+            Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
+            Ok(r) => r,
+        }
+    }
+
+    /// One git command with no network, in `dir`, for its answer alone: whether it
+    /// succeeded, or None if it couldn't run or didn't finish within GIT_LOCAL.
+    async fn says(&self, dir: &Path, args: &[&str]) -> Option<bool> {
+        let work = async {
+            let mut child = self.spawn(dir, args, Net::Off).await.ok()?;
+            // Nothing is read: the pipes are closed, and git gets EPIPE if it writes.
+            drop(child.child.stdout.take());
+            drop(child.child.stderr.take());
+            child.wait().await.ok().map(|s| s.success())
+        };
+        tokio::time::timeout(GIT_LOCAL, work).await.ok().flatten()
+    }
+
+    /// One git command with no network, in `dir`: the SHA-256 (hex) of all of its stdout,
+    /// however long, read as it comes and never kept.
+    async fn sha256(&self, dir: &Path, args: &[&str], limit: Duration) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+        let work = async {
+            let mut child = self.spawn(dir, args, Net::Off).await?;
+            let (Some(mut stdout), Some(stderr)) = (child.child.stdout.take(), child.child.stderr.take()) else {
+                return Err("git: no pipes".to_string());
+            };
+            let errors = tokio::spawn(async move {
+                let mut err = Vec::new();
+                let _ = stderr.take(STDERR_CAP).read_to_end(&mut err).await;
+                err
+            });
+            let mut hash = Sha256::new();
+            let mut buf = vec![0u8; 64 << 10];
+            loop {
+                let n = stdout.read(&mut buf).await.map_err(|e| format!("git {}: {e}", args[0]))?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buf[..n]);
+            }
+            let status = child.wait().await.map_err(|e| format!("git: {e}"))?;
+            let err = errors.await.unwrap_or_default();
+            if !status.success() {
+                return Err(child.failed(args[0], &err));
+            }
+            Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+        };
+        match tokio::time::timeout(limit, work).await {
+            Err(_) => Err(format!("git {} took over {} s", args[0], limit.as_secs())),
+            Ok(r) => r,
+        }
     }
 }
 
-/// git, in `dir`, with no user or system config, no prompts, no replace objects, no hooks,
-/// fsck on fetch, no automatic maintenance, and the token (if any) as an HTTP header; stdout
-/// and stderr piped.
-fn git_command(dir: &Path, args: &[&str], token: Option<&str>) -> Command {
+/// git's own settings for every command: no user or system config, no prompts, no replace
+/// objects, no hooks, fsck on fetch, no automatic maintenance, no credential helper;
+/// stdout and stderr piped. No token: the remote is reached through sandboxd (remote.rs),
+/// which adds it.
+fn git_command(cmd: &mut Command, home: &Path, args: &[String], global_config: &str) {
     use std::process::Stdio;
-    // A clean environment (child::command), plus git's own settings.
-    let mut cmd = crate::child::command("git");
-    cmd.arg("-C").arg(dir).args(args);
-    cmd.env("HOME", dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    cmd.args(args);
+    cmd.env("HOME", home)
+        .env("GIT_CONFIG_GLOBAL", global_config)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1");
-    let mut config: Vec<(&str, String)> = vec![
-        ("core.hooksPath", "/dev/null".into()),
-        ("fetch.fsckObjects", "true".into()),
-        ("transfer.fsckObjects", "true".into()),
-        ("credential.helper", String::new()),
+    let config: [(&str, &str); 9] = [
+        ("core.hooksPath", "/dev/null"),
+        ("fetch.fsckObjects", "true"),
+        ("transfer.fsckObjects", "true"),
+        ("credential.helper", ""),
         // No maintenance git starts on its own: a fetch ends with a detached `git
         // maintenance run --auto` (traced on git 2.55 in #76), which would write to the
         // mirror after the lock is released. A gc sandboxd asks for runs in the foreground,
         // so under the lock.
-        ("maintenance.auto", "false".into()),
-        ("gc.auto", "0".into()),
-        ("gc.autoDetach", "false".into()),
-        ("maintenance.autoDetach", "false".into()),
+        ("maintenance.auto", "false"),
+        ("gc.auto", "0"),
+        ("gc.autoDetach", "false"),
+        ("maintenance.autoDetach", "false"),
+        // The remote is reached over plain HTTP to sandboxd's listener, never via a proxy
+        // a mirror's config names.
+        ("http.proxy", ""),
     ];
-    if let Some(t) = token {
-        config.push(("http.extraHeader", format!("Authorization: Basic {}", B64.encode(format!("x-access-token:{t}")))));
-    }
     cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
     for (i, (k, v)) in config.iter().enumerate() {
         cmd.env(format!("GIT_CONFIG_KEY_{i}"), k).env(format!("GIT_CONFIG_VALUE_{i}"), v);
     }
     // In a process group of its own, so a command that is cut off is stopped with all of
-    // its helpers (Running).
+    // its helpers (Running), and, isolated, in a cgroup of its own, killed whole after it.
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
-    // git reads bundles and objects a VM produced: it runs with none of sandboxd's
-    // capabilities (jail::drop_capabilities).
-    #[cfg(target_os = "linux")]
-    // SAFETY: drop_capabilities only makes async-signal-safe syscalls.
-    unsafe {
-        cmd.pre_exec(crate::jail::drop_capabilities);
-    }
-    cmd
 }
 
 /// How long a cut-off git command's process group has after SIGTERM before it gets SIGKILL.
@@ -350,23 +466,36 @@ const STOP_LOG_AFTER: Duration = Duration::from_secs(5);
 /// (the lock is taken first, so it is dropped last), so the lock is never released with one
 /// of them alive. drop() blocks its thread for that while: until the leader exits, two
 /// seconds at most, unless a process then can't die even of SIGKILL.
+///
+/// Isolated, the run's cgroup is then killed whole and removed (Confined), however the
+/// command ended: a process that left the group (setsid) is gone too, before the uid is
+/// free again and before the mirror's lock is released.
 struct Running {
     child: Child,
     /// None once the command has been waited for (its id may then be reused) or stopped.
     group: Option<libc::pid_t>,
+    /// Held for the run, and dropped after the group is stopped (fields drop after
+    /// Drop::drop), in this order: the cgroup killed and the uid freed, then the proxy.
+    _confined: Option<Confined>,
+    /// The run's way to the remote, closed once it is over.
+    _proxy: Option<remote::Proxy>,
+    grant: Option<Arc<Grant>>,
 }
 
 impl Running {
-    fn spawn(cmd: &mut Command) -> std::io::Result<Running> {
-        let child = cmd.spawn()?;
-        let group = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
-        Ok(Running { child, group })
-    }
-
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         let status = self.child.wait().await?;
         self.group = None;
         Ok(status)
+    }
+
+    /// A failed command's error: the end of its stderr, and why sandboxd refused one of its
+    /// requests to the remote, if it did.
+    fn failed(&self, what: &str, stderr: &[u8]) -> String {
+        match self.grant.as_ref().and_then(|g| g.refused()) {
+            Some(why) => format!("git {what}: {}; sandboxd refused it: {why}", tail(stderr)),
+            None => format!("git {what}: {}", tail(stderr)),
+        }
     }
 
     /// Stop the whole group, and wait until it is gone. The leader is reaped only once both
@@ -441,14 +570,6 @@ fn remove_mirror(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     // Its upkeep state goes with it: a new mirror of the repo starts afresh.
     let _ = std::fs::remove_file(upkeep::state_path(dir));
-}
-
-/// Whether a mirror has never been fetched into: not there, or no refs (a first fetch that
-/// failed or was cut off, by a sandboxd that then stopped). New only when git said so: a
-/// for-each-ref that couldn't run or failed says nothing about the mirror, and a failed
-/// refresh mustn't remove one that has been fetched.
-async fn is_new(dir: &Path) -> bool {
-    !dir.join("HEAD").exists() || matches!(git(dir, &["for-each-ref", "--count=1", "--format=%(refname)"], None, GIT_LOCAL).await, Ok(refs) if refs.trim().is_empty())
 }
 
 /// A mirror whose first fetch hasn't completed, removed when this is dropped unless it was
@@ -578,10 +699,22 @@ fn expired(created_at: u64, now: u64) -> bool {
 }
 
 impl Publisher {
-    pub fn new(mirrors: PathBuf, remote_base: String) -> Publisher {
+    /// A publisher whose git runs isolated in `jail` (gitjail.rs): the only kind there is
+    /// outside tests.
+    pub fn new(mirrors: PathBuf, remote_base: String, jail: Arc<GitJail>) -> Publisher {
+        Publisher::with_git(mirrors, Git::new(Some(jail), &remote_base))
+    }
+
+    /// A publisher whose git runs unisolated, as the test's own user.
+    #[cfg(test)]
+    pub fn unconfined(mirrors: PathBuf, remote_base: String) -> Publisher {
+        Publisher::with_git(mirrors, Git::new(None, &remote_base))
+    }
+
+    fn with_git(mirrors: PathBuf, git: Git) -> Publisher {
         Publisher {
             mirrors,
-            remote_base: remote_base.trim_end_matches('/').to_string(),
+            git,
             review_cap: REVIEW_CAP,
             locks: Mutex::default(),
             new_mirrors: tokio::sync::Mutex::new(()),
@@ -607,10 +740,6 @@ impl Publisher {
         self.mirrors.join(owner).join(format!("{name}.git"))
     }
 
-    fn url(&self, owner: &str, name: &str) -> String {
-        format!("{}/{owner}/{name}.git", self.remote_base)
-    }
-
     /// One job at a time per mirror.
     fn lock(&self, dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
@@ -621,9 +750,9 @@ impl Publisher {
     async fn refresh(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
         if !dir.join("HEAD").exists() {
             tokio::fs::create_dir_all(dir).await.map_err(|e| format!("mirror dir: {e}"))?;
-            git(dir, &["init", "-q", "--bare"], None, GIT_LOCAL).await?;
+            self.git.run(dir, &["init", "-q", "--bare"], GIT_LOCAL).await?;
         }
-        git(dir, &["fetch", "-q", "--prune", "--no-tags", &self.url(owner, name), "+refs/heads/*:refs/heads/*"], token, GIT_NETWORK).await?;
+        self.git.run_net(dir, &["fetch", "-q", "--prune", "--no-tags", REMOTE, "+refs/heads/*:refs/heads/*"], Net::Fetch { owner, name, token }, GIT_NETWORK).await?;
         Ok(())
     }
 
@@ -632,7 +761,7 @@ impl Publisher {
     /// it is gone (a stage ref to a missing object, a lock file a killed git left). A mirror
     /// with no refs yet (its first fetch didn't complete), failed or cut off, is removed.
     async fn update_mirror(&self, dir: &Path, owner: &str, name: &str, token: Option<&str>) -> Result<(), String> {
-        let mut new = NewMirror(is_new(dir).await.then_some(dir));
+        let mut new = NewMirror(self.git.is_new(dir).await.then_some(dir));
         let mut updated = self.refresh(dir, owner, name, token).await;
         if updated.is_err() && self.prune(dir).await {
             updated = self.refresh(dir, owner, name, token).await;
@@ -663,7 +792,7 @@ impl Publisher {
         let dir = self.mirror(&req.owner, &req.name);
         let lock = self.lock(&dir);
         let _held = lock.lock().await;
-        let new = is_new(&dir).await;
+        let new = self.git.is_new(&dir).await;
         // A new mirror is admitted, fetched and measured one at a time, so the next one is
         // admitted against what the last one measured, not against the same room.
         let first = if new { Some(self.new_mirrors.lock().await) } else { None };
@@ -707,7 +836,7 @@ impl Publisher {
             let _ = std::fs::remove_file(bundle);
         }
         if let Err(e) = self.check_size(dir, &req.owner, &req.name) {
-            let _ = git(dir, &["update-ref", "-d", &format!("refs/stage/{id}")], None, GIT_LOCAL).await;
+            let _ = self.git.run(dir, &["update-ref", "-d", &format!("refs/stage/{id}")], GIT_LOCAL).await;
             return Err(e);
         }
         #[cfg(test)]
@@ -786,24 +915,24 @@ impl Publisher {
     async fn stage_bundle(&self, dir: &Path, bundle: &Path, base: &str, id: &str) -> Result<Staged, Failure> {
         let staged_ref = format!("refs/stage/{id}");
         let bundle = bundle.to_string_lossy();
-        // One ref, from the bundle's HEAD; no tags; fsck on (git()). Nothing else in the
+        // One ref, from the bundle's HEAD; no tags; fsck on (git_command). Nothing else in the
         // bundle (tags, replace refs, other branches) can land in the mirror.
-        git(dir, &["fetch", "-q", "--no-tags", &bundle, &format!("HEAD:{staged_ref}")], None, GIT_LOCAL)
+        self.git.run(dir, &["fetch", "-q", "--no-tags", &bundle, &format!("HEAD:{staged_ref}")], GIT_LOCAL)
             .await
             .map_err(|e| (422, format!("the sandbox's commits were refused: {e}")))?;
-        let sha = match git(dir, &["rev-parse", "--verify", &format!("{staged_ref}^{{commit}}")], None, GIT_LOCAL).await {
+        let sha = match self.git.run(dir, &["rev-parse", "--verify", &format!("{staged_ref}^{{commit}}")], GIT_LOCAL).await {
             Ok(sha) => sha.trim().to_string(),
             Err(e) => {
-                let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
+                let _ = self.git.run(dir, &["update-ref", "-d", &staged_ref], GIT_LOCAL).await;
                 return Err((422, format!("the sandbox's HEAD isn't a commit: {e}")));
             }
         };
         // The ref names the commit itself, not a tag that peels to it: the one the record
         // will name, whose objects the ref keeps.
-        git(dir, &["update-ref", &staged_ref, &sha], None, GIT_LOCAL).await.map_err(|e| (500, e))?;
+        self.git.run(dir, &["update-ref", &staged_ref, &sha], GIT_LOCAL).await.map_err(|e| (500, e))?;
         let base_ref = format!("refs/heads/{base}");
-        let Ok(base_sha) = git(dir, &["rev-parse", "--verify", "-q", &format!("{base_ref}^{{commit}}")], None, GIT_LOCAL).await else {
-            let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
+        let Ok(base_sha) = self.git.run(dir, &["rev-parse", "--verify", "-q", &format!("{base_ref}^{{commit}}")], GIT_LOCAL).await else {
+            let _ = self.git.run(dir, &["update-ref", "-d", &staged_ref], GIT_LOCAL).await;
             return Err((404, format!("the base branch {base} isn't on GitHub")));
         };
         let base_sha = base_sha.trim().to_string();
@@ -812,12 +941,13 @@ impl Publisher {
         // What the approval shows, each read only so far: all of it, or the stage is refused
         // (a cut list of files or authors would hide what is past the cut).
         let review_cap = self.review_cap;
+        let git = &self.git;
         let fact = |what: &'static str, args: Vec<&str>| {
             let dir = dir.to_path_buf();
             let args: Vec<String> = args.into_iter().map(String::from).collect();
             async move {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                match git_capped(&dir, &args, None, GIT_LOCAL, review_cap).await {
+                match git.capped(&dir, &args, Net::Off, GIT_LOCAL, review_cap).await {
                     Ok((out, false)) => Ok(out),
                     Ok((_, true)) => Err((413, format!("too much to review: the {what} come to over {review_cap} bytes"))),
                     Err(e) => Err((500, e)),
@@ -831,7 +961,7 @@ impl Publisher {
             // listed too. -z: one NUL after each path, none quoted (a newline in a name stays).
             let files: Vec<String> = fact("files", vec!["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", &three_dot]).await?.split('\0').filter(|f| !f.is_empty()).map(String::from).collect();
             // The patch is only an excerpt: cut, not refused.
-            let (patch, patch_truncated) = git_capped(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], None, GIT_LOCAL, MAX_PATCH).await.map_err(|e| (500, e))?;
+            let (patch, patch_truncated) = self.git.capped(dir, &["diff", "--no-ext-diff", "--no-textconv", &three_dot], Net::Off, GIT_LOCAL, MAX_PATCH).await.map_err(|e| (500, e))?;
             // The same diff in full, hashed as it streams: what an approval binds, the
             // part past the excerpt included. --full-index: whole blob ids, not abbreviations
             // whose length depends on the mirror (its size, its core.abbrev); a binary change
@@ -839,18 +969,18 @@ impl Publisher {
             // core.compression and the zlib build. Renames, the algorithm and the heuristic
             // are pinned, not left to the git release's defaults (a rename limit's, say).
             // What is left is how a git release prints a diff, which is stable.
-            let diff_sha256 = git_sha256(dir, &["diff", "--no-ext-diff", "--no-textconv", "--full-index", "--no-renames", "--diff-algorithm=myers", "--indent-heuristic", &three_dot], GIT_LOCAL).await.map_err(|e| (500, e))?;
+            let diff_sha256 = self.git.sha256(dir, &["diff", "--no-ext-diff", "--no-textconv", "--full-index", "--no-renames", "--diff-algorithm=myers", "--indent-heuristic", &three_dot], GIT_LOCAL).await.map_err(|e| (500, e))?;
             Ok::<_, Failure>((authors, stat, files, patch, patch_truncated, diff_sha256))
         };
         let (authors, stat, files, patch, patch_truncated, diff_sha256) = match described.await {
             Ok(d) => d,
             Err(e) => {
-                let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
+                let _ = self.git.run(dir, &["update-ref", "-d", &staged_ref], GIT_LOCAL).await;
                 return Err(e);
             }
         };
         if authors.is_empty() {
-            let _ = git(dir, &["update-ref", "-d", &staged_ref], None, GIT_LOCAL).await;
+            let _ = self.git.run(dir, &["update-ref", "-d", &staged_ref], GIT_LOCAL).await;
             return Err((409, format!("no commits to publish: HEAD has nothing that isn't on {base} already")));
         }
         Ok(Staged { stage: String::new(), sha, base_sha, commits: authors.len(), stat, authors, files, patch, patch_truncated, diff_sha256 })
@@ -875,14 +1005,13 @@ impl Publisher {
         if asked != recorded {
             return Err((403, format!("the push doesn't match stage {}: it was {} of {}/{} to {} from sandbox {}; nothing was pushed", req.stage, record.sha, record.owner, record.name, record.branch, record.sandbox)));
         }
-        let refspec = format!("{}:refs/heads/{}", record.sha, record.branch);
-        let pushed = git(&dir, &["push", "-q", &self.url(&record.owner, &record.name), &refspec], Some(&req.token), GIT_NETWORK).await;
+        let pushed = self.send(&dir, &record, &req.token).await;
         // The stage's ref is done with either way (its record is gone).
-        let _ = git(&dir, &["update-ref", "-d", &format!("refs/stage/{}", record.id)], None, GIT_LOCAL).await;
+        let _ = self.git.run(&dir, &["update-ref", "-d", &format!("refs/stage/{}", record.id)], GIT_LOCAL).await;
         self.prune(&dir).await;
         // gc before the mirror is measured, so the size kept is what the push left.
         if pushed.is_ok() {
-            let _ = git(&dir, GC_AUTO, None, GIT_LOCAL).await;
+            let _ = self.git.run(&dir, GC_AUTO, GIT_LOCAL).await;
         }
         self.after_job(&dir, pushed.as_ref().ok().map(|_| record.id.as_str())).await;
         if let Err(e) = pushed {
@@ -890,6 +1019,43 @@ impl Publisher {
             return Err((status, format!("push to {}: {e}", record.branch)));
         }
         Ok(Pushed { sha: record.sha, branch: record.branch })
+    }
+
+    /// The push itself, as a git run that never sees the token. To an HTTP remote, sandboxd
+    /// first reads where the branch is there and checks the push is a fast-forward from it;
+    /// the run may then send only that one update (remote.rs). A file:// remote (tests) is
+    /// pushed to directly, and git's own check refuses a non-fast-forward.
+    async fn send(&self, dir: &Path, record: &StageRecord, token: &str) -> Result<String, String> {
+        let (owner, name, sha) = (record.owner.as_str(), record.name.as_str(), record.sha.as_str());
+        let refname = format!("refs/heads/{}", record.branch);
+        let refspec = format!("{sha}:{refname}");
+        let zero = "0".repeat(sha.len());
+        let old = match &self.git.remote {
+            Remote::File(_) => zero,
+            Remote::Http(base) => {
+                let at = tokio::time::timeout(GIT_NETWORK, remote::branch_at(&self.git.client, base, owner, name, token, &refname)).await.map_err(|_| "reading the remote's branches took too long".to_string())??;
+                match at {
+                    None => zero,
+                    Some(old) if !commit_id(&old) => return Err(format!("the remote says {refname} is at {old:?}, not a commit id")),
+                    Some(old) => {
+                        // Never forced: what the branch is at must be in the mirror, and an
+                        // ancestor of what is pushed. A git that couldn't answer refuses too.
+                        match self.git.says(dir, &["cat-file", "-e", &format!("{old}^{{commit}}")]).await {
+                            Some(true) => {}
+                            Some(false) => return Err(format!("[rejected] {refname} (fetch first): the branch is at {old}, which the stage doesn't have")),
+                            None => return Err("checking the branch's commit: git didn't answer".into()),
+                        }
+                        match self.git.says(dir, &["merge-base", "--is-ancestor", &old, sha]).await {
+                            Some(true) => {}
+                            Some(false) => return Err(format!("[rejected] {refname} (non-fast-forward): the branch is at {old}, which {sha} doesn't follow")),
+                            None => return Err("checking the push is a fast-forward: git didn't answer".into()),
+                        }
+                        old
+                    }
+                }
+            }
+        };
+        self.git.run_net(dir, &["push", "-q", REMOTE, &refspec], Net::Push { owner, name, token, old: &old, new: sha, refname: &refname }, GIT_NETWORK).await
     }
 
     /// Housekeeping, never authorization: drop expired records (all repos'), this mirror's
@@ -913,7 +1079,7 @@ impl Publisher {
             }
         }
         // for-each-ref lists a ref whose object is missing too, with the id it names.
-        for line in git(dir, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/stage/"], None, GIT_LOCAL).await.unwrap_or_default().lines() {
+        for line in self.git.run(dir, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/stage/"], GIT_LOCAL).await.unwrap_or_default().lines() {
             let Some((name, oid)) = line.split_once(' ') else { continue };
             let id = name.trim_start_matches("refs/stage/");
             let stale = match stage_secs(id) {
@@ -922,8 +1088,8 @@ impl Publisher {
             };
             // Missing only when git ran and said so; a git that couldn't run or timed out
             // says nothing about the ref.
-            let missing = git_says(dir, &["cat-file", "-e", oid]).await == Some(false);
-            if (stale || missing) && git(dir, &["update-ref", "-d", name], None, GIT_LOCAL).await.is_ok() {
+            let missing = self.git.says(dir, &["cat-file", "-e", oid]).await == Some(false);
+            if (stale || missing) && self.git.run(dir, &["update-ref", "-d", name], GIT_LOCAL).await.is_ok() {
                 repaired |= missing;
             }
         }
@@ -993,8 +1159,8 @@ async fn bundle_from(vms: &Manager, sandbox: &str, to: &Path) -> Result<(), Fail
     // Bounded like every other guest call: the guest is untrusted, and an answer it never
     // sends would otherwise hold this stage, and the repo's lock, for good.
     let _ = tokio::time::timeout(Duration::from_secs(35), vsock::request(&uds, Method::POST, "/exec", Bytes::from(cleanup))).await;
-    // A new file, never one already there: a link planted at this name in the mirror, which
-    // git writes, must not be followed.
+    // A new file, never one already there: the mirror is writable by the uid its git runs
+    // as (gitjail.rs), and a link planted at this name must not be followed.
     let write = async {
         use tokio::io::AsyncWriteExt;
         let mut f = tokio::fs::OpenOptions::new().write(true).create_new(true).open(to).await?;
@@ -1022,20 +1188,19 @@ mod tests {
         let own = std::fs::read_to_string("/proc/self/status").unwrap();
         assert_ne!(field(&own, "CapEff:"), "0000000000000000", "the test itself has no capabilities to drop");
         let dir = std::env::temp_dir();
-        let out = git_command(&dir, &["-c", "alias.status-of-proc=!cat /proc/self/status", "status-of-proc"], None).output().await.unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let status = String::from_utf8_lossy(&out.stdout);
+        let status = Git::new(None, "file:///").run(&dir, &["-c", "alias.status-of-proc=!cat /proc/self/status", "status-of-proc"], GIT_LOCAL).await.unwrap();
         assert_eq!(field(&status, "NoNewPrivs:"), "1");
         for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
             assert_eq!(field(&status, cap), "0000000000000000", "{cap}");
         }
     }
 
+    /// Run one ignored test of this module in a user namespace, where the test is root with
+    /// every capability, as sandboxd is: it must pass there.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn git_runs_without_capabilities() {
+    fn in_userns(test: &str) {
         let me = std::env::current_exe().unwrap();
-        let inner = ["publish::tests::git_without_capabilities_in_userns", "--exact", "--ignored", "--nocapture"];
+        let inner = [&format!("publish::tests::{test}"), "--exact", "--ignored", "--nocapture"];
         let Ok(out) = std::process::Command::new("unshare").arg("--user").arg("--map-root-user").arg(&me).args(inner).output() else {
             eprintln!("skipped: no unshare(1)");
             return;
@@ -1049,6 +1214,297 @@ mod tests {
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_runs_without_capabilities() {
+        in_userns("git_without_capabilities_in_userns");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_git_sees_only_its_mirror_and_no_network() {
+        in_userns("isolated_git_in_userns");
+    }
+
+    /// Stage and push with git isolated (gitjail.rs) but for the uid and the cgroup, which
+    /// take real root (the lab checks those, sandbox/lab): its own mount namespace with only
+    /// its mirror and git's binaries, no network but sandboxd's proxy.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run by isolated_git_sees_only_its_mirror_and_no_network, in a user namespace"]
+    async fn isolated_git_in_userns() {
+        let mut s = scratch("isolated");
+        let jail = Arc::new(GitJail::unprivileged(&s.root.join("state")).unwrap());
+        s.publisher.git = Git::new(Some(jail.clone()), &format!("file://{}", s.root.display()));
+        // A stage and its push, all through isolated runs (a file:// remote is bound in).
+        sh(&s.vm, "echo iso > iso && git add iso && git commit -qm iso");
+        let staged = s.stage_all(request("scout/iso"), || {}).await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/iso")).await.unwrap();
+        assert_eq!(s.remote("scout/iso").as_deref(), Some(staged.sha.as_str()));
+        // What a run sees: /usr and the links into it, a few devices, ld.so.cache, its
+        // mirror at /repo, its own /tmp. Not /proc, not /etc's files, not the other mirror.
+        sh(&s.root, "git clone -q --bare acme/gadgets.git mirrors/acme/gadgets.git");
+        let other = s.publisher.mirror("acme", "gadgets");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let script = format!(
+            "ls -A /; echo --; ls -A /etc; echo --; ls -A /dev; echo --; cat /proc/self/status 2>/dev/null || echo no-proc; test -e {} && echo other-mirror; test -w /repo/HEAD && echo repo-writable; git ls-remote -q http://127.0.0.1:{port}/x 2>&1 | tail -1",
+            other.display()
+        );
+        let out = s.publisher.git.run(&s.dir(), &["-c", &format!("alias.look=!{script}"), "look"], GIT_LOCAL).await.unwrap_or_else(|e| e);
+        eprintln!("what an isolated run sees:\n{out}");
+        let parts: Vec<&str> = out.split("--\n").collect();
+        assert_eq!(parts.len(), 4, "{out}");
+        for entry in parts[0].lines() {
+            assert!(["bin", "sbin", "lib", "lib32", "lib64", "libx32", "usr", "nix", "etc", "dev", "tmp", "repo"].contains(&entry), "/ holds {entry}: {out}");
+        }
+        assert!(parts[1].lines().all(|e| e == "ld.so.cache"), "/etc: {out}");
+        assert!(parts[2].lines().all(|e| ["null", "zero", "full", "random", "urandom"].contains(&e)), "/dev: {out}");
+        let rest = parts[3];
+        assert!(rest.contains("no-proc"), "{out}");
+        assert!(!rest.contains("other-mirror"), "{out}");
+        assert!(rest.contains("repo-writable"), "{out}");
+        // No network: not even the host's loopback, where something listens.
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "the run reached the host's loopback: {out}");
+        assert!(rest.contains("unreachable") || rest.contains("Couldn't connect") || rest.contains("Failed to connect"), "{out}");
+        // A run that talks to an HTTP remote reaches only sandboxd's proxy, which forwards
+        // to the remote with the token; the run itself never sees the token.
+        let (url, seen, _server) = smart_http(s.root.clone()).await;
+        s.publisher.git = Git::new(Some(jail), &url);
+        let staged = s.stage_all(request("scout/iso2"), || {}).await.unwrap();
+        let mut req = s.push(&staged, "scout/iso2");
+        req.token = "tok-only-for-the-proxy".into();
+        s.publisher.push(SANDBOX, req).await.unwrap();
+        assert_eq!(s.remote("scout/iso2").as_deref(), Some(staged.sha.as_str()));
+        let seen = seen.lock().unwrap().join("\n");
+        assert!(seen.contains(&format!("POST /acme/widgets.git/git-receive-pack auth={}", basic("tok-only-for-the-proxy"))), "{seen}");
+    }
+
+    /// The processes whose real uid is in git's range: (pid, uid).
+    #[cfg(target_os = "linux")]
+    fn git_uid_processes(base: u32) -> Vec<(u32, u32)> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+            let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else { continue };
+            let uid = status.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u32>().ok());
+            if let Some(uid) = uid.filter(|u| (base..base + gitjail::GIT_UIDS).contains(u)) {
+                found.push((pid, uid));
+            }
+        }
+        found
+    }
+
+    /// All of the isolation, the uid and the cgroup included: as root, in a delegated cgroup,
+    /// as sandboxd runs. The lab runs it (sandbox/lab/README.md):
+    /// `systemd-run --scope -p Delegate=yes cargo test -- --ignored as_root`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs root and a delegated cgroup: the lab runs it"]
+    async fn isolated_git_as_root() {
+        const BASE: u32 = 1_900_100_000;
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+        let vms = crate::jail::setup_cgroups().await.expect("a delegated cgroup (systemd-run --scope -p Delegate=yes)");
+        let cgroups = Path::new("/sys/fs/cgroup").join(vms.strip_suffix("/vms").unwrap()).join("git");
+        let mut s = scratch("asroot");
+        let jail = Arc::new(GitJail::prepare(&s.root.join("state"), cgroups.clone(), BASE).unwrap());
+        // The file:// "GitHub" is the test's, so any uid may write it.
+        sh(&s.root, "chmod -R a+rwX acme && chmod a+rx .");
+        s.publisher.git = Git::new(Some(jail.clone()), &format!("file://{}", s.root.display()));
+        sh(&s.vm, "echo root > root && git add root && git commit -qm root");
+        let staged = s.stage_all(request("scout/root"), || {}).await.unwrap();
+        s.publisher.push(SANDBOX, s.push(&staged, "scout/root")).await.unwrap();
+        assert_eq!(s.remote("scout/root").as_deref(), Some(staged.sha.as_str()));
+        // The mirror belongs to the last run's uid, one of git's.
+        let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(s.dir().join("HEAD")).unwrap());
+        assert!((BASE..BASE + gitjail::GIT_UIDS).contains(&owner), "{owner}");
+        // A run, seen from outside while it runs: its uid, no capabilities, no_new_privs, its
+        // own cgroup under git/, its own mount and network namespaces, a root with no /etc
+        // of the host's in it.
+        let hold = {
+            let git = Git::new(Some(jail.clone()), "file:///nonexistent");
+            let dir = s.dir();
+            tokio::spawn(async move { git.run(&dir, &["-c", "alias.hold=!sleep 3; git ls-remote -q http://1.1.1.1/x 2>&1 | tail -1", "hold"], GIT_LOCAL).await })
+        };
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            seen = git_uid_processes(BASE);
+            if !seen.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (pid, uid) = *seen.first().expect("a git run to look at");
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim).unwrap_or_default().to_string();
+        eprintln!("pid {pid} uid {uid}: CapEff {} CapPrm {} NoNewPrivs {}", field("CapEff:"), field("CapPrm:"), field("NoNewPrivs:"));
+        assert_ne!(uid, 0);
+        assert_eq!(field("Uid:").split_whitespace().collect::<Vec<_>>(), vec![uid.to_string(); 4]);
+        assert_eq!(field("CapEff:"), "0000000000000000");
+        assert_eq!(field("CapPrm:"), "0000000000000000");
+        assert_eq!(field("NoNewPrivs:"), "1");
+        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        eprintln!("cgroup {}", cgroup.trim());
+        assert!(cgroup.trim().ends_with(&format!("/git/u{uid}")), "{cgroup}");
+        // Under sandboxd.service's confinement (no CAP_SYS_PTRACE) another uid's namespaces
+        // and root can't be looked into at all; as plain root they can.
+        if std::fs::read_link(format!("/proc/{pid}/ns/mnt")).is_err() {
+            eprintln!("its namespaces and root aren't readable from here (no CAP_SYS_PTRACE): not checked");
+        } else {
+            for ns in ["mnt", "net"] {
+                let theirs = std::fs::read_link(format!("/proc/{pid}/ns/{ns}")).unwrap();
+                let ours = std::fs::read_link(format!("/proc/self/ns/{ns}")).unwrap();
+                eprintln!("{ns}: {} (sandboxd's: {})", theirs.display(), ours.display());
+                assert_ne!(theirs, ours, "{ns}");
+            }
+            let root: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/root")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            let etc: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/root/etc")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            eprintln!("its /: {root:?}; its /etc: {etc:?}");
+            assert!(etc.iter().all(|e| e == "ld.so.cache"), "{etc:?}");
+            assert!(std::fs::metadata(format!("/proc/{pid}/root/etc/lorehouse")).is_err());
+            assert!(std::fs::metadata(format!("/proc/{pid}/root/run")).is_err());
+            assert!(std::fs::metadata(format!("/proc/{pid}/root/sys")).is_err());
+            assert!(std::fs::metadata(format!("/proc/{pid}/root/proc")).is_err());
+        }
+        // And no network: not even an address on the internet.
+        let held = hold.await.unwrap().unwrap();
+        eprintln!("its network: {}", held.trim());
+        assert!(held.contains("unreachable") || held.contains("connect"), "{held}");
+        // A process that leaves git's process group (setsid) is killed with the run's cgroup,
+        // before its uid is used again.
+        let git = Git::new(Some(jail.clone()), "file:///nonexistent");
+        git.run(&s.dir(), &["-c", "alias.escape=!setsid sleep 300 </dev/null >/dev/null 2>&1 & echo started", "escape"], GIT_LOCAL).await.unwrap();
+        let left = git_uid_processes(BASE);
+        assert!(left.is_empty(), "left after the run: {left:?}");
+        let cgroups_left: Vec<_> = std::fs::read_dir(&cgroups).unwrap().flatten().filter(|e| e.file_type().unwrap().is_dir()).map(|e| e.file_name()).collect();
+        assert!(cgroups_left.is_empty(), "{cgroups_left:?}");
+        // Two runs at once never share a uid.
+        let (other, dir) = (Git::new(Some(jail.clone()), "file:///nonexistent"), s.dir());
+        let (a, b) = tokio::join!(git.run(&dir, &["-c", "alias.me=!id -u; sleep 1", "me"], GIT_LOCAL), other.run(&dir, &["-c", "alias.me=!id -u; sleep 1", "me"], GIT_LOCAL));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        eprintln!("two runs at once: uids {} and {}", a.trim(), b.trim());
+        assert_ne!(a.trim(), b.trim());
+    }
+
+    fn basic(token: &str) -> String {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        format!("Basic {}", B64.encode(format!("x-access-token:{token}")))
+    }
+
+    /// A smart-HTTP git server over the bare repos in `root` (`git http-backend`), standing in
+    /// for GitHub: its URL, and every request it got (`<method> <path?query> auth=<header>`).
+    async fn smart_http(root: PathBuf) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let (root, log) = (root.clone(), log.clone());
+            async move {
+                use tokio::io::AsyncWriteExt;
+                let (parts, body) = req.into_parts();
+                let header = |n: &str| parts.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                log.lock().unwrap().push(format!("{} {} auth={}", parts.method, parts.uri, if header("authorization").is_empty() { "-".into() } else { header("authorization") }));
+                let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                let mut cgi = tokio::process::Command::new("git");
+                cgi.arg("http-backend")
+                    .env("GIT_PROJECT_ROOT", &root)
+                    .env("GIT_HTTP_EXPORT_ALL", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("REMOTE_USER", "test")
+                    .env("REQUEST_METHOD", parts.method.as_str())
+                    .env("PATH_INFO", parts.uri.path())
+                    .env("QUERY_STRING", parts.uri.query().unwrap_or(""))
+                    .env("CONTENT_TYPE", header("content-type"))
+                    .env("CONTENT_LENGTH", body.len().to_string())
+                    .env("HTTP_GIT_PROTOCOL", header("git-protocol"))
+                    .env("HTTP_CONTENT_ENCODING", header("content-encoding"))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped());
+                let mut child = cgi.spawn().unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(&body).await.unwrap();
+                drop(stdin);
+                let out = child.wait_with_output().await.unwrap().stdout;
+                let split = out.windows(4).position(|w| w == b"\r\n\r\n").map(|i| (i, 4)).or_else(|| out.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2))).unwrap();
+                let mut resp = axum::response::Response::builder();
+                for line in String::from_utf8_lossy(&out[..split.0]).lines() {
+                    let Some((k, v)) = line.split_once(':') else { continue };
+                    if k.eq_ignore_ascii_case("status") {
+                        resp = resp.status(v.trim()[..3].parse::<u16>().unwrap());
+                    } else {
+                        resp = resp.header(k.trim(), v.trim());
+                    }
+                }
+                resp.body(axum::body::Body::from(out[split.0 + split.1..].to_vec())).unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, seen, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_http_remote_is_reached_only_through_sandboxd_which_adds_the_token() {
+        let mut s = scratch("proxied");
+        let (url, seen, _server) = smart_http(s.root.clone()).await;
+        s.publisher.git = Git::new(None, &url);
+        let head = sh(&s.vm, "echo p > p && git add p && git commit -qm p && git rev-parse HEAD");
+        let mut req = request("scout/p");
+        req.token = Some("read-tok".into());
+        let staged = s.stage_all(req, || {}).await.unwrap();
+        let mut push = s.push(&staged, "scout/p");
+        push.token = "write-tok".into();
+        s.publisher.push(SANDBOX, push).await.unwrap();
+        assert_eq!(s.remote("scout/p").as_deref(), Some(head.as_str()));
+        let log = seen.lock().unwrap().join("\n");
+        // The fetch with the read token, the push with the write token, sandboxd's own read
+        // of the branches before the push with it too.
+        assert!(log.contains(&format!("GET /acme/widgets.git/info/refs?service=git-upload-pack auth={}", basic("read-tok"))), "{log}");
+        assert!(log.contains(&format!("POST /acme/widgets.git/git-receive-pack auth={}", basic("write-tok"))), "{log}");
+        assert_eq!(log.matches("GET /acme/widgets.git/info/refs?service=git-receive-pack").count(), 2, "{log}");
+        // And git itself never had it: what a push run's environment holds.
+        let zero = "0".repeat(40);
+        let net = Net::Push { owner: "acme", name: "widgets", token: "write-tok", old: &zero, new: &head, refname: "refs/heads/scout/q" };
+        let env = s.publisher.git.run_net(&s.dir(), &["-c", "alias.env=!env; git config --list", "env"], net, GIT_LOCAL).await.unwrap();
+        assert!(!env.contains("write-tok") && !env.contains(&basic("write-tok")[6..]) && !env.to_lowercase().contains("authorization"), "{env}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_run_may_send_only_the_update_sandboxd_checked() {
+        let mut s = scratch("narrow");
+        let (url, seen, _server) = smart_http(s.root.clone()).await;
+        s.publisher.git = Git::new(None, &url);
+        let main = s.remote("main").unwrap();
+        sh(&s.vm, "echo n > n && git add n && git commit -qm n");
+        let staged = s.stage("scout/n").await.unwrap();
+        let zero = "0".repeat(40);
+        let narrow = || Net::Push { owner: "acme", name: "widgets", token: "t", old: &zero, new: &staged.sha, refname: "refs/heads/scout/n" };
+        // A git that pushes another branch (main) than its grant: refused, nothing forwarded.
+        let err = s.publisher.git.run_net(&s.dir(), &["push", "-q", REMOTE, &format!("{}:refs/heads/main", staged.sha)], narrow(), GIT_NETWORK).await.unwrap_err();
+        assert!(err.contains("sandboxd refused it"), "{err}");
+        assert_eq!(s.remote("main"), Some(main));
+        assert!(!seen.lock().unwrap().iter().any(|l| l.starts_with("POST /acme/widgets.git/git-receive-pack")), "{:?}", seen.lock().unwrap());
+        // A fetch run can't push at all.
+        let fetch = Net::Fetch { owner: "acme", name: "widgets", token: None };
+        let err = s.publisher.git.run_net(&s.dir(), &["push", "-q", REMOTE, &format!("{}:refs/heads/scout/n", staged.sha)], fetch, GIT_NETWORK).await.unwrap_err();
+        assert!(err.contains("sandboxd refused it"), "{err}");
+        assert_eq!(s.remote("scout/n"), None);
+        // The update its grant names goes through.
+        s.publisher.git.run_net(&s.dir(), &["push", "-q", REMOTE, &format!("{}:refs/heads/scout/n", staged.sha)], narrow(), GIT_NETWORK).await.unwrap();
+        assert_eq!(s.remote("scout/n").as_deref(), Some(staged.sha.as_str()));
+        sh(&s.root, "git -C acme/widgets.git update-ref -d refs/heads/scout/n");
+        // A branch that moved on at the remote to a commit the stage doesn't follow: refused
+        // before git runs (never forced).
+        sh(&s.root, "git clone -q acme/widgets.git elsewhere && cd elsewhere && echo e > e && git add e && git -c user.name=x -c user.email=x@x commit -qm e && git push -q origin HEAD:refs/heads/scout/n");
+        let err = s.publisher.push(SANDBOX, s.push(&staged, "scout/n")).await.unwrap_err();
+        assert_eq!(err.0, 409, "{}", err.1);
+        assert!(err.1.contains("fetch first"), "{}", err.1);
     }
 
     /// A scratch area: a bare "GitHub" remote with main, a clone standing in for the VM's
@@ -1145,7 +1601,7 @@ mod tests {
         std::fs::create_dir_all(root.join("acme")).unwrap();
         sh(&root, "git init -q --bare acme/widgets.git && git init -q --bare acme/gadgets.git && git init -q -b main vm && cd vm && echo a > a && git add a && git commit -qm base && git remote add origin ../acme/widgets.git && git push -q origin main && git push -q ../acme/gadgets.git main && git fetch -q origin");
         let vm = root.join("vm");
-        let mut publisher = Publisher::new(root.join("mirrors"), format!("file://{}", root.display()));
+        let mut publisher = Publisher::unconfined(root.join("mirrors"), format!("file://{}", root.display()));
         let disk = Arc::new(FakeDisk::default());
         publisher.disk = disk.clone();
         let later = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1580,7 +2036,7 @@ mod tests {
             ("head -c 1000000 /dev/zero | tr '\\000' a", "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"),
         ] {
             let oid = blob(content);
-            assert_eq!(git_sha256(&s.vm, &["cat-file", "blob", &oid], GIT_LOCAL).await.unwrap(), want, "{content}");
+            assert_eq!(s.publisher.git.sha256(&s.vm, &["cat-file", "blob", &oid], GIT_LOCAL).await.unwrap(), want, "{content}");
         }
     }
 
@@ -1662,7 +2118,7 @@ mod tests {
         let s = scratch("maintenance");
         s.publisher.refresh(&s.dir(), "acme", "widgets", None).await.unwrap();
         for (key, want) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false"), ("maintenance.autoDetach", "false")] {
-            let got = git(&s.dir(), &["config", "--get", key], None, GIT_LOCAL).await;
+            let got = s.publisher.git.run(&s.dir(), &["config", "--get", key], GIT_LOCAL).await;
             assert_eq!(got.as_deref().map(str::trim), Ok(want), "{key}");
         }
     }
@@ -1760,7 +2216,7 @@ mod tests {
                 conns.push(c);
             }
         });
-        let hanging = Publisher::new(s.root.join("mirrors"), format!("http://{addr}"));
+        let hanging = Publisher::unconfined(s.root.join("mirrors"), format!("http://{addr}"));
         let dir = hanging.mirror("acme", "slow");
         let cut = tokio::time::timeout(Duration::from_millis(1500), hanging.update_mirror(&dir, "acme", "slow", None)).await;
         assert!(cut.is_err(), "the fetch was cut off: {cut:?}");
@@ -1786,7 +2242,7 @@ mod tests {
         let packed = dir.join("packed-refs");
         let refs = std::fs::read(&packed).unwrap();
         std::fs::write(&packed, [refs.as_slice(), b"not a ref\n"].concat()).unwrap();
-        assert!(git(&dir, &["for-each-ref"], None, GIT_LOCAL).await.is_err(), "for-each-ref fails");
+        assert!(s.publisher.git.run(&dir, &["for-each-ref"], GIT_LOCAL).await.is_err(), "for-each-ref fails");
         std::fs::rename(s.root.join("acme/widgets.git"), s.root.join("acme/gone.git")).unwrap();
         s.publisher.update_mirror(&dir, "acme", "widgets", None).await.unwrap_err();
         assert!(packed.exists(), "the mirror is still there");
@@ -1815,7 +2271,7 @@ mod tests {
             let (lock, dir) = (lock.clone(), dir.clone());
             async move {
                 let _held = lock.lock().await;
-                git(&dir, &["-c", &alias, "hang"], None, Duration::from_secs(120)).await
+                Git::new(None, "file:///").run(&dir, &["-c", &alias, "hang"], Duration::from_secs(120)).await
             }
         });
         let started = std::time::Instant::now();
@@ -1853,7 +2309,7 @@ mod tests {
         let s = scratch("helpers");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let hanging = Publisher::new(s.root.join("mirrors"), format!("http://{addr}"));
+        let hanging = Publisher::unconfined(s.root.join("mirrors"), format!("http://{addr}"));
         let dir = hanging.mirror("acme", "slow");
         let fetch = tokio::spawn(async move { hanging.update_mirror(&dir, "acme", "slow", None).await });
         // Cut off once it has connected: the job's future is dropped.
@@ -2051,7 +2507,7 @@ mod tests {
         s.size("acme/gadgets", 3 * GIB);
         s.stage_all(on("gadgets", "main", "scout/i"), || {}).await.unwrap();
         // A new sandboxd over the same mirrors: until they are measured it knows of none.
-        let mut restarted = Publisher::new(s.root.join("mirrors"), format!("file://{}", s.root.display())).with_policy(s.publisher.policy.clone());
+        let mut restarted = Publisher::unconfined(s.root.join("mirrors"), format!("file://{}", s.root.display())).with_policy(s.publisher.policy.clone());
         restarted.disk = s.disk.clone();
         restarted.inventory();
         // 3 GiB used, and a new mirror counts at 4: over the 6.
