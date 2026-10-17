@@ -32,7 +32,7 @@ oauth_config:
       - files:write        # attaching a file to the thread: the PDF render_pdf made (PDF_REPLIES=1), or a file from the sandbox (workspace_attach_file, code tools)
       - im:history         # message.im events: DMs to the agent (never indexed)
       - reactions:read     # reaction_added/removed events: 👍/👎 on the agent's replies (usage, GET /api/v1/usage)
-      - users:read         # naming people in knowledge ("Wendy: …" instead of a user id)
+      - users:read         # naming people in knowledge ("Wendy: …" instead of a user id); checking an asker is a full member, not a guest or from another workspace, or nobody is answered
 settings:
   org_deploy_enabled: false
   socket_mode_enabled: false

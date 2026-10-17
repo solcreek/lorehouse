@@ -50,7 +50,7 @@ function world(w: World = {}) {
       if (method === "users.info") return Response.json({ ok: true, user: { name: "scout", profile: { display_name: w.displayName ?? "scout" } } });
       if (method === "conversations.info") {
         const channel = url.searchParams.get("channel")!;
-        const info = w.info?.[channel] ?? { name: "general", is_channel: true, is_private: false, is_archived: false };
+        const info = w.info?.[channel] ?? { name: "general", is_channel: true, is_private: false, is_archived: false, is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false };
         return Response.json(typeof info === "string" ? { ok: false, error: info } : { ok: true, channel: { id: channel, ...info } });
       }
       if (method === "conversations.history") {
@@ -239,6 +239,29 @@ describe("channels", () => {
     expect(find(checks, "C8")[0]?.level).toBe("fail");
     expect(find(checks, "C8")[0]?.detail).toStartWith("C8 (#old) is archived");
     expect(seen.filter((s) => s.includes("conversations.history"))).toEqual(["GET slack.test/api/conversations.history"]);
+  });
+
+  test("a channel shared with another organization or workspace fails, named, saying why; its history isn't read", async () => {
+    const shared = { name: "partners", is_channel: true, is_private: false, is_archived: false, is_shared: true };
+    const { f, seen } = world({ info: { C3: { ...shared, is_ext_shared: true }, C4: { ...shared, name: "grid", is_org_shared: true } } });
+    const checks = await doctor({ env: { ...ENV, AGENT_CHANNELS: "C3,C4" }, fetch: f });
+    const [c3, c4] = [find(checks, "C3")[0]!, find(checks, "C4")[0]!];
+    expect(c3.level).toBe("fail");
+    expect(c3.detail).toStartWith("C3 (#partners) is shared with another organization (Slack Connect)");
+    expect(c3.detail).toEndWith("lorehouse refuses to start until it is no longer shared or off AGENT_CHANNELS");
+    expect(c4.level).toBe("fail");
+    expect(c4.detail).toStartWith("C4 (#grid) is shared with other workspaces of this Enterprise Grid organization");
+    expect(seen.some((s) => s.includes("conversations.history"))).toBe(false);
+  });
+
+  test("says who is answered: full members only, and a missing users:read means nobody", async () => {
+    const policy = find(await run({ DM_MODE: "answer" }), "who is answered")[0];
+    expect(policy?.level).toBe("info");
+    expect(policy?.detail).toStartWith("full members of this workspace only: a guest");
+    expect(policy?.detail).toContain("a follow-up or a DM");
+    const scopes = find(await run({}, { scopes: MANIFEST_SCOPES.filter((s) => s !== "users:read").join(",") }), "scopes")[0];
+    expect(scopes?.level).toBe("fail");
+    expect(scopes?.detail).toContain("users:read (without it nobody can be checked as a full member, so nobody is answered)");
   });
 
   test("a channel that can't be looked up fails closed: not found, a missing scope", async () => {

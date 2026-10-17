@@ -7,9 +7,11 @@
 // each service directly, with the same environment the app would start with:
 //
 //   configuration  every setting loadConfig checks, all problems at once
-//   slack          the bot token, its scopes (against slack/manifest.yaml), the agent's name
-//   channels       each AGENT_CHANNELS id: public as Slack says (conversations.info, the
-//                  check a start refuses on), and readable by the bot; what the next start
+//   slack          the bot token, its scopes (against slack/manifest.yaml), the agent's name,
+//                  and who is answered (full members only: members.ts)
+//   channels       each AGENT_CHANNELS id: public and shared with no other workspace, as
+//                  Slack says (conversations.info, the check a start refuses on), and
+//                  readable by the bot; what the next start
 //                  would purge for channels no longer listed (read from the database)
 //   anthropic      the API key, and that ANTHROPIC_MODEL exists
 //   github         the App's key and permissions, or the token (code tools only)
@@ -133,7 +135,10 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       const attachers = [config.pdf ? "PDF_REPLIES=1 (render_pdf)" : "", config.sandbox ? "code tools (workspace_attach_file)" : ""].filter(Boolean);
       const needed = MANIFEST_SCOPES.filter((s) => !(s === "im:history" && config.agent.dm === "ignore") && !(s === "files:write" && !attachers.length));
       const missing = needed.filter((s) => !granted.has(s));
-      const why = (s: string) => (s === "files:write" ? `${s} (to attach files, for ${attachers.join(" and ")})` : s);
+      const why = (s: string) =>
+        s === "files:write" ? `${s} (to attach files, for ${attachers.join(" and ")})`
+        : s === "users:read" ? `${s} (without it nobody can be checked as a full member, so nobody is answered)`
+        : s;
       if (missing.length) add("slack", "scopes", "fail", `missing ${missing.map(why).join(", ")}: add under OAuth & Permissions (or re-create from slack/manifest.yaml), then reinstall the app`);
       else add("slack", "scopes", "ok", needed.join(", "));
     }
@@ -151,6 +156,9 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       else add("slack", "agent name", "ok", `@${identity.name}`);
     }
   }
+  // Who gets answers (members.ts, #145): a policy, not a check, said so it's never a surprise.
+  add("slack", "who is answered", "info",
+    `full members of this workspace only: a guest (single- or multi-channel), someone from another workspace (Slack Connect, or another Enterprise Grid workspace), or a sender users.info can't vouch for gets a one-line refusal instead of an answer (to a mention, a follow-up${config.agent.dm === "answer" ? " or a DM" : ""}), with no search or model call`);
 
   // ── channels ──
   if (!config.agent.channels.size) {
@@ -173,7 +181,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
         ? { channel, public: false, reason: "lookup_failed", error: info.error }
         : classifyChannel(channel, info.body?.channel as ChannelInfo | undefined);
       if (!verdict.public) {
-        add("channels", channel, "fail", `${describeVerdict(verdict)}: lorehouse refuses to start until it is public or off AGENT_CHANNELS`);
+        add("channels", channel, "fail", `${describeVerdict(verdict)}: lorehouse refuses to start until it is ${verdict.reason === "shared" ? "no longer shared" : "public"} or off AGENT_CHANNELS`);
         continue;
       }
       const named = verdict.name ? ` (#${verdict.name})` : "";
