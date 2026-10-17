@@ -133,7 +133,7 @@ confirmed through Vercel's sandbox bounty on 2026-10-03, still unpatched a week 
 [The Register](https://www.theregister.com/offbeat/2026/10/06/security-researcher-claims-they-found-kvm-guest-host-escape-flaw/5301267)). So the host is set up assuming a guest may
 get out of its VM, and what it lands in should hold as little as possible.
 
-Every VM runs under Firecracker's `jailer` ([ADR 0003](../../docs/adr/0003-sandbox-host-isolation.md),
+Every VM runs under Firecracker's `jailer` ([ADR 0003](../../docs/adr/0003-sandbox-trust-boundaries.md),
 [`src/jail.rs`](src/jail.rs)):
 
 | | |
