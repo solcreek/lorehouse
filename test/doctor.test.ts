@@ -509,6 +509,24 @@ describe("the tenant", () => {
 
   // A -wal, -shm or -journal at the new place that isn't the database's own: the start sets
   // it aside rather than let SQLite replay it (upgradeLayout), and the doctor says which.
+  test("a side file at the old place that links elsewhere fails, as the start refuses it, and nothing moves", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      db.close();
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/tenant.json`, JSON.stringify({ id: "acme" }));
+      writeFileSync(`${dir}/elsewhere-wal`, "");
+      rmSync(`${dir}/lorehouse.db-wal`, { force: true });
+      symlinkSync("elsewhere-wal", `${dir}/lorehouse.db-wal`);
+      const upgrade = find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade");
+      expect(upgrade.filter((c) => c.level === "fail").map((c) => c.detail)).toEqual([`${dir}/lorehouse.db-wal is a symlink, not to ${dir}/acme/lorehouse.db-wal: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is (the start refuses until then)`]);
+      expect(readdirSync(`${dir}/acme`)).toEqual(["tenant.json"]);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
   test("a side file in both places is named: the next start sets the stale one aside", async () => {
     const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
     try {

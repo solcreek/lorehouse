@@ -266,6 +266,10 @@ export function upgradeLayout(moves: Move[]): string[] {
     const main = standing(from, to);
     if (main === "none") continue; // a new install
     if (main === "other") throw otherLink(from, to);
+    // A side file at the old place that links somewhere else: refused before anything is
+    // checkpointed, set aside or moved, at the point planMove refuses it.
+    const sideOther = SIDE_FILES.find((s) => standing(from + s, to + s) === "other");
+    if (sideOther) throw otherLink(from + sideOther, to + sideOther);
     const aside: string[] = [];
     let itself = false;
     if (main === "file") {

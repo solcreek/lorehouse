@@ -293,6 +293,24 @@ describe("an install laid out before tenants upgrades in place", () => {
     expect(existsSync(join(d, "elsewhere.db"))).toBe(true);
   });
 
+  // A side file at the old place that links somewhere else: refused before anything is
+  // checkpointed, set aside or moved, at the same point and in the words planMove (the
+  // doctor) gives.
+  test("a -wal at the old place that is a symlink elsewhere is refused before anything moves, as planMove says", async () => {
+    const d = await todaysLayout();
+    const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
+    prepareTenant(config.tenant);
+    renameSync(join(d, "lorehouse.db-wal"), join(d, "elsewhere.db-wal"));
+    symlinkSync("elsewhere.db-wal", join(d, "lorehouse.db-wal"));
+    writeFileSync(`${config.db.lorehouse}-journal`, "stale"); // would be set aside by a move
+    const before = { old: readdirSync(d).sort(), now: readdirSync(config.tenant.dir).sort() };
+    const refusal = planMove(config.db.upgrade[0]!).refusal;
+    expect(refusal).toBe(`${join(d, "lorehouse.db-wal")} is a symlink, not to ${config.db.lorehouse}-wal: move the file it points at yourself with the app stopped, or set LOREHOUSE_DB to where it is`);
+    expect(() => upgradeLayout(config.db.upgrade)).toThrow(refusal!);
+    expect({ old: readdirSync(d).sort(), now: readdirSync(config.tenant.dir).sort() }).toEqual(before);
+    expect(lstatSync(join(d, "lorehouse.db")).isFile()).toBe(true);
+  });
+
   test("a start that died part-way (the database moved, its side files not yet) finishes the move", async () => {
     const d = await todaysLayout();
     const config = loadConfig({ ...base, LOREHOUSE_DATA_DIR: d });
