@@ -113,8 +113,10 @@ hostile input:**
 
 1. **guestd's vsock, host to guest only.** sandboxd connects in; the guest has no listener
    on the host. The host side of this channel is the security-relevant parser: response
-   sizes are bounded (vsock responses at 64 MiB, files at 16 MiB), and every answer is
-   treated as layer 1 data.
+   sizes are bounded by the host, which caps every guestd response body at 64 MiB
+   (`vsock.rs`) whatever guestd claims. guestd's own limits (16 MiB per file, 4 MiB per
+   output stream) are layer 1 behaviour: useful defaults, never a bound the host relies
+   on. Every answer is treated as layer 1 data.
 2. **The internet, through the uplink, and nothing else.**
    - Private ranges, the host, other sandboxes, IPv6 and outbound mail (TCP 25, 465, 587,
      2525) are dropped.
