@@ -12,7 +12,7 @@
 // jobs the runner says it never got (they never ran, so a retry is safe).
 
 import type { Database } from "bun:sqlite";
-import { EXEC_TIMEOUT_MS, FileTooLarge, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
+import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
 
 // `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
 // `received` (long poll only): ids from the last poll answer the runner got, so jobs whose
@@ -315,7 +315,18 @@ export class RunnerHub {
       if (r.status < 200 || r.status > 299) throw new Error(`${op}: ${r.status} ${r.error ?? decode(r)}`);
       return JSON.parse(decode(r));
     };
+    // A background job call: every status is guestd's (or the runner's) to explain, so
+    // none is turned into an error here (jobReply does that).
+    const job = async (op: string, method: "POST" | "GET", path: string, body: object | undefined, timeoutMs: number) => {
+      const r = await this.submit(id, { op: "guest", method, path, bodyBase64: body === undefined ? undefined : Buffer.from(JSON.stringify(body)).toString("base64") }, timeoutMs);
+      return jobReply(op, r.status, r.bodyBase64 ? decode(r) : JSON.stringify({ error: r.error ?? "" }));
+    };
     return {
+      jobs: {
+        start: (o) => job("start", "POST", "/jobs", o, JOB_CALL_MS),
+        status: (job_, o = {}) => job("status", "GET", `/jobs/${encodeURIComponent(job_)}?${jobQuery(o)}`, undefined, (o.waitMs ?? 0) + JOB_CALL_MS),
+        cancel: (job_) => job("cancel", "POST", `/jobs/${encodeURIComponent(job_)}/cancel`, undefined, JOB_CANCEL_MS),
+      },
       async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
         // One timeout for both: the guest's limit, and (plus boot slack) this call's deadline.
         const timeoutMs = o.timeoutMs ?? EXEC_TIMEOUT_MS;

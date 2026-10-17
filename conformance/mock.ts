@@ -42,7 +42,10 @@
 // or for a user lookup, the names returned ("[q7] [whois:{"name":…}] …"), or for a
 // skill, its name and the first words of its body ("[q7] [skill:<name>:<words>] …"), or for
 // "[exec] <command>" (a workspace_exec tool_use), the exit code and output
-// ("[q7] [exec:0:<stdout>] …"), for a pull request, what came of it
+// ("[q7] [exec:0:<stdout>] …"), for "[job] <id> <command>" (workspace_job_start, then
+// workspace_job_status with no wait while it runs; "[jobcancel] <id> <command>" cancels it
+// instead) the job as it ended ("[q7] [job:<id>:<state>:<exitCode>:<tail>] …"), for a pull
+// request, what came of it
 // ("[q7] [pr:opened:<url>] …"), for a PDF, the attached file's name and size
 // ("[q7] [pdf:conformance-report.pdf:<bytes>] …"), for any other attached file, its name, size
 // and media type ("[q7] [file:Conformance chart.png:<bytes>:image/png] …"), and for a tool
@@ -243,6 +246,8 @@ function answerFor(messages: Msg[], result: Block): string {
   const attached = (value as { file?: { name?: string; size?: number; mediaType?: string } } | undefined)?.file;
   if (attached?.name && attached.mediaType === "application/pdf") return `${nonce} [pdf:${attached.name}:${attached.size}] ${words.join(" ")}`;
   if (attached?.name) return `${nonce} [file:${attached.name}:${attached.size}:${attached.mediaType}] ${words.join(" ")}`;
+  const job = value as { id?: string; state?: string; exitCode?: number | null; elapsed?: string; tail?: string } | undefined;
+  if (typeof job?.state === "string" && typeof job.elapsed === "string") return `${nonce} [job:${job.id}:${job.state}:${job.exitCode}:${(job.tail ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
   if (value?.id) return `${nonce} [whois:${JSON.stringify({ name: value.name, realName: value.realName })}] ${words.join(" ")}`;
   const exec = value as { exitCode?: number; stdout?: string } | undefined;
   if (typeof exec?.exitCode === "number") return `${nonce} [exec:${exec.exitCode}:${(exec.stdout ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
@@ -289,6 +294,24 @@ function message(id: string, content: unknown[], stopReason: string) {
   return { id, type: "message", role: "assistant", model: "claude-opus-5", content, stop_reason: stopReason, stop_sequence: null, usage: { input_tokens: 100, output_tokens: 50 } };
 }
 
+// One tool_use reply, streamed or not.
+async function toolUse(id: string, name: string, input: unknown, stream: boolean): Promise<Response> {
+  if (!stream) {
+    await sleep(TTFT_MS);
+    return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name, input }], "tool_use"));
+  }
+  const json = JSON.stringify(input);
+  return sse([
+    ["message_start", { type: "message_start", message: { ...message(id, [], null as unknown as string), stop_reason: null } }],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_${modelCalls}`, name, input: {} } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(0, Math.ceil(json.length / 2)) } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(Math.ceil(json.length / 2)) } }],
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    ["message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 20 } }],
+    ["message_stop", { type: "message_stop" }],
+  ], TTFT_MS, () => 0);
+}
+
 async function anthropic(req: Request): Promise<Response> {
   modelCalls++;
   const body = (await req.json()) as { messages: Msg[]; stream?: boolean; tools?: { name: string }[] };
@@ -309,6 +332,8 @@ async function anthropic(req: Request): Promise<Response> {
     const pdf = question.includes("[pdf]");
     const attachPath = /\[attach\] (\S+)/.exec(question)?.[1];
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
+    // "[job] <id> <command>" / "[jobcancel] <id> <command>" → start a background job
+    const jobStart = /\[job(?:cancel)?\] (\S+) (.+)$/.exec(question);
     const prBranch = /\[pr\] (\S+)/.exec(question)?.[1];
     const recent = question.includes("[recent]");
     const threadIn = /\[thread:([A-Z0-9]+)\]/.exec(question)?.[1];
@@ -316,23 +341,18 @@ async function anthropic(req: Request): Promise<Response> {
     const reactionsIn = /\[reactions:([A-Z0-9]+)\]/.exec(question)?.[1];
     const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = pdf ? "render_pdf" : attachPath ? "workspace_attach_file" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = jobStart ? "workspace_job_start" : pdf ? "render_pdf" : attachPath ? "workspace_attach_file" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : attachPath ? { path: attachPath, title: "Conformance chart" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
-    if (!body.stream) {
-      await sleep(TTFT_MS);
-      return Response.json(message(id, [{ type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input }], "tool_use"));
-    }
-    const json = JSON.stringify(input);
-    return sse([
-      ["message_start", { type: "message_start", message: { ...message(id, [], null as unknown as string), stop_reason: null } }],
-      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_${modelCalls}`, name: toolName, input: {} } }],
-      ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(0, Math.ceil(json.length / 2)) } }],
-      ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: json.slice(Math.ceil(json.length / 2)) } }],
-      ["content_block_stop", { type: "content_block_stop", index: 0 }],
-      ["message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 20 } }],
-      ["message_stop", { type: "message_stop" }],
-    ], TTFT_MS, () => 0);
+    const input = jobStart ? { id: jobStart[1], command: jobStart[2] } : pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : attachPath ? { path: attachPath, title: "Conformance chart" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
+    return toolUse(id, toolName, input, !!body.stream);
+  }
+
+  // A background job still running: check on it again, or (for "[jobcancel]") cancel it.
+  const asked = firstUserText(body.messages);
+  const running = resultValue(result.content) as { id?: string; state?: string } | undefined;
+  if (/\[job(cancel)?\] /.test(asked) && running?.state === "running" && running.id) {
+    const cancel = asked.includes("[jobcancel] ");
+    return toolUse(id, cancel ? "workspace_job_cancel" : "workspace_job_status", cancel ? { id: running.id } : { id: running.id, waitSeconds: 0 }, !!body.stream);
   }
 
   const answer = answerFor(body.messages, result);

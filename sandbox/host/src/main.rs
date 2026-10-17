@@ -6,7 +6,10 @@
 //!   POST   /v1/sandboxes/{id}/exec   {command, cwd, env, timeoutMs} → {exitCode, stdout, stderr}
 //!   GET    /v1/sandboxes/{id}/file?path=…                         → bytes (404 if absent)
 //!   PUT    /v1/sandboxes/{id}/file?path=…                         → 204
-//!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone)
+//!   POST   /v1/sandboxes/{id}/jobs   {id, command, cwd, env, timeoutMs} → 201 a background job (200: that id's job, already started)
+//!   GET    /v1/sandboxes/{id}/jobs/{job}?waitMs=…&tailBytes=…       → the job: state, exit code, elapsed, output tail
+//!   POST   /v1/sandboxes/{id}/jobs/{job}/cancel                     → the job, once stopped (its process group killed)
+//!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone, its jobs with it)
 //!   GET    /v1/sandboxes                                          → what exists, running or not
 //!   POST   /v1/sandboxes/{id}/stage  {owner, name, base, branch, token?} → the commits to publish, verified, and a stage id
 //!   POST   /v1/sandboxes/{id}/push   {stage, owner, name, sha, branch, token} → pushed (see publish.rs)
@@ -120,6 +123,42 @@ async fn read_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): 
 
 async fn write_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): RawQuery, body: Bytes) -> Response {
     forward(&app, &id, Method::PUT, file_path(q), body).await
+}
+
+async fn job_start(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> Response {
+    forward(&app, &id, Method::POST, "/jobs".into(), body).await
+}
+
+/// The guestd path for a job route, or why it is refused (a 400). `job` is as Axum decoded it, so
+/// an encoded `%2F` is a `/` by now: it must be a job id before it goes into a path, and the
+/// method is the route's (GET status, POST cancel), never read from the path's text.
+fn job_guest_path(method: &Method, job: &str, query: Option<String>) -> Result<String, &'static str> {
+    if !vm::valid_job_id(job) {
+        return Err(vm::BAD_JOB_ID);
+    }
+    let path = match (method, query) {
+        (&Method::POST, _) => format!("/jobs/{job}/cancel"),
+        (_, Some(q)) => format!("/jobs/{job}?{q}"),
+        (_, None) => format!("/jobs/{job}"),
+    };
+    match vm::job_call(method.as_str(), &path) {
+        Some(m) if m == *method => Ok(path),
+        _ => Err(vm::job_call_refusal(&path)),
+    }
+}
+
+async fn job_status(State(app): State<App>, Path((id, job)): Path<(String, String)>, RawQuery(q): RawQuery) -> Response {
+    match job_guest_path(&Method::GET, &job, q) {
+        Ok(path) => forward(&app, &id, Method::GET, path, Bytes::new()).await,
+        Err(why) => error(400, why),
+    }
+}
+
+async fn job_cancel(State(app): State<App>, Path((id, job)): Path<(String, String)>) -> Response {
+    match job_guest_path(&Method::POST, &job, None) {
+        Ok(path) => forward(&app, &id, Method::POST, path, Bytes::new()).await,
+        Err(why) => error(400, why),
+    }
 }
 
 async fn destroy(State(app): State<App>, Path(id): Path<String>) -> Response {
@@ -299,6 +338,9 @@ async fn main() {
                 .route("/v1/sandboxes/{id}", axum::routing::delete(destroy))
                 .route("/v1/sandboxes/{id}/exec", post(exec))
                 .route("/v1/sandboxes/{id}/file", get(read_file).put(write_file))
+                .route("/v1/sandboxes/{id}/jobs", post(job_start))
+                .route("/v1/sandboxes/{id}/jobs/{job}", get(job_status))
+                .route("/v1/sandboxes/{id}/jobs/{job}/cancel", post(job_cancel))
                 .route("/v1/sandboxes/{id}/stage", post(stage))
                 .route("/v1/sandboxes/{id}/push", post(push))
                 .layer(middleware::from_fn_with_state(app.clone(), auth));
@@ -333,4 +375,56 @@ async fn main() {
     fw.close().await;
     vms.stop_all().await;
     net::teardown_all().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        extract::{Path, RawQuery},
+        http::Method,
+        response::IntoResponse,
+        routing::{get, post},
+        Router,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The serve API's job routes, each answering with the guestd call it would forward
+    /// (forward itself needs a VM), and one raw HTTP request to them: status and body.
+    async fn job_route(method: &str, target: &str) -> (u16, String) {
+        let to_guest = |m: Method| move |Path((_id, job)): Path<(String, String)>, RawQuery(q): RawQuery| async move {
+            match super::job_guest_path(&m, &job, if m == Method::POST { None } else { q }) {
+                Ok(path) => format!("{m} {path}").into_response(),
+                Err(why) => super::error(400, why),
+            }
+        };
+        let app = Router::new()
+            .route("/v1/sandboxes/{id}/jobs/{job}", get(to_guest(Method::GET)))
+            .route("/v1/sandboxes/{id}/jobs/{job}/cancel", post(to_guest(Method::POST)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("{method} {target} HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).await.unwrap();
+        let status = reply[9..12].parse().unwrap();
+        (status, reply.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn a_job_route_forwards_its_own_method_and_refuses_an_encoded_slash() {
+        assert_eq!(job_route("GET", "/v1/sandboxes/s/jobs/bench-1?waitMs=5").await, (200, "GET /jobs/bench-1?waitMs=5".into()));
+        assert_eq!(job_route("POST", "/v1/sandboxes/s/jobs/bench-1/cancel").await, (200, "POST /jobs/bench-1/cancel".into()));
+        // Axum decodes %2F inside {job}: a status must not become a cancel, nor reach another route.
+        for (m, t) in [
+            ("GET", "/v1/sandboxes/s/jobs/bench-1%2Fcancel"),
+            ("GET", "/v1/sandboxes/s/jobs/bench-1%2fcancel"),
+            ("POST", "/v1/sandboxes/s/jobs/bench-1%2Fcancel/cancel"),
+            ("GET", "/v1/sandboxes/s/jobs/..%2F..%2Fexec"),
+        ] {
+            let (status, body) = job_route(m, t).await;
+            assert_eq!(status, 400, "{m} {t}: {body}");
+            assert!(body.contains("bad job id"), "{m} {t}: {body}");
+        }
+    }
 }

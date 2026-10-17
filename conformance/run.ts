@@ -1323,6 +1323,30 @@ const scenarios: Scenario[] = [
     }),
   },
   {
+    // #124: a command longer than one tool call runs as a background job. The scripted
+    // model starts it, checks on it until it ends, then answers with how it ended; with
+    // "[jobcancel]", the asker cancels it instead.
+    name: "sandbox runners: a background job starts, is checked on until it ends, and the asker can cancel one",
+    run: () => inMode(RUNNER_ENV, async () => {
+      const runner = pollRunner(APP, RUNNER_TOKEN, "r-jobs");
+      try {
+        await Bun.sleep(200); // the first poll registers the runner
+        const a = await ask("[job] bench-1 sleep 1; echo done");
+        if (!a.text.includes("[job:bench-1:exited:0:ran:sleep 1; echo done]")) return `answer ${a.text.slice(0, 200)}, want the job as it ended`;
+        const calls = runner.jobs.filter((j) => j.path?.startsWith("/jobs")).map((j) => `${j.method} ${j.path}`);
+        const want = ["POST /jobs", "GET /jobs/bench-1?tailBytes=8192", "GET /jobs/bench-1?tailBytes=8192"];
+        if (JSON.stringify(calls) !== JSON.stringify(want)) return `guest calls ${JSON.stringify(calls)}, want ${JSON.stringify(want)}`;
+        const start = JSON.parse(Buffer.from(runner.jobs.find((j) => j.path === "/jobs")!.bodyBase64 ?? "", "base64").toString()) as { id?: string; cwd?: string; timeoutMs?: number };
+        if (start.id !== "bench-1" || start.cwd !== "/workspace/repo" || start.timeoutMs !== 3_600_000) return `the start asked for ${JSON.stringify({ id: start.id, cwd: start.cwd, timeoutMs: start.timeoutMs })}, want bench-1 in /workspace/repo for an hour`;
+        const c = await ask("[jobcancel] long-1 sleep 600");
+        if (!c.text.includes("[job:long-1:cancelled:143:")) return `cancel: ${c.text.slice(0, 200)}, want the job cancelled by its starter`;
+        return runner.jobs.some((j) => j.path === "/jobs/long-1/cancel") ? null : "no cancel reached the runner";
+      } finally {
+        await runner.stop();
+      }
+    }),
+  },
+  {
     name: "workspace_attach_file over a runner: a PNG made in the sandbox is uploaded into the asker's thread; an SVG is refused, uploading nothing",
     run: () => inMode(RUNNER_ENV, async () => {
       const runner = await wsRunner(APP, RUNNER_TOKEN, "r-attach");

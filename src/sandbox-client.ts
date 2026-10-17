@@ -10,10 +10,11 @@
 //   GET  /v1/sandboxes/{id}/file?path=…                            → bytes (404 if absent,
 //                                                                     413 over 16 MiB)
 //   PUT  /v1/sandboxes/{id}/file?path=…                            → 204
+//   POST /v1/sandboxes/{id}/jobs, GET …/jobs/{job}, POST …/jobs/{job}/cancel → a background job
 //
 // Feasibility numbers (boot, exec, persistence): sandbox/spike/.
 
-import { EXEC_TIMEOUT_MS, FileTooLarge, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "./tools/workspace";
+import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type SandboxJob, type Staged } from "./tools/workspace";
 
 export type RemoteSandboxOptions = {
   url: string; // daemon base URL, e.g. https://sandbox.example.com
@@ -34,7 +35,23 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
     return res;
   }
 
+  // A background job call; every status is guestd's (or the daemon's) to explain (jobReply).
+  async function job(op: string, method: "POST" | "GET", path: string, body: object | undefined, timeoutMs: number): Promise<SandboxJob> {
+    const res = await f(`${base}${path}`, {
+      method,
+      headers: { ...auth, ...(body ? { "content-type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return jobReply(op, res.status, await res.text());
+  }
+
   return {
+    jobs: {
+      start: (o) => job("start", "POST", "/jobs", o, JOB_CALL_MS),
+      status: (j, o = {}) => job("status", "GET", `/jobs/${encodeURIComponent(j)}?${jobQuery(o)}`, undefined, (o.waitMs ?? 0) + JOB_CALL_MS),
+      cancel: (j) => job("cancel", "POST", `/jobs/${encodeURIComponent(j)}/cancel`, undefined, JOB_CANCEL_MS),
+    },
     async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
       const res = await call("/exec", {
         method: "POST",

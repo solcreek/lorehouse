@@ -103,13 +103,16 @@ impl JobResult {
     }
 }
 
-/// Only these guest calls are run, whatever a job asks for.
+/// Only these guest calls are run, whatever a job asks for: exec, file read and write, and
+/// a background job's start, status and cancel.
 fn allowed(method: &str, path: &str) -> Option<Method> {
     let (route, _) = path.split_once('?').unwrap_or((path, ""));
     match (method, route) {
         ("POST", "/exec") => Some(Method::POST),
         ("GET", "/file") if path.starts_with("/file?") => Some(Method::GET),
         ("PUT", "/file") if path.starts_with("/file?") => Some(Method::PUT),
+        // Background jobs: start, status, cancel (vm::job_call says which paths).
+        (_, r) if r == "/jobs" || r.starts_with("/jobs/") => vm::job_call(method, path),
         _ => None,
     }
 }
@@ -647,7 +650,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn only_the_three_guest_calls_are_allowed() {
+    fn only_the_listed_guest_calls_are_allowed() {
         assert!(allowed("POST", "/exec").is_some());
         assert!(allowed("GET", "/file?path=%2Fw%2Fa").is_some());
         assert!(allowed("PUT", "/file?path=%2Fw%2Fa").is_some());
@@ -656,6 +659,11 @@ mod tests {
         assert!(allowed("GET", "/file").is_none()); // no path given
         assert!(allowed("GET", "/healthz").is_none());
         assert!(allowed("POST", "/exec/../admin").is_none());
+        assert!(allowed("POST", "/jobs").is_some());
+        assert!(allowed("GET", "/jobs/bench?waitMs=60000&tailBytes=8192").is_some());
+        assert!(allowed("POST", "/jobs/bench/cancel").is_some());
+        assert!(allowed("GET", "/jobs").is_none());
+        assert!(allowed("GET", "/jobs/../exec").is_none());
     }
 
     fn done(id: &str) -> JobResult {
@@ -803,6 +811,7 @@ mod tests {
             uplink: "lo".into(),
             max_vms: 1,
             idle: Duration::from_secs(60),
+            job_hold: Duration::from_secs(6 * 3600),
             vcpus: 1,
             mem_mib: 128,
             github_url: format!("file://{}", dir.display()),

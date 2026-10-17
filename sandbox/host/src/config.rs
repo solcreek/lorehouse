@@ -32,6 +32,9 @@ pub struct Config {
     pub uplink: String,
     pub max_vms: usize,
     pub idle: Duration,
+    /// How long after its last request a VM with a running background job is kept from
+    /// its idle stop (guestd says how many run; vm.rs `reap`). 0: a job doesn't hold it.
+    pub job_hold: Duration,
     pub vcpus: u32,
     pub mem_mib: u32,
     /// Where repos are published to and mirrored from: https://github.com. Another base (a
@@ -98,6 +101,10 @@ pub const DEFAULT_JAIL_UID_BASE: u64 = 1_900_000_000;
 /// Seconds between checks of the nftables table: how long a flushed table can leave
 /// running guests unfiltered. A check is one `nft list table`.
 pub const DEFAULT_NET_CHECK_SECS: u64 = 10;
+
+/// A running job holds its VM up for this long after the last request: the longest a job
+/// may run (guestd's limit, 6 h), so a job whose caller stopped polling still finishes.
+pub const DEFAULT_JOB_HOLD_SECS: u64 = 6 * 3600;
 
 /// Where sandboxes live unless SANDBOXD_STATE says otherwise; sandboxd.service's
 /// StateDirectory= creates this directory and makes it writable.
@@ -222,6 +229,7 @@ impl Config {
             }
         };
         let (max_vms, idle, vcpus, mem) = (num("SANDBOXD_MAX_VMS", 4), num("SANDBOXD_IDLE_SECS", 900), num("SANDBOXD_VCPUS", 2), num("SANDBOXD_MEM_MIB", 2048));
+        let job_hold = num("SANDBOXD_JOB_HOLD_SECS", DEFAULT_JOB_HOLD_SECS);
         // The mirrors' quotas and retention: issue #76's measured proposal by default.
         let d = Policy::default();
         let mirror_max = num("SANDBOXD_MIRROR_MAX_GIB", d.mirror_max / GIB);
@@ -278,6 +286,9 @@ impl Config {
                 problems.push(format!("{key} must be 0 (unlimited)..=100000"));
             }
         }
+        if job_hold > 7 * 86_400 {
+            problems.push("SANDBOXD_JOB_HOLD_SECS must be 0 (jobs don't hold a VM)..=604800 (a week)".into());
+        }
         if !(1..=3600).contains(&net_check) {
             problems.push("SANDBOXD_NET_CHECK_SECS must be 1..=3600".into());
         }
@@ -312,6 +323,7 @@ impl Config {
             uplink,
             max_vms: max_vms as usize,
             idle: Duration::from_secs(idle),
+            job_hold: Duration::from_secs(job_hold),
             vcpus: vcpus as u32,
             mem_mib: mem as u32,
             github_url: var("SANDBOXD_GITHUB_URL").unwrap_or_else(|| "https://github.com".into()),
@@ -450,6 +462,16 @@ mod tests {
             assert!(Config::from_env().unwrap_err().contains("SANDBOXD_NET_CHECK_SECS"), "{v}");
         }
         std::env::remove_var("SANDBOXD_NET_CHECK_SECS");
+
+        // A running job holds its VM up for 6 h after the last request by default; 0: never.
+        assert_eq!(Config::from_env().unwrap().job_hold, std::time::Duration::from_secs(6 * 3600));
+        std::env::set_var("SANDBOXD_JOB_HOLD_SECS", "0");
+        assert!(Config::from_env().unwrap().job_hold.is_zero());
+        for v in ["604801", "x"] {
+            std::env::set_var("SANDBOXD_JOB_HOLD_SECS", v);
+            assert!(Config::from_env().unwrap_err().contains("SANDBOXD_JOB_HOLD_SECS"), "{v}");
+        }
+        std::env::remove_var("SANDBOXD_JOB_HOLD_SECS");
 
         // Rates and the disk quota: on by default, 0 turns each off, a set quota is explicit.
         use super::{DiskQuota, Limits};

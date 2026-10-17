@@ -45,6 +45,69 @@ export interface Sandbox {
   // Both throw with the host's reason (no commits, the base isn't on GitHub, refused…).
   stage(o: { repo: RepoRef; base: string; branch: string; token?: string }): Promise<Staged>;
   push(o: { stage: string; repo: RepoRef; sha: string; branch: string; token: string }): Promise<{ sha: string; branch: string }>;
+  // Background jobs (sandbox/guest/jobs.go), for a command longer than one tool call.
+  // Absent on a backend that has none (test fakes).
+  jobs?: SandboxJobs;
+}
+
+// A background job as guestd reports it. `exitCode` is set once it has ended (null while
+// running, and for a lost one). `lost`: the VM stopped while it ran. `created`, on a
+// start only: false when that id had already been started (the same job, not a copy).
+export type JobState = "running" | "exited" | "cancelled" | "timed_out" | "lost";
+export type SandboxJob = {
+  id: string; command: string; cwd: string; state: JobState; exitCode: number | null;
+  startedAt: string; endedAt: string | null; elapsedMs: number; timeoutMs: number;
+  outputBytes: number; tail: string; tailTruncated: boolean; reason?: string; created?: boolean;
+  // Set while guestd couldn't write the job's end to disk (it is kept in memory meanwhile).
+  persistError?: string;
+};
+export type JobStart = { id: string; command: string; cwd: string; env?: Record<string, string>; timeoutMs?: number };
+
+export interface SandboxJobs {
+  // Starting an id that was started before returns that job (`created: false`).
+  start(o: JobStart): Promise<SandboxJob>;
+  // waitMs: return once the job ends, or after this long (≤ 5 min), whichever is first.
+  status(id: string, o?: { waitMs?: number; tailBytes?: number }): Promise<SandboxJob>;
+  cancel(id: string): Promise<SandboxJob>;
+}
+
+// A job call's deadline at the host: its own wait, plus room for a boot and the answer.
+export const JOB_CALL_MS = 30_000;
+// A cancel waits up to 12 s in the guest for the process group to go.
+export const JOB_CANCEL_MS = 45_000;
+
+// A job status's query: only what guestd takes (sandboxd refuses anything else).
+export function jobQuery(o: { waitMs?: number; tailBytes?: number }): string {
+  const q = new URLSearchParams();
+  if (o.waitMs) q.set("waitMs", String(Math.max(0, Math.round(o.waitMs))));
+  q.set("tailBytes", String(Math.max(0, Math.round(o.tailBytes ?? 8192))));
+  return q.toString();
+}
+
+// A job call that got an answer other than the job: `status` is the host's or guestd's. A
+// 4xx means the call was refused before anything ran; a start that throws anything else
+// (a timeout, a 5xx, a dropped runner) may have started the job.
+export class JobCallError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+// A guestd job answer (both backends): the job, or a JobCallError with guestd's reason,
+// which says what to do. A 404 that isn't guestd's JSON, or a runner refusing the path, is
+// a host that predates jobs.
+export function jobReply(op: string, status: number, body: string): SandboxJob {
+  let parsed: { state?: unknown; error?: unknown } | undefined;
+  try {
+    parsed = JSON.parse(body);
+  } catch {}
+  if (status >= 200 && status < 300 && typeof parsed?.state === "string") return parsed as SandboxJob;
+  if (typeof parsed?.error === "string") {
+    if (parsed.error.startsWith("guest call not allowed")) throw new JobCallError(`job ${op}: this sandbox runner's sandboxd predates background jobs and refuses them; it needs updating (sandbox/host) before jobs can run there. Use workspace_exec for commands under 10 minutes meanwhile`, status);
+    throw new JobCallError(`job ${op}: ${parsed.error}`, status);
+  }
+  if (status === 404) throw new JobCallError(`job ${op}: this sandbox's guest agent predates background jobs (no /jobs); its golden image needs rebuilding with the current guestd (sandbox/host/prepare-golden.sh). Use workspace_exec for commands under 10 minutes meanwhile`, status);
+  throw new JobCallError(`job ${op}: ${status} ${body.slice(0, 300)}`, status);
 }
 
 // A file guestd won't read: over its limit (sandbox/guest/main.go, 16 MiB). `detail` is

@@ -184,6 +184,61 @@ async fn exited_or_killed(vmm: &mut Vmm, grace: Duration) -> bool {
     vmm.wait(grace).await
 }
 
+/// Whether an idle VM with `jobs` running is kept up: while its last request is under
+/// `hold` ago.
+fn held_by_jobs(jobs: u64, idle_secs: u64, hold: Duration) -> bool {
+    jobs > 0 && idle_secs < hold.as_secs()
+}
+
+/// A background job's id, as guestd takes it: 1–64 of [A-Za-z0-9_.-], starting with a
+/// letter or digit (so never `.` or `..` as a path segment).
+pub fn valid_job_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.as_bytes()[0].is_ascii_alphanumeric() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
+/// A job's guestd path from its parts, or None if any part isn't one guestd takes: `GET
+/// /jobs/{job}` with only `waitMs` and `tailBytes` (digits) in its query, `POST
+/// /jobs/{job}/cancel` with none, `POST /jobs` with none. The runner's allow list and the
+/// serve API both go through this.
+pub fn job_call(method: &str, path: &str) -> Option<Method> {
+    let (route, query) = match path.split_once('?') {
+        Some((r, q)) => (r, Some(q)),
+        None => (path, None),
+    };
+    let numeric_params = |q: Option<&str>| {
+        q.is_none_or(|q| {
+            q.split('&').all(|kv| match kv.split_once('=') {
+                Some(("waitMs" | "tailBytes", v)) => !v.is_empty() && v.len() <= 9 && v.bytes().all(|b| b.is_ascii_digit()),
+                _ => false,
+            })
+        })
+    };
+    match (method, route) {
+        ("POST", "/jobs") if query.is_none() => Some(Method::POST),
+        (_, r) => {
+            let rest = r.strip_prefix("/jobs/")?;
+            match (method, rest.split_once('/')) {
+                ("GET", None) if valid_job_id(rest) && numeric_params(query) => Some(Method::GET),
+                ("POST", Some((job, "cancel"))) if valid_job_id(job) && query.is_none() => Some(Method::POST),
+                _ => None,
+            }
+        }
+    }
+}
+
+pub const BAD_JOB_ID: &str = "bad job id: use 1–64 of [A-Za-z0-9_.-], starting with a letter or digit";
+
+/// Why job_call refused a call, as a sentence the caller can act on: the job id, or the query.
+pub fn job_call_refusal(path: &str) -> &'static str {
+    let route = path.split_once('?').map_or(path, |(r, _)| r);
+    let job = route.strip_prefix("/jobs/").map(|r| r.split_once('/').map_or(r, |(j, _)| j));
+    match job {
+        Some(j) if !valid_job_id(j) => BAD_JOB_ID,
+        Some(_) if path.contains('?') && !route.ends_with("/cancel") => "bad status query: it takes only waitMs and tailBytes, each in digits",
+        _ => "not a job call: POST /jobs, GET /jobs/<id>?waitMs=&tailBytes=, or POST /jobs/<id>/cancel (with no query)",
+    }
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') && !id.starts_with('.')
 }
@@ -438,7 +493,11 @@ impl Manager {
         removed
     }
 
-    /// Stop every running VM that has been idle longer than the configured idle time.
+    /// Stop every running VM that has been idle longer than the configured idle time. A
+    /// running background job counts as activity (guestd says how many run), for up to
+    /// SANDBOXD_JOB_HOLD_SECS after the VM's last request: past that a job is taken to be
+    /// abandoned, or a guest to be claiming one to keep its slot, and the VM is stopped
+    /// with its jobs (their status reads "lost" from then on).
     pub async fn reap(&self) {
         let list: Vec<Arc<Sandbox>> = self.sandboxes.lock().await.values().cloned().collect();
         let now = now_secs();
@@ -447,9 +506,20 @@ impl Manager {
             // request that arrives after this point waits, then boots the VM again.
             let mut running = sb.running.lock().await;
             let idle = now.saturating_sub(sb.last_used.load(Ordering::SeqCst));
-            if running.is_some() && sb.in_flight.load(Ordering::SeqCst) == 0 && idle >= self.cfg.idle.as_secs() {
-                let _ = self.stop_locked(&sb, &mut running).await;
+            let Some(slot) = running.as_ref().map(|r| r.slot) else { continue };
+            if sb.in_flight.load(Ordering::SeqCst) > 0 || idle < self.cfg.idle.as_secs() {
+                continue;
             }
+            // Asked only of a VM about to be stopped, and bounded: a guest that doesn't
+            // answer is stopped as before.
+            let jobs = if self.cfg.job_hold.is_zero() { 0 } else { vsock::running_jobs(&self.jail(&sb, slot).uds()).await.unwrap_or(0) };
+            if held_by_jobs(jobs, idle, self.cfg.job_hold) {
+                continue;
+            }
+            if jobs > 0 {
+                eprintln!("sandboxd: {}: stopping with {jobs} running job(s): no request for {idle} s, past SANDBOXD_JOB_HOLD_SECS ({} s)", sb.id, self.cfg.job_hold.as_secs());
+            }
+            let _ = self.stop_locked(&sb, &mut running).await;
         }
     }
 
@@ -629,6 +699,7 @@ mod tests {
             uplink: "lo".into(),
             max_vms: 2,
             idle: Duration::from_secs(60),
+            job_hold: Duration::from_secs(6 * 3600),
             vcpus: 2,
             mem_mib: 2048,
             github_url: "https://github.com".into(),
@@ -637,6 +708,52 @@ mod tests {
             limits: crate::config::Limits::default(),
             net_check: Duration::from_secs(10),
         }
+    }
+
+    #[test]
+    fn only_the_job_calls_guestd_serves_pass() {
+        use super::job_call;
+        assert!(job_call("POST", "/jobs").is_some());
+        assert!(job_call("GET", "/jobs/bench-1").is_some());
+        assert!(job_call("GET", "/jobs/bench-1?waitMs=60000&tailBytes=8192").is_some());
+        assert!(job_call("POST", "/jobs/bench-1/cancel").is_some());
+        for (m, p) in [
+            ("GET", "/jobs"), // the list is for sandboxd's own idle check
+            ("POST", "/jobs?x=1"),
+            ("DELETE", "/jobs/a"),
+            ("GET", "/jobs/../exec"),
+            ("GET", "/jobs/.hidden"),
+            ("GET", "/jobs/a/b"),
+            ("GET", "/jobs/a?waitMs=-1"),
+            ("GET", "/jobs/a?waitMs=1&path=/etc/passwd"),
+            ("GET", "/jobs/a?waitMs=9999999999"),
+            ("POST", "/jobs/a/cancel?now=1"),
+            ("POST", "/jobs/a/kill"),
+            ("GET", &format!("/jobs/{}", "a".repeat(65))),
+        ] {
+            assert!(job_call(m, p).is_none(), "{m} {p}");
+        }
+    }
+
+    #[test]
+    fn a_refused_job_call_says_whether_the_id_or_the_query_was_wrong() {
+        use super::job_call_refusal;
+        assert!(job_call_refusal("/jobs/.hidden").starts_with("bad job id"));
+        assert!(job_call_refusal(&format!("/jobs/{}?waitMs=1", "a".repeat(65))).starts_with("bad job id"));
+        assert!(job_call_refusal("/jobs/bench-1?tailBytes=abc").starts_with("bad status query"));
+        assert!(job_call_refusal("/jobs/bench-1?waitMs=1&path=/etc/passwd").starts_with("bad status query"));
+        assert!(job_call_refusal("/jobs/bench-1/cancel?now=1").starts_with("not a job call"));
+        assert!(job_call_refusal("/jobs/bench-1/kill").starts_with("not a job call"));
+    }
+
+    #[test]
+    fn a_running_job_holds_an_idle_vm_up_until_the_hold_runs_out() {
+        use super::held_by_jobs;
+        let hold = Duration::from_secs(6 * 3600);
+        assert!(held_by_jobs(1, 900, hold), "a job running, the VM idle past SANDBOXD_IDLE_SECS: kept");
+        assert!(!held_by_jobs(0, 900, hold), "no job: stopped as before");
+        assert!(!held_by_jobs(3, 6 * 3600, hold), "no request for the whole hold: stopped, jobs and all");
+        assert!(!held_by_jobs(1, 900, Duration::ZERO), "SANDBOXD_JOB_HOLD_SECS=0: jobs don't hold a VM");
     }
 
     #[test]
