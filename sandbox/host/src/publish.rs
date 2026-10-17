@@ -1274,6 +1274,14 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         assert!(listener.accept().is_err(), "the run reached the host's loopback: {out}");
         assert!(rest.contains("unreachable") || rest.contains("Couldn't connect") || rest.contains("Failed to connect"), "{out}");
+        // No IPC object outlives its run: a SysV segment one run makes isn't there for the
+        // next (cgroup.kill doesn't remove one; an IPC namespace of its own does).
+        if std::process::Command::new("ipcmk").arg("--help").output().is_ok() {
+            let made = s.publisher.git.run(&s.dir(), &["-c", "alias.mk=!ipcmk -M 4096", "mk"], GIT_LOCAL).await.unwrap();
+            let id = made.split_whitespace().last().unwrap().to_string();
+            let removed = s.publisher.git.run(&s.dir(), &["-c", &format!("alias.drop=!ipcrm -m {id} && echo removed-by-a-later-run"), "drop"], GIT_LOCAL).await.unwrap_or_else(|e| e);
+            assert!(!removed.contains("removed-by-a-later-run"), "segment {id}, made by one run, was there for the next: {removed}");
+        }
         // A run that talks to an HTTP remote reaches only sandboxd's proxy, which forwards
         // to the remote with the token; the run itself never sees the token.
         let (url, seen, _server) = smart_http(s.root.clone()).await;

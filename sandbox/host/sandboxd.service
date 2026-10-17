@@ -75,10 +75,10 @@ DeviceAllow=/dev/urandom m
 # AF_NETLINK: ip and nft.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # The jailer's mount namespace; and publishing's git, which reads what a VM hands over,
-# runs in a mount and a network namespace of its own (src/gitjail.rs): it sees only its
-# mirror and /usr, and has no network but a listener sandboxd serves. No user, pid, ipc,
-# uts or cgroup namespaces.
-RestrictNamespaces=mnt net
+# runs in a mount, a network and an IPC namespace of its own (src/gitjail.rs): it sees
+# only its mirror and /usr, has no network but a listener sandboxd serves, and no IPC
+# object of another run's or sandboxd's. No user, pid, uts or cgroup namespaces.
+RestrictNamespaces=mnt net ipc
 # net.ipv4.ip_forward comes from sandboxd.sysctl.conf at boot (sandboxd checks it is on
 # and refuses to start otherwise), and nft's modules from sandboxd.modules.conf.
 ProtectKernelTunables=yes

@@ -20,6 +20,8 @@
 //! - **Its own cgroup** (`<sandboxd.service>/git/u<uid>`, beside `vms/`), killed whole once
 //!   the run is over however it ended, so a process that left git's process group (setsid)
 //!   doesn't outlive it.
+//! - **Its own IPC namespace**, so no SysV or POSIX IPC object a run makes outlives it
+//!   (cgroup.kill doesn't remove one) for a later run of the same uid to attach to.
 //! - **No capabilities and `no_new_privs`** (jail::drop_capabilities), and no core dumps.
 //!
 //! None of this can be turned off: sandboxd doesn't start when it can't be set up (a probe
@@ -592,7 +594,9 @@ impl Plan {
             let umask = libc::umask(0o022);
             let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
             ok(libc::setrlimit(libc::RLIMIT_CORE, &none) as _, 2)?;
-            let flags = libc::CLONE_NEWNS | if self.netns.is_none() { libc::CLONE_NEWNET } else { 0 };
+            // Its own IPC namespace too: a SysV or POSIX IPC object outlives cgroup.kill, and a
+            // later run with the same leased uid could attach to it.
+            let flags = libc::CLONE_NEWNS | libc::CLONE_NEWIPC | if self.netns.is_none() { libc::CLONE_NEWNET } else { 0 };
             ok(libc::unshare(flags) as _, 3)?;
             if let Some(fd) = self.netns {
                 ok(libc::setns(fd, libc::CLONE_NEWNET) as _, 4)?;
