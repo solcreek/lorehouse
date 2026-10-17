@@ -439,6 +439,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// creating its mirror in it, under its own lock.
 fn remove_mirror(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
+    // Its upkeep state goes with it: a new mirror of the repo starts afresh.
+    let _ = std::fs::remove_file(upkeep::state_path(dir));
 }
 
 /// Whether a mirror has never been fetched into: not there, or no refs (a first fetch that
@@ -991,7 +993,15 @@ async fn bundle_from(vms: &Manager, sandbox: &str, to: &Path) -> Result<(), Fail
     // Bounded like every other guest call: the guest is untrusted, and an answer it never
     // sends would otherwise hold this stage, and the repo's lock, for good.
     let _ = tokio::time::timeout(Duration::from_secs(35), vsock::request(&uds, Method::POST, "/exec", Bytes::from(cleanup))).await;
-    tokio::fs::write(to, out).await.map_err(|e| (500, format!("bundle file: {e}")))
+    // A new file, never one already there: a link planted at this name in the mirror, which
+    // git writes, must not be followed.
+    let write = async {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new().write(true).create_new(true).open(to).await?;
+        f.write_all(&out).await?;
+        f.flush().await
+    };
+    write.await.map_err(|e| (500, format!("bundle file: {e}")))
 }
 
 #[cfg(test)]
@@ -1943,7 +1953,7 @@ mod tests {
     }
 
     fn upkeep_state(dir: &Path) -> upkeep::MirrorState {
-        serde_json::from_slice(&std::fs::read(dir.join("sandboxd.json")).unwrap()).unwrap()
+        upkeep::read_state(dir).expect("the mirror's upkeep state")
     }
 
     #[tokio::test]

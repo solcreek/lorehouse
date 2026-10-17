@@ -31,7 +31,11 @@
 //!   (every 5 minutes). The quotas are enforced against it at admission and again after
 //!   each fetch, so a lag of one pass can't let a mirror grow without bound.
 //!
-//! What a mirror was last used for is kept in it, in `sandboxd.json` (git ignores the file).
+//! What a mirror was last used for is kept beside the mirrors, in
+//! `<mirrors>/.upkeep/<owner>/<name>.json`, not in the mirror, which git writes: whatever
+//! a git that a VM's objects compromised can write must neither set its mirror's own
+//! retention nor plant a link sandboxd would write through. (It was the mirror's
+//! `sandboxd.json` before: that file is removed when the mirror's state is next written.)
 
 use super::{expired, git, remove_mirror, Failure, Publisher, StageRecord};
 use serde::{Deserialize, Serialize};
@@ -44,8 +48,8 @@ pub const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 /// Eviction stops once the mirrors use this share of mirrors_max (in percent).
 const EVICT_TO_PCT: u64 = 80;
-/// Where a mirror keeps what its upkeep needs.
-const STATE: &str = "sandboxd.json";
+/// Where a mirror's upkeep state was kept before, in the mirror itself.
+const OLD_STATE: &str = "sandboxd.json";
 /// After a gc fails (or runs out of time), how long until the next try on that mirror.
 const GC_RETRY: u64 = 3600;
 
@@ -168,18 +172,34 @@ pub(super) struct MirrorState {
     pub(super) heavy: Vec<String>,
 }
 
-fn read_state(dir: &Path) -> Option<MirrorState> {
-    serde_json::from_slice(&std::fs::read(dir.join(STATE)).ok()?).ok()
+/// Where the upkeep state of the mirror in `dir` (`<mirrors>/<owner>/<name>.git`) is:
+/// `<mirrors>/.upkeep/<owner>/<name>.json`, out of the mirror's reach.
+pub(super) fn state_path(dir: &Path) -> PathBuf {
+    let name = dir.file_name().map(|n| n.to_string_lossy().trim_end_matches(".git").to_string()).unwrap_or_default();
+    let owner = dir.parent();
+    let mirrors = owner.and_then(Path::parent).unwrap_or(Path::new("."));
+    mirrors.join(".upkeep").join(owner.and_then(Path::file_name).unwrap_or_default()).join(format!("{name}.json"))
+}
+
+pub(super) fn read_state(dir: &Path) -> Option<MirrorState> {
+    serde_json::from_slice(&std::fs::read(state_path(dir)).ok()?).ok()
 }
 
 /// Written whole (a temporary file renamed into place). Not synced: losing it to a crash
 /// costs a gc or a few days' retention, nothing else.
 fn write_state(dir: &Path, state: &MirrorState) {
-    let tmp = dir.join(format!(".{STATE}.tmp"));
-    let written = serde_json::to_vec(state).map_err(std::io::Error::other).and_then(|json| std::fs::write(&tmp, json)).and_then(|()| std::fs::rename(&tmp, dir.join(STATE)));
+    let path = state_path(dir);
+    let Some(parent) = path.parent() else { return };
+    let tmp = parent.join(format!(".{}.tmp", path.file_name().unwrap_or_default().to_string_lossy()));
+    let written = std::fs::create_dir_all(parent)
+        .and_then(|()| serde_json::to_vec(state).map_err(std::io::Error::other))
+        .and_then(|json| std::fs::write(&tmp, json))
+        .and_then(|()| std::fs::rename(&tmp, &path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+    // Where it was kept before: unlinked, never followed.
+    let _ = std::fs::remove_file(dir.join(OLD_STATE));
 }
 
 /// `owner/name` of a mirror's directory (`<mirrors>/<owner>/<name>.git`).
