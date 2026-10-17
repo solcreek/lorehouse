@@ -19,6 +19,12 @@ settings.json.*.tmp
 # by default: its databases are ignored above, and this is the rest of it.
 tenant.json
 tenant.json.*.tmp
+# What an interrupted or careful upgrade can leave (src/tenant.ts): a set-aside side file,
+# which holds the database's pages and so its messages, and the temporary rollback link.
+*.db-wal.stale-*
+*.db-shm.stale-*
+*.db-journal.stale-*
+*.tenant-link
 !/.claude/settings.json
 *.pem
 
