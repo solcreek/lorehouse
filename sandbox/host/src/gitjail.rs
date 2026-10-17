@@ -171,7 +171,7 @@ impl GitJail {
         let uid = lease.as_ref().map(|l| l.uid);
         let mut confined = Confined { lease, cgroup: None, net: None };
         if let Some(uid) = uid {
-            own(dir, uid).map_err(|e| format!("giving the mirror to its run's uid: {e}"))?;
+            own(dir, uid, uid).map_err(|e| format!("giving the mirror to its run's uid: {e}"))?;
         }
         if let Some(parent) = &self.cgroups {
             let cgroup = parent.join(format!("u{}", uid.unwrap_or(0)));
@@ -334,20 +334,20 @@ impl Drop for Confined {
     }
 }
 
-/// Make `dir` and everything in it owned by `uid` (user and group), without following a
-/// link. Run before every run, while nothing of a run is alive: the files are the previous
-/// run's (another uid), or sandboxd's own (a bundle, a new mirror).
-fn own(dir: &Path, uid: u32) -> std::io::Result<()> {
+/// Make `dir` and everything in it owned by `uid` and `gid` (a run's are the same id),
+/// without following a link. Run before every run, while nothing of a run is alive: the
+/// files are the previous run's (another uid), or sandboxd's own (a bundle, a new mirror).
+fn own(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    fn walk(dir: &Path, uid: u32) -> std::io::Result<()> {
+    fn walk(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let meta = entry.metadata()?; // doesn't follow a link
-            if meta.uid() != uid || meta.gid() != uid {
-                std::os::unix::fs::lchown(entry.path(), Some(uid), Some(uid))?;
+            if meta.uid() != uid || meta.gid() != gid {
+                std::os::unix::fs::lchown(entry.path(), Some(uid), Some(gid))?;
             }
             if meta.is_dir() {
-                walk(&entry.path(), uid)?;
+                walk(&entry.path(), uid, gid)?;
             }
         }
         Ok(())
@@ -356,10 +356,10 @@ fn own(dir: &Path, uid: u32) -> std::io::Result<()> {
     if !meta.is_dir() {
         return Err(std::io::Error::other(format!("{} isn't a directory", dir.display())));
     }
-    if meta.uid() != uid || meta.gid() != uid {
-        std::os::unix::fs::lchown(dir, Some(uid), Some(uid))?;
+    if meta.uid() != uid || meta.gid() != gid {
+        std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
     }
-    walk(dir, uid)
+    walk(dir, uid, gid)
 }
 
 fn cstr(p: &Path) -> Result<CString, String> {
@@ -661,23 +661,28 @@ mod tests {
     #[test]
     fn a_mirror_is_given_to_the_runs_uid_without_following_links() {
         use std::os::unix::fs::MetadataExt;
-        let me = unsafe { libc::geteuid() };
+        let (me, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         let dir = std::env::temp_dir().join(format!("gitjail-own-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("objects/ab")).unwrap();
         std::fs::write(dir.join("objects/ab/cd"), b"x").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", dir.join("planted")).unwrap();
         // As the owner already: nothing to change, and the link's target is never touched.
-        own(&dir, me).unwrap();
+        own(&dir, me, gid).unwrap();
         assert_eq!(std::fs::symlink_metadata(dir.join("objects/ab/cd")).unwrap().uid(), me);
         // A file isn't a mirror.
-        assert!(own(&dir.join("objects/ab/cd"), me).is_err());
+        assert!(own(&dir.join("objects/ab/cd"), me, gid).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn a_run_sees_usr_and_its_mirror_and_nothing_else_of_the_host() {
+        // A build sandbox (Nix's) may have no /usr: then there is no plan to look at.
+        if !Path::new("/usr/bin").is_dir() {
+            eprintln!("skipped: no /usr here");
+            return;
+        }
         let tmp = std::env::temp_dir().join(format!("gitjail-plan-{}", std::process::id()));
         let jail = GitJail::unprivileged(&tmp).unwrap();
         let plan = jail.plan(Path::new("/var/lib/x/.mirrors/acme/w.git"), Some(1_900_100_000), Some(Path::new("/sys/fs/cgroup/s/git/u1")), None, None).unwrap();
