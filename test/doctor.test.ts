@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHmac, generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
 import { countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
@@ -445,11 +445,71 @@ describe("storage", () => {
   });
 });
 
+// The tenant and the data directory (tenant.ts), and what the next start moves: reported,
+// never done (the doctor only reads).
+describe("the tenant", () => {
+  const unset = { LOREHOUSE_DB: undefined, SESSIONS_DB: undefined };
+  test("none yet: the first start makes one; the databases are checked in the data directory", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir });
+      expect(find(checks, "tenant")[0]).toMatchObject({ level: "info", detail: `none yet: the first start makes one and keeps it in ${dir}/<id>/tenant.json` });
+      expect(find(checks, "data directory")[0]?.detail).toBe(`${dir}: settings.json, and the tenant's files in <id>/`);
+      expect(find(checks, "LOREHOUSE_DB")[0]?.level).toBe("ok");
+      expect(readdirSync(dir)).toEqual([]); // nothing made
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  test("an install laid out before tenants: the next start's move is named, and nothing moves", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      const db = openKnowledge(`${dir}/lorehouse.db`);
+      upsertDocument(db, { docId: "slack:C9:1.1", kind: "slack_thread", source: "https://x/p1", title: "#c9", text: "gone soon" });
+      db.close();
+      writeFileSync(`${dir}/sessions.db`, "");
+      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
+      expect(find(checks, "tenant")[0]?.detail).toBe("acme (TENANT_ID)");
+      expect(find(checks, "upgrade")[0]).toMatchObject({ level: "info", detail: `the next start moves lorehouse.db and sessions.db (with their -wal and -shm) from ${dir} into ${dir}/acme` });
+      expect(find(checks, "LOREHOUSE_DB")[0]?.detail).toBe(`${dir}/lorehouse.db (moves to ${dir}/acme/lorehouse.db on the next start)`);
+      // What a start would purge is read from where the database is now.
+      expect(find(checks, "purge on start")[0]?.detail).toContain("C9 (1 document)");
+      expect(readdirSync(dir).filter((f) => !/-(wal|shm)$/.test(f)).sort()).toEqual(["lorehouse.db", "sessions.db"]);
+      // Both places holding one: the start would refuse, and so does the doctor.
+      mkdirSync(`${dir}/acme`);
+      writeFileSync(`${dir}/acme/lorehouse.db`, "");
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" }), "upgrade")[0]).toMatchObject({ level: "fail", detail: expect.stringContaining(`both ${dir}/lorehouse.db and ${dir}/acme/lorehouse.db exist`) });
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  test("another tenant's directory beside this one's warns", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/doctor-tenant-`);
+    try {
+      mkdirSync(`${dir}/globex`);
+      writeFileSync(`${dir}/globex/tenant.json`, JSON.stringify({ id: "globex" }));
+      const checks = await run({ ...unset, LOREHOUSE_DATA_DIR: dir, TENANT_ID: "acme" });
+      expect(find(checks, "other tenants")[0]).toMatchObject({ level: "warn", detail: expect.stringContaining(`${dir} also holds globex`) });
+      expect(find(await run({ ...unset, LOREHOUSE_DATA_DIR: dir }), "tenant")[0]?.detail).toBe(`globex (named by ${dir}/globex/tenant.json)`);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+});
+
 describe("the running deployment (--url)", () => {
   test("a running app with the same secrets passes, and reports what it knows", async () => {
     const checks = await run({}, {}, "https://app.test");
     expect(levels(checks.filter((c) => c.section === "deployment"))).toEqual(new Set(["ok", "info"]));
     expect(find(checks, "knowledge")[0]?.detail).toBe("ready, 12 threads indexed");
+  });
+
+  test("the running app's tenant is named, and one that isn't this environment's warns", async () => {
+    const status = (tenant: string) => ({ app: { status: { agent: "scout", tenant, knowledge: { state: "ready", documents: 1 } } } });
+    expect(find(await run({ TENANT_ID: "acme" }, status("acme"), "https://app.test"), "tenant").at(-1)).toMatchObject({ section: "deployment", level: "ok", detail: "acme" });
+    expect(find(await run({ TENANT_ID: "acme" }, status("globex"), "https://app.test"), "tenant").at(-1)).toMatchObject({ section: "deployment", level: "warn", detail: expect.stringContaining("serves tenant globex, this environment acme") });
   });
 
   test("a different signing secret on the running app fails", async () => {
