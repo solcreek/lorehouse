@@ -77,7 +77,9 @@ control plane, of events the edge can't read back.
   at most a bounded time (24 h), after which it is dropped and counted.
 
 So the control plane holds tenants' content only as ciphertext it can't open. Its registry
-holds none at all. An edge that restarts after acknowledging loses nothing.
+holds none at all. An edge that restarts after acknowledging loses nothing. A data plane
+that is stopped or cold therefore never misses a platform's deadline, so an idle
+tenant's compute can scale to zero.
 
 Delivery from the inbox to the data plane is **at least once, with an idempotency key**.
 Redelivery, which every platform above does, never produces a second answer.
@@ -89,8 +91,6 @@ tenant and the platform, and stays the same across the platform's retries:
   contract documents how the key is derived, for example from the message or
   interaction's resource name and type. Its conformance scenarios prove that a resent
   event maps to the same key.
-A data plane that is stopped or cold therefore never misses a platform's deadline, so
-an idle tenant's compute can scale to zero.
 
 **Hosted, there is one app per chat platform** (one Slack app, one Teams app, one Google
 Chat app), installed by each organization through the platform's own consent flow. A
