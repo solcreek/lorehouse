@@ -368,11 +368,23 @@ impl Git {
     /// succeeded, or None if it couldn't run or didn't finish within GIT_LOCAL.
     async fn says(&self, dir: &Path, args: &[&str]) -> Option<bool> {
         let work = async {
+            use tokio::io::AsyncReadExt;
             let mut child = self.spawn(dir, args, Net::Off).await.ok()?;
-            // Nothing is read: the pipes are closed, and git gets EPIPE if it writes.
-            drop(child.child.stdout.take());
-            drop(child.child.stderr.take());
-            child.wait().await.ok().map(|s| s.success())
+            // Read and dropped, up to a cap: a pipe closed instead would kill a git that
+            // writes a warning (SIGPIPE), and its answer would read as "no".
+            let drain = |pipe: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>| {
+                tokio::spawn(async move {
+                    if let Some(p) = pipe {
+                        let _ = tokio::io::copy(&mut p.take(STDERR_CAP), &mut tokio::io::sink()).await;
+                    }
+                })
+            };
+            let out = drain(child.child.stdout.take().map(|p| Box::new(p) as _));
+            let err = drain(child.child.stderr.take().map(|p| Box::new(p) as _));
+            let status = child.wait().await.ok().map(|s| s.success());
+            out.abort();
+            err.abort();
+            status
         };
         tokio::time::timeout(GIT_LOCAL, work).await.ok().flatten()
     }
@@ -599,6 +611,26 @@ pub(crate) fn read_in_mirror(path: &Path, cap: u64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     f.take(cap + 1).read_to_end(&mut out).ok()?;
     (out.len() as u64 <= cap).then_some(out)
+}
+
+/// What in a mirror would make git see another history than its commits' own, if any:
+/// grafts, a shallow file, alternates, or replace refs (loose or packed). Read as sandboxd
+/// reads a mirror (no links followed, packed-refs capped; one it can't read counts).
+pub(crate) fn rewritten_history(dir: &Path) -> Option<&'static str> {
+    for file in ["info/grafts", "shallow", "objects/info/alternates", "objects/info/http-alternates", "refs/replace"] {
+        if std::fs::symlink_metadata(dir.join(file)).is_ok() {
+            return Some(file);
+        }
+    }
+    let packed = dir.join("packed-refs");
+    if std::fs::symlink_metadata(&packed).is_ok() {
+        match read_in_mirror(&packed, 64 << 20) {
+            None => return Some("an unreadable packed-refs"),
+            Some(p) if p.windows(14).any(|w| w == b" refs/replace/") => return Some("packed replace refs"),
+            Some(_) => {}
+        }
+    }
+    None
 }
 
 /// Whether a mirror has a HEAD (git made it one), without following it if it is a link.
@@ -1082,12 +1114,21 @@ impl Publisher {
                     Some(old) => {
                         // Never forced: what the branch is at must be in the mirror, and an
                         // ancestor of what is pushed. A git that couldn't answer refuses too.
-                        match self.git.says(dir, &["cat-file", "-e", &format!("{old}^{{commit}}")]).await {
+                        // The mirror is an earlier run's to write: one that rewrites history
+                        // for git (grafts, shallow, replace refs, alternates) is refused, and
+                        // the check reads the commits themselves, not a commit-graph.
+                        if let Some(what) = rewritten_history(dir) {
+                            // Only a git run could have put it there: the mirror goes.
+                            self.drop_mirror(dir);
+                            return Err(format!("the mirror's history isn't the commits' own ({what}): nothing was pushed, and the mirror was dropped; stage again"));
+                        }
+                        let off = ["-c", "core.commitGraph=false", "-c", "core.useReplaceRefs=false"];
+                        match self.git.says(dir, &[&off[..], &["cat-file", "-e", &format!("{old}^{{commit}}")]].concat()).await {
                             Some(true) => {}
                             Some(false) => return Err(format!("[rejected] {refname} (fetch first): the branch is at {old}, which the stage doesn't have")),
                             None => return Err("checking the branch's commit: git didn't answer".into()),
                         }
-                        match self.git.says(dir, &["merge-base", "--is-ancestor", &old, sha]).await {
+                        match self.git.says(dir, &[&off[..], &["merge-base", "--is-ancestor", &old, sha]].concat()).await {
                             Some(true) => {}
                             Some(false) => return Err(format!("[rejected] {refname} (non-fast-forward): the branch is at {old}, which {sha} doesn't follow")),
                             None => return Err("checking the push is a fast-forward: git didn't answer".into()),
@@ -1554,6 +1595,44 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("big"), dir.join("stage-x.bundle")).unwrap();
         s.publisher.mark_heavy(&dir, &dir.join("stage-x.bundle"), "x");
         assert!(upkeep::read_state(&dir).is_none_or(|st| st.heavy.is_empty()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mirror_whose_history_was_rewritten_is_never_pushed_from_over_the_branch() {
+        // The branch moved on at GitHub to a commit the staged one doesn't follow; a mirror
+        // that grafts it under the staged commit would pass the fast-forward check, and the
+        // push would replace the branch.
+        let mut s = scratch("grafted");
+        let (url, _seen, _server) = smart_http(s.root.clone()).await;
+        s.publisher.git = Git::new(None, &url);
+        let staged_head = sh(&s.vm, "echo g > g && git add g && git commit -qm g && git rev-parse HEAD");
+        let staged = s.stage("scout/g").await.unwrap();
+        let theirs = sh(&s.root, "git clone -q acme/widgets.git other && cd other && echo o > o && git add o && git -c user.name=x -c user.email=x@x commit -qm o && git push -q origin HEAD:refs/heads/scout/g && git rev-parse HEAD");
+        s.publisher.refresh(&s.dir(), "acme", "widgets", None).await.unwrap();
+        let dir = s.dir();
+        for (name, plant) in [
+            ("info/grafts", format!("std:info/grafts:{staged_head} {theirs}\n")),
+            ("shallow", format!("std:shallow:{theirs}\n")),
+            ("objects/info/alternates", "std:objects/info/alternates:/nonexistent\n".to_string()),
+            ("refs/replace", format!("git:replace -f {staged_head} {theirs}")),
+        ] {
+            let stage = if name == "info/grafts" { staged.stage.clone() } else { s.stage("scout/g").await.unwrap().stage };
+            match plant.split_once(':').unwrap() {
+                ("std", rest) => {
+                    let (file, content) = rest.split_once(':').unwrap();
+                    std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
+                    std::fs::write(dir.join(file), content).unwrap();
+                }
+                (_, cmd) => drop(sh(&dir, &format!("git {cmd}"))),
+            }
+            let mut req = s.push(&staged, "scout/g");
+            req.stage = stage;
+            let err = s.publisher.push(SANDBOX, req).await.unwrap_err();
+            assert!(err.0 == 409 || err.0 == 502, "{name}: {err:?}");
+            assert_eq!(s.remote("scout/g").as_deref(), Some(theirs.as_str()), "{name}: the branch was replaced");
+            let _ = std::fs::remove_file(dir.join(name));
+            let _ = std::fs::remove_dir_all(dir.join(name));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

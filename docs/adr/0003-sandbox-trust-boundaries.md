@@ -123,10 +123,21 @@ around sandboxd. So:
   pushing from a mirror no VM object touched), and needed: a push packs the VM's objects
   again, so a git holding the token would parse guest objects with it. A push run may send
   only one update, `<old> <staged sha> refs/heads/<branch>`: `<old>` is where sandboxd itself
-  read the branch at GitHub, after checking in an isolated, offline run that the staged
-  commit follows it. Anything else (another branch, a forced update, push options) is
-  refused before it is forwarded. A fetch gets the stage's read token on the same terms,
-  which the VM holds anyway (layer 1's exception).
+  read the branch at GitHub. Anything else (another branch, another commit, a delete, push
+  options) is refused before it is forwarded, whatever the git sending it.
+
+  **Never forced, with one limit.** Before that, an isolated, offline run checks that the
+  staged commit follows `<old>` (`merge-base --is-ancestor`). That run reads the mirror,
+  which earlier runs wrote. So sandboxd first refuses (and drops) a mirror holding anything
+  that makes git see another history than the commits' own: `info/grafts`, `shallow`,
+  alternates, or replace refs, loose or packed. The check runs with the commit-graph and
+  replace refs off. What it still trusts is the content of the commit objects the mirror
+  stores under their ids, which git doesn't re-hash on read. Only a git bug can store a
+  forged one, and then the most it gets is a forced update of the stage's own branch to the
+  staged commit, the one an approval binds; never another branch or commit.
+
+  A fetch gets the stage's read token on the same terms, which the VM holds anyway (layer
+  1's exception).
 
   What a git bug reached through a VM's objects still gets: the one mirror of that run, to
   read and write (and so the facts the next stage of that repo shows, which the commit id
