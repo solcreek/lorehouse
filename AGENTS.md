@@ -86,6 +86,16 @@ them usage records, until `pruneUsage` drops them past `USAGE_RETENTION_DAYS` (#
 June's `SESSIONS_DB`, which keeps every turn's full tool results and answers until June
 supports redaction (junebuild/june#360). DMs are never indexed.
 
+**SQLite.** `src/sqlite.ts` is the only driver Lorehouse's own databases are opened with:
+better-sqlite3-multiple-ciphers, so the tenant's files can be encrypted (#148). Nothing
+else in `src/` imports `bun:sqlite` or the addon (a test holds it). It keeps bun:sqlite's
+shape (`query()` caches, `get()` is null for no row, bun:sqlite's pragmas), but parameters
+are `?` or named (`@name`, bound from an object without the prefix), never `?1`, and a
+boolean doesn't bind. June's `SESSIONS_DB` is June's own driver, a different file: two
+SQLite libraries in one process must never open the same file (closing one's descriptor
+drops the other's locks), so tests' second connections go through `src/sqlite.ts` too.
+Needs Bun 1.4.3+.
+
 **Policy.** `src/policy.ts` restricts every channel event to channels in
 `AGENT_CHANNELS` (empty means nowhere) and refuses private channels and group DMs where the
 payload says so; mentions and reactions carry no channel type, and ingest reads every listed

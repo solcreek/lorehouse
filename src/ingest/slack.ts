@@ -38,7 +38,7 @@
 // reconcile (Slack's history exposes a thread's latest reply, not its latest edit);
 // it is picked up the next time that thread changes.
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "../sqlite";
 import { countDocuments, deleteDocument, docIdsWithPrefix, documentVersion, getCursor, setCursor, upsertDocument, type Document } from "../knowledge";
 import { SlackApiError, type SlackApi } from "../slack-api";
 import { describeVerdict, isDefiniteFailure, type ChannelVerdict } from "../channel-check";

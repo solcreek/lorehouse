@@ -61,12 +61,21 @@ let
     outputHashAlgo = "sha256";
     outputHash =
       {
-        x86_64-linux = "sha256-HFTL/bDD2GpAUVW5Wb3b+AotcumP5ld4RmGcFf7Bc1g=";
-        aarch64-linux = "sha256-0NF4Qsc8w+Dn4lZGW8x9ZhLBL3AOEJLxvXNlKceoN/o=";
-        aarch64-darwin = "sha256-N4WMqC3enMYxiuByAefKbou90tFLd472S+5qXu3joCI=";
+        x86_64-linux = "sha256-p4owj8zDKTYwJrHReC+brhCvVe1OmlOuND9nQZ5Tejg=";
+        aarch64-linux = "sha256-HnQaEb07bj/lBlhjuqRKQh8Q6UYcBuWyRDwmoGJs+wU=";
+        aarch64-darwin = "sha256-nLUhvKy727ltIa0XCROySO57+V1+4bqRc/wu1EG8qlU=";
       }
       .${stdenv.hostPlatform.system};
   };
+
+  # The SQLite driver's prebuilt addon (src/sqlite.ts) needs libstdc++.so.6, and the Nix
+  # bun's loader looks for it only in the store. Give the addon a RUNPATH to nixpkgs'
+  # before `bun build --compile` embeds it: that store path, inside the binary, makes this
+  # libstdc++ part of the binary's closure, and so of the image.
+  patchSqliteAddon = lib.optionalString stdenv.hostPlatform.isLinux ''
+    patchelf --add-rpath ${lib.getLib stdenv.cc.cc}/lib \
+      node_modules/better-sqlite3-multiple-ciphers/prebuilds/${bunTarget.os}-${bunTarget.cpu}.node
+  '';
 
   # Only what the binary is built from; editing docs or tests doesn't rebuild it.
   appSrc = lib.fileset.toSource {
@@ -85,13 +94,14 @@ let
     pname = "lorehouse";
     inherit version;
     src = appSrc;
-    nativeBuildInputs = [ bun ];
+    nativeBuildInputs = [ bun ] ++ lib.optional stdenv.hostPlatform.isLinux pkgs.patchelf;
     dontConfigure = true;
     buildPhase = ''
       runHook preBuild
       export HOME=$TMPDIR
       # A copy, not a symlink: bun resolves from the real path, which has no node_modules above it.
       cp -R ${nodeModules} node_modules && chmod -R u+w node_modules
+      ${patchSqliteAddon}
       bun build --compile --minify ./src/server.ts --outfile dist/lorehouse
       runHook postBuild
     '';

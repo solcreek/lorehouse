@@ -24,7 +24,7 @@
 //
 // pendingPurge counts the same rows without changing anything, for `lorehouse doctor`.
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "./sqlite";
 import { checkpointSoon, deleteDocument } from "./knowledge";
 
 export type ChannelPurge = { channel: string; documents: number; threads: number; cursors: number; asks: number; searches: number };

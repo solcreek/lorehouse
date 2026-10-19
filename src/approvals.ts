@@ -25,7 +25,7 @@
 // approverGate watches it) deletes it, and prune() clears anything a process that died left
 // behind.
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "./sqlite";
 import type { AuthorizeAnswer, TurnEvent } from "@junejs/core/agent-runtime";
 import type { PrApprover } from "./config";
 

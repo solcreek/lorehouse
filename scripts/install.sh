@@ -116,6 +116,9 @@ if ! cmp -s "$tmp/env" "$ENV_FILE" 2>/dev/null; then
 fi
 
 # ── service ──────────────────────────────────────────────────────────────────────────────
+# PrivateTmp gives the service its own writable /tmp. Keep exec allowed there (no
+# NoExecPaths=/tmp, no noexec mount): the binary unpacks its SQLite driver, a native
+# addon, into /tmp at every start and loads it from there.
 unit=$(cat <<EOF
 [Unit]
 Description=Lorehouse

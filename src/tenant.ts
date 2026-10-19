@@ -30,7 +30,7 @@
 // it is and never moved.
 
 import { createHash, randomBytes } from "node:crypto";
-import { Database } from "bun:sqlite";
+import { Database } from "./sqlite";
 import { closeSync, constants, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { formatWithOptions } from "node:util";
@@ -220,7 +220,7 @@ const linkTemp = (from: string) => `${from}.tenant-link`;
 function checkpointAt(path: string): void {
   let db: Database | undefined;
   try {
-    db = new Database(path, { readwrite: true, create: false });
+    db = new Database(path, { mustExist: true });
     db.query("SELECT COUNT(*) FROM sqlite_master").get(); // a hot -journal is rolled back here
     const r = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number } | null;
     if (r?.busy) throw new UpgradeError(`${path} is in use (its checkpoint was blocked): stop whatever has it open, then start again`);

@@ -27,7 +27,8 @@
     "@junejs/pdf": "0.2.0",
     "@junejs/pdf-font-noto-sans-tc": "0.2.0",
     "@junejs/pdf-typst-wasm": "0.2.0",
-    "@junejs/server": "0.2.0"
+    "@junejs/server": "0.2.0",
+    "better-sqlite3-multiple-ciphers": "13.0.3"
   },
   "devDependencies": {
     "@types/bun": "latest",

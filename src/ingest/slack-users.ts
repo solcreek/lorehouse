@@ -5,7 +5,7 @@
 // lookups fail once with missing_scope and everything falls back to ids: knowledge
 // still works, it just reads "U02ABC" where a name would be.
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "../sqlite";
 import { SlackApiError, type SlackApi } from "../slack-api";
 
 const REFRESH_MS = 24 * 3600 * 1000;

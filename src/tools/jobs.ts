@@ -22,7 +22,7 @@
 // whether its starter was known can't be told then. An id guestd has no job for gets
 // guestd's not-found instead, so a mistyped id isn't refused as if it existed.
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "../sqlite";
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
 import { toolDescription } from "../prompts";
 import type { GitIdentity } from "../github-auth";

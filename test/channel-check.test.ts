@@ -1,6 +1,6 @@
 // Every channel in AGENT_CHANNELS must be public, as conversations.info says (#86).
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "../src/sqlite";
 import { describe, expect, test } from "bun:test";
 import { assertPublicChannels, classifyChannel, describeVerdict, isDefiniteFailure, lookUpChannel, lookUpChannels, type ChannelInfo } from "../src/channel-check";
 import { ConfigError } from "../src/config";

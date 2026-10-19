@@ -86,6 +86,10 @@ Every host needs the same few things:
 - a writable data directory (`LOREHOUSE_DATA_DIR`): the SQLite files go in its tenant's directory under it (a `LOREHOUSE_DB` or `SESSIONS_DB` set elsewhere needs its own directory writable too)
 - the Slack and Anthropic secrets as environment variables
 - outbound HTTPS to Slack and Anthropic
+- a temporary directory (`TMPDIR`, else `/tmp`) it can write to and execute from: the
+  binary unpacks its SQLite driver, a native addon, there at every start. systemd's
+  `PrivateTmp` is fine; a `noexec` one is not. On Linux the addon needs glibc 2.34 or newer
+  and `libstdc++.so.6`
 
 The sandbox is separate. It runs on hosts with KVM, such as bare metal or a VM with nested
 virtualization. Those hosts **connect out** to Lorehouse, the way CI runners do, over

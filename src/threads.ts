@@ -12,7 +12,7 @@
 //     (@channel, @here, @everyone): people talking to each other
 // Bots and edits never get here (June normalizes only people's new messages).
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "./sqlite";
 
 export function joinThread(db: Database, channel: string, threadTs: string, now = new Date()): void {
   db.query("INSERT INTO agent_threads (channel, thread_ts, joined_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING").run(channel, threadTs, now.toISOString());
@@ -54,7 +54,7 @@ export function listThreads(db: Database, opts: { limit: number; after?: { joine
        (SELECT count(*) FROM agent_searches s WHERE s.channel = t.channel AND s.thread_ts = t.thread_ts) AS searches,
        (SELECT count(*) FROM agent_searches s WHERE s.channel = t.channel AND s.thread_ts = t.thread_ts AND s.hits = 0) AS emptySearches
      FROM agent_threads t LEFT JOIN knowledge_documents d ON d.doc_id = 'slack:' || t.channel || ':' || t.thread_ts
-     WHERE (?1 IS NULL OR (t.joined_at, t.rowid) < (?1, ?2))
-     ORDER BY t.joined_at DESC, t.rowid DESC LIMIT ?3`,
-  ).all(opts.after?.joinedAt ?? null, opts.after?.rowid ?? null, opts.limit) as JoinedThread[];
+     WHERE (@at IS NULL OR (t.joined_at, t.rowid) < (@at, @rowid))
+     ORDER BY t.joined_at DESC, t.rowid DESC LIMIT @limit`,
+  ).all({ at: opts.after?.joinedAt ?? null, rowid: opts.after?.rowid ?? null, limit: opts.limit }) as JoinedThread[];
 }
