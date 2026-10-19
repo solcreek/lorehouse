@@ -20,7 +20,8 @@ branch still carries the platform, but only until it goes out of support at the 
 On an Intel Mac, work without Nix:
 
 - **Bun from Homebrew** (`brew install bun`) or the official installer
-  (`curl -fsSL https://bun.sh/install | bash`). Then `bun install`, `bun run typecheck`,
+  (`curl -fsSL https://bun.sh/install | bash -s bun-v1.4.3`), at the version
+  [`nix/bun.nix`](../nix/bun.nix) pins. Then `bun install`, `bun run typecheck`,
   `bun run test`, `bun run conformance`, `bun run build`, as in
   [`AGENTS.md`](../AGENTS.md). Nothing in the app needs Node: `start`, `test`,
   `conformance`, `build` and `doctor` run on Bun's own runtime. `typecheck` is `tsc`,
@@ -89,8 +90,25 @@ for t in linux:x64 linux:arm64 darwin:arm64; do
 done
 ```
 
-`nix flake update` moves nixpkgs (and with it bun, go and rust) forward; run
+`nix flake update` moves nixpkgs (and with it go and rust) forward; run
 `nix flake check` before committing the new `flake.lock`.
+
+## Moving Bun
+
+Bun isn't nixpkgs' version: [`nix/bun.nix`](../nix/bun.nix) pins the same exact
+release as the [`Dockerfile`](../Dockerfile) and every `setup-bun` step in
+`.github/workflows/`, so a flake update doesn't move it. To move it, change the version
+in all of them, and in `nix/bun.nix` each download's hash:
+
+```bash
+for f in bun-darwin-aarch64 bun-linux-aarch64 bun-linux-x64-baseline; do
+  nix store prefetch-file --json "https://github.com/oven-sh/bun/releases/download/bun-v<version>/$f.zip" | jq -r .hash
+done
+```
+
+Each one is the `sha256` of that zip in the release's `SHASUMS256.txt` (`nix hash convert
+--to base16 <hash>` to compare). A new Bun can change what `bun install` writes, so the
+`node_modules` hashes above may need pasting in too.
 
 ## Hosts
 
