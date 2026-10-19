@@ -6,11 +6,11 @@
       "name": "lorehouse",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.131.0",
-        "@junejs/core": "0.2.0",
-        "@junejs/pdf": "0.2.0",
-        "@junejs/pdf-font-noto-sans-tc": "0.2.0",
-        "@junejs/pdf-typst-wasm": "0.2.0",
-        "@junejs/server": "0.2.0",
+        "@junejs/core": "0.2.2",
+        "@junejs/pdf": "0.2.2",
+        "@junejs/pdf-font-noto-sans-tc": "0.2.2",
+        "@junejs/pdf-typst-wasm": "0.2.2",
+        "@junejs/server": "0.2.2",
         "better-sqlite3-multiple-ciphers": "13.0.3",
       },
       "devDependencies": {
@@ -24,17 +24,17 @@
 
     "@babel/runtime": ["@babel/runtime@7.29.7", "", {}, "sha512-Nq8OhGWiZIZGV6hLHoyAKLLcJihP/xFeBMGJoUrxTX2psI8dCifzLhZISFb+VWS3wFMRDmCGw5R+dOySCqPLhw=="],
 
-    "@junejs/core": ["@junejs/core@0.2.0", "", { "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "react": "^19.2.0", "react-dom": "^19.2.0" }, "optionalPeers": ["@anthropic-ai/sdk", "react"] }, "sha512-HFmkoa0bFqgZKzw2aIBY7/kVQkrrdo9AiMNrA3q2wTy2pF2u6voxLzEDSJg+VHNBTCZz4wcNlvI1ZU4YoZghLw=="],
+    "@junejs/core": ["@junejs/core@0.2.2", "", { "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "react": "^19.2.0", "react-dom": "^19.2.0" }, "optionalPeers": ["@anthropic-ai/sdk", "react"] }, "sha512-CjG+ZWjleNpCzKV9Pl8Dk7SAjmJhECABaf0MD0RHcvUfbWfOMoWZMz8myw1f5PJw66M5FRKK0TMR9MW1N+ZmQw=="],
 
-    "@junejs/db": ["@junejs/db@0.2.0", "", { "dependencies": { "@junejs/core": "^0.2.0" } }, "sha512-MYKP4gvX9SfNSjhanMqKOjxUFyRR5LJ0p85nm4Gh7SheCKyNAXVSuUwomHgPI7vf6RE0NHttt+Yg3MjDYIqP4Q=="],
+    "@junejs/db": ["@junejs/db@0.2.2", "", { "dependencies": { "@junejs/core": "^0.2.2" } }, "sha512-N0ElU4F5ECaWGOjmMx+UKjmBYshn4rGOUnP08sH5Kd8waWHu09tFj3/sI8ZglTQ/jWhOblIiF5cY9Np46tAqTw=="],
 
-    "@junejs/pdf": ["@junejs/pdf@0.2.0", "", { "dependencies": { "@junejs/core": "^0.2.0", "marked": "^18.0.14" } }, "sha512-HTk597nhiE0k8eSfxIWAryRWRI4fs+bqab+mdIgnaHqLNnKdP8BS1ONdTPe1TJmPzpOTNla30Q/uAfKoYDuI5Q=="],
+    "@junejs/pdf": ["@junejs/pdf@0.2.2", "", { "dependencies": { "@junejs/core": "^0.2.2", "marked": "^18.0.14" } }, "sha512-rW97ZtyRLIjQ6l4NCQ5rXAv7ZV8MxcYhpb2M/Yi4qq0Xrcvrbv+M8MKJRv1OugGjm4lDmDURAhXKXCwsCqmLNQ=="],
 
-    "@junejs/pdf-font-noto-sans-tc": ["@junejs/pdf-font-noto-sans-tc@0.2.0", "", { "peerDependencies": { "@junejs/pdf-typst-wasm": "^0.2.0" } }, "sha512-iiCXF6fNSG4WoscQfyHC3z7PIYTbAQozyYKdLSAbx8zyIwIFFIcN/+1ejCAsS8M8Zq0oazaFq8qf1cFM6rMGbA=="],
+    "@junejs/pdf-font-noto-sans-tc": ["@junejs/pdf-font-noto-sans-tc@0.2.2", "", { "peerDependencies": { "@junejs/pdf-typst-wasm": "^0.2.2" } }, "sha512-vdGtCJGII+13ONw+eEprYYDLNeqQafOzdA7zB2dqAIf8aSg0hRumHFx3s2cF4POR5kvZDkyadPE/4327i6SCVA=="],
 
-    "@junejs/pdf-typst-wasm": ["@junejs/pdf-typst-wasm@0.2.0", "", { "dependencies": { "@junejs/pdf": "^0.2.0" } }, "sha512-tCeLYPZZt7PKui1+T1N33cQsYt3BzZ+49jYMlaCl5mP8nfSoOLzOKbEzKohUdeC5QJrsDKfnvrFGmU0lIJXlOA=="],
+    "@junejs/pdf-typst-wasm": ["@junejs/pdf-typst-wasm@0.2.2", "", { "dependencies": { "@junejs/pdf": "^0.2.2" } }, "sha512-P0mLawaBYnrOyp4Xvt4sVn1S/MZBvwoCBYHgrEeu0wXLee1qLmzU4a6+QATXqOC7tB5HvKjh0DaPShRh5rT2Zw=="],
 
-    "@junejs/server": ["@junejs/server@0.2.0", "", { "dependencies": { "@junejs/db": "^0.2.0", "@momiji-rs/sparkdown": "^0.0.4", "@resvg/resvg-wasm": "^2.6.2", "lightningcss": "^1.27.0", "oxc-parser": "^0.152.0", "rolldown": "^1.1.0" }, "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "@junejs/core": "^0.2.0", "@libsql/client": "^0.14.0 || ^0.15.0 || ^0.16.0 || ^0.17.0", "mysql2": "^3.0.0", "pg": "^8.0.0", "react": "^19.2.0", "react-dom": "^19.2.0", "react-server-dom-webpack": "19.3.0" }, "optionalPeers": ["@anthropic-ai/sdk", "@libsql/client", "mysql2", "pg", "react-server-dom-webpack"] }, "sha512-/lOexQcN7hAPQyuKXZJGN9rjxmJeEaO3tSAzEc1e0HgGfmTY2C/BeD4s82fRcbUsretvku1q946iXb2BKqJ/lg=="],
+    "@junejs/server": ["@junejs/server@0.2.2", "", { "dependencies": { "@junejs/db": "^0.2.2", "@momiji-rs/sparkdown": "^0.0.4", "@resvg/resvg-wasm": "^2.6.2", "lightningcss": "^1.27.0", "oxc-parser": "^0.152.0", "rolldown": "^1.1.0" }, "peerDependencies": { "@anthropic-ai/sdk": ">=0.60.0", "@junejs/core": "^0.2.2", "@libsql/client": "^0.14.0 || ^0.15.0 || ^0.16.0 || ^0.17.0", "mysql2": "^3.0.0", "pg": "^8.0.0", "react": "^19.2.0", "react-dom": "^19.2.0", "react-server-dom-webpack": "19.3.0" }, "optionalPeers": ["@anthropic-ai/sdk", "@libsql/client", "mysql2", "pg", "react-server-dom-webpack"] }, "sha512-coeZ/vFJh0aeuXJDmxuOpkVcyva9bYXPN+W82rHKwFDCR52yMEyQtuozV1RQOtdcftV+0WbWxF30Ut+thT0IFw=="],
 
     "@momiji-rs/sparkdown": ["@momiji-rs/sparkdown@0.0.4", "", {}, "sha512-AVy2A/D623xI+wG1HFpNymrJz6onDQlw3HnkaqyLXSgTEA13LVeFgXNGWBaAl4kR1105I3k/YSOWrihpnF+IXA=="],
 
