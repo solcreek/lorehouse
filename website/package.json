@@ -12,14 +12,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@junejs/core": "0.2.0-dev.49",
+    "@junejs/core": "0.2.0-dev.65",
     "@junejs/db": "0.1.0-dev.2",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
   "devDependencies": {
-    "@junejs/cli": "0.0.52-dev.2",
-    "@junejs/server": "1.0.0-dev.28",
+    "@junejs/cli": "0.0.52-dev.3",
+    "@junejs/server": "1.0.0-dev.45",
     "@types/react": "^19.2.0",
     "typescript": "^7.0.2"
   }
