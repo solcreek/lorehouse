@@ -15,7 +15,7 @@
 // all of /api/ is closed (404), as if it didn't exist. Nothing here writes.
 // Contract: docs/admin-api.md.
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "./sqlite";
 import type { IngestStatus } from "./ingest/slack";
 import { getDocument, listDocuments, searcher } from "./knowledge";
 import { listPlacements } from "./runners/hub";

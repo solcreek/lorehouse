@@ -5,7 +5,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { Database as BunDatabase } from "bun:sqlite";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openKnowledge, searcher, upsertDocument } from "../src/knowledge";
@@ -174,5 +174,12 @@ describe("sqlite driver", () => {
     expect(search("公司").map((c) => c.id)).toEqual(["d1"]);
     expect(search("rollback").map((c) => c.id)).toEqual(["d1"]);
     db.close();
+  });
+
+  test("the app opens SQLite only through src/sqlite.ts: nothing else in src/ imports bun:sqlite or the addon", () => {
+    const root = join(import.meta.dir, "..", "src");
+    const files = (readdirSync(root, { recursive: true }) as string[]).filter((f) => /\.ts$/.test(f) && f !== "sqlite.ts");
+    const offenders = files.filter((f) => /["']bun:sqlite["']|["']better-sqlite3/.test(readFileSync(join(root, f), "utf8")));
+    expect(offenders).toEqual([]);
   });
 });

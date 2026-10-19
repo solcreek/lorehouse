@@ -4,7 +4,9 @@
 // truncated: whatever removes text asks for that, and closing the store does it too.
 
 import { describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+// A second connection in this process goes through the app's driver: two SQLite libraries
+// in one process don't see each other's locks on the same file.
+import { Database } from "../src/sqlite";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { checkpointRuns, checkpointSoon, closeKnowledge, deleteDocument, openKnowledge, searcher, upsertDocument } from "../src/knowledge";

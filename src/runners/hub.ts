@@ -11,7 +11,7 @@
 // runner on the job's connection or a newer one, and after a reconnect fails at once the
 // jobs the runner says it never got (they never ran, so a retry is safe).
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "../sqlite";
 import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
 
 // `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
@@ -396,7 +396,7 @@ export type Placement = { sandbox: string; runner: string; placedAt: string; row
 export function listPlacements(db: Database, opts: { limit: number; after?: { placedAt: string; rowid: number } }): Placement[] {
   return db.query(
     `SELECT rowid, sandbox, runner, placed_at AS placedAt FROM sandbox_placements
-     WHERE (?1 IS NULL OR (placed_at, rowid) < (?1, ?2))
-     ORDER BY placed_at DESC, rowid DESC LIMIT ?3`,
-  ).all(opts.after?.placedAt ?? null, opts.after?.rowid ?? null, opts.limit) as Placement[];
+     WHERE (@at IS NULL OR (placed_at, rowid) < (@at, @rowid))
+     ORDER BY placed_at DESC, rowid DESC LIMIT @limit`,
+  ).all({ at: opts.after?.placedAt ?? null, rowid: opts.after?.rowid ?? null, limit: opts.limit }) as Placement[];
 }

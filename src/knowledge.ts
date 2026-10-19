@@ -2,7 +2,7 @@
 // recorded in `lorehouse_migrations`, the documents the agent searches, and where each
 // ingest source got to.
 
-import { Database } from "bun:sqlite";
+import { Database } from "./sqlite";
 import { readFileSync } from "node:fs";
 import { MIGRATIONS } from "./migrations";
 
@@ -110,16 +110,16 @@ class WalCheckpoint {
   now(retrying: boolean): boolean {
     this.runs++;
     const then = retrying ? "trying again" : "the next open tries again";
+    // Closed under it (a plain db.close()): nothing left to checkpoint, and never will be.
+    if (!this.db.open) {
+      this.stop();
+      return true;
+    }
     try {
       const { busy } = this.db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
       if (!busy) return true;
       this.log(`knowledge: couldn't empty the WAL of removed text (the database is in use); ${then}`);
     } catch (err) {
-      // Closed under it (a plain db.close()): nothing left to checkpoint, and never will be.
-      if (/closed/i.test(String(err))) {
-        this.stop();
-        return true;
-      }
       this.log(`knowledge: couldn't empty the WAL of removed text; ${then}: ${err}`);
     }
     return false;
@@ -330,9 +330,9 @@ export function listDocuments(db: Database, opts: { limit: number; prefix?: stri
     // Qualified: SQLite would read a bare `id` in WHERE or ORDER BY as the doc_id alias.
     `SELECT d.id AS rowid, d.doc_id AS id, d.kind, d.source, d.title, d.updated_at AS updatedAt, d.source_version AS v, length(d.text) AS chars
      FROM knowledge_documents d
-     WHERE d.doc_id >= ?1 AND d.doc_id < ?2 AND (?3 IS NULL OR d.kind = ?3) AND (?4 IS NULL OR (d.updated_at, d.id) < (?4, ?5))
-     ORDER BY d.updated_at DESC, d.id DESC LIMIT ?6`,
-  ).all(prefix, `${prefix}￿`, opts.kind ?? null, opts.after?.updatedAt ?? null, opts.after?.rowid ?? null, opts.limit) as (Omit<DocumentSummary, "activeAt"> & { v: string | null })[];
+     WHERE d.doc_id >= @from AND d.doc_id < @to AND (@kind IS NULL OR d.kind = @kind) AND (@at IS NULL OR (d.updated_at, d.id) < (@at, @rowid))
+     ORDER BY d.updated_at DESC, d.id DESC LIMIT @limit`,
+  ).all({ from: prefix, to: `${prefix}￿`, kind: opts.kind ?? null, at: opts.after?.updatedAt ?? null, rowid: opts.after?.rowid ?? null, limit: opts.limit }) as (Omit<DocumentSummary, "activeAt"> & { v: string | null })[];
   return rows.map(({ v, ...d }) => ({ ...d, activeAt: activeAt(v) }));
 }
 

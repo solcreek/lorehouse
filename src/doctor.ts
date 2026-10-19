@@ -22,7 +22,7 @@
 //
 // Exit code: 0 when nothing failed (warnings allowed), 1 when something did.
 
-import { Database } from "bun:sqlite";
+import { Database } from "./sqlite";
 import { accessSync, constants, existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createHmac } from "node:crypto";
@@ -447,9 +447,9 @@ function pendingPurgeIn(path: string, listed: ReadonlySet<string>): ChannelPurge
   if (path === ":memory:" || !existsSync(path)) return [];
   let db: Database | undefined;
   try {
-    // Not { readonly: true }: macOS's SQLite can't open a WAL database read-only without
+    // Not { readonly: true }: SQLite can't open a WAL database read-only without
     // its -shm file. query_only refuses every write instead.
-    db = new Database(path, { readwrite: true, create: false });
+    db = new Database(path, { mustExist: true });
     db.exec("PRAGMA query_only = ON");
     return pendingPurge(db, listed);
   } catch (e) {

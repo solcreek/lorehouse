@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+// A second connection in this process goes through the app's driver: two SQLite libraries
+// in one process don't see each other's locks on the same file.
+import { Database } from "../src/sqlite";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

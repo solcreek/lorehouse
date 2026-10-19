@@ -16,7 +16,7 @@
 // its ask with it (forgetAsk), as a deleted message leaves the knowledge index. What is
 // erased or forgotten here leaves the WAL too, as a deleted document does (checkpointSoon).
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "./sqlite";
 import { createHmac } from "node:crypto";
 import { checkpointSoon } from "./knowledge";
 
