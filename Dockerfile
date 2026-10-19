@@ -3,7 +3,8 @@
 # Everything it keeps goes under /data, so mount a volume there. Configuration is all
 # environment variables; see the README.
 
-FROM oven/bun:1.3 AS build
+# The same exact Bun as CI's setup-bun steps and Nix (nix/bun.nix).
+FROM oven/bun:1.4.3 AS build
 WORKDIR /src
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
