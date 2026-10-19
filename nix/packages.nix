@@ -5,6 +5,7 @@
 let
   inherit (pkgs) lib stdenv;
   version = "0.0.0-${self.shortRev or self.dirtyShortRev or "dirty"}";
+  bun = import ./bun.nix { inherit pkgs; };
 
   # bun.lock lists native packages for every platform; install only this one's, so the
   # output (and its hash) depends on the target, not on the machine that fetched it.
@@ -39,7 +40,7 @@ let
       ];
     };
     nativeBuildInputs = [
-      pkgs.bun
+      bun
       pkgs.cacert
     ];
     dontConfigure = true;
@@ -84,7 +85,7 @@ let
     pname = "lorehouse";
     inherit version;
     src = appSrc;
-    nativeBuildInputs = [ pkgs.bun ];
+    nativeBuildInputs = [ bun ];
     dontConfigure = true;
     buildPhase = ''
       runHook preBuild
@@ -129,7 +130,7 @@ let
     };
     # lsof: the suite checks that the port it tests is held by the app it started.
     nativeBuildInputs = [
-      pkgs.bun
+      bun
       pkgs.lsof
     ];
     dontConfigure = true;

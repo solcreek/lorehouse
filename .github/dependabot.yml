@@ -54,6 +54,11 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    # Bun is pinned in five setup-bun steps, nix/bun.nix (with three hashes) and the
+    # Dockerfile, and they move together (docs/nix.md, "Moving Bun"). A bump of the
+    # Dockerfile's tag alone would split them, and no workflow builds the Dockerfile.
+    ignore:
+      - dependency-name: oven/bun
     groups:
       docker:
         patterns: ["*"]

@@ -3,7 +3,7 @@
 { pkgs }:
 let
   build = [
-    pkgs.bun
+    (import ./bun.nix { inherit pkgs; })
     pkgs.go
     pkgs.cargo
     pkgs.rustc
