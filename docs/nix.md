@@ -19,7 +19,7 @@ branch still carries the platform, but only until it goes out of support at the 
 
 On an Intel Mac, work without Nix:
 
-- **Bun from Homebrew** (`brew install bun`) or the official installer
+- **Bun from Homebrew** (`brew install oven-sh/bun/bun@1.4.3`) or the official installer
   (`curl -fsSL https://bun.sh/install | bash -s bun-v1.4.3`), at the version
   [`nix/bun.nix`](../nix/bun.nix) pins. Then `bun install`, `bun run typecheck`,
   `bun run test`, `bun run conformance`, `bun run build`, as in

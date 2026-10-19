@@ -29,7 +29,7 @@ bun run doctor                       # check Slack/Anthropic/GitHub/sandbox setu
 The Nix flake (`nix develop`, `nix build`; see `docs/nix.md`) covers Linux and Apple
 Silicon only. **Intel Macs (`x86_64-darwin`) are not supported by the flake**: nixpkgs
 dropped the platform in 26.11. On an Intel Mac, install Bun from Homebrew
-(`brew install bun`) or bun.sh and run the commands above directly. Use Bun 1.4.3, the
+(`brew install oven-sh/bun/bun@1.4.3`) or bun.sh and run the commands above directly. Use Bun 1.4.3, the
 version CI, the Dockerfile and the flake (`nix/bun.nix`) pin (#148 needs 1.4.1+).
 Run them through `bun`, never `node`/`npx`: a Mac with both nvm and Homebrew Node can
 have two Node ABIs on the `PATH`, and a run under the wrong one fails in ways that look
