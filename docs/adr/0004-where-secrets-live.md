@@ -79,7 +79,7 @@ solcreek/strongroom#12 makes the only form Strongroom accepts.
    the Slack tokens stay Fly secrets or `settings.json` values. Moving one key into
    Strongroom would only swap it for the Strongroom token, at the cost of a network
    dependency on every start. That changes once there are many tenants' keys (2).
-   Hosted, the credentials that act for every tenant (the platforms' signing secrets,
+   Hosted, the credentials that act for every tenant (Slack's signing secret,
    the Teams and Google Chat app credentials, the GitHub App key) stay with the edge and
    the broker, never in a tenant's runtime (ADR 0005 §4).
 

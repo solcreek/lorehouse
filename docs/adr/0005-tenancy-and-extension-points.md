@@ -59,13 +59,11 @@ a virtual machine to reach another tenant. Every section below follows from this
 - the services all tenants share hold no tenant's data key, and no credential that acts
   for every tenant ever enters a tenant's runtime (section 4).
 
-**The shared services are the deliberate exceptions.** Every tenant's events pass through
-the edge, and every tenant's runtime asks the broker for tokens, so a bug in either that
-a tenant's input reaches is not stopped by a VM. They are kept small and given a bounded
-exposure instead: the edge parses only what it must, keeps at most 24 h of pending
-events, and is trusted by every tenant to report events truthfully (section 4, invariant
-4); the broker acts only for the tenant its caller's own
-identity names, and holds no tenant's data key.
+**The shared services are the deliberate exceptions:** the edge, the control plane and
+the broker. Every tenant's input reaches them, and no VM stands between one tenant and
+another inside them. They are kept few and small, none of them can open a tenant's files,
+and section 4 lists what each holds and what its compromise gives. Nothing else is
+shared.
 
 ### 2. A tenant's data lives in files of its own
 
@@ -75,8 +73,9 @@ document, answer, session and usage record.
 - **One key per tenant.** The files are encrypted with that tenant's own data key. The
   key is stored only as an envelope under the tenant's own Strongroom deployment and KMS
   key (ADR 0004). Lorehouse requires that deployment to serve this tenant alone, and
-  provisions it that way until Strongroom enforces it (solcreek/strongroom#12). It is unwrapped in the tenant's runtime, kept in memory only, and never
-  written anywhere in the clear.
+  provisions it that way until Strongroom enforces it (solcreek/strongroom#12). It is
+  unwrapped in the tenant's runtime, kept in memory only, and never written anywhere in
+  the clear.
 - **Deleting a tenant** is destroying its KMS key, deleting its files, and purging its
   events not yet delivered (section 4). Destroying the key comes first: it also makes
   every backup and snapshot of the files unreadable. A runtime told that the key is
@@ -106,10 +105,9 @@ never several tenants in one process or one VM. The VM holds:
 A host runs many tenants' VMs. Which tenants share a host is placement, not isolation:
 a tenant's runtime that is taken reaches nothing of a tenant beside it without escaping
 its VM. Those VMs hold unwrapped data keys in memory, so a host that runs several
-tenants' runtimes meets the conditions ADR 0003 layer 5 sets for a sandbox host shared
-between tenants: SMT off or a core-aware scheduler, no memory overcommit beyond its
-limit, per-tenant quotas, and logs that name the tenant. It runs nothing else (layer 4).
-Until a host meets them, it runs one tenant's runtime.
+tenants' runtimes meets every condition of ADR 0003 layer 5, read with "tenant runtime"
+for "sandbox", and runs nothing else (layer 4). Until all of them hold, it runs one
+tenant's runtime.
 
 **A tenant's VM may stop when idle.** The edge answers the platforms for it (section 4,
 invariant 6), so a stopped runtime costs storage and nothing else, and the cost of the
@@ -119,6 +117,16 @@ not correctness.
 
 ### 4. Shared services are few, hold no tenant's key, and act for one tenant at a time
 
+| shared service | holds | tenant input that reaches it | if it is taken |
+|---|---|---|---|
+| **edge** | the signing secrets of platforms that sign with one (Slack); every tenant's pending events, at most 24 h | every event, as the platform sent it | it sees every new event, and can forge an event from such a platform as any member of any tenant. Events a runtime verifies itself (below) it can only delay, drop or replay within their validity |
+| **control plane** | the tenant registry, routing, installations, and where each tenant's runtime and Strongroom deployment are | install and admin flows | it can misroute, stop or start tenants. It holds no data key, Strongroom token or bot token, so it can't open a tenant's files |
+| **broker** | the credentials that act for every tenant: the GitHub App's signing right, the chat apps' client secrets and app credentials; a tenant's bot token in passing, during an exchange or a refresh | requests from every tenant's runtime | it can mint tokens for any tenant's installation and post in any tenant's conversations. It holds no data key, so it can't open a tenant's files |
+
+A compromise of any of the three is an incident for every tenant. Checking that an
+event's user is a member doesn't authenticate it: a runtime answers a forged question as
+it would the member's own.
+
 **The control plane** owns the tenant registry, provisioning and installations: which
 chat workspace, Teams tenant or Google Workspace domain belongs to which tenant. It
 routes events, and knows where each tenant's runtime and Strongroom deployment are. It
@@ -127,7 +135,7 @@ data key, and no tenant's Strongroom token.
 
 **Every chat platform's events arrive at the control plane's edge.** The edge parses as
 little as it can, because every tenant's input passes through it. It:
-- verifies the platform's signature;
+- verifies the platform's signature, and forwards the request as the platform signed it;
 - answers inside the platform's deadline;
 - maps `(platform, platform tenant id)` to a tenant;
 - computes the event's idempotency key (below);
@@ -151,17 +159,7 @@ choice, made in its own issue against them:
    - They're excluded from backups and snapshots, and they stay in the tenant's region
      where the deployment form promises one.
    - They're purged when the tenant is deleted or moved.
-   - At rest they hold every tenant's events of the last 24 h at most, and nothing
-     stored in any tenant's files.
-
-   That bounds what is kept, not what an attacker who controls the edge can do. The edge
-   holds the platforms' signing secrets and writes every tenant's queue, so while it is
-   held, it sees every new event and can forge one as any member of any tenant. A tenant's
-   runtime answers a forged question as it would the member's own: checking that the
-   claimed user is a member doesn't authenticate them. The edge is therefore a trust
-   boundary for every tenant, and its compromise is an incident for all of them. It is
-   kept small and runs apart from everything else; a runtime that verified each event
-   itself would need a secret that acts for every tenant, which section 4 keeps out of it.
+   - The 24 h bounds what is kept, not what a held edge can do (the table above).
 5. **No shared service can open a tenant's files.** Everything that works on content
    happens only in that tenant's runtime, which opens its files with the tenant's key:
    indexing, search, embeddings, assembling context and the model call. Embeddings and
@@ -170,6 +168,13 @@ choice, made in its own issue against them:
    answers for it. A runtime that scales to zero is started by something allowed to
    start it. In a tenant's own cloud account, that is something in that account, or a
    start call the tenant grants. Otherwise that form doesn't scale to zero.
+
+**A runtime verifies each event itself where the platform allows it without a shared
+secret.** Teams (Bot Framework) and Google Chat sign each request with a token the
+runtime checks against the platform's public keys and its own app id, so the edge can't
+forge their events. Slack signs with one secret shared by every installation; a runtime
+holding it could forge events for any tenant, so for Slack the edge's check stands, and
+the edge is trusted for Slack events.
 
 **Each chat surface's contract defines its idempotency key.** The key is scoped to the
 tenant and the platform, and stays the same across the platform's retries:
@@ -182,7 +187,9 @@ tenant and the platform, and stays the same across the platform's retries:
 **A credential that acts for every tenant never enters a tenant's runtime.** A broker
 holds it, or the KMS key behind it, and uses it on a runtime's behalf, for that runtime's
 tenant only. The broker learns which tenant is asking from the runtime's own identity,
-never from the request:
+never from the request. An install has no runtime yet: its exchange carries a state the
+control plane issued for the tenant being provisioned, and the broker binds the result to
+that tenant, and to that tenant's runtime only.
 - **Code hosts.** The broker signs the GitHub App's JWT (in KMS, ADR 0004) and mints an
   installation token only for the asking tenant's installation, only for the repos and
   permissions its turn needs.
@@ -193,7 +200,7 @@ never from the request:
   Getting it still takes the app's client secret: the broker runs the install's code
   exchange and every refresh of a rotating token, hands the token to the tenant's
   runtime, and keeps no copy, nor does the control plane.
-- **The platforms' signing secrets** stay with the edge.
+- **Shared signing secrets** (Slack's) stay with the edge.
 
 **Hosted, there is one app per chat platform** (one Slack app, one Teams app, one Google
 Chat app), installed by each organization through the platform's own consent flow. A
@@ -286,7 +293,8 @@ Anthropic are the first implementations, never assumptions in the core:
   directory of files per tenant, each with its own key under the tenant's own Strongroom
   deployment, and the tenant id threaded through config, logs and jobs.
 - **No process that works on a tenant's content serves two tenants.** Only the edge,
-  the broker and the control plane serve many, and none of them opens a tenant's files.
+  the control plane and the broker serve many, and none of them opens a tenant's files
+  (section 4's table).
   Lorehouse never needs to resolve configuration, storage, schedules or sessions for many
   tenants within one process, and June's in-process state (its session store, its Slack
   event dedup) is one tenant's by construction.
@@ -302,8 +310,9 @@ Anthropic are the first implementations, never assumptions in the core:
     from the runtime's own identity;
   - a tenant registry, and provisioning from code that creates a tenant's runtime, its
     Strongroom deployment and KMS key, and its model key, and that destroys them.
-- **New June channels for Teams and Google Chat.** The conformance mock grows a surface
-  per platform, so one scenario runs against each.
+- **New June channels for Teams and Google Chat**, which verify each forwarded request's
+  platform token in the tenant's runtime. The conformance mock grows a surface per
+  platform, so one scenario runs against each, a forged event included.
 - **Code that says Slack moves behind the chat-surface contract:** `src/policy.ts`,
   `src/threads.ts`, `src/slack-guard.ts`, `src/ingest/slack.ts`, the `slack:` ids. The
   `slack:` ids stay valid as one source's ids.
