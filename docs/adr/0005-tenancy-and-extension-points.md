@@ -310,12 +310,15 @@ Anthropic are the first implementations, never assumptions in the core:
 - **Search and content tools get an audience filter** (the asker and the reply's
   audience, intersected), and saved sessions are filtered the same way before they're
   reused.
-- **Session reuse doesn't hold the audience rule today.** The organization-wide half does
-  for Slack: shared channels are refused, and only full members are answered. But saved
-  sessions keep every turn's tool results, and material from a channel later turned
-  private or unlisted is still reused in later turns, until June supports redaction or
-  filtering (junebuild/june#360). The first connector with access lists can't ship before
-  that is fixed.
+- **The audience rule doesn't hold today, even for organization-wide material.** Shared
+  channels are refused, and only full members are answered, but two gaps remain:
+  - Only the asker is checked. A guest who is a member of a listed channel reads a full
+    member's answer there, which may quote channels the guest can't open (#155).
+  - Saved sessions keep every turn's tool results, and material from a channel later
+    turned private or unlisted is still reused in later turns, until June supports
+    redaction or filtering (junebuild/june#360).
+
+  The first connector with access lists can't ship before both are fixed.
 - **Skills move from `prompts/skills/` to tenant data**, with the shipped ones as seeds.
   `src/prompts.ts` keeps tool prompts (code), not tenant skills.
 - **Docs.** AGENTS.md and the README describe Lorehouse as a Slack agent, and are reworded
