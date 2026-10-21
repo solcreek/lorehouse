@@ -36,9 +36,11 @@ app's service account, and the GitHub App's private key, which mints a token for
 installation. Others are scoped to one organization: a Slack workspace's bot token, a
 GitHub installation token.
 
-[Strongroom](https://github.com/solcreek/strongroom) serves exactly one tenant per
-deployment, with that tenant's own KMS key and KMS identity (solcreek/strongroom#12).
-Destroying the key makes every envelope under it unrecoverable.
+[Strongroom](https://github.com/solcreek/strongroom) 0.1.0 binds each token to one tenant,
+but one deployment may hold principals of several tenants under one KMS key and one KMS
+identity. solcreek/strongroom#12 makes one tenant per deployment, with its own KMS key
+and KMS identity, the only form. Destroying that key makes every envelope under it
+unrecoverable.
 
 ADR 0003 (layer 5) already requires that a sandbox host serves one tenant until
 isolation between tenants is complete.
@@ -64,7 +66,8 @@ files (knowledge, sessions, Lorehouse's own state). That content is every messag
 document, answer, session and usage record.
 - **One key per tenant.** The files are encrypted with that tenant's own data key. The
   key is stored only as an envelope under the tenant's own Strongroom deployment and KMS
-  key (ADR 0004). It is unwrapped in the tenant's runtime, kept in memory only, and never
+  key (ADR 0004). Lorehouse requires that deployment to serve this tenant alone, and
+  provisions it that way until Strongroom enforces it (solcreek/strongroom#12). It is unwrapped in the tenant's runtime, kept in memory only, and never
   written anywhere in the clear.
 - **Deleting a tenant** is destroying its KMS key, deleting its files, and purging its
   events not yet delivered (section 4). Destroying the key comes first: it also makes

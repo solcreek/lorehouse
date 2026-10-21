@@ -25,8 +25,9 @@ commands, and whatever a Slack message or an indexed thread talked the model int
 [Strongroom](https://github.com/solcreek/strongroom) (0.1.0, 2026-10-13) encrypts
 recoverable credentials under a managed KMS (Cloud KMS, AWS KMS, Vault, OpenBao) as
 envelopes that the caller stores in its own database. `decrypt` returns the plaintext
-to an authorized caller. A Strongroom deployment serves exactly one tenant, with that
-tenant's own KMS key (solcreek/strongroom#12).
+to an authorized caller. Each Strongroom token is bound to one tenant. Lorehouse gives
+each tenant a Strongroom deployment and KMS key of its own (ADR 0005 §2), which
+solcreek/strongroom#12 makes the only form Strongroom accepts.
 
 ## Decision
 
