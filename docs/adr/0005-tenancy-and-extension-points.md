@@ -180,6 +180,9 @@ never from the request:
   credential (Teams, Google Chat), the broker posts, or mints a token scoped to the
   tenant's conversations if the platform has one. Where the platform issues a credential
   per organization (a Slack workspace's bot token), the runtime holds that one directly.
+  Getting it still takes the app's client secret: the broker runs the install's code
+  exchange and every refresh of a rotating token, hands the token to the tenant's
+  runtime, and keeps no copy, nor does the control plane.
 - **The platforms' signing secrets** stay with the edge.
 
 **Hosted, there is one app per chat platform** (one Slack app, one Teams app, one Google
