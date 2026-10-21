@@ -1,6 +1,6 @@
 # ADR 0005: Tenancy, and what is replaceable
 
-Status: proposed, 2026-10-16
+Status: proposed, 2026-10-21
 
 ## Context
 
@@ -15,6 +15,13 @@ source, one model provider, and GitHub as the only code host:
   Crisp and plain HTTP only.
 - **Skills and profiles are compiled in.** They live in `prompts/` and the binary.
 
+**Where an attack on a tenant comes from.** The attacker is usually one of the tenant's
+own members, or content someone put in its workspace: a message, a document, a repo.
+That input reaches the model (prompt injection), the tools, Lorehouse's parsers and June.
+A bug anywhere on that path can give the attacker the process that handles the tenant.
+So the question that decides isolation is not whether that process can be taken, but
+what else it holds when it is.
+
 What the chat platforms require of whoever receives their events:
 
 | platform | the app must answer within | when it doesn't |
@@ -23,72 +30,120 @@ What the chat platforms require of whoever receives their events:
 | Microsoft Teams (Bot Framework) | 15 s | the activity is resent, so duplicates arrive |
 | Google Chat (HTTP app) | 30 s for a synchronous reply | the reply has to go through the Chat API |
 
+Some credentials act for every organization that installed an app, not one: the Slack
+app's signing secret and client secret, the Teams bot's app credential, the Google Chat
+app's service account, and the GitHub App's private key, which mints a token for any
+installation. Others are scoped to one organization: a Slack workspace's bot token, a
+GitHub installation token.
+
+[Strongroom](https://github.com/solcreek/strongroom) serves exactly one tenant per
+deployment, with that tenant's own KMS key and KMS identity (solcreek/strongroom#12).
+Destroying the key makes every envelope under it unrecoverable.
+
 ADR 0003 (layer 5) already requires that a sandbox host serves one tenant until
 isolation between tenants is complete.
 
 ## Decision
 
-### 1. A tenant's data lives in files of its own
+### 1. The tenant is the unit of compromise
+
+**Nothing a tenant sends, and no bug in Lorehouse or June that its input reaches, gives
+access to another tenant.** To reach another tenant, an attacker who holds a tenant's
+process must escape a virtual machine, the same bar ADR 0003 sets for a sandbox (layer
+2). Every section below follows from this:
+- a tenant's content is in files of its own, under a key of its own (section 2);
+- a tenant's code runs in a runtime of its own, which holds that tenant's credentials
+  and nothing else (section 3);
+- the services all tenants share hold no tenant's data key, and no credential that acts
+  for every tenant ever enters a tenant's runtime (section 4).
+
+### 2. A tenant's data lives in files of its own
 
 **A tenant is one customer organization.** Each tenant's content gets its own set of SQLite
 files (knowledge, sessions, Lorehouse's own state). That content is every message,
 document, answer, session and usage record.
-- **One key per tenant.** The files are encrypted with that tenant's own data key, held
-  as an envelope under KMS (ADR 0004).
-- **Deleting a tenant** is deleting its files, destroying its key, and purging its
-  events not yet delivered (section 2).
+- **One key per tenant.** The files are encrypted with that tenant's own data key. The
+  key is stored only as an envelope under the tenant's own Strongroom deployment and KMS
+  key (ADR 0004). It is unwrapped in the tenant's runtime, kept in memory only, and never
+  written anywhere in the clear.
+- **Deleting a tenant** is destroying its KMS key, deleting its files, and purging its
+  events not yet delivered (section 4). Destroying the key comes first: it also makes
+  every backup and snapshot of the files unreadable. A runtime told that the key is
+  destroyed stops serving, drops the key and everything derived from it from memory, and
+  never retries or restores. Disabling the key instead suspends the tenant, reversibly.
 - **Moving a tenant to another region** is moving its files, after its pending events
   are delivered or purged.
 
 **No tenant's content shares a table with another tenant's.** A query can't reach
 another tenant's rows because they aren't in the database it opened. Pooled tables are
-for the control plane only (section 2): the tenant registry, routing, installations and
+for the control plane only (section 4): the tenant registry, routing, installations and
 entitlements. They hold no customer content. The one bounded exception is events not yet
-delivered (section 2, invariant 4).
+delivered (section 4, invariant 4).
 
 **The tenant id is part of every key, log line, metric, job and file path from now on**,
-in single-tenant installs too. Moving between deployment forms (section 3) then never
+in single-tenant installs too. Moving between deployment forms (section 5) then never
 means a migration of identifiers.
 
-### 2. A control plane in front, data planes behind
+### 3. A tenant's runtime is its own
 
-- **The control plane** owns the tenant registry, provisioning and installations: which
-  chat workspace, Teams tenant or Google Workspace domain belongs to which tenant. It
-  also routes events. It is multi-tenant by nature, and holds no customer content beyond
-  events not yet delivered (invariant 4).
-- **A data plane** runs Lorehouse for one or more tenants (section 3), against their files.
+**Each tenant's data plane runs in a virtual machine of its own**, one tenant per VM,
+never several tenants in one process or one VM. The VM holds:
+- that tenant's files, and no other tenant's;
+- that tenant's credentials only: its Strongroom token, its chat workspace's bot token,
+  its model key, and short-lived tokens minted for it (section 4).
 
-**Every chat platform's events arrive at the control plane's edge.** The edge:
+A host runs many tenants' VMs. Which tenants share a host is placement, not isolation:
+a tenant's runtime that is taken reaches nothing of a tenant beside it without escaping
+its VM.
+
+**A tenant's VM may stop when idle.** The edge answers the platforms for it (section 4,
+invariant 6), so a stopped runtime costs storage and nothing else, and the cost of the
+hosted service grows with the tenants that are active, not with all of them. A cold start
+includes unwrapping the tenant's data key; how long it takes decides user-visible latency,
+not correctness.
+
+### 4. Shared services are few, hold no tenant's key, and act for one tenant at a time
+
+**The control plane** owns the tenant registry, provisioning and installations: which
+chat workspace, Teams tenant or Google Workspace domain belongs to which tenant. It
+routes events, and knows where each tenant's runtime and Strongroom deployment are. It
+holds no customer content beyond events not yet delivered (invariant 4), no tenant's
+data key, and no tenant's Strongroom token.
+
+**Every chat platform's events arrive at the control plane's edge.** The edge parses as
+little as it can, because every tenant's input passes through it. It:
 - verifies the platform's signature;
 - answers inside the platform's deadline;
 - maps `(platform, platform tenant id)` to a tenant;
 - computes the event's idempotency key (below);
-- queues the event for that tenant's data plane, which may be stopped or starting up at the time.
+- queues the event for that tenant's runtime, which may be stopped or starting up at the
+  time.
 
-**Delivery from the edge to a data plane must hold these invariants.** The mechanism
-(the queue, how it's stored, how a stopped data plane is woken) is an implementation
+**Delivery from the edge to a tenant's runtime must hold these invariants.** The mechanism
+(the queue, how it's stored, how a stopped runtime is woken) is an implementation
 choice, made in its own issue against them:
 1. **Durable before acknowledged.** The edge answers the platform only after the event
    is durably accepted, so an edge restart loses nothing.
-2. **At least once, until the data plane says so.** A pending event is redelivered until
-   the data plane acknowledges it. The data plane acknowledges only after it has written
+2. **At least once, until the runtime says so.** A pending event is redelivered until
+   the tenant's runtime acknowledges it. The runtime acknowledges only after it has written
    the event and its idempotency key to the tenant's files, in one transaction.
-3. **No second answer.** The data plane checks each key against the keys it has recorded,
+3. **No second answer.** The runtime checks each key against the keys it has recorded,
    in the tenant's files. It keeps them at least as long as pending events are kept, plus
    the platform's retry window.
 4. **Pending events are the one exception to "content lives in the tenant's files".**
    They are kept for a bounded time (at most 24 h).
-   - Only the edge may write them, and only that tenant's data plane may read them.
+   - Only the edge may write them, and only that tenant's runtime may read them.
    - They're excluded from backups and snapshots, and they stay in the tenant's region
      where the deployment form promises one.
    - They're purged when the tenant is deleted or moved.
-5. **The control plane never holds a tenant's data key.** It can't open a tenant's files.
-   Everything that works on content happens only in that tenant's data plane, which opens
-   its files with the tenant's key: indexing, search, embeddings, assembling context and
-   the model call. Embeddings and indexes are stored in the tenant's files like the rest
-   of its content.
-6. **A data plane that is stopped or cold never misses a platform's deadline.** The edge
-   answers for it. A data plane that scales to zero is started by something allowed to
+   - They are what a compromise of the edge exposes: every tenant's events of the last
+     24 h at most, and nothing stored in any tenant's files.
+5. **No shared service can open a tenant's files.** Everything that works on content
+   happens only in that tenant's runtime, which opens its files with the tenant's key:
+   indexing, search, embeddings, assembling context and the model call. Embeddings and
+   indexes are stored in the tenant's files like the rest of its content.
+6. **A runtime that is stopped or cold never misses a platform's deadline.** The edge
+   answers for it. A runtime that scales to zero is started by something allowed to
    start it. In a tenant's own cloud account, that is something in that account, or a
    start call the tenant grants. Otherwise that form doesn't scale to zero.
 
@@ -100,28 +155,45 @@ tenant and the platform, and stays the same across the platform's retries:
   interaction's resource name and type. Its conformance scenarios prove that a resent
   event maps to the same key.
 
+**A credential that acts for every tenant never enters a tenant's runtime.** A broker
+holds it, or the KMS key behind it, and uses it on a runtime's behalf, for that runtime's
+tenant only. The broker learns which tenant is asking from the runtime's own identity,
+never from the request:
+- **Code hosts.** The broker signs the GitHub App's JWT (in KMS, ADR 0004) and mints an
+  installation token only for the asking tenant's installation, only for the repos and
+  permissions its turn needs.
+- **Chat platforms whose app credential is global.** Where posting needs the app's own
+  credential (Teams, Google Chat), the broker posts, or mints a token scoped to the
+  tenant's conversations if the platform has one. Where the platform issues a credential
+  per organization (a Slack workspace's bot token), the runtime holds that one directly.
+- **The platforms' signing secrets** stay with the edge.
+
 **Hosted, there is one app per chat platform** (one Slack app, one Teams app, one Google
 Chat app), installed by each organization through the platform's own consent flow. A
 tenant may bring its own app instead: a self-hosted install has one by definition, and
-a tenant on its own deployment may choose one.
+a tenant on its own deployment may choose one. Its credentials then belong to that tenant
+and go to its runtime.
 
-### 3. Deployment forms, one codebase
+**The model provider key is per tenant** where the provider allows one: a key the tenant
+brings, or one Lorehouse provisions per tenant (for example in a provider workspace of
+its own), so a key taken from one runtime is revoked and limited for that tenant alone.
 
-All three run the same binary and pass the same conformance suite (ADR 0001):
+### 5. Deployment forms, one codebase
 
-| form | compute | data | sandbox hosts |
+All of them run the same binary and pass the same conformance suite (ADR 0001), and in
+all of them a tenant's runtime is its own (section 3). They differ in what a tenant
+shares with others below the VM:
+
+| form | a tenant's runtime runs on | sandbox hosts | a VM escape reaches |
 |---|---|---|---|
-| **single-tenant** | one data plane per tenant | that tenant's files | that tenant's own (ADR 0003 layer 5 holds trivially) |
-| **cell** | one data plane serves many tenants, each with its own files | per-tenant files | per tenant, until layer 5 is complete |
-| **isolated cloud account** | a single-tenant deployment in a cloud project or account of the tenant's own, made by the same provisioning code | in the tenant's region | in that account |
+| **hosted** | hosts shared by many tenants' VMs | the tenant's own, until ADR 0003 layer 5 is complete | the tenants on that host |
+| **dedicated** | hosts that run only this tenant's VMs | the tenant's own | this tenant only |
+| **isolated cloud account** | a dedicated deployment in a cloud project or account of the tenant's own, made by the same provisioning code, in the tenant's region | in that account | this tenant only, and KMS quota and billing are separate too |
 
-**Single-tenant comes first**: it needs almost no change to the data plane. A cell needs
-the data plane to resolve configuration, storage, schedules and sessions per tenant
-within one process. That is planned now (the tenant id in every key, section 1) and
-built after. Self-hosting is the single-tenant form with the control plane's edge
+Self-hosting is a dedicated deployment with one tenant, and the control plane's edge
 folded into the process.
 
-### 4. Replaceable by contract
+### 6. Replaceable by contract
 
 Each of these is an interface with conformance scenarios of its own. Slack, GitHub and
 Anthropic are the first implementations, never assumptions in the core:
@@ -135,6 +207,8 @@ Anthropic are the first implementations, never assumptions in the core:
     Lorehouse.
   - Policy is written in the surface's terms through the contract ("a conversation every
     member of the organization can read"), not in Slack's.
+  - The contract says which of the platform's credentials are per organization and which
+    are global (section 4).
 - **Knowledge source.** A connector syncs documents into the tenant's knowledge files.
   - It also keeps them true to the source: edits, deletions and changes to who may see
     them.
@@ -163,10 +237,11 @@ Anthropic are the first implementations, never assumptions in the core:
 - **Model provider.** Covers the provider and model per tenant and per profile.
   - Anthropic's API, cloud providers' hosted endpoints (Bedrock, Vertex, Azure), and
     endpoints a tenant runs itself.
-  - The key is the tenant's own when it brings one (ADR 0004).
+  - The key is per tenant (section 4).
 - **Code host.** Covers clone, stage and push, the approval to write, and the identity
   mapping (ADR 0003 layer 1 and the Approve flow).
   - GitHub first, then GitLab and the others.
+  - Tokens come from the broker, scoped to the tenant's installation (section 4).
   - **Code work is an optional capability of a profile** (ADR 0002). The core, answering
     from an organization's knowledge, needs no code host and no sandbox.
 - **Sandbox provider.** Covers runners Lorehouse hosts, runners a tenant hosts (they
@@ -181,13 +256,24 @@ Anthropic are the first implementations, never assumptions in the core:
 ## Consequences
 
 - **What everything else builds on.** Tenancy lands in the storage layer first: one
-  directory of files per tenant, each with its own key, and the tenant id threaded
-  through config, logs and jobs. Every other item builds on it.
+  directory of files per tenant, each with its own key under the tenant's own Strongroom
+  deployment, and the tenant id threaded through config, logs and jobs.
+- **No process serves two tenants.** Lorehouse never needs to resolve configuration,
+  storage, schedules or sessions for many tenants within one process, and June's
+  in-process state (its session store, its Slack event dedup) is one tenant's by
+  construction.
+- **Each tenant costs a VM, a Strongroom deployment and a KMS key.** Before the hosted
+  form is built, a spike measures what that costs per tenant: a runtime's idle memory,
+  its cold start including the key unwrap, how many tenants' VMs a host holds, and the
+  platforms' limits on Strongroom deployments per account. Scaling to zero (section 3) is
+  what keeps idle tenants cheap, so it is part of the hosted form, not an optimization.
 - **New services and code:**
   - an edge with per-platform verification and acknowledgement, and a delivery mechanism
-    meeting section 2's six invariants, designed in its own issue;
-  - a tenant registry, and provisioning that creates a single-tenant deployment from
-    code.
+    meeting section 4's six invariants, designed in its own issue;
+  - a broker for the credentials that act for every tenant, with tenant identity taken
+    from the runtime's own identity;
+  - a tenant registry, and provisioning from code that creates a tenant's runtime, its
+    Strongroom deployment and KMS key, and its model key, and that destroys them.
 - **New June channels for Teams and Google Chat.** The conformance mock grows a surface
   per platform, so one scenario runs against each.
 - **Code that says Slack moves behind the chat-surface contract:** `src/policy.ts`,
@@ -196,20 +282,13 @@ Anthropic are the first implementations, never assumptions in the core:
 - **Search and content tools get an audience filter** (the asker and the reply's
   audience, intersected), and saved sessions are filtered the same way before they're
   reused.
-- **Neither half holds today**, even for organization-wide material.
-  - The public-channels rule doesn't check every reader:
-    - a channel shared with another organization (Slack Connect) can be listed;
-    - a guest who can't open every listed channel can ask (#145).
-  - Saved sessions keep every turn's tool results. Material from a channel later turned
-    private or unlisted is still reused in later turns, until June supports redaction or
-    filtering (junebuild/june#360).
-  - The first connector with access lists can't ship before both are fixed.
+- **Session reuse doesn't hold the audience rule today.** The organization-wide half does
+  for Slack: shared channels are refused, and only full members are answered. But saved
+  sessions keep every turn's tool results, and material from a channel later turned
+  private or unlisted is still reused in later turns, until June supports redaction or
+  filtering (junebuild/june#360). The first connector with access lists can't ship before
+  that is fixed.
 - **Skills move from `prompts/skills/` to tenant data**, with the shipped ones as seeds.
   `src/prompts.ts` keeps tool prompts (code), not tenant skills.
-- **Open questions before a cell is built**, each a spike:
-  - Can June hold many tenants' session stores in one process?
-  - How fast does a cold single-tenant data plane take over from the edge? The edge
-    removes the platform deadline, so this is about user-visible latency, not
-    correctness.
 - **Docs.** AGENTS.md and the README describe Lorehouse as a Slack agent, and are reworded
   as the contracts land.
