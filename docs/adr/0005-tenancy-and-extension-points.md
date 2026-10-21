@@ -50,14 +50,21 @@ isolation between tenants is complete.
 ### 1. The tenant is the unit of compromise
 
 **Nothing a tenant sends, and no bug in Lorehouse or June that its input reaches, gives
-access to another tenant.** To reach another tenant, an attacker who holds a tenant's
-process must escape a virtual machine, the same bar ADR 0003 sets for a sandbox (layer
-2). Every section below follows from this:
+access to another tenant's content or credentials.** Everything that works on a
+tenant's content runs in that tenant's runtime, so an attacker who holds it must escape
+a virtual machine to reach another tenant. Every section below follows from this:
 - a tenant's content is in files of its own, under a key of its own (section 2);
 - a tenant's code runs in a runtime of its own, which holds that tenant's credentials
   and nothing else (section 3);
 - the services all tenants share hold no tenant's data key, and no credential that acts
   for every tenant ever enters a tenant's runtime (section 4).
+
+**The shared services are the deliberate exceptions.** Every tenant's events pass through
+the edge, and every tenant's runtime asks the broker for tokens, so a bug in either that
+a tenant's input reaches is not stopped by a VM. They are kept small and given a bounded
+exposure instead: the edge parses only what it must and holds at most 24 h of pending
+events (section 4, invariant 4); the broker acts only for the tenant its caller's own
+identity names, and holds no tenant's data key.
 
 ### 2. A tenant's data lives in files of its own
 
@@ -97,7 +104,11 @@ never several tenants in one process or one VM. The VM holds:
 
 A host runs many tenants' VMs. Which tenants share a host is placement, not isolation:
 a tenant's runtime that is taken reaches nothing of a tenant beside it without escaping
-its VM.
+its VM. Those VMs hold unwrapped data keys in memory, so a host that runs several
+tenants' runtimes meets the conditions ADR 0003 layer 5 sets for a sandbox host shared
+between tenants: SMT off or a core-aware scheduler, no memory overcommit beyond its
+limit, per-tenant quotas, and logs that name the tenant. It runs nothing else (layer 4).
+Until a host meets them, it runs one tenant's runtime.
 
 **A tenant's VM may stop when idle.** The edge answers the platforms for it (section 4,
 invariant 6), so a stopped runtime costs storage and nothing else, and the cost of the
@@ -189,7 +200,7 @@ shares with others below the VM:
 
 | form | a tenant's runtime runs on | sandbox hosts | a VM escape reaches |
 |---|---|---|---|
-| **hosted** | hosts shared by many tenants' VMs | the tenant's own, until ADR 0003 layer 5 is complete | the tenants on that host |
+| **hosted** | hosts shared by many tenants' VMs, under ADR 0003 layer 5's conditions (section 3) | the tenant's own, until ADR 0003 layer 5 is complete | the tenants on that host |
 | **dedicated** | hosts that run only this tenant's VMs | the tenant's own | this tenant only |
 | **isolated cloud account** | a dedicated deployment in a cloud project or account of the tenant's own, made by the same provisioning code, in the tenant's region | in that account | this tenant only, and KMS quota and billing are separate too |
 
@@ -261,10 +272,11 @@ Anthropic are the first implementations, never assumptions in the core:
 - **What everything else builds on.** Tenancy lands in the storage layer first: one
   directory of files per tenant, each with its own key under the tenant's own Strongroom
   deployment, and the tenant id threaded through config, logs and jobs.
-- **No process serves two tenants.** Lorehouse never needs to resolve configuration,
-  storage, schedules or sessions for many tenants within one process, and June's
-  in-process state (its session store, its Slack event dedup) is one tenant's by
-  construction.
+- **No process that works on a tenant's content serves two tenants.** Only the edge,
+  the broker and the control plane serve many, and none of them opens a tenant's files.
+  Lorehouse never needs to resolve configuration, storage, schedules or sessions for many
+  tenants within one process, and June's in-process state (its session store, its Slack
+  event dedup) is one tenant's by construction.
 - **Each tenant costs a VM, a Strongroom deployment and a KMS key.** Before the hosted
   form is built, a spike measures what that costs per tenant: a runtime's idle memory,
   its cold start including the key unwrap, how many tenants' VMs a host holds, and the
