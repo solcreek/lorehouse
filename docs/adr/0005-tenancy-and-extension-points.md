@@ -62,8 +62,9 @@ a virtual machine to reach another tenant. Every section below follows from this
 **The shared services are the deliberate exceptions.** Every tenant's events pass through
 the edge, and every tenant's runtime asks the broker for tokens, so a bug in either that
 a tenant's input reaches is not stopped by a VM. They are kept small and given a bounded
-exposure instead: the edge parses only what it must and holds at most 24 h of pending
-events (section 4, invariant 4); the broker acts only for the tenant its caller's own
+exposure instead: the edge parses only what it must, keeps at most 24 h of pending
+events, and is trusted by every tenant to report events truthfully (section 4, invariant
+4); the broker acts only for the tenant its caller's own
 identity names, and holds no tenant's data key.
 
 ### 2. A tenant's data lives in files of its own
@@ -150,8 +151,17 @@ choice, made in its own issue against them:
    - They're excluded from backups and snapshots, and they stay in the tenant's region
      where the deployment form promises one.
    - They're purged when the tenant is deleted or moved.
-   - They are what a compromise of the edge exposes: every tenant's events of the last
-     24 h at most, and nothing stored in any tenant's files.
+   - At rest they hold every tenant's events of the last 24 h at most, and nothing
+     stored in any tenant's files.
+
+   That bounds what is kept, not what an attacker who controls the edge can do. The edge
+   holds the platforms' signing secrets and writes every tenant's queue, so while it is
+   held, it sees every new event and can forge one as any member of any tenant. A tenant's
+   runtime answers a forged question as it would the member's own: checking that the
+   claimed user is a member doesn't authenticate them. The edge is therefore a trust
+   boundary for every tenant, and its compromise is an incident for all of them. It is
+   kept small and runs apart from everything else; a runtime that verified each event
+   itself would need a secret that acts for every tenant, which section 4 keeps out of it.
 5. **No shared service can open a tenant's files.** Everything that works on content
    happens only in that tenant's runtime, which opens its files with the tenant's key:
    indexing, search, embeddings, assembling context and the model call. Embeddings and
