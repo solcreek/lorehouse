@@ -105,9 +105,16 @@ never several tenants in one process or one VM. The VM holds:
 A host runs many tenants' VMs. Which tenants share a host is placement, not isolation:
 a tenant's runtime that is taken reaches nothing of a tenant beside it without escaping
 its VM. Those VMs hold unwrapped data keys in memory, so a host that runs several
-tenants' runtimes meets every condition of ADR 0003 layer 5, read with "tenant runtime"
-for "sandbox", and runs nothing else (layer 4). Until all of them hold, it runs one
-tenant's runtime.
+tenants' runtimes meets these conditions from ADR 0003 layer 5, and runs nothing else
+(layer 4):
+- SMT is off, or the scheduler is core-aware, so two tenants never share a physical core;
+- memory is checked before a VM starts, with overcommit capped as layer 5 caps it;
+- disk and CPU are under per-tenant quotas (a stopped runtime's files are kept, never
+  removed on a retention policy);
+- egress is separate per host or tenant tier, with rate limits on new connections;
+- logs and metrics name the tenant, and one tenant's data never appears in another's.
+
+Until all of them hold, a host runs one tenant's runtime.
 
 **A tenant's VM may stop when idle.** The edge answers the platforms for it (section 4,
 invariant 6), so a stopped runtime costs storage and nothing else, and the cost of the
@@ -119,13 +126,17 @@ not correctness.
 
 | shared service | holds | tenant input that reaches it | if it is taken |
 |---|---|---|---|
-| **edge** | the signing secrets of platforms that sign with one (Slack); every tenant's pending events, at most 24 h | every event, as the platform sent it | it sees every new event, and can forge an event from such a platform as any member of any tenant. Events a runtime verifies itself (below) it can only delay, drop or replay within their validity |
-| **control plane** | the tenant registry, routing, installations, and where each tenant's runtime and Strongroom deployment are | install and admin flows | it can misroute, stop or start tenants. It holds no data key, Strongroom token or bot token, so it can't open a tenant's files |
+| **edge** | the platforms' verification material (Slack's signing secret, the request tokens Teams and Google Chat send); every tenant's pending events, at most 24 h | every event, as the platform sent it | it sees every new event, and can forge an event as any member of any tenant, on every platform |
+| **control plane** | the tenant registry, routing, installations, and where each tenant's runtime and Strongroom deployment are; it issues the state an install is bound to | install and admin flows | it can deliver any tenant's events to another tenant's runtime or elsewhere, bind a new install (and so its bot token) to another tenant's runtime, and stop or start tenants. It holds no data key, Strongroom token or bot token, so it can't open what is already in a tenant's files |
 | **broker** | the credentials that act for every tenant: the GitHub App's signing right, the chat apps' client secrets and app credentials; a tenant's bot token in passing, during an exchange or a refresh | requests from every tenant's runtime | it can mint tokens for any tenant's installation and post in any tenant's conversations. It holds no data key, so it can't open a tenant's files |
 
-A compromise of any of the three is an incident for every tenant. Checking that an
-event's user is a member doesn't authenticate it: a runtime answers a forged question as
-it would the member's own.
+**Every tenant trusts all three.** A compromise of any of them is an incident for every
+tenant, so they are kept few, small and apart from everything else. A runtime can't
+check the edge's word: checking that an event's user is a member doesn't authenticate
+the event, and a runtime answers a forged question as it would the member's own. The
+platforms' request tokens (Teams, Google Chat) don't sign the request body and expire
+long before a queued event may be delivered, so a runtime that rechecked them would
+reject genuine events and still not stop a forged one.
 
 **The control plane** owns the tenant registry, provisioning and installations: which
 chat workspace, Teams tenant or Google Workspace domain belongs to which tenant. It
@@ -135,7 +146,7 @@ data key, and no tenant's Strongroom token.
 
 **Every chat platform's events arrive at the control plane's edge.** The edge parses as
 little as it can, because every tenant's input passes through it. It:
-- verifies the platform's signature, and forwards the request as the platform signed it;
+- verifies the platform's signature or request token;
 - answers inside the platform's deadline;
 - maps `(platform, platform tenant id)` to a tenant;
 - computes the event's idempotency key (below);
@@ -169,13 +180,6 @@ choice, made in its own issue against them:
    start it. In a tenant's own cloud account, that is something in that account, or a
    start call the tenant grants. Otherwise that form doesn't scale to zero.
 
-**A runtime verifies each event itself where the platform allows it without a shared
-secret.** Teams (Bot Framework) and Google Chat sign each request with a token the
-runtime checks against the platform's public keys and its own app id, so the edge can't
-forge their events. Slack signs with one secret shared by every installation; a runtime
-holding it could forge events for any tenant, so for Slack the edge's check stands, and
-the edge is trusted for Slack events.
-
 **Each chat surface's contract defines its idempotency key.** The key is scoped to the
 tenant and the platform, and stays the same across the platform's retries:
 - Where the platform has a native event id, the key uses it.
@@ -200,7 +204,7 @@ that tenant, and to that tenant's runtime only.
   Getting it still takes the app's client secret: the broker runs the install's code
   exchange and every refresh of a rotating token, hands the token to the tenant's
   runtime, and keeps no copy, nor does the control plane.
-- **Shared signing secrets** (Slack's) stay with the edge.
+- **The platforms' signing secrets** (Slack's) stay with the edge.
 
 **Hosted, there is one app per chat platform** (one Slack app, one Teams app, one Google
 Chat app), installed by each organization through the platform's own consent flow. A
@@ -310,9 +314,8 @@ Anthropic are the first implementations, never assumptions in the core:
     from the runtime's own identity;
   - a tenant registry, and provisioning from code that creates a tenant's runtime, its
     Strongroom deployment and KMS key, and its model key, and that destroys them.
-- **New June channels for Teams and Google Chat**, which verify each forwarded request's
-  platform token in the tenant's runtime. The conformance mock grows a surface per
-  platform, so one scenario runs against each, a forged event included.
+- **New June channels for Teams and Google Chat.** The conformance mock grows a surface
+  per platform, so one scenario runs against each.
 - **Code that says Slack moves behind the chat-surface contract:** `src/policy.ts`,
   `src/threads.ts`, `src/slack-guard.ts`, `src/ingest/slack.ts`, the `slack:` ids. The
   `slack:` ids stay valid as one source's ids.
