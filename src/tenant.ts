@@ -1,4 +1,4 @@
-// tenant.ts — who this install's data belongs to, and where it lives (ADR 0005 §1).
+// tenant.ts — who this install's data belongs to, and where it lives (ADR 0005 §2).
 //
 // A tenant is one customer organization. Its content lives in files of its own, and its
 // id is part of every path, sandbox id and log line, in a single-tenant install too: a

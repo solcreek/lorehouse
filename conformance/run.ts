@@ -398,7 +398,7 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    // ADR 0005 §1: the tenant id is in every key, path and log line, and /status names it
+    // ADR 0005 §2: the tenant id is in every key, path and log line, and /status names it
     // with the install's data directory. LOREHOUSE_DB is set here, so the data directory is
     // the one it names; the tenant is kept there (<dataDir>/<tenant>/tenant.json), and the
     // same one comes back after a restart.
@@ -1501,7 +1501,7 @@ const scenarios: Scenario[] = [
         const a = await ask("[exec] echo hi");
         if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
         // One per thread, and the tenant's: "<tenant>.<thread>", so two tenants' threads
-        // never share a sandbox on one host (ADR 0005 §1).
+        // never share a sandbox on one host (ADR 0005 §2).
         const tenant = ((await status()) as Status & { tenant?: string }).tenant;
         const sandbox = runner.jobs[0]?.sandbox ?? "";
         if (!sandbox.startsWith(`${tenant}.`) || !/^slack_C1_\d+\.\d+$/.test(sandbox.slice(`${tenant}.`.length))) return `the job's sandbox ${sandbox}, want one per thread of this tenant (${tenant}.slack_C1_<ts>)`;

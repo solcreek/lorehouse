@@ -49,7 +49,7 @@ describe("who may use it", () => {
     expect((await get("/api/v1/documents")).status).toBe(200);
   });
 
-  // ADR 0005 §1: the tenant id is in every answer, errors included; a refusal of the token
+  // ADR 0005 §2: the tenant id is in every answer, errors included; a refusal of the token
   // says nothing about the install.
   test("every answer to the token names the tenant; a refusal doesn't", async () => {
     const { db, get } = setup();
