@@ -1,4 +1,4 @@
-// The tenant (ADR 0005 §1): its id in every path, sandbox id and log line, and an install
+// The tenant (ADR 0005 §2): its id in every path, sandbox id and log line, and an install
 // laid out before tenants moved into its tenant's directory on the first start.
 
 import { describe, expect, test } from "bun:test";

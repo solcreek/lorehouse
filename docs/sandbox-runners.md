@@ -90,7 +90,7 @@ publishing step (`stage`, `push`; see [Publishing](#publishing)):
 A sandbox id is `<tenant>.<thread>`: the tenant's id (`acme` here; `src/tenant.ts`), a
 dot, then the thread's session id with every character outside `[A-Za-z0-9_.-]` as `_`.
 A tenant id has no dot, so the first dot ends it, and two tenants' threads never share an
-id on one host (ADR 0005 §1). It is at most 128 characters, sandboxd's limit: a longer
+id on one host (ADR 0005 §2). It is at most 128 characters, sandboxd's limit: a longer
 session is cut and a hash of it added.
 
 `timeoutMs` is the command's own limit. `deadlineMs` is how long Lorehouse will still wait
