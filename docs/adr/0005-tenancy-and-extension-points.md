@@ -175,8 +175,9 @@ the events sealed to the old key are delivered. It signs a **binding** for
 each tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
 Google Workspace domain it is), and its runtime's public key. The edge and the runtime
 check that signature; the control plane only stores and serves the bindings. Each
-binding carries a version that rises with every change to it, and every platform tenant
-id it names carries that version too. The edge and each runtime keep, durably, the
+binding carries a version from one counter the provisioner keeps for all bindings, which
+only rises, across tenants and through a tenant's destruction and re-creation; every
+platform tenant id a binding names carries that version too. The edge and each runtime keep, durably, the
 highest version they have seen per tenant and per platform tenant id, and refuse a lower
 one, so an older binding, still validly signed, can't be served again. When a workspace
 leaves a tenant, the provisioner re-signs that tenant's binding without it first. The
