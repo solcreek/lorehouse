@@ -81,6 +81,14 @@ document, answer, session and usage record.
   every backup and snapshot of the files unreadable. A runtime told that the key is
   destroyed stops serving, drops the key and everything derived from it from memory, and
   never retries or restores. Disabling the key instead suspends the tenant, reversibly.
+- **Destruction has a waiting period, and until it ends it can be cancelled**: 7 to 30
+  days on AWS KMS, 24 hours to 120 days on Cloud KMS, fixed when the key is created.
+  Decryption fails from the moment destruction is scheduled, so Lorehouse can no longer
+  read the tenant's data; but whoever can cancel the schedule can restore it until the
+  period ends, and the provider's backups keep the key material for a while after. The
+  deletion Lorehouse reports to the tenant states both dates: when the data became
+  unreadable, and when it became unrecoverable. The right to cancel is held as tightly as
+  the right to schedule.
 - **Moving a tenant to another region** is moving its files, after its pending events
   are delivered or purged.
 
