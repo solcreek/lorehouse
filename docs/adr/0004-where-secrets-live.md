@@ -72,7 +72,7 @@ solcreek/strongroom#12 makes the only form Strongroom accepts.
    Strongroom token stays a static bearer token for now: Strongroom has no OIDC
    caller auth. It is the one bootstrap secret. Each tenant has its own, for its own
    Strongroom deployment, and only that tenant's runtime and the host that runs it hold
-   it, never on the tenant's volume or in its backups (ADR 0005 §4): it opens the
+   it, never on the tenant's volume or in its backups when hosted (ADR 0005 §4): it opens the
    tenant's data key, so it is kept like one, never in the control plane. A self-hosted
    install with no federation keeps today's env and `settings.json` path.
 

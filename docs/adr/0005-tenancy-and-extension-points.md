@@ -90,8 +90,8 @@ document, answer, session and usage record.
   deletion Lorehouse reports to the tenant states both dates: when the data became
   unreadable, and when it became unrecoverable. The right to cancel is held as tightly as
   the right to schedule.
-- **Moving a tenant to another region** is moving its files, after its pending events
-  are delivered or purged.
+- **Moving a tenant to another region** is moving its files, and its bootstrap secret to
+  the new host (section 4), after its pending events are delivered or purged.
 
 **No tenant's content shares a table with another tenant's.** A query can't reach
 another tenant's rows because they aren't in the database it opened. Pooled tables are
@@ -161,28 +161,25 @@ tenant's Strongroom token.
 
 **The provisioner is apart from the control plane**, because creating a tenant is the
 power to give a runtime its keys. It creates a tenant's runtime, its Strongroom
-deployment and KMS key, and its model key, and destroys them. **The runtime key is the
-tenant's, not a VM's.** The runtime generates the key pair at the tenant's first start,
-and the provisioner hands it the Strongroom token sealed to that key and keeps no copy.
-The token is the tenant's one bootstrap secret, so it is never on the tenant's volume:
-the host keeps it for the tenant's VM, outside every volume, backup and snapshot, and
-hands it in at each start (a host can therefore reach the tokens of the tenants it runs,
-as section 5's table says of a VM escape). The private key is a Strongroom envelope in
-the tenant's files, opened with that token, so it survives a restart and a replaced VM,
-and events sealed while the runtime was stopped still open. Both are tenant secrets
-(section 3's snapshot rule). Replacing the key is a change: the provisioner re-signs the binding with
-the new key first, and the runtime keeps the old private key until the events sealed to
-it (at most 24 h of them) are delivered, then drops it. It signs a **binding** for
-each tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
-Google Workspace domain it is), and its runtime's public key. The edge and the runtime
-check that signature; the control plane only stores and serves the bindings. Each
-binding carries a version from one counter the provisioner keeps for all bindings, which
-only rises, across tenants and through a tenant's destruction and re-creation; every
-platform tenant id a binding names carries that version too. The edge and each runtime keep, durably, the
-highest version they have seen per tenant and per platform tenant id, and refuse a lower
-one, so an older binding, still validly signed, can't be served again. When a workspace
-leaves a tenant, the provisioner re-signs that tenant's binding without it first. The
-provisioner runs when a tenant is created, changed or destroyed, and at no other time.
+deployment and KMS key, and its model key, and destroys them. It runs when a tenant is
+created, changed or destroyed, and at no other time. It signs a **binding** for each
+tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
+Google Workspace domain it is), and its runtime's public key, which events are sealed to
+(invariant 5). The mechanism is designed in its own issue, against these rules:
+- **The edge and the runtime check a binding's signature**; the control plane only
+  stores and serves bindings.
+- **A binding can't be rolled back.** An older binding, still validly signed, is refused
+  by the edge and by every runtime, including after a workspace moves to another tenant
+  or a tenant is destroyed and re-created.
+- **The provisioner keeps no secret it hands out.**
+- **A tenant's bootstrap secret** (its Strongroom token, which opens its data key) is held
+  only by the tenant's runtime and the host running it, never in the control plane, and
+  never on the tenant's volume, in its backups or in a snapshot. A host can therefore
+  reach the tokens of the tenants it runs, as section 5's table says of a VM escape.
+- **The runtime key is the tenant's, not a VM's.** It survives a restart, a replaced VM
+  and a move to another host or region, so events sealed to it while the runtime was
+  stopped still open. Replacing it never strands an event sealed to the old key. It is a
+  tenant secret (section 3's snapshot rule).
 
 **Every chat platform's events arrive at the control plane's edge.** The edge parses as
 little as it can, because every tenant's input passes through it. It:
