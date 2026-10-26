@@ -95,9 +95,9 @@ document, answer, session and usage record.
 
 **No tenant's content shares a table with another tenant's.** A query can't reach
 another tenant's rows because they aren't in the database it opened. Pooled tables are
-for the shared services only (section 4): the tenant registry, routing, bindings,
-installations and entitlements. They hold no customer content. The one bounded exception is events not yet
-delivered (section 4, invariant 5).
+for the shared services only (section 4): the tenant registry, routing, bindings (which
+say which installations belong to which tenant) and entitlements. They hold no customer
+content. The one bounded exception is events not yet delivered (section 4, invariant 5).
 
 **The tenant id is part of every key, log line, metric, job and file path from now on**,
 in single-tenant installs too. Moving between deployment forms (section 5) then never
