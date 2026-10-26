@@ -142,7 +142,7 @@ the snapshot froze all three.
 | shared service | holds | tenant input that reaches it | if it is taken |
 |---|---|---|---|
 | **edge** | the platforms' verification material (Slack's signing secret, the request tokens Teams and Google Chat send); every tenant's pending events, at most 24 h, sealed to each tenant's runtime | every event, as the platform sent it | it sees every new event, and can forge an event as any member of any tenant, on every platform. Through forged questions it also reads what is already in a tenant's files: the runtime answers from them, and the answer comes back through the edge as the platform's next event. It can forge an Approve too, so an Approve opens only what the code host still reviews (ADR 0002) |
-| **control plane** | the tenant registry, routing and entitlements; the provisioner's signed bindings, which it can store and serve but not change | admin flows | it can delay or drop any tenant's events, and stop or start tenants. It can't change which runtime a tenant's events are for (the binding is signed), and it holds no data key, Strongroom token or bot token |
+| **control plane** | the tenant registry, routing and entitlements; the provisioner's signed bindings, which it can store and serve but not change | admin flows | it can delay or drop any tenant's events, and stop or start tenants. It can't change which runtime a tenant's events are for (the binding is signed and versioned), and it holds no data key, Strongroom token or bot token |
 | **provisioner** | the right to create and destroy a tenant's runtime, Strongroom deployment and KMS key, and to sign bindings; it issues the state an install is bound to | install flows, and requests from the control plane to create or destroy a tenant | it can bind a new install (and so its bot token) to a runtime of its choosing, and create a runtime that unwraps a tenant's key. It runs only to create, change or destroy a tenant, and keeps nothing it hands out |
 | **broker** | the credentials that act for every tenant: the GitHub App's signing right, the chat apps' client secrets and app credentials; a tenant's bot token in passing, during an exchange or a refresh | requests from every tenant's runtime | it can mint tokens for any tenant's installation and post in any tenant's conversations. It holds no data key, so it can't open a tenant's files |
 
@@ -165,7 +165,12 @@ own key pair at first start; the provisioner hands the Strongroom token and the 
 token to the runtime sealed to that key, and keeps no copy. It signs a **binding** for
 each tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
 Google Workspace domain it is), and its runtime's public key. The edge and the runtime
-check that signature; the control plane only stores and serves the bindings. The
+check that signature; the control plane only stores and serves the bindings. Each
+binding carries a version that rises with every change to it, and every platform tenant
+id it names carries that version too. The edge and each runtime keep, durably, the
+highest version they have seen per tenant and per platform tenant id, and refuse a lower
+one, so an older binding, still validly signed, can't be served again. When a workspace
+leaves a tenant, the provisioner re-signs that tenant's binding without it first. The
 provisioner runs when a tenant is created, changed or destroyed, and at no other time.
 
 **Every chat platform's events arrive at the control plane's edge.** The edge parses as
