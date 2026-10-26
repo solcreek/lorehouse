@@ -122,6 +122,13 @@ hosted service grows with the tenants that are active, not with all of them. A c
 includes unwrapping the tenant's data key; how long it takes decides user-visible latency,
 not correctness.
 
+**A VM's memory is never snapshotted once it has held a tenant's secret.** A snapshot of
+a running runtime holds the unwrapped data key, and every token, in the clear, and
+destroying the KMS key doesn't reach it. A faster start may restore a snapshot taken
+before any tenant secret entered the VM, and unwrap after the restore. A restore sets
+the guest's clock, reseeds its randomness and drops the connections it was holding, since
+the snapshot froze all three.
+
 ### 4. Shared services are few, hold no tenant's key, and act for one tenant at a time
 
 | shared service | holds | tenant input that reaches it | if it is taken |
