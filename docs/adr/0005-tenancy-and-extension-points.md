@@ -160,9 +160,14 @@ tenant's Strongroom token.
 
 **The provisioner is apart from the control plane**, because creating a tenant is the
 power to give a runtime its keys. It creates a tenant's runtime, its Strongroom
-deployment and KMS key, and its model key, and destroys them. The runtime generates its
-own key pair at first start; the provisioner hands the Strongroom token and the bot
-token to the runtime sealed to that key, and keeps no copy. It signs a **binding** for
+deployment and KMS key, and its model key, and destroys them. **The runtime key is the
+tenant's, not a VM's.** The runtime generates the key pair at the tenant's first start,
+and the provisioner hands it the Strongroom token sealed to that key and keeps no copy.
+The runtime keeps the token on the tenant's own volume and the private key as a
+Strongroom envelope in the tenant's files, so both survive a restart and a replaced VM,
+and events sealed while it was stopped still open. Both are tenant secrets (section 3's
+snapshot rule). Replacing the key is a change: the provisioner re-signs the binding once
+the events sealed to the old key are delivered. It signs a **binding** for
 each tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
 Google Workspace domain it is), and its runtime's public key. The edge and the runtime
 check that signature; the control plane only stores and serves the bindings. Each
@@ -239,7 +244,8 @@ that tenant, and to that tenant's runtime only.
   per organization (a Slack workspace's bot token), the runtime holds that one directly.
   Getting it still takes the app's client secret: the broker runs the install's code
   exchange and every refresh of a rotating token, hands the token to the tenant's
-  runtime, and keeps no copy, nor does the control plane or the provisioner.
+  runtime sealed to the runtime key in its binding, and keeps no copy, nor does the
+  control plane or the provisioner.
 - **The platforms' signing secrets** (Slack's) stay with the edge.
 
 **Hosted, there is one app per chat platform** (one Slack app, one Teams app, one Google
