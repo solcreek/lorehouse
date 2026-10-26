@@ -59,8 +59,8 @@ a virtual machine to reach another tenant. Every section below follows from this
 - the services all tenants share hold no tenant's data key, and no credential that acts
   for every tenant ever enters a tenant's runtime (section 4).
 
-**The shared services are the deliberate exceptions:** the edge, the control plane and
-the broker. Every tenant's input reaches them, and no VM stands between one tenant and
+**The shared services are the deliberate exceptions:** the edge, the control plane, the
+provisioner and the broker. Every tenant's input reaches them, and no VM stands between one tenant and
 another inside them. They are kept few and small, none of them can open a tenant's files,
 and section 4 lists what each holds and what its compromise gives. Nothing else is
 shared.
@@ -86,8 +86,8 @@ document, answer, session and usage record.
 
 **No tenant's content shares a table with another tenant's.** A query can't reach
 another tenant's rows because they aren't in the database it opened. Pooled tables are
-for the control plane only (section 4): the tenant registry, routing, installations and
-entitlements. They hold no customer content. The one bounded exception is events not yet
+for the shared services only (section 4): the tenant registry, routing, bindings,
+installations and entitlements. They hold no customer content. The one bounded exception is events not yet
 delivered (section 4, invariant 4).
 
 **The tenant id is part of every key, log line, metric, job and file path from now on**,
@@ -127,10 +127,11 @@ not correctness.
 | shared service | holds | tenant input that reaches it | if it is taken |
 |---|---|---|---|
 | **edge** | the platforms' verification material (Slack's signing secret, the request tokens Teams and Google Chat send); every tenant's pending events, at most 24 h | every event, as the platform sent it | it sees every new event, and can forge an event as any member of any tenant, on every platform. Through forged questions it also reads what is already in a tenant's files: the runtime answers from them, and the answer comes back through the edge as the platform's next event |
-| **control plane** | the tenant registry, routing, installations, and where each tenant's runtime and Strongroom deployment are; it issues the state an install is bound to | install and admin flows | it can deliver any tenant's events to another tenant's runtime or elsewhere, bind a new install (and so its bot token) to another tenant's runtime, and stop or start tenants. It holds no data key, Strongroom token or bot token, so it can't open what is already in a tenant's files |
+| **control plane** | the tenant registry, routing and entitlements; the provisioner's signed bindings, which it can store and serve but not change | admin flows | it can delay or drop any tenant's events, and stop or start tenants. It can't change which runtime a tenant's events are for (the binding is signed), and it holds no data key, Strongroom token or bot token |
+| **provisioner** | the right to create and destroy a tenant's runtime, Strongroom deployment and KMS key, and to sign bindings; it issues the state an install is bound to | install flows, and requests from the control plane to create or destroy a tenant | it can bind a new install (and so its bot token) to a runtime of its choosing, and create a runtime that unwraps a tenant's key. It runs only to create, change or destroy a tenant, and keeps nothing it hands out |
 | **broker** | the credentials that act for every tenant: the GitHub App's signing right, the chat apps' client secrets and app credentials; a tenant's bot token in passing, during an exchange or a refresh | requests from every tenant's runtime | it can mint tokens for any tenant's installation and post in any tenant's conversations. It holds no data key, so it can't open a tenant's files |
 
-**Every tenant trusts all three.** A compromise of any of them is an incident for every
+**Every tenant trusts all four.** A compromise of any of them is an incident for every
 tenant, so they are kept few, small and apart from everything else. A runtime can't
 check the edge's word: checking that an event's user is a member doesn't authenticate
 the event, and a runtime answers a forged question as it would the member's own. The
@@ -138,11 +139,19 @@ platforms' request tokens (Teams, Google Chat) don't sign the request body and e
 long before a queued event may be delivered, so a runtime that rechecked them would
 reject genuine events and still not stop a forged one.
 
-**The control plane** owns the tenant registry, provisioning and installations: which
-chat workspace, Teams tenant or Google Workspace domain belongs to which tenant. It
-routes events, and knows where each tenant's runtime and Strongroom deployment are. It
-holds no customer content beyond events not yet delivered (invariant 4), no tenant's
-data key, and no tenant's Strongroom token.
+**The control plane** owns the tenant registry and routes events. It holds no customer
+content beyond events not yet delivered (invariant 4), no tenant's data key, and no
+tenant's Strongroom token.
+
+**The provisioner is apart from the control plane**, because creating a tenant is the
+power to give a runtime its keys. It creates a tenant's runtime, its Strongroom
+deployment and KMS key, and its model key, and destroys them. The runtime generates its
+own key pair at first start; the provisioner hands the Strongroom token and the bot
+token to the runtime sealed to that key, and keeps no copy. It signs a **binding** for
+each tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
+Google Workspace domain it is), and its runtime's public key. The edge and the runtime
+check that signature; the control plane only stores and serves the bindings. The
+provisioner runs when a tenant is created, changed or destroyed, and at no other time.
 
 **Every chat platform's events arrive at the control plane's edge.** The edge parses as
 little as it can, because every tenant's input passes through it. It:
@@ -192,7 +201,7 @@ tenant and the platform, and stays the same across the platform's retries:
 holds it, or the KMS key behind it, and uses it on a runtime's behalf, for that runtime's
 tenant only. The broker learns which tenant is asking from the runtime's own identity,
 never from the request. An install has no runtime yet: its exchange carries a state the
-control plane issued for the tenant being provisioned, and the broker binds the result to
+provisioner issued for the tenant being provisioned, and the broker binds the result to
 that tenant, and to that tenant's runtime only.
 - **Code hosts.** The broker signs the GitHub App's JWT (in KMS, ADR 0004) and mints an
   installation token only for the asking tenant's installation, only for the repos and
@@ -203,7 +212,7 @@ that tenant, and to that tenant's runtime only.
   per organization (a Slack workspace's bot token), the runtime holds that one directly.
   Getting it still takes the app's client secret: the broker runs the install's code
   exchange and every refresh of a rotating token, hands the token to the tenant's
-  runtime, and keeps no copy, nor does the control plane.
+  runtime, and keeps no copy, nor does the control plane or the provisioner.
 - **The platforms' signing secrets** (Slack's) stay with the edge.
 
 **Hosted, there is one app per chat platform** (one Slack app, one Teams app, one Google
@@ -297,7 +306,8 @@ Anthropic are the first implementations, never assumptions in the core:
   directory of files per tenant, each with its own key under the tenant's own Strongroom
   deployment, and the tenant id threaded through config, logs and jobs.
 - **No process that works on a tenant's content serves two tenants.** Only the edge,
-  the control plane and the broker serve many, and none of them opens a tenant's files
+  the control plane, the provisioner and the broker serve many, and none of them opens a
+  tenant's files
   (section 4's table).
   Lorehouse never needs to resolve configuration, storage, schedules or sessions for many
   tenants within one process, and June's in-process state (its session store, its Slack
@@ -312,8 +322,9 @@ Anthropic are the first implementations, never assumptions in the core:
     meeting section 4's six invariants, designed in its own issue;
   - a broker for the credentials that act for every tenant, with tenant identity taken
     from the runtime's own identity;
-  - a tenant registry, and provisioning from code that creates a tenant's runtime, its
-    Strongroom deployment and KMS key, and its model key, and that destroys them.
+  - a tenant registry, and a provisioner, apart from it, that creates a tenant's
+    runtime, its Strongroom deployment and KMS key, and its model key from code, signs
+    its binding, and destroys them.
 - **New June channels for Teams and Google Chat.** The conformance mock grows a surface
   per platform, so one scenario runs against each.
 - **Code that says Slack moves behind the chat-surface contract:** `src/policy.ts`,
