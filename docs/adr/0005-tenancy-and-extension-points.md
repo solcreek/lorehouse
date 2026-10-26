@@ -164,10 +164,13 @@ power to give a runtime its keys. It creates a tenant's runtime, its Strongroom
 deployment and KMS key, and its model key, and destroys them. **The runtime key is the
 tenant's, not a VM's.** The runtime generates the key pair at the tenant's first start,
 and the provisioner hands it the Strongroom token sealed to that key and keeps no copy.
-The runtime keeps the token on the tenant's own volume and the private key as a
-Strongroom envelope in the tenant's files, so both survive a restart and a replaced VM,
-and events sealed while it was stopped still open. Both are tenant secrets (section 3's
-snapshot rule). Replacing the key is a change: the provisioner re-signs the binding once
+The token is the tenant's one bootstrap secret, so it is never on the tenant's volume:
+the host keeps it for the tenant's VM, outside every volume, backup and snapshot, and
+hands it in at each start (a host can therefore reach the tokens of the tenants it runs,
+as section 5's table says of a VM escape). The private key is a Strongroom envelope in
+the tenant's files, opened with that token, so it survives a restart and a replaced VM,
+and events sealed while the runtime was stopped still open. Both are tenant secrets
+(section 3's snapshot rule). Replacing the key is a change: the provisioner re-signs the binding once
 the events sealed to the old key are delivered. It signs a **binding** for
 each tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
 Google Workspace domain it is), and its runtime's public key. The edge and the runtime
