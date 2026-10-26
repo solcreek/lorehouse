@@ -142,7 +142,7 @@ the snapshot froze all three.
 
 | shared service | holds | tenant input that reaches it | if it is taken |
 |---|---|---|---|
-| **edge** | the platforms' verification material (Slack's signing secret, the request tokens Teams and Google Chat send); every tenant's pending events, at most 24 h, sealed to each tenant's runtime | every event, as the platform sent it | it sees every new event, and can forge an event as any member of any tenant, on every platform. Through forged questions it also reads what is already in a tenant's files: the runtime answers from them, and the answer comes back through the edge as the platform's next event. It can forge an Approve too, so an Approve opens only what the code host still reviews (ADR 0002) |
+| **edge** | the platforms' verification material (Slack's signing secret, the request tokens Teams and Google Chat send); every tenant's pending events, at most 24 h, sealed to each tenant's runtime | every event, as the platform sent it | it sees every new event, and can forge an event as any member of any tenant, on every platform. Through forged questions it also reads what is already in a tenant's files: the runtime answers from them, and the answer comes back through the edge as the platform's next event. It can forge an Approve too: the merge stays behind the code host's review, but the push and the CI it triggers don't (ADR 0002) |
 | **control plane** | the tenant registry, routing and entitlements; the provisioner's signed bindings, which it can store and serve but not change | admin flows | it can delay or drop any tenant's events, stop or start tenants, and have the provisioner create a tenant or schedule one's destruction, which stays cancellable through its waiting period (section 2). It can't change which runtime a tenant's events are for (the binding is signed and versioned), and it holds no data key, Strongroom token or bot token |
 | **provisioner** | the right to create and destroy a tenant's runtime, Strongroom deployment and KMS key, and to sign bindings; it issues the state an install is bound to | install flows, and requests from the control plane to create or destroy a tenant | it can bind a new install (and so its bot token) to a runtime of its choosing, and create a runtime that unwraps a tenant's key. It runs only to create, change or destroy a tenant, and keeps nothing it hands out |
 | **broker** | the credentials that act for every tenant: the GitHub App's signing right, the chat apps' client secrets and app credentials; a tenant's bot token in passing, during an exchange or a refresh | requests from every tenant's runtime | it can mint tokens for any tenant's installation and post in any tenant's conversations. It holds no data key, so it can't open a tenant's files |
@@ -323,6 +323,8 @@ Anthropic are the first implementations, never assumptions in the core:
   mapping (ADR 0003 layer 1 and the Approve flow).
   - GitHub first, then GitLab and the others.
   - Tokens come from the broker, scoped to the tenant's installation (section 4).
+  - The contract states what a push triggers before review. Where the host allows it,
+    Lorehouse pushes where unreviewed workflows get no secrets, such as a fork (ADR 0002).
   - **Code work is an optional capability of a profile** (ADR 0002). The core, answering
     from an organization's knowledge, needs no code host and no sandbox.
 - **Sandbox provider.** Covers runners Lorehouse hosts, runners a tenant hosts (they
