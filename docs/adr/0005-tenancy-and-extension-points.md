@@ -307,11 +307,10 @@ Anthropic are the first implementations, never assumptions in the core:
   deployment, and the tenant id threaded through config, logs and jobs.
 - **No process that works on a tenant's content serves two tenants.** Only the edge,
   the control plane, the provisioner and the broker serve many, and none of them opens a
-  tenant's files
-  (section 4's table).
-  Lorehouse never needs to resolve configuration, storage, schedules or sessions for many
-  tenants within one process, and June's in-process state (its session store, its Slack
-  event dedup) is one tenant's by construction.
+  tenant's files (section 4's table). Lorehouse never needs to resolve configuration,
+  storage, schedules or sessions for many tenants within one process, and June's
+  in-process state (its session store, its Slack event dedup) is one tenant's by
+  construction.
 - **Each tenant costs a VM, a Strongroom deployment and a KMS key.** Before the hosted
   form is built, a spike measures what that costs per tenant: a runtime's idle memory,
   its cold start including the key unwrap, how many tenants' VMs a host holds, and the
