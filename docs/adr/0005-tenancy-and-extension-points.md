@@ -170,8 +170,9 @@ hands it in at each start (a host can therefore reach the tokens of the tenants 
 as section 5's table says of a VM escape). The private key is a Strongroom envelope in
 the tenant's files, opened with that token, so it survives a restart and a replaced VM,
 and events sealed while the runtime was stopped still open. Both are tenant secrets
-(section 3's snapshot rule). Replacing the key is a change: the provisioner re-signs the binding once
-the events sealed to the old key are delivered. It signs a **binding** for
+(section 3's snapshot rule). Replacing the key is a change: the provisioner re-signs the binding with
+the new key first, and the runtime keeps the old private key until the events sealed to
+it (at most 24 h of them) are delivered, then drops it. It signs a **binding** for
 each tenant: the tenant id, its platform tenant ids (which chat workspace, Teams tenant or
 Google Workspace domain it is), and its runtime's public key. The edge and the runtime
 check that signature; the control plane only stores and serves the bindings. Each
