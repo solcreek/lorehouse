@@ -88,7 +88,7 @@ document, answer, session and usage record.
 another tenant's rows because they aren't in the database it opened. Pooled tables are
 for the shared services only (section 4): the tenant registry, routing, bindings,
 installations and entitlements. They hold no customer content. The one bounded exception is events not yet
-delivered (section 4, invariant 4).
+delivered (section 4, invariant 5).
 
 **The tenant id is part of every key, log line, metric, job and file path from now on**,
 in single-tenant installs too. Moving between deployment forms (section 5) then never
@@ -117,7 +117,7 @@ tenants' runtimes meets these conditions from ADR 0003 layer 5, and runs nothing
 Until all of them hold, a host runs one tenant's runtime.
 
 **A tenant's VM may stop when idle.** The edge answers the platforms for it (section 4,
-invariant 6), so a stopped runtime costs storage and nothing else, and the cost of the
+invariant 7), so a stopped runtime costs storage and nothing else, and the cost of the
 hosted service grows with the tenants that are active, not with all of them. A cold start
 includes unwrapping the tenant's data key; how long it takes decides user-visible latency,
 not correctness.
@@ -126,7 +126,7 @@ not correctness.
 
 | shared service | holds | tenant input that reaches it | if it is taken |
 |---|---|---|---|
-| **edge** | the platforms' verification material (Slack's signing secret, the request tokens Teams and Google Chat send); every tenant's pending events, at most 24 h | every event, as the platform sent it | it sees every new event, and can forge an event as any member of any tenant, on every platform. Through forged questions it also reads what is already in a tenant's files: the runtime answers from them, and the answer comes back through the edge as the platform's next event |
+| **edge** | the platforms' verification material (Slack's signing secret, the request tokens Teams and Google Chat send); every tenant's pending events, at most 24 h, sealed to each tenant's runtime | every event, as the platform sent it | it sees every new event, and can forge an event as any member of any tenant, on every platform. Through forged questions it also reads what is already in a tenant's files: the runtime answers from them, and the answer comes back through the edge as the platform's next event |
 | **control plane** | the tenant registry, routing and entitlements; the provisioner's signed bindings, which it can store and serve but not change | admin flows | it can delay or drop any tenant's events, and stop or start tenants. It can't change which runtime a tenant's events are for (the binding is signed), and it holds no data key, Strongroom token or bot token |
 | **provisioner** | the right to create and destroy a tenant's runtime, Strongroom deployment and KMS key, and to sign bindings; it issues the state an install is bound to | install flows, and requests from the control plane to create or destroy a tenant | it can bind a new install (and so its bot token) to a runtime of its choosing, and create a runtime that unwraps a tenant's key. It runs only to create, change or destroy a tenant, and keeps nothing it hands out |
 | **broker** | the credentials that act for every tenant: the GitHub App's signing right, the chat apps' client secrets and app credentials; a tenant's bot token in passing, during an exchange or a refresh | requests from every tenant's runtime | it can mint tokens for any tenant's installation and post in any tenant's conversations. It holds no data key, so it can't open a tenant's files |
@@ -140,7 +140,7 @@ long before a queued event may be delivered, so a runtime that rechecked them wo
 reject genuine events and still not stop a forged one.
 
 **The control plane** owns the tenant registry and routes events. It holds no customer
-content beyond events not yet delivered (invariant 4), no tenant's data key, and no
+content beyond events not yet delivered (invariant 5), no tenant's data key, and no
 tenant's Strongroom token.
 
 **The provisioner is apart from the control plane**, because creating a tenant is the
@@ -157,7 +157,7 @@ provisioner runs when a tenant is created, changed or destroyed, and at no other
 little as it can, because every tenant's input passes through it. It:
 - verifies the platform's signature or request token;
 - answers inside the platform's deadline;
-- maps `(platform, platform tenant id)` to a tenant;
+- maps `(platform, platform tenant id)` to a tenant, through that tenant's signed binding;
 - computes the event's idempotency key (below);
 - queues the event for that tenant's runtime, which may be stopped or starting up at the
   time.
@@ -170,21 +170,28 @@ choice, made in its own issue against them:
 2. **At least once, until the runtime says so.** A pending event is redelivered until
    the tenant's runtime acknowledges it. The runtime acknowledges only after it has written
    the event and its idempotency key to the tenant's files, in one transaction.
-3. **No second answer.** The runtime checks each key against the keys it has recorded,
+3. **Only its own tenant's events.** A runtime accepts an event only if its platform
+   tenant id is one its own binding names, and refuses any other, whoever delivered it.
+   An event the control plane routed to the wrong runtime is refused there.
+4. **No second answer.** The runtime checks each key against the keys it has recorded,
    in the tenant's files. It keeps them at least as long as pending events are kept, plus
    the platform's retry window.
-4. **Pending events are the one exception to "content lives in the tenant's files".**
+5. **Pending events are the one exception to "content lives in the tenant's files".**
    They are kept for a bounded time (at most 24 h).
+   - The edge seals each one to the public key in its tenant's binding (HPKE) as soon as
+     it has verified it, before it is stored. The queue, its backups and a misrouted
+     event hold only ciphertext that the tenant's runtime alone can open; the edge sees
+     an event in the clear only while it handles it.
    - Only the edge may write them, and only that tenant's runtime may read them.
    - They're excluded from backups and snapshots, and they stay in the tenant's region
      where the deployment form promises one.
    - They're purged when the tenant is deleted or moved.
    - The 24 h bounds what is kept, not what a held edge can do (the table above).
-5. **No shared service can open a tenant's files.** Everything that works on content
+6. **No shared service can open a tenant's files.** Everything that works on content
    happens only in that tenant's runtime, which opens its files with the tenant's key:
    indexing, search, embeddings, assembling context and the model call. Embeddings and
    indexes are stored in the tenant's files like the rest of its content.
-6. **A runtime that is stopped or cold never misses a platform's deadline.** The edge
+7. **A runtime that is stopped or cold never misses a platform's deadline.** The edge
    answers for it. A runtime that scales to zero is started by something allowed to
    start it. In a tenant's own cloud account, that is something in that account, or a
    start call the tenant grants. Otherwise that form doesn't scale to zero.
@@ -318,7 +325,7 @@ Anthropic are the first implementations, never assumptions in the core:
   what keeps idle tenants cheap, so it is part of the hosted form, not an optimization.
 - **New services and code:**
   - an edge with per-platform verification and acknowledgement, and a delivery mechanism
-    meeting section 4's six invariants, designed in its own issue;
+    meeting section 4's seven invariants, designed in its own issue;
   - a broker for the credentials that act for every tenant, with tenant identity taken
     from the runtime's own identity;
   - a tenant registry, and a provisioner, apart from it, that creates a tenant's
