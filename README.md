@@ -37,9 +37,11 @@ You name it per install; it defaults to `scout`.
   [Strongroom](https://github.com/solcreek/strongroom) deployment (`STRONGROOM_URL`,
   `STRONGROOM_TOKEN`, `STRONGROOM_KEY`), both databases are encrypted (AEGIS-256) under the
   tenant's own data key, which is kept only wrapped by your KMS key, in `key.json` in the
-  tenant's directory. Without that key the files, and every backup of them, can't be read:
-  destroy the KMS key and they are gone; disable it and the app won't start until it is
-  enabled again. Without Strongroom the files are plaintext, as before.
+  tenant's directory. Without that key the files, and every backup taken after they were
+  encrypted, can't be read: destroy the KMS key and they are gone; disable it and the app
+  won't start until it is enabled again. Earlier backups, and any `*.stale-*` side file an
+  upgrade set aside (the start that encrypts names them), are still plaintext. Without
+  Strongroom the files are plaintext, as before.
 - **Works in your team's languages.** Chinese, Japanese and Korean are searchable word by
   word, not only in English. It replies in the language it was asked in.
 - **Knows people by name, and never pings them.**
