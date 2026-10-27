@@ -42,7 +42,7 @@ export type Config = {
   anthropic: { apiKey: string; baseUrl?: string; model: string };
   agent: { name?: string; coAuthor?: string; channels: Set<string>; dm: DmMode };
   // Whose data this is and where it lives (TENANT_ID, LOREHOUSE_DATA_DIR; tenant.ts, ADR
-  // 0005 §1): the tenant's files are in <dataDir>/<id>/.
+  // 0005 §2): the tenant's files are in <dataDir>/<id>/.
   tenant: Tenant;
   // Lorehouse's own database (knowledge, migrations) — separate from the framework's
   // session store on purpose. Unset, both are files in the tenant's directory; a

@@ -124,7 +124,7 @@ process env, `LOREHOUSE_ENV_FILE` (default `/etc/lorehouse/lorehouse.env`, writt
 `scripts/install.sh`), then `settings.json` in the data directory (written by `lorehouse
 setup` and the OAuth install).
 
-**Tenancy** (`src/tenant.ts`, ADR 0005 §1). A single-tenant install is the case with one
+**Tenancy** (`src/tenant.ts`, ADR 0005 §2). A single-tenant install is the case with one
 tenant. Its id (`TENANT_ID`, else the one `<data>/<id>/tenant.json`, else new) goes in
 every path, key, log line and job: the databases default to `<LOREHOUSE_DATA_DIR>/<id>/`,
 sandbox ids are `<id>.<session>` (`sandboxIdFor`), every console line starts

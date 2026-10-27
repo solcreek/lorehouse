@@ -163,7 +163,15 @@ These are Lorehouse's position, not settings:
   every thread's memory. It never has code tools (#58). A profile can't loosen that.
 - A pull request opens only after a person approves it in the thread. The Approve in
   Slack authorizes opening the pull request, not merging it: it opens as a draft, and the
-  merge is gated on GitHub, by its review and branch protection (#60). By default only the
+  merge is gated on GitHub, by its review and branch protection (#60). An Approve may
+  authorize no more than that, because a click reaches Lorehouse through the chat
+  platform and the edge, and a held edge can forge one like any other event (ADR 0005
+  §4). What a forged Approve still gets before any review is the push of the staged
+  branch and the draft pull request, and whatever the repo's CI runs on them: in the same
+  repo, workflows for a push or a pull request run with the repo's secrets. So the
+  code-host contract (ADR 0005 §6) states what a push triggers before review, and
+  Lorehouse pushes where unreviewed workflows get no secrets wherever the host allows it,
+  such as a fork. By default only the
   requester may approve: the person whose message got the agent to post the card. An
   install may widen that to anyone in the thread (`PR_APPROVER=anyone`), or require
   someone else (`PR_APPROVER=not-requester`), #67. Under `not-requester` the requester's
