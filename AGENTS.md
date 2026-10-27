@@ -91,10 +91,21 @@ better-sqlite3-multiple-ciphers, so the tenant's files can be encrypted (#148). 
 else in `src/` imports `bun:sqlite` or the addon (a test holds it). It keeps bun:sqlite's
 shape (`query()` caches, `get()` is null for no row, bun:sqlite's pragmas), but parameters
 are `?` or named (`@name`, bound from an object without the prefix), never `?1`, and a
-boolean doesn't bind. June's `SESSIONS_DB` is June's own driver, a different file: two
+boolean doesn't bind. June's `SESSIONS_DB` is June's own driver, a different file, unless the tenant's files are
+encrypted: then June opens it through `src/sqlite.ts` too, by its `open` hook. Two
 SQLite libraries in one process must never open the same file (closing one's descriptor
 drops the other's locks), so tests' second connections go through `src/sqlite.ts` too.
 Needs Bun 1.4.3+.
+
+**Encryption at rest** (#148, `src/tenant-key.ts`). With `STRONGROOM_*` set, the tenant's
+data key (32 random bytes) is made on its first start, proved to unwrap, and kept only as a
+Strongroom envelope in `<tenant>/key.json`, bound to the tenant id. Every start unwraps it
+(`decryptBytes`, never a string), encrypts a database still plaintext in place
+(`encryptInPlace`: checkpointed, out of WAL for the rekey, back after), opens both with
+`key` (AEGIS-256, the raw key, no KDF), then wipes it. A `key.json` and no Strongroom, or a
+key Strongroom can't unwrap (`KMS_KEY_UNAVAILABLE`: disabled or destroyed), fail the start.
+A database opened with a key refuses a plaintext file (`KeyMismatchError`): only
+`encryptInPlace` turns one into the other.
 
 **Policy.** `src/policy.ts` restricts every channel event to channels in
 `AGENT_CHANNELS` (empty means nowhere) and refuses private channels and group DMs where the
