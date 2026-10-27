@@ -34,8 +34,9 @@ export function indexText(s: string): string {
   });
 }
 
-export function openKnowledge(path: string, migrations = MIGRATIONS, wal: WalOptions = {}): Database {
-  const db = new Database(path);
+// `key`: the tenant's data key, when its files are encrypted (src/tenant-key.ts).
+export function openKnowledge(path: string, migrations = MIGRATIONS, wal: WalOptions = {}, key?: Uint8Array): Database {
+  const db = new Database(path, { key });
   db.exec("PRAGMA journal_mode = WAL");
   // Freed pages are zeroed, not left holding what was deleted (a pragma lasts one
   // connection, so it is set on every open). See migrations/0010_fts_secure_delete.sql.

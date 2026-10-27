@@ -1,7 +1,16 @@
 // sqlite.ts — the one SQLite driver Lorehouse's own databases are opened with:
 // better-sqlite3-multiple-ciphers (SQLite3MultipleCiphers in a Node-API addon), so the
-// tenant's files can later be encrypted at rest (#148). Nothing else in src/ imports a
-// driver; June's SESSIONS_DB is still opened by June, with its own.
+// tenant's files can be encrypted at rest (#148). Nothing else in src/ imports a driver.
+// June's SESSIONS_DB is opened by June with its own driver, except when the tenant's files
+// are encrypted: then it is opened here too, through June's `open` hook (src/app.ts).
+//
+// Encryption: a connection opened with `key` (the tenant's 32-byte data key,
+// src/tenant-key.ts) reads and writes its file, -wal included, under AEGIS-256. The key
+// is given raw, as SQLite3MultipleCiphers' x'<hex>' form, so there is no KDF on open
+// (a passphrase would run Argon2 on every open). The hex is built in a buffer, never a
+// string, and wiped after; SQLite keeps its own copy of the key for the connection.
+// A file that the key doesn't open fails the open (KeyMismatchError), and so does a
+// plaintext one: `encryptInPlace` is what turns a plaintext file into an encrypted one.
 //
 // The surface is the part of bun:sqlite Lorehouse used, so callers didn't change:
 //
@@ -35,6 +44,8 @@
 // exec (not mounted noexec). Under `bun src/server.ts` and `bun test` it's loaded from
 // node_modules. Linux needs glibc 2.34 and libstdc++.so.6.
 
+import { existsSync, statSync } from "node:fs";
+
 // The addon's surface Lorehouse uses. Declared here: the package's own index.d.ts isn't
 // reachable through its "exports", and `require` gives no types anyway.
 type NativeStatement = {
@@ -47,6 +58,8 @@ type Native = {
   exec(sql: string): unknown;
   transaction<F extends (...args: never[]) => unknown>(fn: F): F;
   close(): unknown;
+  key(key: Buffer): unknown;
+  rekey(key: Buffer): unknown;
   readonly open: boolean;
   readonly inTransaction: boolean;
 };
@@ -95,7 +108,82 @@ export type OpenOptions = {
   // Fail instead of creating the file (bun:sqlite's { readwrite: true, create: false }).
   mustExist?: boolean;
   readonly?: boolean;
+  // The tenant's data key: the file is encrypted under it (see the top of this file).
+  key?: Uint8Array;
 };
+
+// SQLite3MultipleCiphers' name for AEGIS; its default variant is AEGIS-256.
+export const CIPHER = "aegis";
+export const KEY_BYTES = 32;
+
+// The file isn't readable with the key given: encrypted under another key, plaintext, or
+// not a database.
+export class KeyMismatchError extends Error {
+  constructor(readonly path: string) {
+    super(`${path} can't be opened with the tenant's key: it is encrypted under another key, not encrypted, or not a database`);
+    this.name = "KeyMismatchError";
+  }
+}
+
+const isNotADatabase = (e: unknown) => (e as { code?: string } | null)?.code === "SQLITE_NOTADB";
+
+// `x'<64 hex digits>'`, SQLite3MultipleCiphers' raw-key form, as bytes.
+function rawKeyLiteral(key: Uint8Array): Uint8Array {
+  if (key.length !== KEY_BYTES) throw new Error(`a database key is ${KEY_BYTES} bytes, got ${key.length}`);
+  const digits = "0123456789abcdef";
+  const out = new Uint8Array(3 + key.length * 2);
+  out[0] = 0x78; // x
+  out[1] = out[out.length - 1] = 0x27; // '
+  for (let i = 0; i < key.length; i++) {
+    out[2 + 2 * i] = digits.charCodeAt(key[i]! >> 4);
+    out[3 + 2 * i] = digits.charCodeAt(key[i]! & 15);
+  }
+  return out;
+}
+
+// Give `db` the key, with `set` (key, or rekey to encrypt a plaintext file), the hex wiped
+// after. The cipher is chosen before anything reads the file: once a connection has read
+// it, SQLite3MultipleCiphers refuses a rekey.
+function applyKey(db: Native, key: Uint8Array, set: "key" | "rekey"): void {
+  const literal = rawKeyLiteral(key);
+  try {
+    db[set](Buffer.from(literal.buffer, literal.byteOffset, literal.byteLength));
+  } finally {
+    literal.fill(0);
+  }
+}
+
+// What encryptInPlace found: a plaintext file, now encrypted under the key; a file that
+// isn't plaintext (left alone: opening it with the key is what checks it); or no file yet.
+export type EncryptResult = "encrypted" | "not-plaintext" | "no-file";
+
+// Encrypt a plaintext database file in place under `key`, its -wal checkpointed into it
+// first. Run before anything else opens the file. A file that isn't plaintext SQLite is
+// left as it is.
+export function encryptInPlace(path: string, key: Uint8Array): EncryptResult {
+  if (path === ":memory:" || !existsSync(path) || statSync(path).size === 0) return "no-file";
+  const db = new NativeDatabase(path, { readonly: false, fileMustExist: true, timeout: 0 });
+  try {
+    db.exec(`PRAGMA cipher = '${CIPHER}'`);
+    try {
+      db.prepare("SELECT count(*) FROM sqlite_master").get();
+    } catch (e) {
+      if (isNotADatabase(e)) return "not-plaintext";
+      throw e;
+    }
+    const r = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number } | undefined;
+    if (r?.busy) throw new Error(`${path} is in use (its checkpoint was blocked), so it can't be encrypted: stop whatever has it open, then start again`);
+    // A rekey rewrites every page; SQLite3MultipleCiphers does it only outside WAL, so the
+    // file leaves WAL for it and goes back after.
+    const mode = (db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+    if (mode === "wal") db.exec("PRAGMA journal_mode = DELETE");
+    applyKey(db, key, "rekey");
+    if (mode === "wal") db.exec("PRAGMA journal_mode = WAL");
+    return "encrypted";
+  } finally {
+    db.close();
+  }
+}
 
 // The pragmas every connection starts with: bun:sqlite's effective values on Linux.
 const CONNECTION_PRAGMAS = [
@@ -113,7 +201,22 @@ export class Database {
   constructor(path: string, opts: OpenOptions = {}) {
     // timeout 0: no busy handler, as bun:sqlite (the addon's default is 5 s).
     this.db = new NativeDatabase(path, { readonly: opts.readonly ?? false, fileMustExist: opts.mustExist ?? false, timeout: 0 });
-    for (const p of CONNECTION_PRAGMAS) this.db.exec(p);
+    try {
+      if (opts.key) {
+        // The key is the connection's first statement; reading the schema proves it opens the file.
+        this.db.exec(`PRAGMA cipher = '${CIPHER}'`);
+        applyKey(this.db, opts.key, "key");
+        try {
+          this.db.prepare("SELECT count(*) FROM sqlite_master").get();
+        } catch (e) {
+          throw isNotADatabase(e) ? new KeyMismatchError(path) : e;
+        }
+      }
+      for (const p of CONNECTION_PRAGMAS) this.db.exec(p);
+    } catch (e) {
+      this.db.close();
+      throw e;
+    }
   }
 
   // A statement prepared once per SQL text and reused (least recently used goes first).
