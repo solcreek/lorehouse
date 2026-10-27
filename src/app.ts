@@ -45,7 +45,8 @@ import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
 import { prepareTenant, sandboxIdFor, tenantsIn, upgradeLayout } from "./tenant";
 import { KEY_FILE, loadTenantKey, strongroomKeys } from "./tenant-key";
 import { Database, encryptInPlace } from "./sqlite";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { existsSync, readdirSync } from "node:fs";
 
 // How each tool call shows up on the reply's task timeline in Slack.
 const TASK_LABELS: Record<string, string> = {
@@ -69,7 +70,18 @@ const TASK_LABELS: Record<string, string> = {
 // workspace must not orphan its threads' sessions.
 const AGENT_ID = "lorehouse";
 
+// The start. The tenant's data key, if any, is needed only while it opens the databases:
+// it is wiped when the start ends, whether the app came up or not.
 export async function createApp(config: Config) {
+  const keys: Uint8Array[] = [];
+  try {
+    return await startApp(config, keys);
+  } finally {
+    for (const k of keys) k.fill(0);
+  }
+}
+
+async function startApp(config: Config, keys: Uint8Array[]) {
   const identity = agentIdentity(config.agent.name, config.agent.coAuthor);
 
   // Every listed channel must be public, as Slack says (channel-check.ts): before the
@@ -88,14 +100,20 @@ export async function createApp(config: Config) {
   if (others.length) console.warn(`lorehouse: storage: ${tenant.dataDir} also holds tenant ${others.join(", ")}, not served here (TENANT_ID=${tenant.id})`);
 
   // The tenant's data key (tenant-key.ts), when its files are encrypted: both databases
-  // open only with it, and one still plaintext is encrypted in place first. Wiped once
-  // both are open; SQLite keeps its own copy per connection.
-  const tenantKey = await loadTenantKey(tenant, config.strongroom && strongroomKeys(config.strongroom));
+  // open only with it, and one still plaintext is encrypted in place first. Wiped when the
+  // start ends (createApp); SQLite keeps its own copy per connection.
+  const databases = [config.db.lorehouse, config.db.sessions];
+  const tenantKey = await loadTenantKey(tenant, config.strongroom && strongroomKeys(config.strongroom), databases);
+  if (tenantKey) keys.push(tenantKey.key);
   if (tenantKey?.made) console.log(`lorehouse: tenant ${tenant.id}: made its data key, kept wrapped by Strongroom in ${join(tenant.dir, KEY_FILE)}`);
   if (tenantKey) {
-    for (const path of [config.db.lorehouse, config.db.sessions]) {
+    for (const path of databases) {
       if (encryptInPlace(path, tenantKey.key) === "encrypted") console.log(`lorehouse: storage: encrypted ${path} under tenant ${tenant.id}'s key`);
     }
+    // Side files the move into the tenant's directory set aside (tenant.ts) were never
+    // the database's own, so nothing encrypts them: say where plaintext may remain.
+    const stale = staleCopies([...databases, ...config.db.upgrade.map((m) => m.from)]);
+    if (stale.length) console.warn(`lorehouse: storage: ${stale.join(", ")} ${stale.length === 1 ? "was" : "were"} set aside unencrypted when the files moved into the tenant's directory, and may hold plaintext: delete ${stale.length === 1 ? "it" : "them"} once nothing is missing`);
   }
   const knowledge = openKnowledge(config.db.lorehouse, undefined, undefined, tenantKey?.key);
   // Both files exist from here on, so this compares the files themselves, not their names.
@@ -351,11 +369,7 @@ export async function createApp(config: Config) {
   // Encrypted, the session store is opened here with the tenant's key (June's `open` hook);
   // otherwise June opens it with its own driver.
   const open = tenantKey && ((path: string) => new Database(path, { key: tenantKey.key }));
-  try {
-    runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions, { files: fileStore(config.files.store), ...(open ? { open } : {}) });
-  } finally {
-    tenantKey?.key.fill(0);
-  }
+  runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions, { files: fileStore(config.files.store), ...(open ? { open } : {}) });
   const mounted = mountAgent(agent, runtime);
   // Recording who asks is never silent: each channel is told when it starts, and again
   // when it stops (the record erased). Once per change, not on every start.
@@ -472,4 +486,15 @@ export async function createApp(config: Config) {
 function fileStore(kind: Config["files"]["store"]): FileStore {
   if (kind === "memory") return memoryFileStore();
   throw new Error(`FILE_STORE=${kind} is not available yet`);
+}
+
+// The `*.stale-<time>` side files the tenant upgrade set aside beside any of `paths`.
+function staleCopies(paths: string[]): string[] {
+  const found = new Set<string>();
+  for (const p of paths) {
+    if (p === ":memory:" || !existsSync(dirname(p))) continue;
+    const base = basename(p);
+    for (const name of readdirSync(dirname(p))) if (name.startsWith(base) && /\.stale-\d+$/.test(name)) found.add(join(dirname(p), name));
+  }
+  return [...found].sort();
 }
