@@ -24,7 +24,7 @@
 
 import { Database } from "./sqlite";
 import { accessSync, constants, existsSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createHmac } from "node:crypto";
 import manifest from "../slack/manifest.yaml";
 import { ConfigError, isLoopbackUrl as isLoopback, loadConfig, type Config } from "./config";
@@ -36,6 +36,7 @@ import { loadEnv, readSettings } from "./settings";
 import { configToken, slackCall, urlMismatch, type ManagedManifest } from "./setup";
 import { describeEgress, typstRenderer } from "./tools/render-pdf";
 import { pendingMoves, planMove, tenantsIn } from "./tenant";
+import { KEY_FILE, loadTenantKey, strongroomKeys } from "./tenant-key";
 
 export type Level = "ok" | "warn" | "fail" | "info";
 export type Check = { section: string; name: string; level: Level; detail: string };
@@ -199,7 +200,23 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   // from the database, read-only, so it can be put back on the list before it happens.
   // A database the next start moves into the tenant's directory is read where it is now.
   const moves = pendingMoves(config.db.upgrade);
-  const purge = pendingPurgeIn(moves.find((m) => m.to === config.db.lorehouse)?.from ?? config.db.lorehouse, config.agent.channels);
+  // The tenant's data key (tenant-key.ts), unwrapped as a start would, and never made here:
+  // doctor writes nothing. The count reads an encrypted database with it; reported below.
+  const keyFile = join(config.tenant.dir, KEY_FILE);
+  let dataKey: Uint8Array | undefined;
+  let encryption: [Level, string];
+  if (config.tenant.source === "throwaway") encryption = ["info", "none: LOREHOUSE_DB is in memory"];
+  else if (existsSync(keyFile)) {
+    try {
+      dataKey = (await loadTenantKey(config.tenant, config.strongroom && strongroomKeys(config.strongroom, f)))?.key;
+      encryption = ["ok", `on: both databases are encrypted under tenant ${config.tenant.id}'s data key, and Strongroom unwraps it (${keyFile})`];
+    } catch (e) {
+      encryption = ["fail", `${e instanceof Error ? e.message : e} (a start fails the same way)`];
+    }
+  } else if (config.strongroom) encryption = ["info", `the next start makes tenant ${config.tenant.id}'s data key with Strongroom at ${config.strongroom.url}, keeps it wrapped in ${keyFile}, and encrypts both databases in place`];
+  else encryption = ["info", "off: the databases are plaintext on disk; set STRONGROOM_URL, STRONGROOM_TOKEN and STRONGROOM_KEY to encrypt them (#148)"];
+  const purge = pendingPurgeIn(moves.find((m) => m.to === config.db.lorehouse)?.from ?? config.db.lorehouse, config.agent.channels, dataKey);
+  dataKey?.fill(0);
   if (typeof purge === "string") add("channels", "purge on start", "info", purge);
   else if (purge.length) {
     const docs = (k: number) => `${k} document${k === 1 ? "" : "s"}`;
@@ -301,6 +318,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     // TENANT_NEW, and the other directory is a warning here too.
     if (others.length) add("storage", "other tenants", "warn", `${tenant.dataDir} also holds ${others.join(", ")}, which this install doesn't serve (TENANT_ID=${tenant.id}): if that is where the data is, unset TENANT_ID, or set it to that one`);
   }
+  add("storage", "encryption", ...encryption);
   // An install laid out before tenants: what the next start moves, by link and rename, into the
   // tenant's directory (upgradeLayout).
   // Judged by upgradeLayout's own rules (planMove): a move a start began is one the next
@@ -443,13 +461,13 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
 
 // The purge a start would make on the database at `path`, opened read-only; nothing for
 // a database that doesn't exist yet or lives in memory, and why not, when it can't be read.
-function pendingPurgeIn(path: string, listed: ReadonlySet<string>): ChannelPurge[] | string {
+function pendingPurgeIn(path: string, listed: ReadonlySet<string>, key?: Uint8Array): ChannelPurge[] | string {
   if (path === ":memory:" || !existsSync(path)) return [];
   let db: Database | undefined;
   try {
     // Not { readonly: true }: SQLite can't open a WAL database read-only without
     // its -shm file. query_only refuses every write instead.
-    db = new Database(path, { mustExist: true });
+    db = new Database(path, { mustExist: true, key });
     db.exec("PRAGMA query_only = ON");
     return pendingPurge(db, listed);
   } catch (e) {
