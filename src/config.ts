@@ -50,6 +50,11 @@ export type Config = {
   // `upgrade`: where each database in the tenant's directory was before tenants, to move it
   // from on start (upgradeLayout); empty for a database set explicitly.
   db: { lorehouse: string; sessions: string; knowledgeSeed?: string; upgrade: Move[] };
+  // The tenant's Strongroom deployment (STRONGROOM_URL, STRONGROOM_TOKEN, STRONGROOM_KEY),
+  // which holds its data key under KMS (src/tenant-key.ts, ADR 0004). Set, the tenant's
+  // databases are encrypted; unset, they are plaintext, unless a key was made before, in
+  // which case the start fails.
+  strongroom?: { url: string; token: string; key: string };
   // Slack history → knowledge, for the allowlisted channels. backfillDays 0 = live only.
   // recheckMs: how often listed channels are looked up again for one turned private (0 = never).
   ingest: { backfillDays: number; refreshDays: number; debounceMs: number; recheckMs: number };
@@ -284,6 +289,17 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   } else if (github) {
     missing.push("SANDBOX_RUNNER_TOKEN or SANDBOX_URL + SANDBOX_TOKEN (GitHub credentials are set, but no sandbox)");
   }
+  // The tenant's data key: all three, or none.
+  const sr = (["STRONGROOM_URL", "STRONGROOM_TOKEN", "STRONGROOM_KEY"] as const).filter((k) => env[k]);
+  if (sr.length && sr.length < 3) {
+    missing.push(...(["STRONGROOM_URL", "STRONGROOM_TOKEN", "STRONGROOM_KEY"] as const).filter((k) => !env[k]).map((k) => `${k} (encrypting the tenant's files needs STRONGROOM_URL, STRONGROOM_TOKEN and STRONGROOM_KEY)`));
+  } else if (sr.length) {
+    const url = env.STRONGROOM_URL!;
+    if (!strongroomUrlSafe(url)) missing.push(`STRONGROOM_URL must be an origin (no path), https://, or http:// to localhost, 127.0.0.1 or [::1]; got ${JSON.stringify(url)}`);
+    if (!/^[A-Za-z0-9_-]{32,256}$/.test(env.STRONGROOM_TOKEN!)) missing.push("STRONGROOM_TOKEN (32 to 256 characters of A-Z, a-z, 0-9, _ and -)");
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(env.STRONGROOM_KEY!)) missing.push(`STRONGROOM_KEY (the key reference configured in Strongroom: 1 to 64 characters of A-Z, a-z, 0-9, _ and -; got ${JSON.stringify(env.STRONGROOM_KEY)})`);
+    config.strongroom = { url, token: env.STRONGROOM_TOKEN!, key: env.STRONGROOM_KEY! };
+  }
   if (config.agent.dm === "answer" && config.sandbox) missing.push("DM_MODE=answer (not with code tools: code work stays in public channels)");
   if (missing.length) throw new ConfigError(missing);
   return config;
@@ -304,4 +320,13 @@ export function sandboxUrlSafe(url: string): boolean {
   if (!URL.canParse(url)) return false;
   const { protocol } = new URL(url);
   return protocol === "https:" || (protocol === "http:" && isLoopbackUrl(url));
+}
+
+// Where the tenant's Strongroom may be, by Strongroom's own client's rules: an origin (no
+// path, query or credentials), https://, or plain http:// to localhost, 127.0.0.1 or [::1].
+export function strongroomUrlSafe(url: string): boolean {
+  if (!URL.canParse(url)) return false;
+  const u = new URL(url);
+  if (u.username || u.password || u.search || u.hash || u.pathname !== "/") return false;
+  return u.protocol === "https:" || (u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname));
 }
