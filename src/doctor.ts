@@ -22,7 +22,7 @@
 //
 // Exit code: 0 when nothing failed (warnings allowed), 1 when something did.
 
-import { Database } from "./sqlite";
+import { Database, fileKind } from "./sqlite";
 import { accessSync, constants, existsSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { createHmac } from "node:crypto";
@@ -206,16 +206,28 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   let dataKey: Uint8Array | undefined;
   let encryption: [Level, string];
   if (config.tenant.source === "throwaway") encryption = ["info", "none: LOREHOUSE_DB is in memory"];
-  else if (existsSync(keyFile)) {
+  else {
+    // Each database where it is now (a move still pending reads the old path), by its header.
+    const here = (p: string) => moves.find((m) => m.to === p)?.from ?? p;
+    const files = [config.db.lorehouse, config.db.sessions].map(here);
+    const plain = files.filter((p) => fileKind(p) === "plaintext");
     try {
-      dataKey = (await loadTenantKey(config.tenant, config.strongroom && strongroomKeys(config.strongroom, f)))?.key;
-      encryption = ["ok", `on: both databases are encrypted under tenant ${config.tenant.id}'s data key, and Strongroom unwraps it (${keyFile})`];
+      // Strongroom only with a key file, to unwrap it: with none, loadTenantKey would make one.
+      const unwrapWith = existsSync(keyFile) ? config.strongroom && strongroomKeys(config.strongroom, f) : undefined;
+      dataKey = (await loadTenantKey(config.tenant, unwrapWith, files))?.key;
+      if (dataKey) {
+        encryption = plain.length
+          ? ["info", `tenant ${config.tenant.id}'s data key unwraps (${keyFile}), but ${plain.join(" and ")} ${plain.length === 1 ? "is" : "are"} still plaintext: the next start encrypts ${plain.length === 1 ? "it" : "them"} in place`]
+          : ["ok", `on: the databases are encrypted under tenant ${config.tenant.id}'s data key, and Strongroom unwraps it (${keyFile})`];
+      } else if (config.strongroom) encryption = ["info", `the next start makes tenant ${config.tenant.id}'s data key with Strongroom at ${config.strongroom.url}, keeps it wrapped in ${keyFile}, and encrypts both databases in place`];
+      else encryption = ["info", "off: the databases are plaintext on disk; set STRONGROOM_URL, STRONGROOM_TOKEN and STRONGROOM_KEY to encrypt them (#148)"];
     } catch (e) {
       encryption = ["fail", `${e instanceof Error ? e.message : e} (a start fails the same way)`];
     }
-  } else if (config.strongroom) encryption = ["info", `the next start makes tenant ${config.tenant.id}'s data key with Strongroom at ${config.strongroom.url}, keeps it wrapped in ${keyFile}, and encrypts both databases in place`];
-  else encryption = ["info", "off: the databases are plaintext on disk; set STRONGROOM_URL, STRONGROOM_TOKEN and STRONGROOM_KEY to encrypt them (#148)"];
-  const purge = pendingPurgeIn(moves.find((m) => m.to === config.db.lorehouse)?.from ?? config.db.lorehouse, config.agent.channels, dataKey);
+  }
+  const purgePath = moves.find((m) => m.to === config.db.lorehouse)?.from ?? config.db.lorehouse;
+  // A plaintext file is read as it is: the next start encrypts it before it purges.
+  const purge = pendingPurgeIn(purgePath, config.agent.channels, fileKind(purgePath) === "other" ? dataKey : undefined);
   dataKey?.fill(0);
   if (typeof purge === "string") add("channels", "purge on start", "info", purge);
   else if (purge.length) {

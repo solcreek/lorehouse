@@ -5,7 +5,7 @@ import { createHmac, generateKeyPairSync } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
-import { countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
+import { closeKnowledge, countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
 import { inThread, joinThread } from "../src/threads";
 import { loadTenantKey, strongroomKeys } from "../src/tenant-key";
 
@@ -413,12 +413,16 @@ describe("storage", () => {
       expect(readdirSync(dataDir)).not.toContain("acme");
       mkdirSync(`${dataDir}/acme`);
       const tenant = { id: "acme", source: "configured" as const, dataDir, dir: `${dataDir}/acme` };
+      // A plaintext database and a key, as a start that died before encrypting it leaves them.
+      closeKnowledge(openKnowledge(`${dataDir}/acme/lorehouse.db`));
       const { key } = (await loadTenantKey(tenant, strongroomKeys({ url: STRONGROOM.STRONGROOM_URL, token: STRONGROOM.STRONGROOM_TOKEN, key: "tenant" }, f)))!;
+      expect(await check(STRONGROOM)).toMatchObject({ level: "info", detail: expect.stringMatching(/data key unwraps .*lorehouse\.db is still plaintext: the next start encrypts it in place/) });
+      rmSync(`${dataDir}/acme/lorehouse.db`);
       const db = openKnowledge(`${dataDir}/acme/lorehouse.db`, undefined, undefined, key);
       upsertDocument(db, { docId: "slack:C9:1.1", kind: "slack_thread", source: "s", title: "t", text: "x" });
       db.close();
       const on = await doctor({ env: { ...ENV, ...env, ...STRONGROOM }, fetch: f });
-      expect(find(on, "encryption")[0]).toMatchObject({ level: "ok", detail: expect.stringContaining("on: both databases are encrypted") });
+      expect(find(on, "encryption")[0]).toMatchObject({ level: "ok", detail: expect.stringContaining("on: the databases are encrypted") });
       // The purge count reads the encrypted database with the key.
       expect(find(on, "purge on start")[0]).toMatchObject({ level: "warn", detail: expect.stringContaining("C9 (1 document)") });
       expect(await check({})).toMatchObject({ level: "fail", detail: expect.stringContaining("files are encrypted") });
