@@ -255,6 +255,9 @@ describe("config", () => {
     }
     expect(() => loadConfig({ ...base, ...sr, STRONGROOM_TOKEN: "short" })).toThrow(/STRONGROOM_TOKEN \(32 to 256/);
     expect(() => loadConfig({ ...base, ...sr, STRONGROOM_KEY: "a/b" })).toThrow(/STRONGROOM_KEY \(the key reference/);
+    // A tenant in memory has no key: a session file beside it would be plaintext.
+    expect(() => loadConfig({ ...base, ...sr, LOREHOUSE_DB: ":memory:", SESSIONS_DB: "/data/sessions.db" })).toThrow(/SESSIONS_DB \(with STRONGROOM_\* set and LOREHOUSE_DB in memory/);
+    expect(loadConfig({ ...base, ...sr, LOREHOUSE_DB: ":memory:", SESSIONS_DB: ":memory:" }).strongroom).toBeDefined();
   });
 
   test("runner mode: a long SANDBOX_RUNNER_TOKEN plus GITHUB_TOKEN; never together with direct mode", () => {

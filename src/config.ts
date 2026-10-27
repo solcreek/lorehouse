@@ -299,6 +299,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (!/^[A-Za-z0-9_-]{32,256}$/.test(env.STRONGROOM_TOKEN!)) missing.push("STRONGROOM_TOKEN (32 to 256 characters of A-Z, a-z, 0-9, _ and -)");
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(env.STRONGROOM_KEY!)) missing.push(`STRONGROOM_KEY (the key reference configured in Strongroom: 1 to 64 characters of A-Z, a-z, 0-9, _ and -; got ${JSON.stringify(env.STRONGROOM_KEY)})`);
     config.strongroom = { url, token: env.STRONGROOM_TOKEN!, key: env.STRONGROOM_KEY! };
+    // A tenant in memory has no key (tenant-key.ts): a session file beside it would be plaintext.
+    if (lorehouseDb === ":memory:" && sessionsDb !== ":memory:") missing.push(`SESSIONS_DB (with STRONGROOM_* set and LOREHOUSE_DB in memory, the tenant has no key, so "${sessionsDb}" would be plaintext: keep it in memory too, or set LOREHOUSE_DB to a file)`);
   }
   if (config.agent.dm === "answer" && config.sandbox) missing.push("DM_MODE=answer (not with code tools: code work stays in public channels)");
   if (missing.length) throw new ConfigError(missing);
