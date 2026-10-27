@@ -5,8 +5,9 @@ import { createHmac, generateKeyPairSync } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
-import { countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
+import { closeKnowledge, countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
 import { inThread, joinThread } from "../src/threads";
+import { loadTenantKey, strongroomKeys } from "../src/tenant-key";
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 const DB = `${tmpdir()}/doctor-test-lorehouse.db`;
@@ -383,6 +384,55 @@ describe("code tools", () => {
 });
 
 describe("storage", () => {
+  // Strongroom, as tenant-key.ts calls it, in front of the world: `kms` stands for the KMS key.
+  function withStrongroom(base: typeof fetch, kms: { key: "enabled" | "destroyed" }): typeof fetch {
+    const kept = new Map<string, string>();
+    return (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.host !== "strongroom.test") return base(input, init);
+      const body = JSON.parse(String(init.body));
+      if (url.pathname === "/v1/encrypt") {
+        kept.set("c", body.plaintextBase64url);
+        return Response.json({ envelope: { version: 1, algorithm: "A256GCM", key: body.key, nonce: "n", ciphertext: "c", wrappedKey: "w" } });
+      }
+      if (kms.key !== "enabled") return Response.json({ error: { code: "KMS_KEY_UNAVAILABLE", message: "Configured KMS key is missing, disabled or unusable.", retryable: false, requestId: "r" } }, { status: 502 });
+      return new Response(Buffer.from(kept.get(body.envelope.ciphertext)!, "base64url"), { headers: { "content-type": "application/octet-stream" } });
+    }) as typeof fetch;
+  }
+  const STRONGROOM = { STRONGROOM_URL: "https://strongroom.test", STRONGROOM_TOKEN: "s".repeat(32), STRONGROOM_KEY: "tenant" };
+
+  test("encryption: off, about to be made, on, and a key that no longer unwraps; doctor never makes the key", async () => {
+    const dataDir = mkdtempSync(`${tmpdir()}/doctor-key-`);
+    try {
+      const env = { LOREHOUSE_DATA_DIR: dataDir, LOREHOUSE_DB: "", TENANT_ID: "acme" };
+      const kms = { key: "enabled" as "enabled" | "destroyed" };
+      const f = withStrongroom(world({}).f, kms);
+      const check = async (extra: Record<string, string>) => find(await doctor({ env: { ...ENV, ...env, ...extra }, fetch: f }), "encryption")[0];
+      expect(await check({})).toMatchObject({ level: "info", detail: expect.stringContaining("off: the databases are plaintext") });
+      expect(await check(STRONGROOM)).toMatchObject({ level: "info", detail: expect.stringContaining("the next start makes tenant acme's data key") });
+      expect(readdirSync(dataDir)).not.toContain("acme");
+      mkdirSync(`${dataDir}/acme`);
+      const tenant = { id: "acme", source: "configured" as const, dataDir, dir: `${dataDir}/acme` };
+      // A plaintext database and a key, as a start that died before encrypting it leaves them.
+      closeKnowledge(openKnowledge(`${dataDir}/acme/lorehouse.db`));
+      const { key } = (await loadTenantKey(tenant, strongroomKeys({ url: STRONGROOM.STRONGROOM_URL, token: STRONGROOM.STRONGROOM_TOKEN, key: "tenant" }, f)))!;
+      expect(await check(STRONGROOM)).toMatchObject({ level: "info", detail: expect.stringMatching(/data key unwraps .*lorehouse\.db is still plaintext: the next start encrypts it in place/) });
+      rmSync(`${dataDir}/acme/lorehouse.db`);
+      const db = openKnowledge(`${dataDir}/acme/lorehouse.db`, undefined, undefined, key);
+      upsertDocument(db, { docId: "slack:C9:1.1", kind: "slack_thread", source: "s", title: "t", text: "x" });
+      db.close();
+      const on = await doctor({ env: { ...ENV, ...env, ...STRONGROOM }, fetch: f });
+      expect(find(on, "encryption")[0]).toMatchObject({ level: "ok", detail: expect.stringContaining("on: the databases are encrypted") });
+      // The purge count reads the encrypted database with the key.
+      expect(find(on, "purge on start")[0]).toMatchObject({ level: "warn", detail: expect.stringContaining("C9 (1 document)") });
+      expect(await check({})).toMatchObject({ level: "fail", detail: expect.stringContaining("files are encrypted") });
+      kms.key = "destroyed";
+      expect(await check(STRONGROOM)).toMatchObject({ level: "fail", detail: expect.stringContaining("KMS_KEY_UNAVAILABLE") });
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   test("a writable database in a read-only directory fails: SQLite's WAL files go beside it", async () => {
     const dir = mkdtempSync(`${tmpdir()}/doctor-ro-`);
     writeFileSync(`${dir}/lorehouse.db`, "");

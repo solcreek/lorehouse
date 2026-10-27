@@ -390,6 +390,30 @@ async function github(req: Request, url: URL): Promise<Response> {
   return Response.json({ message: "Not Found" }, { status: 404 });
 }
 
+// Strongroom (the tenant's key service, src/tenant-key.ts), at this origin's root as the
+// real one is: /v1/encrypt wraps bytes sent as base64url, /v1/decrypt gives them back as
+// application/octet-stream when asked, bound to the context they were wrapped with.
+// `/fixtures/strongroom` stands for the KMS key: disabled or destroyed, nothing unwraps.
+const wrapped = new Map<string, { bytes: Uint8Array; context: string }>();
+let kmsKey: "enabled" | "disabled" | "destroyed" = "enabled";
+const strongroomError = (status: number, code: string, message: string, retryable = false) =>
+  Response.json({ error: { code, message, retryable, requestId: crypto.randomUUID() } }, { status });
+async function strongroom(req: Request, path: string): Promise<Response> {
+  if (!/^Bearer [A-Za-z0-9_-]{32,256}$/.test(req.headers.get("authorization") ?? "")) return strongroomError(401, "UNAUTHENTICATED", "A valid bearer token is required.");
+  const body = (await req.json()) as Record<string, any>;
+  if (path === "/v1/encrypt") {
+    if (typeof body.plaintextBase64url !== "string") return strongroomError(400, "INVALID_REQUEST", "plaintextBase64url is required here.");
+    const id = crypto.randomUUID();
+    wrapped.set(id, { bytes: new Uint8Array(Buffer.from(body.plaintextBase64url, "base64url")), context: JSON.stringify(body.context) });
+    return Response.json({ envelope: { version: 1, algorithm: "A256GCM", key: body.key, nonce: "bW9jaw", ciphertext: id, wrappedKey: "bW9jaw" } });
+  }
+  if (kmsKey !== "enabled") return strongroomError(502, "KMS_KEY_UNAVAILABLE", "Configured KMS key is missing, disabled or unusable.");
+  const hit = wrapped.get(body.envelope?.ciphertext);
+  if (!hit || hit.context !== JSON.stringify(body.context)) return strongroomError(400, "DECRYPT_FAILED", "Envelope could not be decrypted.");
+  if (!(req.headers.get("accept") ?? "").includes("application/octet-stream")) return strongroomError(406, "PLAINTEXT_NOT_TEXT", "The plaintext is binary.");
+  return new Response(hit.bytes as Uint8Array<ArrayBuffer>, { headers: { "content-type": "application/octet-stream" } });
+}
+
 // ── server ───────────────────────────────────────────────────────────────────
 
 Bun.serve({
@@ -467,6 +491,11 @@ Bun.serve({
       return Response.json({ ok: true });
     }
     if (url.pathname === "/anthropic/v1/messages" && req.method === "POST") return anthropic(req);
+    if ((url.pathname === "/v1/encrypt" || url.pathname === "/v1/decrypt") && req.method === "POST") return strongroom(req, url.pathname);
+    if (url.pathname === "/fixtures/strongroom" && req.method === "POST") {
+      kmsKey = ((await req.json()) as { key: typeof kmsKey }).key;
+      return Response.json({ ok: true });
+    }
     if (url.pathname.startsWith("/github/")) return github(req, url);
     if (url.pathname === "/wait") {
       const thread = url.searchParams.get("thread_ts") ?? "";

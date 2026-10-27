@@ -242,6 +242,24 @@ describe("config", () => {
     }
   });
 
+  test("the tenant's Strongroom: all three settings or none, an origin Strongroom's client accepts, a token and key reference of its shape", () => {
+    const sr = { STRONGROOM_URL: "https://strongroom.example", STRONGROOM_TOKEN: "t".repeat(32), STRONGROOM_KEY: "tenant-acme" };
+    expect(loadConfig(base).strongroom).toBeUndefined();
+    expect(loadConfig({ ...base, ...sr }).strongroom).toEqual({ url: "https://strongroom.example", token: "t".repeat(32), key: "tenant-acme" });
+    expect(() => loadConfig({ ...base, STRONGROOM_URL: sr.STRONGROOM_URL })).toThrow(/STRONGROOM_TOKEN .*STRONGROOM_KEY /);
+    for (const url of ["http://strongroom.internal", "http://127.9.8.7", "https://strongroom.example/v1", "https://u:p@strongroom.example", "https://strongroom.example/?a=1", "not a url"]) {
+      expect(() => loadConfig({ ...base, ...sr, STRONGROOM_URL: url }), url).toThrow(/STRONGROOM_URL must be an origin/);
+    }
+    for (const url of ["http://localhost:8787", "http://127.0.0.1:8787", "http://[::1]:8787", "https://strongroom.example/"]) {
+      expect(loadConfig({ ...base, ...sr, STRONGROOM_URL: url }).strongroom?.url, url).toBe(url);
+    }
+    expect(() => loadConfig({ ...base, ...sr, STRONGROOM_TOKEN: "short" })).toThrow(/STRONGROOM_TOKEN \(32 to 256/);
+    expect(() => loadConfig({ ...base, ...sr, STRONGROOM_KEY: "a/b" })).toThrow(/STRONGROOM_KEY \(the key reference/);
+    // A tenant in memory has no key: a session file beside it would be plaintext.
+    expect(() => loadConfig({ ...base, ...sr, LOREHOUSE_DB: ":memory:", SESSIONS_DB: "/data/sessions.db" })).toThrow(/SESSIONS_DB \(with STRONGROOM_\* set and LOREHOUSE_DB in memory/);
+    expect(loadConfig({ ...base, ...sr, LOREHOUSE_DB: ":memory:", SESSIONS_DB: ":memory:" }).strongroom).toBeDefined();
+  });
+
   test("runner mode: a long SANDBOX_RUNNER_TOKEN plus GITHUB_TOKEN; never together with direct mode", () => {
     const runner = "r".repeat(32);
     expect(loadConfig({ ...base, SANDBOX_RUNNER_TOKEN: runner, GITHUB_TOKEN: "z" }).sandbox).toEqual({ mode: "runners", runnerToken: runner, github: { kind: "token", token: "z" } });

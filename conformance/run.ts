@@ -496,6 +496,60 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    // #148: with the tenant's Strongroom set, its databases are encrypted under its data
+    // key, the plaintext ones it had encrypted in place on that start; what was readable in
+    // the files before isn't after. The key is kept only wrapped: a start without
+    // Strongroom, or with the KMS key disabled or destroyed, fails instead of opening them.
+    name: "with Strongroom set, the tenant's databases are encrypted at rest, and a start without the key fails",
+    run: async () => {
+      const db = freshDb();
+      const dir = dirname(db);
+      const keyed = { LOREHOUSE_DB: db, STRONGROOM_URL: MOCK, STRONGROOM_TOKEN: "s".repeat(32), STRONGROOM_KEY: "tenant" };
+      // Every byte of both databases, -wal and -shm included.
+      const onDisk = () => ["lorehouse.db", "sessions.db"].flatMap((f) => ["", "-wal", "-shm"].map((x) => join(dir, f + x))).filter((f) => existsSync(f)).map((f) => readFileSync(f).toString("latin1")).join("");
+      const kms = (key: string) => fetch(`${MOCK}/fixtures/strongroom`, { method: "POST", body: JSON.stringify({ key }) });
+      try {
+        await stopApp();
+        await startApp({ LOREHOUSE_DB: db });
+        await mentionAndWait("where is the wombat review");
+        const plain = (await status()) as Status & { encrypted?: boolean; tenant?: string };
+        if (plain.encrypted !== false) return `plaintext start: /status encrypted ${plain.encrypted}, want false`;
+        await stopApp();
+        // The control: the seeded corpus and the question are readable on disk without a key.
+        if (!onDisk().includes("scaffolder") || !onDisk().includes("wombat review")) return "plaintext start: the corpus or the question isn't in the files, so their absence below would prove nothing";
+        await startApp(keyed);
+        await mentionAndWait("where is the wombat review, again");
+        const s = (await status()) as Status & { encrypted?: boolean };
+        if (s.encrypted !== true) return `/status encrypted ${s.encrypted}, want true`;
+        if (s.knowledge.documents !== plain.knowledge.documents) return `${s.knowledge.documents} documents after encrypting, want ${plain.knowledge.documents}`;
+        const keyFile = join(dir, plain.tenant ?? "", "key.json");
+        if (!existsSync(keyFile)) return `no ${keyFile}`;
+        if (onDisk().includes("scaffolder") || onDisk().includes("wombat review")) return "encrypted: the corpus or a question is still readable in the files";
+        await stopApp();
+        if (onDisk().includes("scaffolder") || onDisk().includes("wombat review")) return "encrypted, after shutdown: the corpus or a question is readable in the files";
+        const unkeyed = await refusedStart({ LOREHOUSE_DB: db });
+        if (typeof unkeyed === "string") return `without Strongroom: ${unkeyed}`;
+        if (!unkeyed.stderr.includes("files are encrypted")) return `without Strongroom: refused, but not for the key: ${unkeyed.stderr.slice(-300)}`;
+        for (const state of ["disabled", "destroyed"]) {
+          await kms(state);
+          const r = await refusedStart(keyed);
+          if (typeof r === "string") return `KMS key ${state}: ${r}`;
+          if (!r.stderr.includes("KMS_KEY_UNAVAILABLE")) return `KMS key ${state}: refused, but not for the key: ${r.stderr.slice(-300)}`;
+        }
+        await kms("enabled");
+        await startApp(keyed);
+        const again = (await status()) as Status & { encrypted?: boolean };
+        if (again.encrypted !== true || again.knowledge.documents !== plain.knowledge.documents) return `restarted with the key: encrypted ${again.encrypted}, ${again.knowledge.documents} documents`;
+        return null;
+      } finally {
+        await kms("enabled");
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
     name: "GET /status is closed (404) when no STATUS_TOKEN is set",
     run: async () => {
       // A restart without the token: nothing to wait on /status for, so it waits on /healthz.
@@ -1846,6 +1900,10 @@ function appEnv(extraEnv: Record<string, string>): Record<string, string | undef
     TENANT_ID: "",
     TENANT_NEW: "",
     LOREHOUSE_DATA_DIR: "",
+    // Plaintext files unless a scenario gives the tenant a Strongroom (the mock's).
+    STRONGROOM_URL: "",
+    STRONGROOM_TOKEN: "",
+    STRONGROOM_KEY: "",
     ...extraEnv,
   };
 }

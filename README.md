@@ -33,6 +33,15 @@ You name it per install; it defaults to `scout`.
       memory goes with it.
 
     The agent's own replies in Slack keep what they quoted until they are deleted there.
+- **Encrypted at rest, with a key under your KMS.** Given a
+  [Strongroom](https://github.com/solcreek/strongroom) deployment (`STRONGROOM_URL`,
+  `STRONGROOM_TOKEN`, `STRONGROOM_KEY`), both databases are encrypted (AEGIS-256) under the
+  tenant's own data key, which is kept only wrapped by your KMS key, in `key.json` in the
+  tenant's directory. Without that key the files, and every backup taken after they were
+  encrypted, can't be read: destroy the KMS key and they are gone; disable it and the app
+  won't start until it is enabled again. Earlier backups, and any `*.stale-*` side file an
+  upgrade set aside (the start that encrypts names them), are still plaintext. Without
+  Strongroom the files are plaintext, as before.
 - **Works in your team's languages.** Chinese, Japanese and Korean are searchable word by
   word, not only in English. It replies in the language it was asked in.
 - **Knows people by name, and never pings them.**
@@ -205,6 +214,7 @@ To set up Slack:
 | `LOREHOUSE_DATA_DIR` | the directory `LOREHOUSE_DB` names, else the working directory | the install's data directory: `settings.json`, and each tenant's files in `<dir>/<tenant>/` (`tenant.json`, `lorehouse.db`, `sessions.db`). `GET /status` shows it (`dataDir`). An install from before tenants, with `lorehouse.db` and `sessions.db` in this directory and `LOREHOUSE_DB` unset, upgrades in place on its first start: each database is checkpointed where it is (its `-wal` emptied), then moves into the tenant's directory by hard link and rename, its `-wal` and `-shm` after it, logged as `storage: moved …`. The old path is never missing, and nothing is copied. A `-wal`, `-shm` or `-journal` in the tenant's directory that isn't the database's own is renamed aside (`….stale-<time>`), never replayed; a start that dies part-way finishes the move on the next; a second start moves nothing. Each old path is left a symlink to the file's new place, so an older version, which still names `<dir>/lorehouse.db`, opens the same database (SQLite puts its `-wal` and `-shm` beside the file itself): rolling back is safe, and rolling forward again finds everything moved. Removing those symlinks is a later, deliberate cleanup, once no older version will run. Where the tenant's directory already has a file and the old path holds a real one too, an old path is a symlink to anywhere else, or the move would cross filesystems, the app refuses to start and says which. `lorehouse doctor` shows what the next start moves |
 | `LOREHOUSE_DB` | `lorehouse.db` in the tenant's directory | Lorehouse's own data (knowledge index). Set, it is used where it is and never moved, and `SESSIONS_DB` defaults to a file beside it |
 | `SESSIONS_DB` | `sessions.db` beside `LOREHOUSE_DB` | the agent framework's conversation state, including a turn waiting on an Approve, so it survives a restart. `:memory:` keeps it in memory (lost on every restart), as it is when `LOREHOUSE_DB` is `:memory:`. It keeps every turn whole: its tools' full results (whole search results, not only what was quoted) and its answers, in every conversation. A message deleted in Slack, or from a channel taken off `AGENT_CHANNELS`, stays there, and a later turn in that conversation can bring it up again, until June supports redaction ([junebuild/june#360](https://github.com/junebuild/june/issues/360)). To erase it now, stop the app and delete this file: every thread's memory goes, a turn waiting on an Approve too |
+| `STRONGROOM_URL` `STRONGROOM_TOKEN` `STRONGROOM_KEY` | (off) | the tenant's [Strongroom](https://github.com/solcreek/strongroom) deployment (an origin: `https://`, or `http://` to localhost), its bearer token, and the key reference it wraps with. Set, the first start makes the tenant's data key, keeps it wrapped in `<tenant>/key.json`, and encrypts both databases in place; every start after unwraps it, and fails if it can't. Once `key.json` exists, a start without these fails rather than open the files. All three or none |
 | `KNOWLEDGE_SEED` | (none) | JSONL of `{id, source, title, text}` to index on first start |
 | `INGEST_BACKFILL_DAYS` | `90` | how far back to read each allowed channel's history on first start (`0` = live only) |
 | `INGEST_REFRESH_DAYS` | `14` | on each start, re-check threads this recent for replies, edits and deletions made while the app was down |
