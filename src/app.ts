@@ -43,6 +43,9 @@ import { githubApp, staticToken } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
 import { prepareTenant, sandboxIdFor, tenantsIn, upgradeLayout } from "./tenant";
+import { KEY_FILE, loadTenantKey, strongroomKeys } from "./tenant-key";
+import { Database, encryptInPlace } from "./sqlite";
+import { join } from "node:path";
 
 // How each tool call shows up on the reply's task timeline in Slack.
 const TASK_LABELS: Record<string, string> = {
@@ -84,7 +87,17 @@ export async function createApp(config: Config) {
   const others = tenant.source === "throwaway" ? [] : tenantsIn(tenant.dataDir).filter((id) => id !== tenant.id);
   if (others.length) console.warn(`lorehouse: storage: ${tenant.dataDir} also holds tenant ${others.join(", ")}, not served here (TENANT_ID=${tenant.id})`);
 
-  const knowledge = openKnowledge(config.db.lorehouse);
+  // The tenant's data key (tenant-key.ts), when its files are encrypted: both databases
+  // open only with it, and one still plaintext is encrypted in place first. Wiped once
+  // both are open; SQLite keeps its own copy per connection.
+  const tenantKey = await loadTenantKey(tenant, config.strongroom && strongroomKeys(config.strongroom));
+  if (tenantKey?.made) console.log(`lorehouse: tenant ${tenant.id}: made its data key, kept wrapped by Strongroom in ${join(tenant.dir, KEY_FILE)}`);
+  if (tenantKey) {
+    for (const path of [config.db.lorehouse, config.db.sessions]) {
+      if (encryptInPlace(path, tenantKey.key) === "encrypted") console.log(`lorehouse: storage: encrypted ${path} under tenant ${tenant.id}'s key`);
+    }
+  }
+  const knowledge = openKnowledge(config.db.lorehouse, undefined, undefined, tenantKey?.key);
   // Both files exist from here on, so this compares the files themselves, not their names.
   try {
     assertDistinctDatabases(config.db.lorehouse, config.db.sessions);
@@ -335,7 +348,14 @@ export async function createApp(config: Config) {
     // No cast: tsc checks the real SDK client against June's AnthropicClient here.
     client: new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl }),
   });
-  runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions, { files: fileStore(config.files.store) });
+  // Encrypted, the session store is opened here with the tenant's key (June's `open` hook);
+  // otherwise June opens it with its own driver.
+  const open = tenantKey && ((path: string) => new Database(path, { key: tenantKey.key }));
+  try {
+    runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions, { files: fileStore(config.files.store), ...(open ? { open } : {}) });
+  } finally {
+    tenantKey?.key.fill(0);
+  }
   const mounted = mountAgent(agent, runtime);
   // Recording who asks is never silent: each channel is told when it starts, and again
   // when it stops (the record erased). Once per change, not on every start.
@@ -400,6 +420,8 @@ export async function createApp(config: Config) {
           // <dataDir>/<tenant>/ unless LOREHOUSE_DB or SESSIONS_DB name others.
           tenant: tenant.id,
           dataDir: tenant.dataDir,
+          // Whether the tenant's databases are encrypted under its data key (tenant-key.ts).
+          encrypted: !!tenantKey,
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
           // Whether usage records who asks: a setting, not anyone's data.
           recordsWhoAsks: recordPeople,
