@@ -44,7 +44,7 @@
 // exec (not mounted noexec). Under `bun src/server.ts` and `bun test` it's loaded from
 // node_modules. Linux needs glibc 2.34 and libstdc++.so.6.
 
-import { existsSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 
 // The addon's surface Lorehouse uses. Declared here: the package's own index.d.ts isn't
 // reachable through its "exports", and `require` gives no types anyway.
@@ -151,6 +151,20 @@ function applyKey(db: Native, key: Uint8Array, set: "key" | "rekey"): void {
   } finally {
     literal.fill(0);
   }
+}
+
+// What a database file is, by its first 16 bytes: absent (or empty: SQLite makes it on
+// open), plaintext SQLite, or anything else, which an encrypted file is.
+export function fileKind(path: string): "none" | "plaintext" | "other" {
+  if (path === ":memory:" || !existsSync(path) || statSync(path).size === 0) return "none";
+  const head = Buffer.alloc(16);
+  const fd = openSync(path, "r");
+  try {
+    readSync(fd, head, 0, 16, 0);
+  } finally {
+    closeSync(fd);
+  }
+  return head.toString("latin1") === "SQLite format 3\0" ? "plaintext" : "other";
 }
 
 // What encryptInPlace found: a plaintext file, now encrypted under the key; a file that

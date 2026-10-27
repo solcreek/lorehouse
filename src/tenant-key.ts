@@ -22,7 +22,7 @@
 import { closeSync, existsSync, fsyncSync, linkSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Strongroom, StrongroomError, type Envelope } from "strongroom";
-import { CIPHER, KEY_BYTES } from "./sqlite";
+import { CIPHER, fileKind, KEY_BYTES } from "./sqlite";
 import type { Tenant } from "./tenant";
 
 export const KEY_FILE = "key.json";
@@ -58,7 +58,10 @@ export class TenantKeyError extends Error {
 export type TenantKey = { key: Uint8Array; made: boolean };
 
 // The tenant's data key, or undefined for plaintext files (see the table at the top).
-export async function loadTenantKey(tenant: Tenant, service: KeyService | undefined): Promise<TenantKey | undefined> {
+// `files`: the tenant's databases. With no key file, one that is already encrypted (or isn't
+// a database) fails the start rather than get a new key it can't be opened with: its
+// key.json is missing.
+export async function loadTenantKey(tenant: Tenant, service: KeyService | undefined, files: string[] = []): Promise<TenantKey | undefined> {
   // A tenant in memory has no files to encrypt.
   if (tenant.source === "throwaway") return undefined;
   const path = join(tenant.dir, KEY_FILE);
@@ -67,6 +70,8 @@ export async function loadTenantKey(tenant: Tenant, service: KeyService | undefi
     if (!service) throw new TenantKeyError(`tenant ${tenant.id}'s files are encrypted (${path}), and the start needs its key: set STRONGROOM_URL, STRONGROOM_TOKEN and STRONGROOM_KEY`);
     return { key: await unwrap(service, file.envelope, tenant.id), made: false };
   }
+  const unreadable = files.filter((f) => fileKind(f) === "other");
+  if (unreadable.length) throw new TenantKeyError(`${unreadable.join(" and ")} ${unreadable.length === 1 ? "is" : "are"} encrypted (or not SQLite), but tenant ${tenant.id} has no ${path}: put back the key.json it was encrypted with${service ? "; no new key was made" : ", and set STRONGROOM_URL, STRONGROOM_TOKEN and STRONGROOM_KEY"}`);
   if (!service) return undefined;
   return { key: await make(service, tenant, path), made: true };
 }

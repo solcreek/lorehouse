@@ -3,12 +3,12 @@
 // leaves the files unreadable.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StrongroomError, type Envelope } from "strongroom";
 import { closeKnowledge, openKnowledge, searcher, upsertDocument } from "../src/knowledge";
-import { Database, encryptInPlace, KeyMismatchError } from "../src/sqlite";
+import { Database, encryptInPlace, fileKind, KeyMismatchError } from "../src/sqlite";
 import { contextFor, KEY_FILE, loadTenantKey, strongroomKeys, TenantKeyError, type KeyContext, type KeyService } from "../src/tenant-key";
 import type { Tenant } from "../src/tenant";
 
@@ -125,6 +125,20 @@ describe("the tenant's data key", () => {
     await expect(loadTenantKey(b, kms)).rejects.toThrow(/DECRYPT_FAILED/);
   });
 
+  test("an encrypted database and no key file: no new key is made over it, and the start says key.json is missing", async () => {
+    const t = tenantAt();
+    const kms = new FakeKms();
+    const path = join(t.dir, "lorehouse.db");
+    const { key } = (await loadTenantKey(t, kms))!;
+    closeKnowledge(knowledgeWith(path, key));
+    rmSync(join(t.dir, KEY_FILE));
+    await expect(loadTenantKey(t, kms, [path])).rejects.toThrow(/lorehouse\.db is encrypted \(or not SQLite\), but tenant acme has no .*key\.json: put back the key\.json it was encrypted with; no new key was made/);
+    expect(existsSync(join(t.dir, KEY_FILE))).toBe(false);
+    await expect(loadTenantKey(t, undefined, [path])).rejects.toThrow(/put back the key\.json .* and set STRONGROOM_URL/);
+    // Plaintext or absent files are what a first key is made over.
+    expect((await loadTenantKey(t, kms, [join(t.dir, "absent.db")]))?.made).toBe(true);
+  });
+
   test("the envelope is bound to the tenant and to its purpose", () => {
     expect(contextFor("acme")).toEqual({ tenantId: "acme", recordId: "database-key", purpose: "lorehouse-database" });
   });
@@ -162,6 +176,20 @@ describe("encrypted databases", () => {
     expect(searcher(again)("launch").map((c) => c.id)).toEqual(["seed:1"]);
     expect(again.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
     closeKnowledge(again);
+  });
+
+  test("a database reached through a symlink (the old layout's path) is encrypted where the file is", async () => {
+    const t = tenantAt();
+    const path = join(t.dir, "lorehouse.db");
+    closeKnowledge(knowledgeWith(path));
+    const old = join(t.dataDir, "lorehouse.db");
+    symlinkSync(path, old);
+    const { key } = (await loadTenantKey(t, new FakeKms()))!;
+    expect(encryptInPlace(old, key)).toBe("encrypted");
+    expect(lstatSync(old).isSymbolicLink()).toBe(true);
+    expect(fileKind(path)).toBe("other");
+    expect(onDisk(path)).not.toContain(SECRET);
+    closeKnowledge(openKnowledge(old, undefined, undefined, key));
   });
 
   test("written under the key, no plaintext reaches the file or its -wal", async () => {
