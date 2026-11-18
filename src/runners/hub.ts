@@ -329,6 +329,7 @@ export class RunnerHub {
   // call boots the sandbox's VM boots it with them, and a refusal is thrown whole.
   sandbox(id: string, opts: { resources?: SandboxResources } = {}): Sandbox {
     const resources = opts.resources ? wireResources(opts.resources) : undefined;
+    const now = () => this.now();
     // One guest job; one the runner refused with a code is thrown with its reason.
     const call = async (method: "POST" | "GET" | "PUT", path: string, bodyBase64: string | undefined, timeoutMs: number) => {
       const r = await this.submit(id, { op: "guest", method, path, bodyBase64, ...(resources ? { resources } : {}) }, timeoutMs);
@@ -370,8 +371,9 @@ export class RunnerHub {
         // One timeout for both: the guest's limit, and (plus boot slack) this call's deadline.
         // And never more than the sandbox's command timeout: the runner stops it there anyway.
         const timeoutMs = execTimeoutMs(resources, o.timeoutMs, EXEC_TIMEOUT_MS);
+        const sent = now();
         const r = await guest("POST", "/exec", JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs }), timeoutMs);
-        return explainTimeout(JSON.parse(decode(r)) as ExecResult, timeoutMs, resources);
+        return explainTimeout(JSON.parse(decode(r)) as ExecResult, timeoutMs, now() - sent, resources);
       },
       async readFile(path: string): Promise<string> {
         const r = await guest("GET", `/file?path=${encodeURIComponent(path)}`, undefined, 30_000);

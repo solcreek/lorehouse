@@ -107,12 +107,18 @@ export function execTimeoutMs(r: SandboxResources | undefined, asked: number | u
 }
 
 // A command's result, saying which limit stopped it when that was the sandbox's command
-// timeout (guestd's exit code 124 and its marker, at exactly that timeout): otherwise a
-// clone cut short by a profile's 120 s reads like a clone that hung. Any other result is
-// returned as it is.
-export function explainTimeout<T extends { exitCode: number; stderr: string }>(result: T, timeoutMs: number, r: SandboxResources | undefined): T {
+// timeout: otherwise a clone cut short by a profile's 120 s reads like a clone that hung.
+// Three things together say it was: the command was sent exactly that timeout, it ended
+// with guestd's exit code 124 and marker, and the call took about that long
+// (`elapsedMs`, measured by the caller around the call). The last matters because the
+// first two are the command's to fake: `timeout 1 x`, or a script that prints the marker
+// and exits 124, ends in a second and was not stopped by anything of the sandbox's. Any
+// other result is returned as it is.
+export function explainTimeout<T extends { exitCode: number; stderr: string }>(result: T, timeoutMs: number, elapsedMs: number, r: SandboxResources | undefined): T {
   if (r?.commandTimeoutSecs === undefined || timeoutMs !== r.commandTimeoutSecs * 1000) return result;
   if (result.exitCode !== 124 || !result.stderr.includes("[guestd] command timed out")) return result;
+  // A boot can only add to the call's time, and clocks differ a little: nine tenths.
+  if (elapsedMs < timeoutMs * 0.9) return result;
   return { ...result, stderr: `${result.stderr}\n[lorehouse] stopped at this sandbox's command timeout, ${r.commandTimeoutSecs} s (the profile's sandboxResources.commandTimeoutSecs): it bounds every command run in the sandbox, a clone or a fetch included. A command that needs longer can run as a background job (workspace_job_start)` };
 }
 
