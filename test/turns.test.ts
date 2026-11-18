@@ -235,6 +235,31 @@ describe("turnGate", () => {
     expect(await second).toEqual({ turn: "refuse", verdict: { user: "U2", member: false, reason: "guest" } });
   });
 
+  // Whichever arrives first and whichever is decided first, the reply waits for both and
+  // finds the thread joined by the member's.
+  for (const arrival of [["U1", "UG1"], ["UG1", "U1"]] as const) {
+    for (const decided of [["U1", "UG1"], ["UG1", "U1"]] as const) {
+      test(`two mentions pending in one thread (${arrival.join(" then ")}; decided ${decided.join(" then ")}): a held reply waits for both, and is answered because the member's was accepted`, async () => {
+        const t = setup();
+        await t.deliver(mention("U2"));
+        const lookups = { U1: t.hold("U1"), UG1: t.hold("UG1") };
+        const mentions = arrival.map((user) => ({ user, done: t.deliver(mention(user, "5.5")) }));
+        await Promise.all([lookups.U1.pending, lookups.UG1.pending]);
+        let replied = false;
+        const held = t.deliver(reply("U2", "5.5")).then((d) => { replied = true; return d; });
+        lookups[decided[0]].release();
+        await mentions.find((m) => m.user === decided[0])!.done;
+        await Bun.sleep(1);
+        expect(replied).toBe(false); // the other mention is still out
+        lookups[decided[1]].release();
+        expect(await held).toEqual(ANSWER);
+        expect(await mentions.find((m) => m.user === "U1")!.done).toEqual(ANSWER);
+        expect(await mentions.find((m) => m.user === "UG1")!.done).toMatchObject({ turn: "refuse", verdict: { reason: "guest" } });
+        expect(t.joined("5.5")).toBe(true);
+      });
+    }
+  }
+
   test("a hold expires: a mention that is never decided lets the follow-up go, unanswered", async () => {
     const t = setup({ holdMs: 20 });
     await t.deliver(mention("U2"));
