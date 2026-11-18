@@ -69,6 +69,11 @@ const TASK_LABELS: Record<string, string> = {
   render_pdf: "Making the PDF",
 };
 
+// fetch for GitHub's REST API, each request given up on after CHECK_TIMEOUT_MS: the
+// credential's own requests and the admin API's repo check. Never a clone or a push,
+// which the sandbox host makes, under its own timeouts.
+const githubFetch = ((url: string, init?: RequestInit) => fetch(url, { ...init, signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) })) as typeof fetch;
+
 // The start. The tenant's data key, if any, is needed only while it opens the databases:
 // it is wiped when the start ends, whether the app came up or not. `profiles`: the profiles
 // to run (profiles.ts), this build's unless a test passes its own.
@@ -246,7 +251,10 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
     const apiUrl = config.githubApiUrl;
-    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
+    // The credential's own requests to GitHub (the installation lookup, the token exchange,
+    // who it acts as) carry a deadline: small API calls, for a clone, a pull request or the
+    // admin API's repo check, and a GitHub that stalls must not hold one open for good.
+    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl, fetch: githubFetch }) : staticToken(sb.github.token, { apiUrl, fetch: githubFetch });
     githubAccess = github;
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
     // Who started each background job, for who may cancel it (tools/jobs.ts): pruned on
@@ -444,8 +452,9 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
     // to check with, and setting one is refused.
     channels: config.agent.channels,
     // The admin API bounds the whole check (CHECK_TIMEOUT_MS); the same deadline on each
-    // request lets a stalled one go instead of leaving it open behind the answer.
-    checkRepo: github && ((repo, branch) => checkRepo(github, repo, { branch, apiUrl: config.githubApiUrl, fetch: ((url: string, init?: RequestInit) => fetch(url, { ...init, signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) })) as typeof fetch })),
+    // request, the credential's own included (githubFetch), lets a stalled one go instead
+    // of leaving it open behind the answer.
+    checkRepo: github && ((repo, branch) => checkRepo(github, repo, { branch, apiUrl: config.githubApiUrl, fetch: githubFetch })),
     log: (line) => console.log(line),
     // With askers recorded, each is named as knowledge names people, from the names already
     // cached: reading usage only reads (no Slack call, no write). Uncached: name null.
