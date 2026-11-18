@@ -494,6 +494,8 @@ pub fn read_stored(dir: &Path) -> Result<Option<Granted>, String> {
 /// Written whole or not at all, and on the disk before it counts: the file is synced
 /// before the rename and the directory after it, so a power cut leaves the old record or
 /// the new one, never an empty or missing one (the rack this runs on loses power uncleanly).
+/// A write that fails anywhere (a full disk, a rename that can't be made) leaves the old
+/// record as it was and no temporary file beside it.
 pub fn store(dir: &Path, granted: &Granted) -> Result<(), String> {
     use std::io::Write;
     let (path, tmp) = (dir.join(FILE), dir.join(format!("{FILE}.tmp")));
@@ -505,7 +507,10 @@ pub fn store(dir: &Path, granted: &Granted) -> Result<(), String> {
         std::fs::rename(&tmp, &path)?;
         std::fs::File::open(dir)?.sync_all()
     };
-    write().map_err(|e| format!("{}: {e}", path.display()))
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
 }
 
 #[cfg(test)]
@@ -796,6 +801,15 @@ pub mod tests {
         let body = &body[..body.find("\n}\n").unwrap()];
         let (sync, rename, dirsync) = (body.find("file.sync_all()").unwrap(), body.find("std::fs::rename(").unwrap(), body.find("File::open(dir)?.sync_all()").unwrap());
         assert!(sync < rename && rename < dirsync, "store() must sync the file, rename, then sync the directory");
+        // A write that fails after the temporary file was made (here the rename: the
+        // record's name is taken by a directory that isn't empty) leaves no temporary file.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(blocked.join(FILE).join("in-the-way")).unwrap();
+        let g = Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 600 };
+        assert!(store(&blocked, &g).unwrap_err().contains("resources.json"));
+        assert!(!blocked.join("resources.json.tmp").exists(), "a failed write left its temporary file");
+        assert!(blocked.join(FILE).join("in-the-way").exists(), "what was there was touched");
+        std::fs::remove_dir_all(&blocked).unwrap();
         // A directory that isn't there: an error that names the file, nothing written.
         assert!(store(&dir.join("gone"), &Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 600 }).unwrap_err().contains("resources.json"));
         for damaged in ["", "{}", r#"{"vcpus":4,"memMib":4096,"diskGib":null,"pids":128,"commandTimeoutSecs":1800,"gpus":1}"#] {
