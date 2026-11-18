@@ -54,7 +54,15 @@ describe("a branch the host pushed", () => {
     sh(`git remote add origin ${dir}.git && git push -q origin HEAD:refs/heads/main && git fetch -q origin`, { cwd: dir });
     sh(`echo a > a && git add a && git commit -qm a`, { cwd: dir });
     const first = sh(`git rev-parse HEAD`, { cwd: dir }).out.trim();
-    sh(`git push -q ${dir}.git ${first}:refs/heads/scout/one`, { cwd: dir }); // as the host pushes: not through origin
+    // As the host pushes: from its own mirror, which got the commit in a bundle, never from
+    // the checkout. (A push run in the checkout to origin's URL is no stand-in: git 2.56
+    // records it under origin/*, as a push to `origin` by name always did.)
+    const staged = join(root, "stage.bundle");
+    const mirror = join(root, "pushed-host.git");
+    expect(sh(`git bundle create -q ${staged} HEAD --not --remotes=origin`, { cwd: dir }).code).toBe(0);
+    sh(`git clone -q --bare ${dir}.git ${mirror} && git -C ${mirror} fetch -q ${staged} HEAD`);
+    expect(sh(`git -C ${mirror} push -q ${dir}.git ${first}:refs/heads/scout/one`).code).toBe(0);
+    expect(sh(`git -C ${dir}.git rev-parse --verify --quiet refs/heads/scout/one`).out.trim()).toBe(first); // it did land
     expect(sh(`git rev-parse --verify --quiet origin/scout/one`, { cwd: dir }).code).not.toBe(0);
     // What the host has the sandbox bundle on a replay: still the pushed commit, not "empty bundle".
     const r = sh(`git bundle create -q ${join(root, "replay.bundle")} HEAD --not --remotes=origin`, { cwd: dir });
