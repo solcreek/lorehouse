@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertDistinctDatabases, ConfigError, loadConfig } from "../src/config";
 import { loadEnv } from "../src/settings";
-import { countDocuments, deleteDocument, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
+import { checkpointRuns, closeKnowledge, countDocuments, deleteDocument, getCursor, getDocument, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, SeedError, type SeedSync, setCursor, syncSeed, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 import { render, systemPrompt, toolDescription } from "../src/prompts";
 import { agentIdentity } from "../src/identity";
@@ -30,12 +30,274 @@ describe("knowledge store", () => {
     }
   });
 
-  test("seeding fills an empty index once, never duplicates", () => {
-    const db = openKnowledge(":memory:");
-    const first = seedFromJsonl(db, CORPUS);
-    expect(first).toBeGreaterThan(200);
-    expect(seedFromJsonl(db, CORPUS)).toBe(0);
-    expect(countDocuments(db)).toBe(first);
+  // KNOWLEDGE_SEED is read on every start and the index follows it (#166). Each test is a
+  // series of starts against one database file: open, read the seed, close.
+  describe("the seed file", () => {
+    type Entry = { id: string; source: string; title: string; text: string };
+    type Store = ReturnType<typeof openKnowledge>;
+    const wombat: Entry = { id: "kb-1", source: "help/wombats.md", title: "Wombats", text: "the wombat review is quarterly" };
+    const ibis: Entry = { id: "kb-2", source: "help/ibises.md", title: "Ibises", text: "the ibis census is in march" };
+    const emu: Entry = { id: "kb-3", source: "help/emus.md", title: "Emus", text: "the emu fence is inspected weekly" };
+    const thread = { docId: "slack:C1:1.1", kind: "slack_thread" as const, source: "https://x/p11", title: "t", text: "the quokka paddock moved north", sourceVersion: "1.1" };
+    const OLD = "2020-01-01T00:00:00.000Z";
+
+    type Install = {
+      db: string;
+      seed: string;
+      write: (...lines: (Entry | string)[]) => void; // the seed file, one entry (or raw line) per line
+      start: (...lines: (Entry | string)[]) => SeedSync; // one start: the file written if lines are given, then read
+      inDb: <T>(fn: (db: Store) => T) => T; // the database opened, used and closed
+    };
+    const withInstall = (run: (i: Install) => void | Promise<void>) => async () => {
+      const dir = mkdtempSync(join(tmpdir(), "lorehouse-seed-"));
+      const db = join(dir, "lorehouse.db");
+      const seed = join(dir, "seed.jsonl");
+      const write = (...lines: (Entry | string)[]) => writeFileSync(seed, lines.map((l) => (typeof l === "string" ? l : JSON.stringify(l))).join("\n") + "\n");
+      const inDb = <T>(fn: (db: Store) => T): T => {
+        const k = openKnowledge(db);
+        try {
+          return fn(k);
+        } finally {
+          closeKnowledge(k);
+        }
+      };
+      const start = (...lines: (Entry | string)[]) => {
+        if (lines.length) write(...lines);
+        return inDb((k) => syncSeed(k, seed));
+      };
+      try {
+        await run({ db, seed, write, start, inDb });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    // Every document as stored, in id order: what "the index is as it was" compares.
+    const stored = (k: Store) => k.query("SELECT doc_id, kind, source, title, text, updated_at FROM knowledge_documents ORDER BY doc_id").all();
+    // Backdate every document, so one written again shows.
+    const backdate = (k: Store) => void k.query("UPDATE knowledge_documents SET updated_at = ?").run(OLD);
+    const refused = (fn: () => unknown): string => {
+      try {
+        fn();
+      } catch (err) {
+        expect(err).toBeInstanceOf(SeedError);
+        return (err as Error).message;
+      }
+      throw new Error("the seed was read; expected a SeedError");
+    };
+
+    test("the first start adds every entry; a start with the file unchanged touches nothing", withInstall(({ start, inDb }) => {
+      expect(start(wombat, "", ibis, emu)).toEqual({ entries: 3, added: 3, updated: 0, removed: 0 }); // a blank line is skipped
+      inDb(backdate);
+      expect(start()).toEqual({ entries: 3, added: 0, updated: 0, removed: 0 });
+      inDb((k) => {
+        expect(countDocuments(k)).toBe(3);
+        for (const e of [wombat, ibis, emu]) expect(getDocument(k, e.id)).toMatchObject({ kind: "seed", title: e.title, updatedAt: OLD });
+      });
+    }));
+
+    test("the whole fixture corpus is read, and read again without a change", withInstall(({ inDb }) => {
+      const first = inDb((k) => syncSeed(k, CORPUS));
+      expect(first.added).toBeGreaterThan(200);
+      expect(first).toEqual({ entries: first.added, added: first.added, updated: 0, removed: 0 });
+      expect(inDb((k) => syncSeed(k, CORPUS))).toEqual({ ...first, added: 0 });
+      expect(inDb((k) => countDocuments(k))).toBe(first.added);
+    }));
+
+    test("an entry whose title, source or text changed is re-indexed; the others keep their updatedAt", withInstall(({ start, inDb }) => {
+      const dingo: Entry = { id: "kb-4", source: "help/dingoes.md", title: "Dingoes", text: "the dingo roster is monthly" };
+      start(wombat, ibis, emu, dingo);
+      inDb(backdate);
+      const edited = [{ ...wombat, text: "the wombat review is yearly" }, { ...ibis, title: "Spoonbills" }, { ...emu, source: "help/birds/emus.md" }];
+      expect(start(...edited, dingo)).toEqual({ entries: 4, added: 0, updated: 3, removed: 0 });
+      inDb((k) => {
+        const search = searcher(k);
+        expect(search("yearly")[0]?.id).toBe("kb-1");
+        expect(search("quarterly")).toEqual([]); // the old text left the index
+        expect(search("spoonbills")[0]?.id).toBe("kb-2");
+        expect(search("ibises")).toEqual([]);
+        expect(getDocument(k, "kb-3")).toMatchObject({ source: "help/birds/emus.md", text: emu.text });
+        for (const e of edited) expect(getDocument(k, e.id)!.updatedAt > OLD).toBe(true);
+        expect(getDocument(k, "kb-4")!.updatedAt).toBe(OLD);
+      });
+    }));
+
+    test("an entry gone from the file leaves the index and the database's files; added back, it is found again", withInstall(async ({ db, seed, write, start, inDb }) => {
+      start(wombat, ibis, emu);
+      expect(start(wombat, emu)).toEqual({ entries: 2, added: 0, updated: 0, removed: 1 });
+      inDb((k) => {
+        expect(getDocument(k, "kb-2")).toBeUndefined();
+        expect(searcher(k)("census")).toEqual([]);
+        expect(countDocuments(k)).toBe(2);
+      });
+      expect(start(wombat, ibis, emu)).toEqual({ entries: 3, added: 1, updated: 0, removed: 0 });
+      inDb((k) => expect(searcher(k)("census")[0]?.id).toBe("kb-2"));
+
+      // A removal asks for a checkpoint (checkpointSoon), so the text leaves the WAL while
+      // the app runs, not only when it stops.
+      const k = openKnowledge(db, MIGRATIONS, { delayMs: 20, retryMs: 20, log: () => {} });
+      try {
+        await Bun.sleep(60);
+        const opened = checkpointRuns(k); // the one every open runs
+        write(wombat, emu);
+        expect(syncSeed(k, seed).removed).toBe(1);
+        expect(readFileSync(`${db}-wal`).length).toBeGreaterThan(0); // the removal is in the WAL
+        await Bun.sleep(150);
+        expect(checkpointRuns(k)).toBe(opened + 1);
+        expect(readFileSync(`${db}-wal`).length).toBe(0);
+        expect(readFileSync(db).includes("census")).toBe(false);
+      } finally {
+        closeKnowledge(k);
+      }
+    }));
+
+    test("an empty file removes every seed; Slack's documents are never touched", withInstall(({ start, inDb }) => {
+      start(wombat, ibis);
+      inDb((k) => {
+        upsertDocument(k, thread);
+        backdate(k);
+      });
+      expect(start("")).toEqual({ entries: 0, added: 0, updated: 0, removed: 2 });
+      inDb((k) => {
+        expect(k.query("SELECT doc_id, kind, updated_at FROM knowledge_documents").all()).toEqual([{ doc_id: thread.docId, kind: "slack_thread", updated_at: OLD }]);
+        expect(searcher(k)("quokka")[0]?.id).toBe(thread.docId);
+      });
+    }));
+
+    test("a seed set on an install that already has threads is read", withInstall(({ start, inDb }) => {
+      inDb((k) => upsertDocument(k, thread));
+      expect(start(wombat, ibis)).toEqual({ entries: 2, added: 2, updated: 0, removed: 0 });
+      inDb((k) => {
+        expect(searcher(k)("census")[0]?.id).toBe("kb-2");
+        expect(getDocument(k, thread.docId)).toMatchObject({ kind: "slack_thread", text: thread.text });
+      });
+    }));
+
+    test("an entry with the id of a document that isn't a seed is refused, naming its line; that document is left alone", withInstall(({ seed, write, start, inDb }) => {
+      start(wombat);
+      const other = { ...thread, docId: "kb-3" }; // another kind's document under an id the file also uses
+      const before = inDb((k) => {
+        upsertDocument(k, other);
+        return stored(k);
+      });
+      write(wombat, ibis, emu);
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain('line 3: id "kb-3" is already the id of a slack_thread document');
+      expect(inDb(stored)).toEqual(before); // kb-2 wasn't added either
+    }));
+
+    // Ingest writes, and its reconcile removes, whatever is under a Slack thread's id: a
+    // seed there would be taken over by the thread, or dropped when Slack has no such thread.
+    test("an id where Slack threads' ids are is refused, whether or not a thread has it yet", withInstall(({ seed, write, inDb }) => {
+      write(wombat, { ...ibis, id: "slack:C1:1700000000.000100" });
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain('line 2: id "slack:C1:1700000000.000100" starts with "slack:"');
+      expect(message).toContain("give the entry another id");
+      expect(inDb((k) => countDocuments(k))).toBe(0);
+    }));
+
+    // A lone surrogate isn't stored as written, so the entry would differ from the index on
+    // every start (re-indexed each time; in an id, added and removed by turns).
+    test("half of a character in any field is refused, naming the field", withInstall(({ seed, write, inDb }) => {
+      const half = "\ud83d"; // the first half of an emoji, as a cut through one leaves
+      write(wombat, { ...ibis, text: `census ${half}` }, { ...emu, id: `kb-3${half}` }, { ...emu, id: "kb-5", title: `${half}Emus` });
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain("3 lines are wrong");
+      expect(message).toContain('line 2: "text" holds half of a character');
+      expect(message).toContain('line 3: "id" holds half of a character');
+      expect(message).toContain('line 4: "title" holds half of a character');
+      expect(inDb((k) => countDocuments(k))).toBe(0);
+    }));
+
+    test("a whole emoji, and text in any script, compares equal on the next start", withInstall(({ start }) => {
+      const entries = [{ ...wombat, text: "袋熊審查每季一次 🦘 quarterly" }, { ...ibis, title: "Ibises 🪶", id: "kb-鳥" }];
+      expect(start(...entries)).toEqual({ entries: 2, added: 2, updated: 0, removed: 0 });
+      expect(start()).toEqual({ entries: 2, added: 0, updated: 0, removed: 0 });
+    }));
+
+    // The failures above are all found before the first write. One found after it (here a
+    // delete the database refuses, once an edit and an addition are written) undoes them too.
+    test("a write that fails part-way leaves the index as it was: the read is one transaction", withInstall(({ seed, write, start, inDb }) => {
+      start(wombat, ibis);
+      const before = inDb(stored);
+      write({ ...wombat, text: "the wombat review is yearly" }, emu); // kb-1 edited, kb-3 added, kb-2 gone
+      inDb((k) => {
+        k.exec("CREATE TRIGGER refuse_delete BEFORE DELETE ON knowledge_documents BEGIN SELECT RAISE(ABORT, 'refused by the test'); END");
+        expect(() => syncSeed(k, seed)).toThrow("refused by the test");
+        k.exec("DROP TRIGGER refuse_delete");
+        expect(stored(k)).toEqual(before);
+        expect(searcher(k)("yearly")).toEqual([]); // the index rows went back with the documents
+        expect(searcher(k)("quarterly")[0]?.id).toBe("kb-1");
+        expect(searcher(k)("emu")).toEqual([]);
+      });
+      expect(start()).toEqual({ entries: 2, added: 1, updated: 1, removed: 1 }); // and the same file is then read whole
+    }));
+
+    test("an edited entry's old text leaves the database's files while the app runs", withInstall(async ({ db, seed, write, start }) => {
+      start(wombat, ibis);
+      const k = openKnowledge(db, MIGRATIONS, { delayMs: 20, retryMs: 20, log: () => {} });
+      try {
+        await Bun.sleep(60);
+        const opened = checkpointRuns(k); // the one every open runs
+        write({ ...wombat, text: "the wombat review is yearly" }, ibis);
+        expect(syncSeed(k, seed).updated).toBe(1);
+        await Bun.sleep(150);
+        expect(checkpointRuns(k)).toBe(opened + 1);
+        expect(readFileSync(`${db}-wal`).length).toBe(0);
+        expect(readFileSync(db).includes("quarterly")).toBe(false);
+      } finally {
+        closeKnowledge(k);
+      }
+    }));
+
+    test("a malformed line fails the read with its line number, and the index is as it was", withInstall(({ seed, write, start, inDb }) => {
+      start(wombat, ibis);
+      const before = inDb(stored);
+      // Line 1 changes an entry, line 2 adds one, kb-2 is gone: none of it may happen.
+      write({ ...wombat, text: "the wombat review is yearly" }, emu, "", '{"id":"kb-9","source":"s","title":"t","text":"cut off he');
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain(seed);
+      expect(message).toContain("line 4: not JSON");
+      expect(message).toContain("the index is as it was");
+      expect(message).not.toContain("line 1:");
+      expect(inDb(stored)).toEqual(before);
+    }));
+
+    test("every wrong line is named with what is wrong with it", withInstall(({ seed, write, inDb }) => {
+      write(wombat, '["kb-5"]', '{"id":"kb-6","source":"s","title":"t"}', '{"id":7,"source":"s","title":"t","text":"x"}', '{"id":" ","source":"s","title":"t","text":"x"}', { ...ibis, id: "kb-1" });
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain("5 lines are wrong");
+      expect(message).toContain("line 2: a JSON array, not an object");
+      expect(message).toContain('line 3: "text" is missing');
+      expect(message).toContain('line 4: "id" is a number, not a string');
+      expect(message).toContain('line 5: "id" is empty');
+      expect(message).toContain('line 6: id "kb-1" is already used on line 1');
+      expect(message).toContain('{"id": "…", "source": "…", "title": "…", "text": "…"}'); // what a line should be
+      expect(inDb((k) => countDocuments(k))).toBe(0);
+    }));
+
+    test("a file with many wrong lines names the first ten and counts the rest", withInstall(({ seed, write, inDb }) => {
+      write(...Array.from({ length: 14 }, () => "nope"));
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain("14 lines are wrong");
+      expect(message).toContain("line 10: not JSON");
+      expect(message).not.toContain("line 11:");
+      expect(message).toContain("and 4 more");
+    }));
+
+    test("a file that can't be read fails the read, naming the path; the seeds already indexed stay", withInstall(({ seed, start, inDb }) => {
+      start(wombat, ibis);
+      const before = inDb(stored);
+      rmSync(seed);
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain(`KNOWLEDGE_SEED ${seed} can't be read`);
+      expect(message).toContain("ENOENT");
+      expect(inDb(stored)).toEqual(before);
+    }));
+
+    test("a file saved with a byte order mark or CRLF line ends reads the same", withInstall(({ seed, inDb }) => {
+      writeFileSync(seed, String.fromCharCode(0xfeff) +[wombat, ibis].map((e) => JSON.stringify(e)).join("\r\n") + "\r\n");
+      expect(inDb((k) => syncSeed(k, seed))).toEqual({ entries: 2, added: 2, updated: 0, removed: 0 });
+    }));
   });
 
   test("upgrading a 0001 database carries its chunks over as seeds, ids intact, still searchable", () => {
@@ -193,7 +455,7 @@ describe("knowledge store", () => {
 
   test("search returns at most 5 ranked chunks", () => {
     const db = openKnowledge(":memory:");
-    seedFromJsonl(db, CORPUS);
+    syncSeed(db, CORPUS);
     const hits = searcher(db)("how does soft navigation work");
     expect(hits.length).toBe(5);
     expect(hits[0]).toMatchObject({ id: expect.stringMatching(/^c\d+$/), title: expect.any(String) });

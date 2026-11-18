@@ -10,7 +10,7 @@ import { memoryFileStore, type FileStore } from "@junejs/core/agent-files";
 import { createNativeRuntime, mountAgent, toAgentDef } from "@junejs/server/agent-native";
 import { assertDistinctDatabases, type Config } from "./config";
 import { agentIdentity } from "./identity";
-import { closeKnowledge, countDocuments, openKnowledge, recentDocuments, searcher, seedFromJsonl } from "./knowledge";
+import { closeKnowledge, countDocuments, describeSeed, openKnowledge, recentDocuments, searcher, syncSeed, type SeedSync } from "./knowledge";
 import { recentKnowledgeTool } from "./tools/recent-knowledge";
 import { SlackIngester } from "./ingest/slack";
 import { slackApi } from "./slack-api";
@@ -126,7 +126,18 @@ async function startApp(config: Config, keys: Uint8Array[]) {
   // A channel taken off AGENT_CHANNELS leaves the index, with its joined threads, before
   // anything is answered (purge.ts); an empty list leaves nothing from Slack.
   for (const p of purgeUnlistedChannels(knowledge, config.agent.channels)) console.log(describePurge(p));
-  const seeded = config.db.knowledgeSeed ? seedFromJsonl(knowledge, config.db.knowledgeSeed) : 0;
+  // The seed file is read on every start and the index follows it (knowledge.ts): one that
+  // can't be used fails the start, naming each wrong line, with the index as it was.
+  let seed: SeedSync | undefined;
+  if (config.db.knowledgeSeed) {
+    try {
+      seed = syncSeed(knowledge, config.db.knowledgeSeed);
+    } catch (err) {
+      closeKnowledge(knowledge);
+      throw err;
+    }
+    console.log(describeSeed(config.db.knowledgeSeed, seed));
+  }
 
   // Slack history becomes knowledge — only for channels the agent is allowed in.
   const ingester = config.agent.channels.size
@@ -408,7 +419,6 @@ async function startApp(config: Config, keys: Uint8Array[]) {
 
   return {
     identity,
-    seeded,
     // Kick off the Slack backfill; call after the server is listening (it runs in the
     // background and never blocks /healthz).
     startIngest: async () => {
@@ -436,6 +446,9 @@ async function startApp(config: Config, keys: Uint8Array[]) {
           dataDir: tenant.dataDir,
           // Whether the tenant's databases are encrypted under its data key (tenant-key.ts).
           encrypted: !!tenantKey,
+          // What this start's read of KNOWLEDGE_SEED did to the index's seed documents
+          // (knowledge.ts); absent when no seed file is set.
+          ...(seed ? { seed } : {}),
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
           // Whether usage records who asks: a setting, not anyone's data.
           recordsWhoAsks: recordPeople,
