@@ -11,7 +11,7 @@
 // new stage id, and push succeeds only for a stage it handed out, once, with the same
 // commit and branch (sandbox/host/src/publish.rs). Background jobs answer as guestd's do.
 
-type Job = { id: string; sandbox: string; op: string; method?: string; path?: string; bodyBase64?: string };
+type Job = { id: string; sandbox: string; op: string; method?: string; path?: string; bodyBase64?: string; timeoutMs?: number; resources?: unknown };
 
 export type FakeRunner = { jobs: Job[]; stop: () => Promise<void> };
 
