@@ -33,6 +33,13 @@ export function getChannelRepo(db: Database, channel: string): ChannelRepo | und
   return (db.query(`${SELECT} WHERE channel = ?`).get(channel) as ChannelRepo | null) ?? undefined;
 }
 
+// The lookup workspace_clone is handed: a channel's default only while the agent works
+// there (`working`: on AGENT_CHANNELS, and not closed since the start). A row alone is not
+// enough: one can outlive its channel's standing until the next start purges it.
+export function defaultRepoFor(db: Database, working: { has(channel: string): boolean }): (channel: string) => ChannelRepo | undefined {
+  return (channel) => (working.has(channel) ? getChannelRepo(db, channel) : undefined);
+}
+
 // Every channel's default, by channel id.
 export function listChannelRepos(db: Database): ChannelRepo[] {
   return db.query(`${SELECT} ORDER BY channel`).all() as ChannelRepo[];

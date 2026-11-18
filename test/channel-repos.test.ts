@@ -2,7 +2,7 @@
 // by an admin, read by workspace_clone.
 
 import { describe, expect, test } from "bun:test";
-import { clearChannelRepo, getChannelRepo, hasChannelRepos, listChannelRepos, setChannelRepo, validBranch } from "../src/channel-repos";
+import { clearChannelRepo, defaultRepoFor, getChannelRepo, hasChannelRepos, listChannelRepos, setChannelRepo, validBranch } from "../src/channel-repos";
 import { openKnowledge } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
 
@@ -57,6 +57,22 @@ describe("a channel's default repo", () => {
     setChannelRepo(db, { channel: "C9", repo: widgets }, T0);
     setChannelRepo(db, { channel: "C1", repo: { owner: "acme", name: "gadgets" }, branch: "dev" }, T0);
     expect(listChannelRepos(db).map((r) => `${r.channel} ${r.repo} ${r.branch}`)).toEqual(["C1 acme/gadgets dev", "C9 acme/widgets null"]);
+  });
+
+  // What workspace_clone is handed (src/app.ts): a stored row is not enough. Rows for a
+  // private channel, a DM, a channel off the list or one closed since the start can exist
+  // (set before it changed, or written by hand); none of them is a default.
+  test("defaultRepoFor: only a channel the agent works in now gets its default", () => {
+    const db = openKnowledge(":memory:");
+    for (const channel of ["C1", "C2", "C9", "G1", "D1"]) setChannelRepo(db, { channel, repo: widgets }, T0);
+    const closed = new Set(["C2"]);
+    const listed = new Set(["C1", "C2"]);
+    const lookup = defaultRepoFor(db, { has: (c) => listed.has(c) && !closed.has(c) });
+    expect(lookup("C1")).toMatchObject({ channel: "C1", repo: "acme/widgets" });
+    for (const channel of ["C2", "C9", "G1", "D1", "C404"]) expect([channel, lookup(channel)]).toEqual([channel, undefined]);
+    // Reopened (a restart), it has its default again: the row was kept.
+    closed.clear();
+    expect(lookup("C2")).toMatchObject({ channel: "C2" });
   });
 
   test("a database from before the table has none, and says so without failing", () => {
