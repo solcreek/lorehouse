@@ -1535,7 +1535,7 @@ const scenarios: Scenario[] = [
     // one added, while Slack threads are already indexed; then with a malformed line, which
     // must fail the start and change nothing (the start after it, on the file from before,
     // finds nothing to add, update or remove).
-    name: "the index follows KNOWLEDGE_SEED on every start: an edited entry is re-indexed, a removed one is gone (404), a new one is found, and GET /status counts them; a malformed line fails the start, naming its line, and changes nothing",
+    name: "the index follows KNOWLEDGE_SEED on every start: an edited entry is re-indexed, a removed one is gone (404), a new one is found, and GET /status counts them; a malformed line fails the start, naming its line, and changes nothing; with it unset the file is not read and the seeds stay",
     run: async () => {
       const db = freshDb();
       const seed = join(dirname(db), "seed.jsonl");
@@ -1583,7 +1583,16 @@ const scenarios: Scenario[] = [
         write(changed);
         await startApp(env);
         const third = differs(await seedStatus(), { entries: SEED_DOCS, added: 0, updated: 0, removed: 0 });
-        return third ? `after the refused start, on the file from before it: ${third}` : null;
+        if (third) return `after the refused start, on the file from before it: ${third}`;
+
+        // With KNOWLEDGE_SEED unset the file isn't read: /status has no seed, and the seeds
+        // already indexed stay (removal is something the file says, never a missing setting).
+        await stopApp();
+        await startApp({ LOREHOUSE_DB: db, KNOWLEDGE_SEED: "" });
+        const unset = await seedStatus();
+        if (unset !== undefined) return `with KNOWLEDGE_SEED unset: /status seed ${JSON.stringify(unset)}, want none`;
+        if ((await found("bilbyseedword")) !== "seed-new") return `with KNOWLEDGE_SEED unset: the seed indexed before found ${await found("bilbyseedword")}, want seed-new`;
+        return null;
       } finally {
         await stopApp();
         removeDb(db);
