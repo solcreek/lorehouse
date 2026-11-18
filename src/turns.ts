@@ -22,8 +22,20 @@
 //     must be typed after the mention) and costs an answer, never exposes anything.
 //   • A hold lives in memory: a reply held when the process stops is lost, as any event
 //     in flight is.
+//
+// Which kinds of message start a turn at all is the profile's to say (profiles.ts): the
+// events of the Slack trigger of the profile Slack starts, given here as `startsOn`.
+//   • A mention that is not a trigger starts nothing, and so is never accepted: its thread
+//     is not joined, its sender is not looked up, and it holds no reply. No profile gets
+//     here that way: loadProfiles requires `mention` in every Slack trigger. The gate
+//     stays coherent without it all the same.
+//   • A follow-up is a reply in a thread a mention opened. Not a trigger: a reply in a
+//     joined thread starts nothing, is not looked up and is never held.
+//   • A DM starts a turn only when it is a trigger AND the install answers DMs (`dms`,
+//     DM_MODE=answer): a profile can ask for DMs, it can't turn them on.
 
 import { decideTurn, mayStartTurn, type Members, type Membership } from "./members";
+import type { SlackTriggerEvent } from "./profiles";
 import { isFollowUp, mentionHolds } from "./threads";
 
 // The sender facts an event carries, before it is decided (June's SlackIdentity).
@@ -44,6 +56,9 @@ export function turnGate(o: {
   listed: { has(channel: string): boolean };
   // Whether DMs are answered (DM_MODE=answer).
   dms: boolean;
+  // The kinds of message that start a turn: the Slack trigger events of the profile Slack
+  // starts (profiles.ts). Left out: all three, as the lorehouse profile lists them.
+  startsOn?: readonly SlackTriggerEvent[];
   // Whether the agent was asked into this thread.
   joined: (channel: string, threadTs: string) => boolean;
   // Record that it was: called for a mention that is answered, and for no other.
@@ -67,8 +82,16 @@ export function turnGate(o: {
     }
   };
   // Mentions start a turn, and so do follow-ups in a thread the agent was mentioned in
-  // (threads.ts); with DMs answered, DMs too.
-  const mayRespond = (e: TurnEvent) => e.kind === "app_mention" || (o.dms && e.channelType === "im") || isFollowUp(e, joined);
+  // (threads.ts); with DMs answered, DMs too. Each only where it is one of the profile's
+  // trigger events.
+  const on = new Set<SlackTriggerEvent>(o.startsOn ?? ["mention", "follow_up", "direct_message"]);
+  const mentions = on.has("mention");
+  const followUps = on.has("follow_up");
+  const dms = o.dms && on.has("direct_message");
+  const mayRespond = (e: TurnEvent) => (mentions && e.kind === "app_mention") || (dms && e.channelType === "im") || (followUps && isFollowUp(e, joined));
+  // Whether the sender must be looked up: the event may start a turn (members.ts), and its
+  // kind is a trigger. A DM is told by its channel id (D…), as mayStartTurn tells it.
+  const mayStart = (s: TurnSender) => mayStartTurn(s, dms) && (s.kind === "app_mention" ? mentions : s.channelId.startsWith("D") || followUps);
   // A reply in a thread whose opening mention is not decided yet waits for it (#163).
   const holds = mentionHolds(o.holdMs);
   const decide = (e: TurnEvent): TurnDecision => {
@@ -85,6 +108,9 @@ export function turnGate(o: {
     // member's reply there is not a follow-up. The join is bookkeeping for later replies:
     // if recording it fails, the mention is still answered (as when the join was an
     // observer beside the turn), and replies there go unanswered until a new mention.
+    // The thread is joined whether or not follow-ups are a trigger (`startsOn: ["mention"]`
+    // joins too): the joined threads are also what the admin API lists. So if the profile
+    // later lists `follow_up`, replies in threads joined before then become follow-ups.
     if (e.kind === "app_mention") {
       try {
         o.join(e.channelId, e.threadId ?? e.ts);
@@ -101,12 +127,14 @@ export function turnGate(o: {
       // thread already joined needs none: replies there are follow-ups whatever this
       // mention comes to.
       const thread = sender.threadId ?? sender.ts;
-      if (sender.kind === "app_mention" && !joined(sender.channelId, thread)) holds.open(sender.channelId, thread, sender.ts);
-      const lookUp = sender.userId && mayStartTurn(sender, o.dms) ? () => o.members.check(sender.userId!, sender.teamId) : undefined;
+      // A hold is for follow-ups to a mention that may be accepted: where either is not a
+      // trigger, there is nothing to hold a reply for.
+      if (mentions && followUps && sender.kind === "app_mention" && !joined(sender.channelId, thread)) holds.open(sender.channelId, thread, sender.ts);
+      const lookUp = sender.userId && mayStart(sender) ? () => o.members.check(sender.userId!, sender.teamId) : undefined;
       if (lookUp) waits.push(lookUp());
       // A reply waits for the mentions pending in its thread, while its own sender is looked
       // up (so a sender not cached costs no extra wait).
-      const held = sender.kind === "message" && thread !== sender.ts && !joined(sender.channelId, thread);
+      const held = followUps && sender.kind === "message" && thread !== sender.ts && !joined(sender.channelId, thread);
       if (held) waits.push(holds.settled(sender.channelId, thread));
       await Promise.all(waits);
       // The wait can outlast the sender's verdict: a cache hit made 5 s before it ran out

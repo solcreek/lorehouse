@@ -17,7 +17,8 @@ import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
-import { PDF_SKILLS, SKILLS, systemPrompt } from "./prompts";
+import { PDF_SKILLS, SKILLS, profilePrompt } from "./prompts";
+import { loadProfiles, PROFILES, profileStatus, selectByName, slackTrigger, unansweredDmNotice, type Profile } from "./profiles";
 import { renderPdfTool, typstRenderer } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
@@ -67,23 +68,30 @@ const TASK_LABELS: Record<string, string> = {
   render_pdf: "Making the PDF",
 };
 
-// The durable agent id is fixed; the display name is config. Renaming the agent in a
-// workspace must not orphan its threads' sessions.
-const AGENT_ID = "lorehouse";
-
 // The start. The tenant's data key, if any, is needed only while it opens the databases:
-// it is wiped when the start ends, whether the app came up or not.
-export async function createApp(config: Config) {
+// it is wiped when the start ends, whether the app came up or not. `profiles`: the profiles
+// to run (profiles.ts), this build's unless a test passes its own.
+export async function createApp(config: Config, profiles: unknown = PROFILES) {
   const keys: Uint8Array[] = [];
   try {
-    return await startApp(config, keys);
+    return await startApp(config, keys, loadProfiles(profiles));
   } finally {
     for (const k of keys) k.fill(0);
   }
 }
 
-async function startApp(config: Config, keys: Uint8Array[]) {
+async function startApp(config: Config, keys: Uint8Array[], profiles: readonly Profile[]) {
   const identity = agentIdentity(config.agent.name, config.agent.coAuthor);
+
+  // The profiles (profiles.ts, ADR 0002), checked before anything was opened: each becomes
+  // one June agent below, under the profile's id. That id is durable and the display name
+  // is config: renaming the agent in a workspace must not orphan its threads' sessions.
+  // At most one profile is started by Slack messages (ADR 0002 §2); this build needs one
+  // (loadProfiles), because the Slack channel is its, and ingest and every post go through it.
+  const interactive = profiles.find(slackTrigger)!;
+  // DM_MODE=answer with a profile that isn't started by DMs: said once, on start.
+  const dmNotice = unansweredDmNotice(interactive, { dm: config.agent.dm });
+  if (dmNotice) console.warn(dmNotice);
 
   // Every listed channel must be public, as Slack says (channel-check.ts): before the
   // database is opened or purged, and before anything listens. A ConfigError names each.
@@ -213,7 +221,11 @@ async function startApp(config: Config, keys: Uint8Array[]) {
     workspace ??= ingester?.ownTeamId ?? (await slackReads.call<{ team_id?: string }>("auth.test").catch(() => undefined))?.team_id;
     return workspace;
   };
-  const authorizeAnswer = approverGate(config.prApprover, approvals, (session) => runtime?.session(AGENT_ID, session), async (user) => {
+  // The gate looks the card's session up under the profile's id. Only the profile Slack
+  // starts can post a card: a click reaches June through the Slack channel, and June resumes
+  // the agent mounted with it, so no other profile may open a pull request (loadProfiles
+  // refuses one that lists the tool). Every agent still carries a gate, so none is ungated.
+  const authorizeAnswerFor = (profile: Profile) => approverGate(config.prApprover, approvals, (session) => runtime?.session(profile.id, session), async (user) => {
     const m = await memberCheck.check(user, await workspaceTeam());
     if (!m.member) console.error(`approvals: a click by ${user} was refused: not a full member of the workspace (${m.reason}${m.reason === "lookup_failed" ? `: ${m.error}` : ""})`);
     return m.member;
@@ -266,6 +278,8 @@ async function startApp(config: Config, keys: Uint8Array[]) {
     members: memberCheck,
     listed,
     dms: dm === "answer",
+    // Which kinds of message start a turn: the Slack trigger of the profile Slack starts.
+    startsOn: slackTrigger(interactive)!.events,
     joined: (channel, thread) => inThread(knowledge, channel, thread),
     join: (channel, thread) => joinThread(knowledge, channel, thread),
     // Like usage (tally): a failed read or write of the joined threads is logged, and
@@ -364,14 +378,19 @@ async function startApp(config: Config, keys: Uint8Array[]) {
     onError: (err) => console.error("slack:", err),
   }), names), (c) => listed.has(c)), names);
 
-  const agent = defineAgent({
-    name: AGENT_ID,
-    instructions: systemPrompt(identity),
-    tools,
-    skills: Object.entries({ ...SKILLS, ...(config.pdf ? PDF_SKILLS : {}) }).map(([name, text]) => parseSkill(name, text)),
-    channels: [slack],
-    authorizeAnswer,
-  });
+  // Each profile becomes one agent: its prompt, and the tools and skills it names out of
+  // those this install has on (the code tools need a sandbox, render_pdf and pdf-report need
+  // PDF_REPLIES), in the profile's order. A second profile is one more entry in PROFILES.
+  const toolsOn = new Map(tools.map((t) => [t.spec.name, t]));
+  const skillsOn = new Map(Object.entries({ ...SKILLS, ...(config.pdf ? PDF_SKILLS : {}) }).map(([name, text]) => [name, parseSkill(name, text)]));
+  const agents = profiles.map((profile) => defineAgent({
+    name: profile.id,
+    instructions: profilePrompt(profile.prompt, identity),
+    tools: selectByName(profile.tools, toolsOn),
+    skills: selectByName(profile.skills, skillsOn),
+    channels: profile === interactive ? [slack] : [],
+    authorizeAnswer: authorizeAnswerFor(profile),
+  }));
 
   const model = anthropic({
     model: config.anthropic.model,
@@ -383,8 +402,11 @@ async function startApp(config: Config, keys: Uint8Array[]) {
   // Encrypted, the session store is opened here with the tenant's key (June's `open` hook);
   // otherwise June opens it with its own driver.
   const open = tenantKey && ((path: string) => new Database(path, { key: tenantKey.key }));
-  runtime = await createNativeRuntime({ [AGENT_ID]: toAgentDef(agent, model) }, config.db.sessions, { files: fileStore(config.files.store), ...(open ? { open } : {}) });
-  const mounted = mountAgent(agent, runtime);
+  const mounting = await createNativeRuntime(Object.fromEntries(agents.map((agent) => [agent.name, toAgentDef(agent, model)])), config.db.sessions, { files: fileStore(config.files.store), ...(open ? { open } : {}) });
+  runtime = mounting;
+  // An agent with a channel has routes (the Slack channel's /slack/events); one without is
+  // started some other way, and has none here.
+  const mounted = agents.filter((agent) => agent.channels.length).map((agent) => mountAgent(agent, mounting));
   // Recording who asks is never silent: each channel is told when it starts, and again
   // when it stops (the record erased). Once per change, not on every start.
   const announceRecordPeople = async () => {
@@ -443,6 +465,9 @@ async function startApp(config: Config, keys: Uint8Array[]) {
         if (refusal) return refusal;
         return Response.json({
           agent: identity.name,
+          // The profiles behind that one name (ADR 0002): each one's id, mode, and the
+          // triggers in force on this install. Nothing of their prompts or tools.
+          profiles: profiles.map((profile) => profileStatus(profile, { dm })),
           // Whose data this is, and the install's data directory: the tenant's files are in
           // <dataDir>/<tenant>/ unless LOREHOUSE_DB or SESSIONS_DB name others.
           tenant: tenant.id,
@@ -464,7 +489,11 @@ async function startApp(config: Config, keys: Uint8Array[]) {
       if (adminReply) return adminReply;
       const runnerReply = await runners?.handle(req, server);
       if (runnerReply) return runnerReply;
-      return (await mounted.fetch(req)) ?? new Response("not found", { status: 404 });
+      for (const agent of mounted) {
+        const reply = await agent.fetch(req);
+        if (reply) return reply;
+      }
+      return new Response("not found", { status: 404 });
     },
     // Shut down (server.ts, on SIGTERM/SIGINT, once the server takes no more requests): no
     // timer starts again, and ingest arms no new read but reads now the threads still
