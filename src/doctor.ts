@@ -235,7 +235,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     const total = purge.reduce((sum, p) => sum + p.documents, 0);
     add("channels", "purge on start", "warn",
       `the next start removes ${docs(total)} learned from channels no longer in AGENT_CHANNELS, with the threads the agent joined there and their usage: ` +
-      purge.map((p) => `${p.channel} (${docs(p.documents)})`).join(", ") + ". Add a channel back to keep what it holds");
+      purge.map((p) => `${p.channel} (${docs(p.documents)}${p.repos ? ", and its default repo" : ""})`).join(", ") + ". Add a channel back to keep what it holds");
   }
 
   // ── anthropic ──

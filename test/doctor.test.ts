@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { createHmac, generateKeyPairSync } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { getChannelRepo, setChannelRepo } from "../src/channel-repos";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
 import { closeKnowledge, countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
 import { inThread, joinThread } from "../src/threads";
@@ -289,17 +290,19 @@ describe("channels", () => {
       }
       upsertDocument(db, { docId: "seed1", kind: "seed", source: "s", title: "t", text: "words" });
       joinThread(db, "C2", "0.1");
+      setChannelRepo(db, { channel: "C2", repo: { owner: "acme", name: "widgets" } });
       db.close();
       const checks = await run({ AGENT_CHANNELS: "C1", LOREHOUSE_DB: path, SESSIONS_DB: `${dir}/sessions.db` });
       const purge = find(checks, "purge on start");
       expect(purge).toHaveLength(1);
       expect(purge[0]).toMatchObject({ section: "channels", level: "warn" });
       expect(purge[0]!.detail).toContain("4 documents");
-      expect(purge[0]!.detail).toContain("C2 (3 documents)");
+      expect(purge[0]!.detail).toContain("C2 (3 documents, and its default repo)");
       expect(purge[0]!.detail).toContain("C3 (1 document)");
       const after = openKnowledge(path);
       expect(countDocuments(after)).toBe(6);
       expect(inThread(after, "C2", "0.1")).toBe(true);
+      expect(getChannelRepo(after, "C2")?.repo).toBe("acme/widgets");
       after.close();
       // Nothing to purge: no line at all.
       expect(find(await run({ AGENT_CHANNELS: "C1,C2,C3", LOREHOUSE_DB: path, SESSIONS_DB: `${dir}/sessions.db` }), "purge on start")).toEqual([]);
