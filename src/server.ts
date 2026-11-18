@@ -87,7 +87,7 @@ if (config) {
     server = srv;
     const sandbox = config.sandbox ? `code tools on (${config.sandbox.mode === "runners" ? "runners connect in" : "direct sandbox host"})` : "code tools off";
     console.log(
-      `lorehouse: @${app.identity.name} on :${srv.port}` + (app.seeded ? ` (seeded ${app.seeded} knowledge chunks)` : "") + ` — ${sandbox}`,
+      `lorehouse: @${app.identity.name} on :${srv.port}` + ` — ${sandbox}`,
     );
     void app.startIngest();
     // Where Slack reaches us may have changed since the last start (a quick tunnel always has).
