@@ -298,26 +298,53 @@ codes and the rules; [`src/resources.rs`](src/resources.rs) is the policy).
   (`sandboxd: a sandbox gets … unless it asks; a request may ask for up to …`), each boot
   with what the VM got, each change (`<id>: resources changed from (…) to (…)`), and each
   refusal (`<id>: refused (<code>): …`).
-- **Fixed while a VM runs; a stopped sandbox takes its next request.** A request for
-  other values than a running VM has is refused (`resources_mismatch`) and does not count
-  as activity, so the VM still stops after `SANDBOXD_IDLE_SECS`. The first request after
-  that is granted afresh against the maxima and recorded in
-  `<SANDBOXD_STATE>/<id>/resources.json` (written and synced before the boot that uses
-  it). A call with no request leaves the sandbox as it is: that record, or, for a sandbox
-  that has none, the host's defaults at each boot, so changing `SANDBOXD_VCPUS`,
-  `SANDBOXD_MEM_MIB` or `SANDBOXD_DISK_QUOTA_GIB` still reaches those. There is no call
-  that stops a VM and keeps its disk; a guest that reboots (`reboot -f`) stops its own.
+- **Fixed while a VM runs; a stopped sandbox takes its next request.** A call that would
+  start work or write in a running VM (an exec, a job's start, a file write) with a
+  request for other values than the VM has is refused (`resources_mismatch`) and does not
+  count as activity, so the VM still stops after `SANDBOXD_IDLE_SECS`. A job's status,
+  its cancel and a file read are served by the running VM as it is, whatever they ask:
+  a job that holds its VM up (`SANDBOXD_JOB_HOLD_SECS`) can always be followed and
+  stopped. The first request after the VM has stopped is granted afresh against the
+  maxima and recorded in `<SANDBOXD_STATE>/<id>/resources.json` (written and synced
+  before the boot that uses it).
+- **Asked for nothing, a sandbox stays as it is**: its record, or, for a sandbox that
+  has none, the host's defaults at each boot, so changing `SANDBOXD_VCPUS`,
+  `SANDBOXD_MEM_MIB` or `SANDBOXD_DISK_QUOTA_GIB` still reaches those. A caller that
+  stops asking (a profile whose `sandboxResources` is removed) therefore leaves the
+  sandboxes it had sized as they are. To return them to the defaults, it asks for the
+  defaults by name; an explicit request re-grants at the next boot.
+- **sandboxd has no call that stops a VM and keeps its disk.** A VM stops at its idle
+  stop, when sandboxd stops, or when its guest reboots (`reboot -f`; the kernel runs with
+  `reboot=k`, so the VMM exits). `GET /v1/sandboxes` is not a liveness check: after a
+  guest reboot it still says `running: true` until the next request for that sandbox,
+  which finds the VMM gone and boots it afresh, or until the reaper does.
 - **A record is checked before it is booted.** One over a maximum lowered since
   (`resource_over_maximum`), or that no request could have been granted
-  (`invalid_stored_resources`: a damaged file), is not started and not adjusted. A request
-  the host can grant replaces it; so does destroying the sandbox.
+  (`invalid_stored_resources`: a damaged file), is not started and not adjusted, on every
+  call that asks for nothing. An explicit request the host can grant replaces it at the
+  next boot (the refusal names one: the defaults); so does raising the maximum again, or
+  destroying the sandbox.
+- **The record lives in the sandbox's own directory**, so on btrfs inside its quota'd
+  subvolume: a few hundred bytes, written to a temporary file and renamed (a failed write
+  leaves the old record and no temporary file). A sandbox whose disk is full can still
+  have its disk grown, because the limit is raised before the record is written. A change
+  to its other resources alone needs room for the new record and fails, with the old one
+  kept, until the sandbox has some: grow its disk in the same request, or free space in
+  it. (Expected from how the quota counts; a full sandbox's record write was not tried.)
+  Keeping the record outside the subvolume was considered and left: it would no longer be
+  removed with the sandbox's directory, listed with it, or moved with it.
 - **Where each is enforced.** vCPUs and memory: the VM's `machine-config` and its cgroup's
   `cpu.max` (vCPUs + 1) and `memory.max` (RAM + headroom). pids: its cgroup's `pids.max`,
   which counts the VMM's threads on the host, not the guest's processes. Disk: its btrfs
   subvolume's qgroup limit, set at every boot; it can grow, and is never set under what
-  the sandbox has written (`disk_in_use`, read with `btrfs qgroup show --raw -f`).
+  the sandbox has written (`disk_in_use`, read with `btrfs qgroup show --sync --raw -f`;
+  usage that can't be read is not taken to fit).
   Command timeout: the `timeoutMs` in the body sandboxd writes for guestd with each
-  `POST /exec` (never the caller's bytes), and sandboxd's own wait 330 s past it.
+  `POST /exec` (never the caller's bytes), and sandboxd's own wait 330 s past it. A body
+  that can't be rewritten is refused before the sandbox is reached, so it boots nothing
+  and is not activity. The timeout kills the command's process group: a process that left
+  the group (`setsid`) outlives it until the VM stops. sandboxd's own script in the
+  guest (a stage's bundle) has a fixed 300 s of its own.
 - **Disk sizes need the quota.** Where disks aren't capped (below), a request with
   `diskGib` is refused (`disk_quota_unavailable`); without it the sandbox runs uncapped,
   as every sandbox there does.
@@ -337,11 +364,15 @@ codes and the rules; [`src/resources.rs`](src/resources.rs) is the policy).
   the main defence), and gets the second check when it is rebuilt
   (`prepare-golden.sh`).
 
-Proved on real KVM by `sandbox/lab/bench.py limits` (2026-11-18, before the two changes
-above): each limit in two sandboxes with different requests, and the refusals. Not yet
-proved there: a stopped sandbox taking a new request, the disk growing and
-`disk_in_use` (its usage is read from `btrfs qgroup show`, parsed from sample output
-only), and the rewritten exec body.
+Run on real KVM with `sandbox/lab/bench.py limits` (GCE, btrfs, `SANDBOXD_IDLE_SECS=20`,
+2026-11-18, by the maintainer; 34 of its 36 checks passed, the 2 misses being the
+script's): each limit in two sandboxes with different requests; the refusals;
+`disk_in_use` on a full 4 GiB sandbox (422, `usedBytes` 4294950912, limit unchanged); a
+sandbox made with no request taking one once stopped, its qgroup limit growing from 3 to
+4 GiB; a running sandbox answering 409 to another request every 5 s and still stopping
+idle (it took the request at 37 s); a guest `reboot -f` followed by a fresh boot in
+1.7 s. Not yet run there: the usage read with `--sync`, a job's status and cancel served
+by a running VM with a changed request, and a refused exec body leaving no sandbox.
 
 ## Limits
 
