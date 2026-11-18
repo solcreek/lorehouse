@@ -225,8 +225,17 @@ describe("a profile as /status lists it", () => {
     expect(activeTriggers(LOREHOUSE, { dm: "answer" })).toEqual([{ kind: "slack", events: ["mention", "follow_up", "direct_message"] }]);
   });
 
-  test("it carries nothing else of the profile: no prompt, tools or skills", () => {
-    expect(Object.keys(profileStatus(LOREHOUSE, { dm: "answer" }))).toEqual(["id", "mode", "triggers"]);
+  test("it carries nothing else of the profile: exactly id, mode and triggers, and each trigger exactly kind and events", () => {
+    for (const dm of ["redirect", "ignore", "answer"] as const) {
+      for (const profile of loadProfiles()) {
+        const status = profileStatus(profile, { dm });
+        expect(Object.keys(status).sort(), dm).toEqual(["id", "mode", "triggers"]);
+        for (const trigger of status.triggers) expect(Object.keys(trigger).sort(), dm).toEqual(["events", "kind"]);
+        // Nothing of the prompt, the tools or the skills, under any key.
+        const text = JSON.stringify(status);
+        for (const kept of [...profile.tools, ...profile.skills]) expect(text).not.toContain(kept);
+      }
+    }
     expect(LOREHOUSE.triggers[0]!.events).toHaveLength(3); // the profile itself is not narrowed
   });
 });

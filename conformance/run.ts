@@ -419,18 +419,23 @@ const scenarios: Scenario[] = [
     // profile is { id, mode, triggers }, a trigger tagged by `kind`; the events are the ones
     // in force, so a DM is one only while the install answers DMs. The values are the
     // contract, read field by field: not the order of an object's keys, and a trigger's
-    // events are a set (each once, in any order).
+    // events are a set (each once, in any order). The keys are the contract too: a profile
+    // has exactly id, mode and triggers, a trigger exactly kind and events.
     name: "GET /status lists the profiles: lorehouse, interactive, started by Slack mentions and follow-ups, and by DMs only with DM_MODE=answer",
     run: async () => {
       const wrong = async (events: string[]): Promise<string | null> => {
         const { profiles } = (await status()) as Status & { profiles?: unknown };
         const got = `/status profiles ${JSON.stringify(profiles)}`;
         if (!Array.isArray(profiles) || profiles.length !== 1) return `${got}, want a list of one profile`;
+        // Exactly these keys, in any order: nothing of a profile's prompt, tools or skills.
+        const keys = (o: unknown) => (o && typeof o === "object" ? Object.keys(o).sort().join(", ") : "none");
         const p = profiles[0] as { id?: unknown; mode?: unknown; triggers?: unknown } | null;
+        if (keys(p) !== "id, mode, triggers") return `${got}, want a profile with exactly id, mode and triggers, got the keys ${keys(p)}`;
         if (p?.id !== "lorehouse") return `${got}, want id "lorehouse" (a string)`;
         if (p.mode !== "interactive") return `${got}, want mode "interactive"`;
         if (!Array.isArray(p.triggers) || p.triggers.length !== 1) return `${got}, want one trigger`;
         const t = p.triggers[0] as { kind?: unknown; events?: unknown } | null;
+        if (keys(t) !== "events, kind") return `${got}, want a trigger with exactly kind and events, got the keys ${keys(t)}`;
         if (t?.kind !== "slack") return `${got}, want a trigger of kind "slack"`;
         const sameSet = Array.isArray(t.events) && t.events.length === events.length && events.every((e) => (t.events as unknown[]).includes(e));
         return sameSet ? null : `${got}, want the events ${events.join(", ")}, each once, in any order`;
