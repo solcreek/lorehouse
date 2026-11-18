@@ -42,6 +42,7 @@ function setup(opts: { dms?: boolean; listed?: string[]; holdMs?: number; join?:
     joined: opts.joined ?? ((channel, thread) => inThread(db, channel, thread)),
     join: opts.join ?? ((channel, thread) => joinThread(db, channel, thread)),
     holdMs: opts.holdMs,
+    onError: (what, err) => errors.push(`${what}: ${err instanceof Error ? err.message : String(err)}`),
   });
   const deliver = async (e: TurnEvent): Promise<TurnDecision> => {
     await gate.before({ userId: e.user?.id, teamId: "T1", channelId: e.channelId, threadId: e.threadId, kind: e.kind, ts: e.ts });
@@ -259,6 +260,27 @@ describe("turnGate", () => {
       });
     }
   }
+
+  test("an accepted mention is still answered when recording the join fails; the failure is reported and its hold ends", async () => {
+    const t = setup({ join: () => { throw new Error("disk full"); } });
+    const asked = mention("U1");
+    expect(await t.deliver(asked)).toEqual(ANSWER);
+    expect(t.errors).toEqual(["joining the thread: disk full"]);
+    // The hold is closed: a reply there is decided at once (and, the join lost, is nothing).
+    const t0 = Date.now();
+    expect(await t.deliver(reply("U2", asked.ts))).toEqual(NONE);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  test("when whether a thread is joined can't be read, the sender is still looked up: a mention is answered, a reply is nothing", async () => {
+    const t = setup({ joined: () => { throw new Error("database is locked"); } });
+    expect(await t.deliver(mention("U1"))).toEqual(ANSWER);
+    expect(await t.deliver(mention("UG1"))).toMatchObject({ turn: "refuse", verdict: { reason: "guest" } });
+    expect(await t.deliver(reply("U2", "1.1"))).toEqual(NONE);
+    expect(t.asked).toEqual(["U1", "UG1", "U2"]);
+    expect(t.errors.length).toBeGreaterThan(0);
+    expect(new Set(t.errors)).toEqual(new Set(["reading whether the thread is joined: database is locked"]));
+  });
 
   test("a hold expires: a mention that is never decided lets the follow-up go, unanswered", async () => {
     const t = setup({ holdMs: 20 });

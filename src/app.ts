@@ -257,6 +257,9 @@ async function startApp(config: Config, keys: Uint8Array[]) {
     dms: dm === "answer",
     joined: (channel, thread) => inThread(knowledge, channel, thread),
     join: (channel, thread) => joinThread(knowledge, channel, thread),
+    // Like usage (tally): a failed read or write of the joined threads is logged, and
+    // costs neither the sender's lookup nor an accepted mention its answer.
+    onError: (what, err) => console.error(`threads: ${what}:`, err),
   });
   const refuse = (e: SlackNormalizedEvent, verdict: Membership | undefined) => {
     const v: Membership = verdict ?? { user: e.user?.id ?? "", member: false, reason: "lookup_failed", error: "not looked up" };
