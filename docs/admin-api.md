@@ -206,6 +206,32 @@ as in `/status`. The list is empty unless sandbox hosts connect in
 `GET /api/v1/sandboxes?limit=&cursor=` returns `{ sandboxes: [{ sandbox, runner, placedAt }],
 next }`. A sandbox stays on the runner that first ran it, because its disk is there.
 
+## `GET /status`, beside it
+
+`/status` is not part of the admin API: it has its own token (`STATUS_TOKEN`), and holds
+settings and counts, never message text. Among them is the list of profiles, the agents
+this install runs under its one name ([ADR 0002](adr/0002-profiles.md)):
+
+```json
+{
+  "agent": "scout",
+  "profiles": [
+    { "id": "lorehouse", "mode": "interactive",
+      "triggers": [{ "kind": "slack", "events": ["mention", "follow_up"] }] }
+  ]
+}
+```
+
+- **`id`** is the profile's durable id, a string matching `[a-z][a-z0-9-]{0,31}`. It is not
+  the display name (`agent`), and renaming the agent doesn't change it.
+- **`mode`** is `interactive` (a person starts it in Slack), `automation` (an outside
+  event does) or `job` (a schedule or a command).
+- **`triggers`** is what starts its turns on this install, each an object tagged by
+  `kind`. The one kind yet is `slack`, with `events` out of `mention`, `follow_up` and
+  `direct_message`; `direct_message` is listed only with `DM_MODE=answer`. Read `kind`
+  first: other kinds (a webhook, a schedule) will carry other fields.
+- A profile's prompt, tools and skills are not here.
+
 ## Pages
 
 Lists return at most `limit` items and a `next` cursor. Pass `next` back as `cursor` for

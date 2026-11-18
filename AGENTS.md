@@ -62,14 +62,36 @@ behavior change means a conformance scenario change, reviewed like an API change
 missing it serves a "setup mode" instead of crashing. `src/app.ts` is the **only** file
 that wires June (agent definition, Slack channel, routes for `/slack/events`, `/status`,
 `/api/v1` admin, sandbox runners). Tools, policy, prompts and the knowledge store must not
-import June session internals.
+import June session internals. A test holds the line: outside `src/app.ts`, `src/` imports
+only types from `@junejs/core` and `@junejs/server` (`test/profiles.test.ts`).
+
+**Profiles** (`src/profiles.ts`, ADR 0002). An agent is a profile: plain data, with no June
+import. `id` (durable: it names the sessions), `mode`, `prompt`, `tools` and `skills` (by
+name, in the order the model sees them), `triggers` (a union tagged by `kind`) and
+`sandbox`. Today's agent is the one profile, `lorehouse`. `src/app.ts` turns each entry of
+`PROFILES` into one June agent, giving it the tools and skills it names out of those the
+install has on (the code tools need a sandbox, `render_pdf` needs `PDF_REPLIES`). Adding a
+profile:
+- Write `prompts/profiles/<name>.md` and register it in `src/prompts.ts`, then add one
+  object to `PROFILES`. No change to `src/app.ts` for a profile that uses what exists.
+- `loadProfiles` checks every profile on start, and a wrong one stops the start, naming the
+  profile, the field and what it allows. A field of ADR 0002 §1 that nothing reads yet
+  (`delivery`, `credentials`, `knowledge`, `model`) is refused, not ignored: add it to the
+  type together with the code that honors it. A new trigger kind is a new member of
+  `ProfileTrigger`, checked in `checkProfile`.
+- Exactly one profile is started by Slack messages (ADR 0002 §2), and it gets the Slack channel.
+- `GET /status` lists each profile's `id`, `mode` and the triggers in force
+  (`profileStatus`). Give a new profile its own conformance scenarios.
+- `test/agent-wiring.test.ts` pins what June is handed for `lorehouse` (system prompt and
+  tool specs by SHA-256, the order of tools and skills). A change to a prompt, a tool
+  description or a profile's lists moves a pin: update it in the same commit, on purpose.
 
 **Embedded assets.** `prompts/*.md` and `migrations/*.sql` are imported as text
 (`with { type: "text" }`); `slack/manifest.yaml` is imported with no attribute, and Bun
 parses it into an object (`src/text-imports.d.ts`). Either way `bun build --compile`
 embeds them; the binary conformance run proves it. Consequences:
 - A new migration must be added to the list in `src/migrations.ts`; never edit an applied one.
-- A new tool prompt must be registered in `src/prompts.ts`. Templates use
+- A new tool prompt, or a profile's prompt (`prompts/profiles/`), must be registered in `src/prompts.ts`. Templates use
   `{{placeholder}}`; an unknown placeholder throws.
 - Lorehouse's own data lives in its migrations/DB (`LOREHOUSE_DB`), never in June's
   session tables (`SESSIONS_DB`).
