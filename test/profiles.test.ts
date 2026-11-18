@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentIdentity } from "../src/identity";
-import { activeTriggers, loadProfiles, LOREHOUSE, PROFILES, profileStatus, ProfileError, selectByName, slackTrigger, type Profile, type SlackTriggerEvent } from "../src/profiles";
+import { activeTriggers, loadProfiles, LOREHOUSE, PROFILES, profileStatus, ProfileError, selectByName, show, slackTrigger, type Profile, type SlackTriggerEvent } from "../src/profiles";
 import { profilePrompt, PROMPT_CATALOG } from "../src/prompts";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -14,7 +14,9 @@ const CATALOG = { prompts: ["lorehouse", "review"], tools: ["search_knowledge", 
 const valid: Profile = { id: "lorehouse", mode: "interactive", prompt: "lorehouse", tools: ["search_knowledge"], skills: [], triggers: [{ kind: "slack", events: ["mention"] }], sandbox: "none" };
 
 // The problems loadProfiles reports for `profiles`, or [] when it accepts them.
-function problems(...profiles: unknown[]): string[] {
+const problems = (...profiles: unknown[]): string[] => problemsOf(profiles);
+// The same, for a list given as it is (a spread would fill its holes).
+function problemsOf(profiles: unknown): string[] {
   try {
     loadProfiles(profiles, CATALOG);
     return [];
@@ -112,6 +114,61 @@ describe("a profile is checked on start", () => {
     expect(problems({ ...valid, id: () => "lorehouse" })).toEqual([expect.stringMatching(/^profile #0: must be plain data, and can't be copied: /)]);
     const throws = { ...valid, get id(): string { throw new Error("no id for you"); } };
     expect(problems(throws)).toEqual(["profile #0: must be plain data, and can't be copied: no id for you"]);
+  });
+
+  test("a hole in the list is refused, not skipped", () => {
+    expect(problemsOf([valid, , ])).toEqual(["profile #1: is missing: the list has a hole there"]);
+    const sparse: unknown[] = [];
+    sparse[1] = valid;
+    expect(problemsOf(sparse)).toEqual(["profile #0: is missing: the list has a hole there"]);
+    expect(() => loadProfiles(new Array(2), CATALOG)).toThrow(ProfileError);
+    // A hole inside a profile's own list is refused too, as a name that isn't one.
+    expect(problems({ ...valid, tools: ["search_knowledge", , ] })).toEqual(['profile "lorehouse": tools: nothing is not a tool (allowed: search_knowledge, workspace_exec, open_pull_request)']);
+  });
+
+  test("every bad input is a ProfileError, whatever it is: a bigint, a circular object, a symbol", () => {
+    const circular: Record<string, unknown> = { ...valid };
+    circular.self = circular;
+    const loop: unknown[] = [];
+    loop.push(loop);
+    const cases: [unknown, RegExp][] = [
+      [10n, /^lorehouse: invalid profile: profiles: must be a list of profiles, got 10n$/],
+      [circular, /profiles: must be a list of profiles, got an object that can't be written as JSON$/],
+      [Symbol("profiles"), /profiles: must be a list of profiles, got Symbol\(profiles\)$/],
+      [() => [valid], /profiles: must be a list of profiles, got a function$/],
+      [[{ ...valid, mode: 1n }], /profile "lorehouse": mode: must be one of interactive, automation, job, got 1n$/],
+      [[{ ...valid, sandbox: circular }], /profile "lorehouse": sandbox: must be one of none, write, got an object that can't be written as JSON$/],
+      [[{ ...valid, tools: [1n, loop] }], /tools: 1n is not a tool .*tools: a list that can't be written as JSON is not a tool/],
+      [[{ ...valid, triggers: [{ kind: 2n }] }], /triggers\[0\]\.kind: must be one of slack, got 2n/],
+      [[circular], /profile "lorehouse": self: is not a profile field/],
+      [[10n, null, "x"], /profile #0: must be an object .*profile #1: must be an object .*profile #2: must be an object/],
+    ];
+    for (const [given, message] of cases) {
+      let thrown: unknown;
+      try {
+        loadProfiles(given, CATALOG);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown, String(message)).toBeInstanceOf(ProfileError);
+      expect((thrown as Error).message).toMatch(message);
+    }
+  });
+
+  test("show never throws, whatever it is asked to quote", () => {
+    const hostile = { toJSON() { throw new Error("no"); } };
+    const noString = Object.create(null) as Record<string, unknown>;
+    noString.self = noString;
+    expect(show(undefined)).toBe("nothing");
+    expect(show(null)).toBe("null");
+    expect(show("x")).toBe('"x"');
+    expect(show(10n)).toBe("10n");
+    expect(show(Symbol("s"))).toBe("Symbol(s)");
+    expect(show(() => 1)).toBe("a function");
+    expect(show(hostile)).toBe("an object that can't be written as JSON");
+    expect(show(noString)).toBe("an object that can't be written as JSON");
+    expect(show({ n: 1n })).toBe("an object that can't be written as JSON");
+    expect(show("y".repeat(500))).toHaveLength(201);
   });
 
   test("something that isn't a list of profiles is a ProfileError too, not a crash", () => {

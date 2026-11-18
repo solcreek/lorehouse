@@ -120,6 +120,12 @@ export function loadProfiles(profiles: unknown = PROFILES, catalog: ProfileCatal
   const problems: string[] = [];
   const checked: (Profile | undefined)[] = [];
   for (let i = 0; i < profiles.length; i++) {
+    // A hole is not a profile left out on purpose: say so, as for any other entry.
+    if (!(i in profiles)) {
+      problems.push(`profile #${i}: is missing: the list has a hole there`);
+      checked.push(undefined);
+      continue;
+    }
     let copy: unknown;
     try {
       copy = structuredClone(profiles[i]);
@@ -242,7 +248,24 @@ function deepFreeze<T>(value: T): T {
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-const show = (v: unknown) => (v === undefined ? "nothing" : (JSON.stringify(v) ?? String(v)));
+// A value as a problem quotes it. Total: whatever it is given (a bigint, a circular object,
+// a symbol, an object whose toJSON throws), it returns a string and never throws.
+export function show(v: unknown): string {
+  if (v === undefined) return "nothing";
+  if (typeof v === "bigint") return `${v}n`;
+  if (typeof v === "function") return "a function";
+  try {
+    const json = JSON.stringify(v);
+    if (json !== undefined) return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+  } catch {
+    // circular, a bigint inside, a toJSON that throws: described by its kind below
+  }
+  try {
+    return typeof v === "object" && v !== null ? `${Array.isArray(v) ? "a list" : "an object"} that can't be written as JSON` : String(v);
+  } catch {
+    return `a ${typeof v}`;
+  }
+}
 
 // The profile's Slack trigger, if Slack messages start it.
 export function slackTrigger(profile: Profile): Extract<ProfileTrigger, { kind: "slack" }> | undefined {
