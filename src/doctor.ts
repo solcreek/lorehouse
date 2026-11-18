@@ -14,7 +14,8 @@
 //                  readable by the bot; what the next start
 //                  would purge for channels no longer listed (read from the database)
 //   anthropic      the API key, and that ANTHROPIC_MODEL exists
-//   github         the App's key and permissions, or the token (code tools only)
+//   github         the App's key and permissions, or the token (code tools only); each
+//                  channel's default repo, and whether the credential can read it now
 //   sandbox        the direct sandbox host answers (code tools only)
 //   storage        the tenant, the data directory, where the SQLite files go, and what the
 //                  next start moves into the tenant's directory
@@ -28,7 +29,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { createHmac } from "node:crypto";
 import manifest from "../slack/manifest.yaml";
 import { ConfigError, isLoopbackUrl as isLoopback, loadConfig, type Config } from "./config";
-import { appJwt } from "./github-auth";
+import { appJwt, checkRepo, githubApp, staticToken } from "./github-auth";
+import { hasChannelRepos, listChannelRepos, type ChannelRepo } from "./channel-repos";
 import { classifyChannel, describeVerdict, type ChannelInfo, type ChannelVerdict } from "./channel-check";
 import { agentIdentity, type AgentIdentity } from "./identity";
 import { pendingPurge, type ChannelPurge } from "./purge";
@@ -227,15 +229,21 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   }
   const purgePath = moves.find((m) => m.to === config.db.lorehouse)?.from ?? config.db.lorehouse;
   // A plaintext file is read as it is: the next start encrypts it before it purges.
-  const purge = pendingPurgeIn(purgePath, config.agent.channels, fileKind(purgePath) === "other" ? dataKey : undefined);
+  const stored = readKept(purgePath, config.agent.channels, fileKind(purgePath) === "other" ? dataKey : undefined);
   dataKey?.fill(0);
+  const purge = typeof stored === "string" ? stored : stored.purge;
+  // Each listed channel's default repo (#126), checked against GitHub below; one of a
+  // channel no longer listed is in the purge instead.
+  const defaults = typeof stored === "string" ? [] : stored.repos.filter((r) => config.agent.channels.has(r.channel));
+  // Why the database couldn't be read, when it couldn't: then the defaults are unknown, not none.
+  const unread = typeof stored === "string" ? stored : undefined;
   if (typeof purge === "string") add("channels", "purge on start", "info", purge);
   else if (purge.length) {
     const docs = (k: number) => `${k} document${k === 1 ? "" : "s"}`;
     const total = purge.reduce((sum, p) => sum + p.documents, 0);
     add("channels", "purge on start", "warn",
       `the next start removes ${docs(total)} learned from channels no longer in AGENT_CHANNELS, with the threads the agent joined there and their usage: ` +
-      purge.map((p) => `${p.channel} (${docs(p.documents)})`).join(", ") + ". Add a channel back to keep what it holds");
+      purge.map((p) => `${p.channel} (${docs(p.documents)}${p.repos ? ", and its default repo" : ""})`).join(", ") + ". Add a channel back to keep what it holds");
   }
 
   // ── anthropic ──
@@ -297,6 +305,41 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       add("github", "in the sandbox", "warn", "code tools are on with GITHUB_TOKEN: workspace_clone puts it in the sandbox to clone with, and it can write too, so code in the sandbox could push without an approval. A GitHub App's clone token is read-only (docs/github-app.md)");
     }
 
+    // Each channel's default repo (#126, docs/admin-api.md): the repo a request there means
+    // when it names none. It was readable when an admin set it and can go stale since (the
+    // App uninstalled, the repo renamed or deleted, the branch removed): asked again here,
+    // the way setting it asks, and a request relying on one that can't be read would fail.
+    const timed = ((url: string, init?: RequestInit) => f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })) as typeof fetch;
+    const access = gh.kind === "token" ? staticToken(gh.token, { fetch: timed, apiUrl: api }) : jwt ? githubApp({ appId: gh.appId, privateKey: gh.privateKey, fetch: timed, apiUrl: api }) : undefined;
+    const credential = gh.kind === "app" ? "the GitHub App" : "GITHUB_TOKEN";
+    for (const d of defaults) {
+      const what = `${d.channel}: ${d.repo}${d.branch ? `, branch ${d.branch}` : ""}`;
+      const [owner, name] = d.repo.split("/") as [string, string];
+      if (!access) {
+        add("github", "default repo", "info", `${what}: not checked: needs a GitHub App key that signs`);
+        continue;
+      }
+      const check = await checkRepo(access, { owner, name }, { branch: d.branch ?? undefined, fetch: timed, apiUrl: api });
+      if (check.ok) {
+        add("github", "default repo", "ok", `${what}: ${credential} can read it`);
+        continue;
+      }
+      const fix = {
+        not_installed: "install the App on that repo",
+        not_readable: "give the credential access to it",
+        branch_not_found: "restore the branch",
+        credential_refused: "fix the credential itself (GITHUB_TOKEN expired or revoked, or an App id and key that don't match: see the checks above), not the repo's access",
+        rate_limited: "run this again once the rate limit has passed",
+        unavailable: "run this again once GitHub answers",
+      }[check.reason];
+      add("github", "default repo", "fail", `${what}: ${check.detail}. A request in ${d.channel} that names no repo fails until then: ${fix}, or set another (PUT /api/v1/channels/${d.channel}/repo, docs/admin-api.md), or clear it (DELETE)`);
+    }
+    const without = [...config.agent.channels].filter((c) => !defaults.some((d) => d.channel === c));
+    // A database that couldn't be read may hold defaults this can't see: not checked, said
+    // as the purge preview says it, and never "none".
+    if (unread) add("github", "default repo", "info", unread);
+    else if (without.length) add("github", "default repo", "info", `none for ${without.join(", ")}: a request there has to name its repo. An admin sets one with PUT /api/v1/channels/<id>/repo (docs/admin-api.md)`);
+
     // ── sandbox ──
     // loadConfig has refused a SANDBOX_URL that isn't https:// or plain http:// to this
     // machine; doctor reports that under configuration.
@@ -310,6 +353,11 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
     } else {
       add("sandbox", "runners", "info", opts.url && config.statusToken ? "runners connect in: see deployment below" : "runners connect in, so they can only be seen on the running app: pass --url, with STATUS_TOKEN set");
     }
+  } else {
+    if (unread) add("github", "default repo", "info", unread);
+    // Set while code tools were on, and nothing uses it now; there is no credential to
+    // check it with, so GitHub isn't asked.
+    for (const d of defaults) add("github", "default repo", "warn", `${d.channel}: ${d.repo}${d.branch ? `, branch ${d.branch}` : ""} is set, but code tools are off, so nothing uses it and it isn't checked: turn code tools on (docs/sandbox-runners.md), or clear it (DELETE /api/v1/channels/${d.channel}/repo, docs/admin-api.md)`);
   }
 
   // ── storage ──
@@ -471,17 +519,19 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   return checks;
 }
 
-// The purge a start would make on the database at `path`, opened read-only; nothing for
-// a database that doesn't exist yet or lives in memory, and why not, when it can't be read.
-function pendingPurgeIn(path: string, listed: ReadonlySet<string>, key?: Uint8Array): ChannelPurge[] | string {
-  if (path === ":memory:" || !existsSync(path)) return [];
+// What the database at `path` keeps per channel, read with it opened read-only: the purge
+// a start would make, and each channel's default repo (none in a database from before
+// they existed). Nothing for a database that doesn't exist yet or lives in memory, and why
+// not, when it can't be read.
+function readKept(path: string, listed: ReadonlySet<string>, key?: Uint8Array): { purge: ChannelPurge[]; repos: ChannelRepo[] } | string {
+  if (path === ":memory:" || !existsSync(path)) return { purge: [], repos: [] };
   let db: Database | undefined;
   try {
     // Not { readonly: true }: SQLite can't open a WAL database read-only without
     // its -shm file. query_only refuses every write instead.
     db = new Database(path, { mustExist: true, key });
     db.exec("PRAGMA query_only = ON");
-    return pendingPurge(db, listed);
+    return { purge: pendingPurge(db, listed), repos: hasChannelRepos(db) ? listChannelRepos(db) : [] };
   } catch (e) {
     return `not checked: couldn't read ${path} (${e instanceof Error ? e.message : e})`;
   } finally {

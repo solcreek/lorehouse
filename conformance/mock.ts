@@ -4,8 +4,10 @@
 //   /slack/api/<method>        Slack Web API (JSON, form or query params). Records every call.
 //                              Serves conversations.history/replies/info from its fixtures.
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
-//   /github/…                  GitHub's REST API, as much as open_pull_request uses: the
-//                              token's user, and listing and opening pull requests.
+//   /github/…                  GitHub's REST API, as much as open_pull_request and a
+//                              channel's default repo use: the token's user, listing and
+//                              opening pull requests, and the repos the token can read
+//                              (acme/widgets, acme/gadgets) with their branches.
 //   POST /slack/response/…     an interaction's response_url: recorded (the ephemeral replies)
 //   POST /slack/upload/<id>    a file's bytes, to the upload_url files.getUploadURLExternal
 //                              handed out: recorded (the uploads)
@@ -34,7 +36,10 @@
 // person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
 // an open_pull_request tool_use for that branch; "[pdf]", a render_pdf tool_use for a short
 // report in English and Chinese named conformance-report.pdf; "[attach] <path>", a
-// workspace_attach_file tool_use for that path titled "Conformance chart"); turn 2 (tool_result
+// workspace_attach_file tool_use for that path titled "Conformance chart"; "[clone]", a
+// workspace_clone tool_use naming no repo, or "[clone] <owner/name>" naming that one, whose
+// answer is what was cloned and why: "[q7] [clone:<status>:<repo>:<branch>:<source>] …");
+// turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …", and with
 // "[quote]" in the question, the hit's text verbatim: "… [quote:<text>] w0 …"), or for
@@ -81,7 +86,7 @@ type SlackCall = { t: number; method: string; body: Record<string, unknown> };
 const holds = new Map<string, { waiting: number; released: Promise<void>; release: () => void }>();
 let calls: SlackCall[] = [];
 let modelCalls = 0;
-let githubCalls: { method: string; path: string; body?: unknown }[] = [];
+let githubCalls: { method: string; path: string; body?: unknown; auth: string }[] = [];
 // Files uploaded through files.getUploadURLExternal: the reserved name and length, then
 // the bytes POSTed to the upload_url.
 type Upload = { fileId: string; filename: string; length: number; bytes?: number; contentType?: string; head?: string };
@@ -255,6 +260,10 @@ function answerFor(messages: Msg[], result: Block): string {
   if (value?.id) return `${nonce} [whois:${JSON.stringify({ name: value.name, realName: value.realName })}] ${words.join(" ")}`;
   const exec = value as { exitCode?: number; stdout?: string } | undefined;
   if (typeof exec?.exitCode === "number") return `${nonce} [exec:${exec.exitCode}:${(exec.stdout ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
+  // workspace_clone: what was cloned (or fetched), on which branch, and whether the repo
+  // was named or the channel's default.
+  const clone = value as { status?: string; repo?: string; branch?: string; source?: string } | undefined;
+  if (typeof clone?.status === "string" && typeof clone.source === "string") return `${nonce} [clone:${clone.status}:${clone.repo}:${clone.branch ?? ""}:${clone.source}] ${words.join(" ")}`;
   const pr = value as { status?: string; url?: string } | undefined;
   if (typeof pr?.status === "string" && !(pr as { error?: unknown }).error) return `${nonce} [pr:${pr.status}:${pr.url ?? ""}] ${words.join(" ")}`;
   // A tool that failed: its error text, so the harness can check what the model was told.
@@ -333,6 +342,8 @@ async function anthropic(req: Request): Promise<Response> {
     // "[pr] <branch>" → open a pull request from that branch (open_pull_request)
     // "[pdf]" → render a short report as a PDF (render_pdf)
     // "[attach] <path>" → attach that file from the thread's sandbox (workspace_attach_file)
+    // "[clone]" → get the repo with no repo named (workspace_clone); "[clone] <owner/name>" → that one
+    const clone = /\[clone\](?: (\S+))?/.exec(question);
     const pdf = question.includes("[pdf]");
     const attachPath = /\[attach\] (\S+)/.exec(question)?.[1];
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
@@ -345,9 +356,9 @@ async function anthropic(req: Request): Promise<Response> {
     const reactionsIn = /\[reactions:([A-Z0-9]+)\]/.exec(question)?.[1];
     const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = jobStart ? "workspace_job_start" : pdf ? "render_pdf" : attachPath ? "workspace_attach_file" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = clone ? "workspace_clone" : jobStart ? "workspace_job_start" : pdf ? "render_pdf" : attachPath ? "workspace_attach_file" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = jobStart ? { id: jobStart[1], command: jobStart[2] } : pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : attachPath ? { path: attachPath, title: "Conformance chart" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
+    const input = clone ? (clone[1] ? { repo: clone[1] } : {}) : jobStart ? { id: jobStart[1], command: jobStart[2] } : pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : attachPath ? { path: attachPath, title: "Conformance chart" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     return toolUse(id, toolName, input, !!body.stream);
   }
 
@@ -379,13 +390,32 @@ async function anthropic(req: Request): Promise<Response> {
 
 // ── GitHub ───────────────────────────────────────────────────────────────────
 
-// The token's user (who the commits must be by), and pull requests: none open yet, and
-// a new one is always number 7. Records every request.
+// The repos the token can read, each with its branches; any other repo is a 404, as
+// GitHub answers for one that doesn't exist or that the token has no access to.
+const REPOS: Record<string, string[]> = { "acme/widgets": ["main", "release/1.x"], "acme/gadgets": ["main"] };
+
+// The token's user (who the commits must be by), the repos it can read and their branches,
+// and pull requests: none open yet, and a new one is always number 7. Records every
+// request, with the kind of credential it carried (`auth` in /stats' github list).
 async function github(req: Request, url: URL): Promise<Response> {
   const path = url.pathname.slice("/github".length) + url.search;
   const raw = await req.text();
-  githubCalls.push({ method: req.method, path, body: raw ? safeJson(raw) : undefined });
+  // What the request authenticated with, by its shape only (never the value): none, an
+  // App's JWT, an installation token (ghs_…), or any other bearer token.
+  const bearer = /^Bearer (.+)$/.exec(req.headers.get("authorization") ?? "")?.[1];
+  const auth = !bearer ? "none" : /^[\w-]+\.[\w-]+\.[\w-]+$/.test(bearer) ? "app_jwt" : bearer.startsWith("ghs_") ? "installation" : "token";
+  githubCalls.push({ method: req.method, path, body: raw ? safeJson(raw) : undefined, auth });
   if (url.pathname === "/github/user") return Response.json({ id: 1, login: "octo" });
+  const repo = /^\/github\/repos\/([^/]+)\/([^/]+)(?:\/branches\/(.+))?$/.exec(url.pathname);
+  if (repo && req.method === "GET") {
+    // As GitHub: a repo read with no credential is refused, not answered as a public repo.
+    if (auth === "none") return Response.json({ message: "Requires authentication" }, { status: 401 });
+    const full = `${repo[1]}/${repo[2]}`;
+    const branches = REPOS[full.toLowerCase()];
+    if (!branches) return Response.json({ message: "Not Found" }, { status: 404 });
+    if (repo[3] === undefined) return Response.json({ full_name: full.toLowerCase(), default_branch: "main" });
+    return branches.includes(repo[3]) ? Response.json({ name: repo[3] }) : Response.json({ message: "Branch not found" }, { status: 404 });
+  }
   const pulls = /^\/github\/repos\/([^/]+)\/([^/]+)\/pulls$/.exec(url.pathname);
   if (pulls && req.method === "GET") return Response.json([]);
   if (pulls && req.method === "POST") return Response.json({ html_url: `https://github.com/${pulls[1]}/${pulls[2]}/pull/7`, number: 7 }, { status: 201 });

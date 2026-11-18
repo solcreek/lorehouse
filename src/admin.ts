@@ -1,10 +1,14 @@
-// admin.ts — the admin API: a read-only view of what Lorehouse knows and runs, for its
-// operators and, later, the Lorehouse app.
+// admin.ts — the admin API: what Lorehouse knows and runs, for its operators, their
+// agents and, later, the Lorehouse app. It reads, with one setting it also writes: a
+// channel's default repo.
 //
 //   GET /api/v1/documents?kind=&channel=&limit=&cursor=   the index, newest first, no text
 //   GET /api/v1/documents/{id}                           one document, with its text
 //   GET /api/v1/search?q=&limit=                         what search_knowledge finds, in its order
-//   GET /api/v1/channels                                 each allowed channel's ingest
+//   GET /api/v1/channels                                 each allowed channel's ingest and default repo
+//   GET /api/v1/channels/{id}/repo                       one channel's default repo (#126)
+//   PUT /api/v1/channels/{id}/repo                       set it: { repo: "owner/name", branch? }
+//   DELETE /api/v1/channels/{id}/repo                    clear it
 //   GET /api/v1/threads?limit=&cursor=                   the threads the agent was asked into
 //   GET /api/v1/runners                                  connected sandbox runners
 //   GET /api/v1/sandboxes?limit=&cursor=                 which runner each sandbox lives on
@@ -12,11 +16,16 @@
 //
 // It returns what people wrote, so it has its own token, ADMIN_TOKEN, apart from
 // STATUS_TOKEN's counts: a monitor holding the status token can't read messages. Unset,
-// all of /api/ is closed (404), as if it didn't exist. Nothing here writes.
+// all of /api/ is closed (404), as if it didn't exist. The one thing written is a
+// channel's default repo (channel-repos.ts): install data in LOREHOUSE_DB, never message
+// text. Setting it is declarative (PUT the state wanted, DELETE for none, either safe to
+// repeat), and a refusal carries a stable `code` beside its message.
 // Contract: docs/admin-api.md.
 
 import type { Database } from "./sqlite";
 import type { IngestStatus } from "./ingest/slack";
+import { CHANNEL_ID, clearChannelRepo, getChannelRepo, listChannelRepos, setChannelRepo, validBranch, type ChannelRepo } from "./channel-repos";
+import { repoName, type RepoCheck, type RepoRef } from "./github-auth";
 import { getDocument, listDocuments, searcher } from "./knowledge";
 import { listPlacements } from "./runners/hub";
 import { bearerMatches } from "./status-auth";
@@ -34,12 +43,42 @@ export type AdminOptions = {
   sandbox: "off" | "direct" | "runners";
   runners?: () => RunnerSummary[];
   usage?: (since: Date) => UsageSummary | Promise<UsageSummary>;
+  // The channels on AGENT_CHANNELS: only they can have a default repo. Unset: none can.
+  channels?: { has(channel: string): boolean };
+  // Whether the GitHub credential can read a repo, and the branch exists (github-auth.ts,
+  // checkRepo). Unset: code tools are off, so no default repo can be set.
+  checkRepo?: (repo: RepoRef, branch?: string) => Promise<RepoCheck>;
+  // How long a PUT waits for checkRepo before answering github_unavailable (CHECK_TIMEOUT_MS).
+  checkTimeoutMs?: number;
+  // The audit trail: one line per attempt to set or clear a default repo, with its outcome
+  // (see channelRepo). Never a token or a request body.
+  log?: (line: string) => void;
 };
 
 const KINDS = new Set(["slack_thread", "seed"]);
 const EXCERPT = 300;
 
 class BadRequest extends Error {}
+
+// A refused write: an HTTP status, a stable machine-readable `code`, and a message that
+// says what to do about it.
+class Refusal extends Error {
+  constructor(readonly status: number, readonly code: string, message: string, readonly headers: Record<string, string> = {}) {
+    super(message);
+  }
+}
+
+// PUT's body is one small JSON object: at most this many bytes.
+const MAX_BODY = 4096;
+// How long PUT waits for GitHub's answers about a repo, all of them together.
+export const CHECK_TIMEOUT_MS = 10_000;
+const REPO_METHODS = ["GET", "PUT", "DELETE"];
+
+// What a write attempt asked for, as far as it validated: what its audit line may hold.
+type Attempt = { channel?: string; repo?: string; branch?: string };
+
+// A default repo as the API shows it; null when the channel has none.
+const shown = (r: ChannelRepo | undefined) => (r ? { repo: r.repo, branch: r.branch, setAt: r.setAt } : null);
 
 // Every answer, refusals included, is never kept by a shared cache: an answer holds
 // message text, and a cached refusal would outlive the token it was about (a closed 404
@@ -120,11 +159,15 @@ export function adminRoutes(opts: AdminOptions) {
     if (path === "/api/v1/channels") {
       const s = opts.ingest();
       if (!s) return json({ state: "idle", channels: [] });
+      const repos = new Map(listChannelRepos(db).map((r) => [r.channel, r]));
       const channels = Object.entries(s.channels).map(([id, c]) => ({
         id,
         threads: c.threads,
         // The cursor is the newest message ts seen.
         lastMessageAt: c.cursor && Number.isFinite(Number(c.cursor)) ? new Date(Number(c.cursor) * 1000).toISOString() : null,
+        // Found private, archived or shared since the start, and closed until the next one.
+        ...(c.closed ? { closed: c.closed } : {}),
+        defaultRepo: shown(repos.get(id)),
       }));
       return json({ state: s.state, ...(s.error ? { error: s.error } : {}), channels });
     }
@@ -158,6 +201,125 @@ export function adminRoutes(opts: AdminOptions) {
     return json({ error: "no such endpoint (docs/admin-api.md)" }, 404);
   }
 
+  // What PUT asks for, from its body: { "repo": "owner/name", "branch": "main" } (branch
+  // optional; null or left out: the repo's own default branch). Strict: a field it doesn't
+  // know is refused, never ignored, so a misspelt "branch" can't silently set none.
+  async function wanted(req: Request, seen: Attempt): Promise<{ repo: RepoRef; branch?: string }> {
+    const example = 'send JSON like { "repo": "owner/name" } or { "repo": "owner/name", "branch": "main" }';
+    // Refused by its declared length before any of it is read, and read no further than
+    // the limit when it declares none (or lies).
+    const tooLong = () => new Refusal(400, "invalid_body", `the body is over ${MAX_BODY} bytes: ${example}`);
+    const declared = req.headers.get("content-length");
+    if (declared !== null && !(/^\d+$/.test(declared) && Number(declared) <= MAX_BODY)) throw tooLong();
+    const parts: Uint8Array[] = [];
+    let size = 0;
+    const reader = req.body?.getReader();
+    for (let part = await reader?.read(); part && !part.done; part = await reader!.read()) {
+      size += part.value.byteLength;
+      if (size > MAX_BODY) {
+        await reader!.cancel().catch(() => undefined);
+        throw tooLong();
+      }
+      parts.push(part.value);
+    }
+    const raw = new TextDecoder().decode(Buffer.concat(parts));
+    let body: unknown;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      throw new Refusal(400, "invalid_body", `the body isn't JSON: ${example}`);
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Refusal(400, "invalid_body", `the body isn't a JSON object: ${example}`);
+    const unknown = Object.keys(body).filter((k) => k !== "repo" && k !== "branch");
+    if (unknown.length) throw new Refusal(400, "invalid_body", `unknown field ${unknown.map((k) => JSON.stringify(k)).join(", ")}: the fields are "repo" and "branch"`);
+    const { repo, branch } = body as { repo?: unknown; branch?: unknown };
+    const named = typeof repo === "string" ? repoName(repo) : undefined;
+    if (!named) throw new Refusal(400, "invalid_repo", '"repo" must be a GitHub repo as owner/name, e.g. "acme/widgets" (not a URL; an owner is up to 39 characters, a name up to 100)');
+    seen.repo = `${named.owner}/${named.name}`;
+    if (branch !== undefined && branch !== null && !(typeof branch === "string" && validBranch(branch))) throw new Refusal(400, "invalid_branch", '"branch" must be a branch name, e.g. "main"; leave it out (or send null) for the repo\'s default branch');
+    if (typeof branch === "string") seen.branch = branch;
+    return { repo: named, branch: typeof branch === "string" ? branch : undefined };
+  }
+
+  // The audit trail: every attempt to write (anything but a GET) leaves one line, through
+  // opts.log, saying what was asked and what came of it: the channel, the repo, the branch,
+  // the outcome (set, unchanged, cleared, none, refused) and a refusal's code. Only values
+  // that passed validation are written (a Slack id, owner/name, a branch name: none can
+  // hold a space or a newline), so never the body, a header or a token.
+  async function channelRepo(req: Request, rawChannel: string): Promise<Response> {
+    const seen: Attempt = {};
+    const line = (outcome: string) => {
+      if (req.method === "GET") return;
+      const method = /^[A-Z]{1,10}$/.test(req.method) ? req.method : "?";
+      opts.log?.(["admin: default repo", method, seen.channel && `channel=${seen.channel}`, seen.repo && `repo=${seen.repo}`, seen.branch && `branch=${seen.branch}`, `outcome=${outcome}`].filter(Boolean).join(" "));
+    };
+    try {
+      const { response, outcome } = await answer(req, rawChannel, seen);
+      line(outcome);
+      return response;
+    } catch (e) {
+      if (e instanceof Refusal) line(`refused code=${e.code}`);
+      else line("failed");
+      throw e;
+    }
+  }
+
+  // A channel's default repo: GET reads it, PUT sets it, DELETE clears it.
+  async function answer(req: Request, rawChannel: string, seen: Attempt): Promise<{ response: Response; outcome: string }> {
+    let channel = rawChannel;
+    try {
+      channel = decodeURIComponent(rawChannel);
+    } catch { /* not a channel id either way */ }
+    if (CHANNEL_ID.test(channel)) seen.channel = channel;
+    if (!REPO_METHODS.includes(req.method)) throw new Refusal(405, "method_not_allowed", "method not allowed: GET reads a channel's default repo, PUT sets it, DELETE clears it", { allow: REPO_METHODS.join(", ") });
+    if (!seen.channel) throw new Refusal(400, "invalid_channel", "the channel must be a Slack channel id, e.g. C0123ABCD (not its name)");
+
+    // Clearing is safe for any channel: one off AGENT_CHANNELS has none to clear.
+    if (req.method === "DELETE") {
+      const cleared = clearChannelRepo(db, channel);
+      return { response: json({ channel, defaultRepo: null }), outcome: cleared ? "cleared" : "none" };
+    }
+    if (!opts.channels?.has(channel)) throw new Refusal(404, "channel_not_listed", `${channel} isn't on AGENT_CHANNELS: only a public channel the agent works in can have a default repo (a DM never does). Add it to AGENT_CHANNELS and restart, then set it`);
+    // A listed channel ingest found private, archived or shared since the start is closed
+    // until the next start (ingest/slack.ts): the agent doesn't work there, and
+    // workspace_clone gets no default for it. The API says what is so: GET shows the default
+    // that is stored and that the channel is closed, and PUT is refused.
+    const closed = opts.ingest()?.channels[channel]?.closed;
+    if (req.method === "GET") return { response: json({ channel, ...(closed ? { closed } : {}), defaultRepo: shown(getChannelRepo(db, channel)) }), outcome: "read" };
+    if (closed) throw new Refusal(409, "channel_closed", `${channel} was closed since the start (${closed}): the agent doesn't work there, and a default repo there is unused until the next start, which refuses to start while the channel is listed and not public. Make it public and unshared again, or take it off AGENT_CHANNELS; then restart`);
+
+    const want = await wanted(req, seen);
+    const full = `${want.repo.owner}/${want.repo.name}`;
+    if (!opts.checkRepo) throw new Refusal(409, "code_tools_off", "code tools are off on this install (no sandbox and no GitHub credential), so a default repo would never be used and can't be checked. Turn them on (SANDBOX_RUNNER_TOKEN or SANDBOX_URL, with a GitHub App: docs/github-app.md), restart, then set it");
+    // Bounded: a GitHub that stalls (or a check that throws) is an answer, not a hung request.
+    const deadline = opts.checkTimeoutMs ?? CHECK_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<RepoCheck>((resolve) => { timer = setTimeout(() => resolve({ ok: false, reason: "unavailable", detail: `GitHub didn't answer in ${deadline / 1000} s` }), deadline); });
+    const checkRepo = opts.checkRepo;
+    const asked = Promise.resolve().then(() => checkRepo(want.repo, want.branch)).catch((e): RepoCheck => ({ ok: false, reason: "unavailable", detail: e instanceof Error ? e.message : String(e) }));
+    const check = await Promise.race([asked, late]).finally(() => clearTimeout(timer));
+    if (!check.ok) {
+      // Nothing is stored: a default the credential can't read would fail every request.
+      if (check.reason === "not_installed") throw new Refusal(422, "app_not_installed", `the GitHub App isn't installed on ${full}: install it there (the App's settings, Install App, Only select repositories), then set it again`);
+      if (check.reason === "not_readable") throw new Refusal(422, "repo_not_readable", `${check.detail}. Check the name, or give the credential access to it, then set it again`);
+      if (check.reason === "branch_not_found") throw new Refusal(422, "branch_not_found", `${check.detail}: name a branch that exists, or leave "branch" out for the repo's default branch`);
+      // Not verdicts on the repo: the install's own credential, or GitHub, is what to fix or wait for.
+      if (check.reason === "credential_refused") throw new Refusal(502, "credential_refused", `GitHub refused this install's own credential (401), so ${full} couldn't be checked and nothing was changed: GITHUB_TOKEN has expired or been revoked, or GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY aren't the same App's. Fix the credential (\`lorehouse doctor\` checks it), restart, then set it again`);
+      if (check.reason === "rate_limited") throw new Refusal(503, "github_rate_limited", `${check.detail}, so ${full} couldn't be checked and nothing was changed: wait${check.retryAfterSecs !== undefined ? ` ${check.retryAfterSecs} s (Retry-After)` : ""}, then set it again`, check.retryAfterSecs !== undefined ? { "retry-after": String(check.retryAfterSecs) } : {});
+      throw new Refusal(502, "github_unavailable", `couldn't check ${full} with GitHub (${check.detail}); nothing was changed, try again`);
+    }
+    // Stored: the repo and the branch as GitHub answered them, and the branch only if that
+    // is the one asked for.
+    if (check.branch !== want.branch) throw new Refusal(502, "github_unavailable", `GitHub's answer for ${full} didn't confirm the branch ${want.branch}; nothing was changed, try again`);
+    const before = getChannelRepo(db, channel);
+    const now = setChannelRepo(db, { channel, repo: check.repo, branch: check.branch });
+    // Logged as it was stored: GitHub's spelling of the repo.
+    seen.repo = now.repo;
+    return { response: json({ channel, defaultRepo: shown(now) }), outcome: before?.repo !== now.repo || before.branch !== now.branch ? "set" : "unchanged" };
+  }
+
+  const REPO_PATH = /^\/api\/v1\/channels\/([^/]+)\/repo$/;
+
   // undefined: not an admin path; the caller goes on routing.
   return async function handle(req: Request): Promise<Response | undefined> {
     const url = new URL(req.url);
@@ -167,11 +329,15 @@ export function adminRoutes(opts: AdminOptions) {
     if (!opts.token) return new Response("not found", { status: 404, headers: NO_STORE });
     // A refusal says nothing about the install, its tenant included.
     if (!bearerMatches(req, opts.token)) return Response.json({ error: "unauthorized: send Authorization: Bearer <ADMIN_TOKEN>" }, { status: 401, headers: { ...NO_STORE, "www-authenticate": "Bearer" } });
-    if (req.method !== "GET") return json({ error: "method not allowed: the admin API only reads" }, 405, { allow: "GET" });
     try {
+      // The one endpoint that also writes.
+      const repo = REPO_PATH.exec(url.pathname.replace(/\/$/, ""));
+      if (repo) return await channelRepo(req, repo[1]!);
+      if (req.method !== "GET") return json({ error: "method not allowed: this endpoint only reads" }, 405, { allow: "GET" });
       return await route(url);
     } catch (e) {
       if (e instanceof BadRequest) return json({ error: e.message }, 400);
+      if (e instanceof Refusal) return json({ error: e.message, code: e.code }, e.status, e.headers);
       throw e;
     }
   };

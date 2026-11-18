@@ -32,7 +32,7 @@ import { neutralizeMentions } from "./mentions";
 import { withoutMentions } from "./slack-guard";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
-import { adminRoutes } from "./admin";
+import { adminRoutes, CHECK_TIMEOUT_MS } from "./admin";
 import { inThread, joinThread } from "./threads";
 import { members, refusalText, type Membership } from "./members";
 import { turnGate } from "./turns";
@@ -41,7 +41,8 @@ import { cachedNames } from "./ingest/slack-users";
 import { pullRequestTool } from "./tools/pull-request";
 import { approvalStore, approverGate } from "./approvals";
 import { cloneTool } from "./tools/clone";
-import { githubApp, staticToken } from "./github-auth";
+import { defaultRepoFor } from "./channel-repos";
+import { checkRepo, githubApp, staticToken, type GithubAccess } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
 import { prepareTenant, sandboxIdFor, tenantsIn, upgradeLayout } from "./tenant";
@@ -67,6 +68,11 @@ const TASK_LABELS: Record<string, string> = {
   open_pull_request: "Preparing a pull request",
   render_pdf: "Making the PDF",
 };
+
+// fetch for GitHub's REST API, each request given up on after CHECK_TIMEOUT_MS: the
+// credential's own requests and the admin API's repo check. Never a clone or a push,
+// which the sandbox host makes, under its own timeouts.
+const githubFetch = ((url: string, init?: RequestInit) => fetch(url, { ...init, signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) })) as typeof fetch;
 
 // The start. The tenant's data key, if any, is needed only while it opens the databases:
 // it is wiped when the start ends, whether the app came up or not. `profiles`: the profiles
@@ -233,6 +239,8 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
   const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
+  // The GitHub credential, which only code tools have (config.ts).
+  let githubAccess: GithubAccess | undefined;
   if (config.sandbox) {
     const sb = config.sandbox;
     // One sandbox per thread, keyed off the tenant and the session (never model input):
@@ -243,7 +251,11 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
       : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
     const apiUrl = config.githubApiUrl;
-    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
+    // The credential's own requests to GitHub (the installation lookup, the token exchange,
+    // who it acts as) carry a deadline: small API calls, for a clone, a pull request or the
+    // admin API's repo check, and a GitHub that stalls must not hold one open for good.
+    const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl, fetch: githubFetch }) : staticToken(sb.github.token, { apiUrl, fetch: githubFetch });
+    githubAccess = github;
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
     // Who started each background job, for who may cancel it (tools/jobs.ts): pruned on
     // start, then daily.
@@ -253,7 +265,9 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
     tools.push(
       ...workspaceTools(sandboxFor, { commitAs: github.identity }),
       ...jobTools(sandboxFor, { store: jobs, authority: slackJobAuthority(slackReads, approverName), commitAs: github.identity }),
-      cloneTool(sandboxFor, github),
+      // With no repo named, the default repo of the channel being answered in (#126): only
+      // a listed channel has one, and not one ingest found private or shared since the start.
+      cloneTool(sandboxFor, github, { defaultRepo: defaultRepoFor(knowledge, { has: (channel) => config.agent.channels.has(channel) && !ingester?.isClosed(channel) }) }),
       pullRequestTool({ sandboxFor, github, identity, approverName, approver: config.prApprover, approvals, apiUrl }),
     );
   }
@@ -424,7 +438,8 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
     }
   };
 
-  // The read-only admin API (/api/v1), behind ADMIN_TOKEN.
+  // The admin API (/api/v1), behind ADMIN_TOKEN: it reads, and sets a channel's default repo.
+  const github = githubAccess;
   const admin = adminRoutes({
     db: knowledge,
     tenant: tenant.id,
@@ -432,8 +447,17 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
     ingest: () => ingester?.status(),
     sandbox: config.sandbox?.mode ?? "off",
     runners: hub ? () => hub.status() : undefined,
+    // A channel's default repo (#126): only for a channel on AGENT_CHANNELS, and only a
+    // repo the GitHub credential can read now. With code tools off there is no credential
+    // to check with, and setting one is refused.
+    channels: config.agent.channels,
+    // The admin API bounds the whole check (CHECK_TIMEOUT_MS); the same deadline on each
+    // request, the credential's own included (githubFetch), lets a stalled one go instead
+    // of leaving it open behind the answer.
+    checkRepo: github && ((repo, branch) => checkRepo(github, repo, { branch, apiUrl: config.githubApiUrl, fetch: githubFetch })),
+    log: (line) => console.log(line),
     // With askers recorded, each is named as knowledge names people, from the names already
-    // cached: the admin API only reads (no Slack call, no write). Uncached: name null.
+    // cached: reading usage only reads (no Slack call, no write). Uncached: name null.
     usage: (since) => {
       const summary = usageSummary(knowledge, { since, people: recordPeople });
       if (!summary.askers?.length) return summary;

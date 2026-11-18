@@ -1,10 +1,10 @@
 # The admin API
 
-A read-only view of what Lorehouse knows and runs: the indexed threads and their text,
-search, each channel's ingest, the threads the agent was asked into, how people use it,
-and the sandboxes.
-It is for the people who run Lorehouse, and later for the Lorehouse app. Nothing in it
-writes.
+What Lorehouse knows and runs: the indexed threads and their text, search, each channel's
+ingest, the threads the agent was asked into, how people use it, and the sandboxes.
+It is for the people who run Lorehouse and the agents they run it with, and later for the
+Lorehouse app. It reads, with one exception: [a channel's default repo](#a-channels-default-repo),
+which it also sets and clears.
 
 ## Access
 
@@ -17,17 +17,20 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" https://<app>/api/v1/documents
 - **Unset, all of `/api/` is closed:** every request gets a 404, as if the API didn't
   exist.
 - **A missing or wrong token gets a 401.**
-- **Anything but GET gets a 405.**
+- **Anything but GET gets a 405,** except on a channel's default repo, which also takes
+  PUT and DELETE.
 
 It has its own token because it returns what people wrote. `STATUS_TOKEN` reads only
 counts, so it can go to a monitor or a status page; the admin token can't be the same
 value, and Lorehouse refuses to start if it is. Anyone holding the admin token can read
-every indexed message, the same as a member of those public channels, so keep it with
-the other secrets.
+every indexed message, the same as a member of those public channels, and can set which
+repo a channel's requests work in, so keep it with the other secrets.
 
 Answers are JSON. An error, a 401 or a 405 included, is `{ "error": "…" }` saying what
-was wrong; a 401 also carries `WWW-Authenticate: Bearer` and a 405 `Allow: GET`. A bad
-parameter gets a 400.
+was wrong; a 401 also carries `WWW-Authenticate: Bearer` and a 405 `Allow` with the
+methods the endpoint takes. A bad parameter gets a 400. A refusal from a channel's default
+repo also has `"code"`, a stable name for the reason, to branch on instead of the message
+([its codes](#refusals)).
 
 Every answer to the admin token, errors included, also has `"tenant"`: the id of the
 tenant whose data it is (`TENANT_ID`, [README](../README.md#run-it); ADR 0005 §2).
@@ -46,7 +49,10 @@ keep serving the closed 404 after `ADMIN_TOKEN` is set.
 | `GET /api/v1/documents` | the index, most recently (re)indexed first, without text |
 | `GET /api/v1/documents/{id}` | one document, with its text |
 | `GET /api/v1/search?q=` | what the agent's `search_knowledge` finds, in its order |
-| `GET /api/v1/channels` | each allowed channel's ingest |
+| `GET /api/v1/channels` | each allowed channel's ingest, and its default repo |
+| `GET /api/v1/channels/{id}/repo` | one channel's default repo |
+| `PUT /api/v1/channels/{id}/repo` | sets it |
+| `DELETE /api/v1/channels/{id}/repo` | clears it |
 | `GET /api/v1/threads` | the threads the agent was asked into, newest first |
 | `GET /api/v1/runners` | the connected sandbox runners |
 | `GET /api/v1/sandboxes` | which runner each sandbox lives on, newest first |
@@ -101,14 +107,127 @@ the top 5. Chinese, Japanese and Korean work as they do for the agent. Each resu
 
 ```json
 { "state": "ready",
-  "channels": [ { "id": "C0123", "threads": 24, "lastMessageAt": "2026-09-28T09:58:00.000Z" } ] }
+  "channels": [ { "id": "C0123", "threads": 24, "lastMessageAt": "2026-09-28T09:58:00.000Z",
+                  "defaultRepo": { "repo": "acme/widgets", "branch": "main",
+                                   "setAt": "2026-11-18T09:00:00.000Z" } } ] }
 ```
 
 - `state`: `idle`, `backfilling`, `ready` or `error`; with `error`, an `error` field says
   what failed.
 - `lastMessageAt`: the newest message ingest has seen in the channel, or `null` before the
   first.
+- `defaultRepo`: the channel's default repo, as below, or `null` when it has none.
 - No `AGENT_CHANNELS` means no ingest: `{ "state": "idle", "channels": [] }`.
+
+### A channel's default repo
+
+With one set, a request in that channel needs no repo name: "@scout run the benchmark"
+works in the channel's repo. A repo named in the request still wins. With none set and
+none named, the agent asks which repo. It needs code tools on
+([sandbox runners](sandbox-runners.md), [the GitHub App](github-app.md)).
+
+`{id}` is the Slack channel id (`C0123ABCD`), not its name. Only a channel on
+`AGENT_CHANNELS` can have a default repo, so a DM never does. It is the admin's to set: the
+model can't set or change it, and it is looked up from the channel a thread is in, never
+from anything the model says. It is kept in `LOREHOUSE_DB`, and goes with the rest of what
+is kept for a channel when the channel leaves `AGENT_CHANNELS` (the next start purges it).
+
+All three answer with the channel's default repo as it now is:
+
+```json
+{ "channel": "C0123ABCD",
+  "defaultRepo": { "repo": "acme/widgets", "branch": "main", "setAt": "2026-11-18T09:00:00.000Z" } }
+```
+
+- `defaultRepo` is `null` when the channel has none.
+- `repo` is `owner/name`, spelt as GitHub spells it.
+- `branch` is the branch a fresh clone starts on, or `null` for the repo's own default
+  branch.
+- `setAt` is when it last changed.
+- `closed`, on a GET only, is there when the channel was closed since the start (found
+  private, archived or shared while running), with why: `private`, `archived`, `shared`,
+  or Slack's error. The default shown is still stored and is not used until the next
+  start; a PUT is refused (`channel_closed`). `GET /api/v1/channels` has the same field.
+
+**Read it:**
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" https://<app>/api/v1/channels/C0123ABCD/repo
+```
+
+**Set it.** The body is the state wanted: `repo` as `owner/name` (not a URL), and
+optionally `branch` (leave it out, or send `null`, for the repo's default branch). No
+other field is taken.
+
+```bash
+curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "repo": "acme/widgets", "branch": "main" }' \
+  https://<app>/api/v1/channels/C0123ABCD/repo
+```
+
+Before anything is stored, GitHub is asked whether the install's credential can read the
+repo now: that the GitHub App is installed on it (with the development `GITHUB_TOKEN`,
+that the token can read it), and that the branch exists when one is given. A public repo
+the App isn't installed on is refused too, though the agent could clone it by name: a
+default is something the install vouches for. If the check fails, nothing is stored, and
+a default already there stays as it was.
+
+PUT is safe to repeat. Sending the state that is already there checks it again and answers
+the same, `setAt` included; sending another replaces it.
+
+**Clear it:**
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" https://<app>/api/v1/channels/C0123ABCD/repo
+```
+
+It answers `"defaultRepo": null` whether or not there was one, and for a channel that
+isn't on `AGENT_CHANNELS` too: there is none to clear.
+
+#### Refusals
+
+A refusal is `{ "error": "…", "code": "…" }`. `error` says what to do about it; `code`
+doesn't change, so a script or an agent can branch on it.
+
+| status | `code` | when | what to do |
+|---|---|---|---|
+| 405 | `method_not_allowed` | anything but GET, PUT or DELETE | use one of those (`Allow` lists them) |
+| 400 | `invalid_channel` | `{id}` isn't a Slack channel id | use the id (`C0123ABCD`), not the name |
+| 404 | `channel_not_listed` | GET or PUT for a channel that isn't on `AGENT_CHANNELS` (a DM, a private channel, one the agent doesn't work in) | add the channel to `AGENT_CHANNELS` and restart |
+| 409 | `channel_closed` | PUT for a listed channel that was closed since the start: Lorehouse found it private, archived or shared with another workspace while running, stopped working there, and uses no default repo there until the next start | make the channel public and unshared again, or take it off `AGENT_CHANNELS`; then restart |
+| 400 | `invalid_body` | PUT's body isn't a JSON object, is over 4096 bytes (refused by its `Content-Length` before it is read), or has a field other than `repo` and `branch` | send `{ "repo": "owner/name" }` |
+| 400 | `invalid_repo` | `repo` is missing or isn't `owner/name` (an owner of up to 39 characters, a name of up to 100) | name the repo as `owner/name`, not its URL |
+| 400 | `invalid_branch` | `branch` isn't a branch name Lorehouse takes: letters, digits and `. _ / -`, up to 255 characters, no part that is empty, starts with `.` or ends in `.lock`, no `..`, no leading `-`, no trailing `.` (stricter than git: a branch with other characters can't be a default) | name such a branch, or leave it out |
+| 409 | `code_tools_off` | PUT on an install with no sandbox and no GitHub credential: there is nothing to check the repo with, and nothing would use it | turn code tools on, restart, set it again |
+| 422 | `app_not_installed` | the GitHub App isn't installed on the repo | install the App on that repo, set it again |
+| 422 | `repo_not_readable` | the credential gets no read of the repo (a 404, or a 403 that isn't a rate limit): there is no such repo, or it has no access | check the name, or give the credential access |
+| 422 | `branch_not_found` | the repo is readable and has no branch of exactly that name (a renamed branch, which GitHub redirects to its new name, counts as gone) | name a branch that exists, or leave `branch` out |
+| 502 | `credential_refused` | GitHub refused the install's own credential (a 401): `GITHUB_TOKEN` expired or revoked, or an App id and key that don't match | fix the credential (`lorehouse doctor` checks it) and restart; the repo's access is not the problem |
+| 503 | `github_rate_limited` | GitHub is rate limiting the credential (a 429, or a 403 that says so) | wait, then set it again; `Retry-After` carries GitHub's own, in seconds, when it gave one |
+| 502 | `github_unavailable` | GitHub didn't answer within 10 seconds, failed (a 5xx), or gave an answer that didn't confirm the repo or branch asked about | try again; if it keeps failing, `lorehouse doctor` |
+
+The checks run in that order, and the first that fails answers; the last three can come
+from any question to GitHub (the installation, the repo, then the branch), and none of
+them is a verdict on the repo. With `code_tools_off`,
+GET and DELETE still work.
+
+Every attempt to write (anything but a GET, once past the token) leaves one line in the
+app's log, under the tenant like every other line, whether it changed anything or not:
+
+```
+tenant=<id> admin: default repo PUT channel=C0123ABCD repo=acme/widgets branch=main outcome=set
+tenant=<id> admin: default repo PUT channel=C0123ABCD repo=acme/secret outcome=refused code=app_not_installed
+tenant=<id> admin: default repo DELETE channel=C0123ABCD outcome=cleared
+```
+
+`outcome` is `set`, `unchanged` (a PUT of what was already there), `cleared`, `none` (a
+DELETE with nothing to clear) or `refused` with the `code`. A value is written only once it
+has passed its check, so a line never holds the request's body or a token.
+
+A default can go stale after it is set: the App uninstalled from the repo, the repo
+renamed or deleted, the branch removed. Nothing is cleared for that; a request that
+relies on it then fails with GitHub's reason, in the thread. `lorehouse doctor` lists each
+channel's default repo and asks GitHub again, and fails while one can't be read.
 
 ### Threads
 
@@ -245,5 +364,6 @@ the front instead of appearing twice.
 `lorehouse doctor --url https://<app>`, with `ADMIN_TOKEN` set, checks that the running
 app's admin API answers to the same token. The conformance suite pins the rest: the
 tokens, paging through every document `/status` counts, search, deleted messages, the
-agent's threads, and usage (counted right, forgotten with a deleted question, and never in
-`/status`).
+agent's threads, usage (counted right, forgotten with a deleted question, and never in
+`/status`), and a channel's default repo (set, read, cleared, kept across a restart, and
+refused with its code).

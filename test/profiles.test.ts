@@ -43,14 +43,17 @@ describe("the lorehouse profile", () => {
     expect([...LOREHOUSE.skills].sort()).toEqual([...PROMPT_CATALOG.skills].sort());
   });
 
-  // The rendered prompt, byte for byte what prompts/system.md rendered to on main before
-  // it became this profile's (#39): the SHA-256 of each, taken there.
-  test("its prompt renders to the same bytes as before it was a profile", () => {
+  // The rendered prompt, pinned by the SHA-256 of each rendering: a change to what the
+  // model is told is made on purpose, with these updated in the same commit. Until #126
+  // they were, byte for byte, what prompts/system.md rendered to on main before it became
+  // this profile's (#39). #126 changed one step, "Working in code" 1: with no repo named in
+  // the request, workspace_clone is called without one, for the channel's default repo.
+  test("its prompt renders to the pinned bytes", () => {
     const rendered = (name?: string, coAuthor?: string) => sha256(profilePrompt(LOREHOUSE.prompt, agentIdentity(name, coAuthor)));
-    expect(rendered()).toBe("2cb936d867968de5151d95ee1fbe0053e3f866b1f0c8bef24f5285f7e4528500");
-    expect(rendered("scout", "Scout <scout@example.com>")).toBe("26b215803d9da059777739d87be04a9a33c562d9237b60046211672d09e352e5");
-    expect(rendered("atlas")).toBe("b420e27f3f0094857d4dde5d702faf3d0fdf593f2e62d29ff081b2251a574684");
-    expect(sha256(readFileSync(join(import.meta.dir, "..", "prompts", "profiles", "lorehouse.md"), "utf8"))).toBe("d5b1d8ca97b90f800b1b5215103f020fa3721190bd3493a039fccb405116d3f2");
+    expect(rendered()).toBe("e525ca1ee8ab13ff26fbb1bec3cafe599801e3635d577d3d741c4b2daa7852e3");
+    expect(rendered("scout", "Scout <scout@example.com>")).toBe("29bb23817a9533d22d111ab3a8b7009cc96c23051e5ca2efbef8ace6d97ad515");
+    expect(rendered("atlas")).toBe("593323e04ce07ef0c7fd281e3bba96aba15663399c3df59ec4a0c686bdd04d65");
+    expect(sha256(readFileSync(join(import.meta.dir, "..", "prompts", "profiles", "lorehouse.md"), "utf8"))).toBe("c87020353a7eacb01ffdf5a10ebbafb3883051c5191c181fb060fe07b037d9b0");
   });
 
   test("every file in prompts/profiles/ is registered, and every profile's prompt is a file there", () => {

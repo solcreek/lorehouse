@@ -135,7 +135,7 @@ describe("workspace_clone", () => {
     const { sb, calls } = fakeSandbox();
     const asked: string[] = [];
     const tool = cloneTool(() => sb, async (r, a) => (asked.push(`${r.owner}/${r.name}:${a}`), "ghs_read"));
-    expect(await run(tool, "acme/secret")).toEqual({ status: "cloned", repo: "acme/secret", path: "/workspace/repo" });
+    expect(await run(tool, "acme/secret")).toEqual({ status: "cloned", repo: "acme/secret", path: "/workspace/repo", source: "named" });
     expect(asked).toEqual(["acme/secret:read"]);
     const clone = calls.find((c) => c.command.includes(" clone "))!;
     expect(clone.command).toContain("clone https://github.com/acme/secret.git /workspace/repo");

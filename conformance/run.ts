@@ -91,7 +91,7 @@ type Stats = {
   posts: { channel: string; thread_ts?: string; text: string; blocks?: Block[]; ts: string }[];
   updates: { channel: string; ts: string; text: string }[];
   responses: { path: string; text?: string; response_type?: string; replace_original?: boolean }[];
-  github: { method: string; path: string; body?: unknown }[];
+  github: { method: string; path: string; body?: unknown; auth?: string }[];
   uploads: { fileId: string; filename: string; length: number; bytes?: number; contentType?: string; head?: string; channel?: string; thread_ts?: string; title?: string }[];
 };
 const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as Stats;
@@ -127,6 +127,12 @@ const ADMIN_TOKEN = "conformance-admin-token-000000000000";
 const adminAs = (path: string, auth: string | null = `Bearer ${ADMIN_TOKEN}`, init: RequestInit = {}) =>
   fetch(`http://localhost:${APP_PORT}${path}`, { ...init, headers: auth ? { authorization: auth } : {} });
 const admin = async <T = Record<string, any>>(path: string) => (await (await adminAs(path)).json()) as T;
+// A channel's default repo (#126): GET reads it, PUT sets it, DELETE clears it.
+type RepoAnswer = { tenant?: string; channel?: string; defaultRepo?: { repo: string; branch: string | null; setAt: string } | null; error?: string; code?: string };
+async function repoCall(method: "GET" | "PUT" | "DELETE", channel: string, body?: unknown): Promise<{ status: number; body: RepoAnswer }> {
+  const r = await adminAs(`/api/v1/channels/${channel}/repo`, `Bearer ${ADMIN_TOKEN}`, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  return { status: r.status, body: (await r.json().catch(() => ({}))) as RepoAnswer };
+}
 // Usage is the admin API's (who asked, what was searched), never /status's.
 const usage = () => admin<Usage>("/api/v1/usage");
 type DocumentList = { documents: { id: string; kind: string; source: string }[]; next: string | null };
@@ -616,7 +622,7 @@ const scenarios: Scenario[] = [
     },
   },
   {
-    name: "the admin API needs ADMIN_TOKEN: the status token doesn't open it, and it only reads",
+    name: "the admin API needs ADMIN_TOKEN: the status token doesn't open it, and a read endpoint takes only GET",
     run: async () => {
       // It returns what people wrote; a monitor holding STATUS_TOKEN must not read it.
       for (const [auth, what] of [[null, "no token"], ["Bearer wrong", "a wrong token"], [`Bearer ${STATUS_TOKEN}`, "the status token"]] as const) {
@@ -636,6 +642,82 @@ const scenarios: Scenario[] = [
       const r = await adminAs("/api/v1/documents");
       return r.status === 404 ? null : `got ${r.status}, want 404`;
     }),
+  },
+  {
+    // #126: the one setting the admin API writes. PUT is the state wanted and DELETE is
+    // none, each safe to repeat; it is checked with GitHub before it is stored.
+    name: "a channel's default repo is set, read and cleared through the admin API, and is still there after a restart",
+    run: async () => {
+      const db = freshDb();
+      const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github`, LOREHOUSE_DB: db };
+      try {
+        return await inMode(env, async () => {
+          await reset();
+          const none = await repoCall("GET", ALLOWED);
+          if (none.status !== 200 || none.body.channel !== ALLOWED || none.body.defaultRepo !== null) return `before any set: ${none.status} ${JSON.stringify(none.body)}, want defaultRepo null`;
+          const set = await repoCall("PUT", ALLOWED, { repo: "acme/widgets", branch: "main" });
+          const d = set.body.defaultRepo;
+          if (set.status !== 200 || d?.repo !== "acme/widgets" || d?.branch !== "main" || typeof d?.setAt !== "string") return `PUT: ${set.status} ${JSON.stringify(set.body)}`;
+          if (typeof set.body.tenant !== "string") return "the answer doesn't name the tenant";
+          // GitHub was asked about the repo and its branch, with the install's credential
+          // (here the development token) on each request: the mock refuses a read without one.
+          const asked = (await stats()).github.filter((c) => c.method === "GET" && c.path.startsWith("/repos/acme/widgets")).map((c) => `${c.path} ${c.auth}`);
+          if (JSON.stringify(asked) !== JSON.stringify(["/repos/acme/widgets token", "/repos/acme/widgets/branches/main token"])) return `GitHub was asked ${JSON.stringify(asked)}, want the repo then its branch, each with the token`;
+          const again = await repoCall("PUT", ALLOWED, { repo: "acme/widgets", branch: "main" });
+          if (JSON.stringify(again.body) !== JSON.stringify(set.body)) return `the same PUT again answered ${JSON.stringify(again.body)}, want the same as the first ${JSON.stringify(set.body)}`;
+          const listed = (await admin<{ channels: { id: string; defaultRepo: unknown }[] }>("/api/v1/channels")).channels.find((c) => c.id === ALLOWED);
+          if (JSON.stringify(listed?.defaultRepo) !== JSON.stringify(d)) return `GET /api/v1/channels lists ${JSON.stringify(listed)}, want its defaultRepo ${JSON.stringify(d)}`;
+
+          // It is in LOREHOUSE_DB: a restart keeps it.
+          await stopApp();
+          await startApp(env);
+          const kept = await repoCall("GET", ALLOWED);
+          if (JSON.stringify(kept.body) !== JSON.stringify(set.body)) return `after a restart: ${JSON.stringify(kept.body)}, want ${JSON.stringify(set.body)}`;
+
+          const noBranch = await repoCall("PUT", ALLOWED, { repo: "acme/gadgets" });
+          if (noBranch.status !== 200 || noBranch.body.defaultRepo?.repo !== "acme/gadgets" || noBranch.body.defaultRepo?.branch !== null) return `PUT without a branch: ${noBranch.status} ${JSON.stringify(noBranch.body)}`;
+          for (const nth of ["first", "second"]) {
+            const cleared = await repoCall("DELETE", ALLOWED);
+            if (cleared.status !== 200 || cleared.body.defaultRepo !== null) return `the ${nth} DELETE: ${cleared.status} ${JSON.stringify(cleared.body)}, want 200 and defaultRepo null`;
+          }
+          const after = await repoCall("GET", ALLOWED);
+          return after.body.defaultRepo === null ? null : `after DELETE: ${JSON.stringify(after.body)}`;
+        });
+      } finally {
+        removeDb(db);
+      }
+    },
+  },
+  {
+    name: "setting a channel's default repo is refused with a code, storing nothing: a repo the credential can't read, a missing branch, an unlisted channel, code tools off",
+    run: async () => {
+      // The usual app has no sandbox and no GitHub credential: nothing to check a repo with.
+      const off = await repoCall("PUT", ALLOWED, { repo: "acme/widgets" });
+      if (off.status !== 409 || off.body.code !== "code_tools_off") return `with code tools off: ${off.status} ${JSON.stringify(off.body)}, want 409 code_tools_off`;
+      return withFreshDb(async () => {
+        const want: [string, string, unknown, number, string][] = [
+          ["a repo the credential can't read", ALLOWED, { repo: "acme/secret" }, 422, "repo_not_readable"],
+          ["a branch the repo doesn't have", ALLOWED, { repo: "acme/widgets", branch: "nope" }, 422, "branch_not_found"],
+          ["a channel off AGENT_CHANNELS", REMOVED, { repo: "acme/widgets" }, 404, "channel_not_listed"],
+          ["a DM", "D1", { repo: "acme/widgets" }, 404, "channel_not_listed"],
+          ["a repo that isn't owner/name", ALLOWED, { repo: "https://github.com/acme/widgets" }, 400, "invalid_repo"],
+          ["a branch that isn't a branch name", ALLOWED, { repo: "acme/widgets", branch: "a b" }, 400, "invalid_branch"],
+          ["a field it doesn't know", ALLOWED, { repo: "acme/widgets", default_branch: "main" }, 400, "invalid_body"],
+          ["a channel name", "general", { repo: "acme/widgets" }, 400, "invalid_channel"],
+        ];
+        for (const [what, channel, body, status, code] of want) {
+          const r = await repoCall("PUT", channel, body);
+          if (r.status !== status || r.body.code !== code) return `${what}: ${r.status} ${JSON.stringify(r.body)}, want ${status} ${code}`;
+          if (typeof r.body.error !== "string" || r.body.error.length < 20) return `${what}: the refusal doesn't say what to do: ${JSON.stringify(r.body)}`;
+        }
+        const posted = await adminAs(`/api/v1/channels/${ALLOWED}/repo`, `Bearer ${ADMIN_TOKEN}`, { method: "POST", body: "{}" });
+        if (posted.status !== 405 || posted.headers.get("allow") !== "GET, PUT, DELETE") return `POST: ${posted.status}, Allow ${posted.headers.get("allow")}, want 405 and GET, PUT, DELETE`;
+        const monitor = await adminAs(`/api/v1/channels/${ALLOWED}/repo`, `Bearer ${STATUS_TOKEN}`, { method: "PUT", body: JSON.stringify({ repo: "acme/widgets" }) });
+        if (monitor.status !== 401) return `the status token: got ${monitor.status}, want 401`;
+        const stored = await repoCall("GET", ALLOWED);
+        return stored.status === 200 && stored.body.defaultRepo === null ? null : `after the refusals, ${ALLOWED} has ${JSON.stringify(stored.body)}, want no default repo`;
+      }, { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github` });
+    },
   },
   {
     name: "the admin API lists every document /status counts, once, and serves a thread's text",
@@ -1608,6 +1690,38 @@ const scenarios: Scenario[] = [
       }
     },
   },
+  {
+    // #126: the agent stops working in a channel closed while running, so its default repo
+    // is unused until the next start, and the admin API says so instead of taking a new one.
+    name: "a channel closed while running can't be given a default repo (409 channel_closed): GET says it is closed and shows what is stored, DELETE still clears, and the other channel is unaffected",
+    run: async () => {
+      const db = freshDb();
+      const PUBLIC_C2 = { name: "random", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false, is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false };
+      await stopApp();
+      try {
+        await startApp({ ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github`, AGENT_CHANNELS: `${ALLOWED},${REMOVED}`, LOREHOUSE_DB: db, INGEST_CHANNEL_RECHECK_MS: "300" });
+        const open = await repoCall("PUT", REMOVED, { repo: "acme/gadgets" });
+        if (open.status !== 200) return `while ${REMOVED} was open: ${open.status} ${JSON.stringify(open.body)}`;
+        await post("/fixtures/channel", { channel: REMOVED, info: { ...PUBLIC_C2, is_private: true } });
+        const closed = await until(async () => (await status()).knowledge.channels[REMOVED]?.closed, 5000);
+        if (!closed) return `${REMOVED} never closed: ${JSON.stringify((await status()).knowledge.channels)}`;
+        const refused = await repoCall("PUT", REMOVED, { repo: "acme/widgets" });
+        if (refused.status !== 409 || refused.body.code !== "channel_closed") return `PUT for the closed channel: ${refused.status} ${JSON.stringify(refused.body)}, want 409 channel_closed`;
+        const got = await repoCall("GET", REMOVED);
+        const says = (got.body as { closed?: string }).closed;
+        if (got.status !== 200 || says !== closed || got.body.defaultRepo?.repo !== "acme/gadgets") return `GET for the closed channel: ${got.status} ${JSON.stringify(got.body)}, want closed: ${JSON.stringify(closed)} and the default stored while it was open`;
+        const other = await repoCall("PUT", ALLOWED, { repo: "acme/widgets" });
+        if (other.status !== 200 || (other.body as { closed?: string }).closed !== undefined) return `the open channel: ${other.status} ${JSON.stringify(other.body)}`;
+        const cleared = await repoCall("DELETE", REMOVED);
+        return cleared.status === 200 && cleared.body.defaultRepo === null ? null : `DELETE for the closed channel: ${cleared.status} ${JSON.stringify(cleared.body)}`;
+      } finally {
+        await post("/fixtures/channel", { channel: REMOVED, info: PUBLIC_C2 });
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
   // An empty AGENT_CHANNELS means nowhere, for every event kind; a channel taken off the
   // list leaves the knowledge index on the next start (#82).
   {
@@ -1861,6 +1975,46 @@ const scenarios: Scenario[] = [
         await runner.stop();
       }
     }),
+  },
+  {
+    // #126: "@scout run the benchmark" needs no repo name in a channel that has a default
+    // repo. The scripted model calls workspace_clone with no repo ("[clone]") or with one
+    // ("[clone] owner/name"); what reached the runner says which repo was cloned.
+    name: "a mention naming no repo clones the channel's default repo on its branch; one naming another repo clones that one; with no default, the model is told to ask",
+    run: () => withFreshDb(async () => {
+      const runner = await wsRunner(APP, RUNNER_TOKEN, "r-default-repo");
+      // The clones that reached the runner, as git was asked for them.
+      const clones = () => runner.jobs.filter((j) => j.op === "guest" && j.path === "/exec")
+        .map((j) => (JSON.parse(Buffer.from(j.bodyBase64 ?? "", "base64").toString()) as { command: string }).command)
+        .filter((c) => c.includes(" clone ")).map((c) => c.slice(c.lastIndexOf(" clone ") + 1));
+      try {
+        // No default yet: the model is told what to do, and nothing is cloned.
+        const none = await ask("[clone]");
+        if (!/\[toolerror:no repo was named, and there is no default repo here\. Ask which GitHub repo/.test(none.text)) return `with no default: ${none.text.slice(0, 200)}, want the model told to ask which repo`;
+        if (runner.jobs.length) return `with no default, the runner was sent ${runner.jobs.length} job(s)`;
+
+        const set = await repoCall("PUT", ALLOWED, { repo: "acme/widgets", branch: "main" });
+        if (set.status !== 200) return `setting the default: ${set.status} ${JSON.stringify(set.body)}`;
+
+        const byDefault = await ask("[clone]");
+        if (!byDefault.text.includes("[clone:cloned:acme/widgets:main:channel_default]")) return `a mention naming no repo: ${byDefault.text.slice(0, 200)}, want acme/widgets cloned as the channel's default`;
+        const first = JSON.stringify(clones());
+        if (first !== JSON.stringify(["clone --branch main https://github.com/acme/widgets.git /workspace/repo"])) return `the runner was asked for ${first}, want one clone of acme/widgets on main`;
+
+        const named = await ask("[clone] acme/gadgets");
+        if (!named.text.includes("[clone:cloned:acme/gadgets::named]")) return `a mention naming acme/gadgets: ${named.text.slice(0, 200)}, want that repo cloned, not the default`;
+        const second = clones()[1];
+        if (second !== "clone https://github.com/acme/gadgets.git /workspace/repo" || clones().length !== 2) return `the runner was asked for ${JSON.stringify(clones())}, want acme/gadgets second, on its own default branch`;
+
+        // Cleared, a mention naming no repo is back to being asked which.
+        await repoCall("DELETE", ALLOWED);
+        const cleared = await ask("[clone]");
+        if (!cleared.text.includes("[toolerror:no repo was named")) return `after the default was cleared: ${cleared.text.slice(0, 200)}`;
+        return clones().length === 2 ? null : `after the default was cleared, something was cloned: ${JSON.stringify(clones())}`;
+      } finally {
+        await runner.stop();
+      }
+    }, { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github` }),
   },
   {
     // ADR 0002 §8: sessions persist by default, so a restart (a deploy, a crash) between

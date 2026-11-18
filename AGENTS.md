@@ -162,8 +162,8 @@ guests, people from other workspaces and deactivated accounts, failing closed. J
 tools that take a channel id (read a thread, list or add reactions)
 are refused any channel but the one being answered in and the listed ones
 (`src/tools/slack-channels.ts`). On start, `src/purge.ts` removes what was kept for a
-channel no longer listed from `LOREHOUSE_DB` (its documents, joined threads, cursor, asks
-and searches; not June's sessions); `src/threads.ts` decides follow-ups (reply in a joined
+channel no longer listed from `LOREHOUSE_DB` (its documents, joined threads, cursor, asks,
+searches and default repo; not June's sessions); `src/threads.ts` decides follow-ups (reply in a joined
 thread without a new mention, but not when it mentions someone else/@channel); `src/dm.ts`
 handles `DM_MODE`. `src/turns.ts` decides each event that may start a turn, in the two
 steps June calls in order (look the sender up, then answer, refuse or nothing). A thread
@@ -198,7 +198,12 @@ moved.
 `src/runners/`, over WebSocket or long poll; `docs/sandbox-runners.md`) or
 `SANDBOX_URL`/`SANDBOX_TOKEN` (direct, `src/sandbox-client.ts`). `sandbox/host` is the
 Rust `sandboxd` (one Firecracker microVM per thread); `sandbox/guest` is the Go in-VM
-agent over vsock. A long command runs as a background job (`src/tools/jobs.ts`, guestd's
+agent over vsock. A request that names no repo works in the channel's default repo
+(`src/channel-repos.ts`, #126): install data in `LOREHOUSE_DB`, set by an admin through
+`/api/v1` (the one thing the admin API writes; `docs/admin-api.md`) once GitHub confirms
+the credential can read it, and looked up by `workspace_clone` from the channel of the
+turn's Slack event. The model never sets it or names the channel, and a DM has none. A
+long command runs as a background job (`src/tools/jobs.ts`, guestd's
 `/jobs`): its id is the model's and runs once, so a start June replays attaches to the job
 instead of starting a copy, and a running job holds its VM up past the idle stop
 (`SANDBOXD_JOB_HOLD_SECS`). GitHub access (`src/github-auth.ts`) is a GitHub App, with a

@@ -38,3 +38,7 @@ Each feature file starts with an H1 and one paragraph of user-visible behavior, 
 - [Direct message](./direct-message.md) covers the default redirect: one public-channel pointer, no model call, and nothing indexed.
 - [Live knowledge](./live-knowledge.md) covers a new channel message becoming citable, and a deletion dropping out of answers and the admin API.
 - [Stay quiet](./stay-quiet.md) covers a mention outside the allowlist, a mention in a private channel, and people talking without mentioning the agent.
+
+## Not driven here yet
+
+- **A channel's default repo** (#126: `@scout run the benchmark` works in the channel's default repo with no repo named; an admin sets it with `PUT /api/v1/channels/{id}/repo`). It can't be driven from this skill yet, for two reasons. Code tools are off in this instance: the helper sets no sandbox or GitHub variables and connects no runner, so `workspace_clone` isn't among the agent's tools, and a `PUT` answers `409 code_tools_off`. And the helper's `admin` command only reads. Driving the code tools through the fake runner is #50. Until then the proof is `bun run conformance --only "default repo"` (set, read, clear, refusals, a closed channel, and a mention with and without a repo named), and a real model and real GitHub for the wording and the GitHub answers.

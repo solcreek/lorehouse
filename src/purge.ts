@@ -8,6 +8,7 @@
 //   • its ingest cursor, so listing it again reads its history afresh
 //   • usage's asks and searches there, as for a deleted question (usage.ts, forgetAsk):
 //     they name its threads, and a search holds the words it was run for
+//   • its default repo (channel-repos.ts): only a listed channel has one
 // A 👍/👎 (agent_feedback) stays until retention: it holds no text and no thread. An empty
 // list purges everything learned from Slack.
 //
@@ -25,20 +26,23 @@
 // pendingPurge counts the same rows without changing anything, for `lorehouse doctor`.
 
 import type { Database } from "./sqlite";
+import { hasChannelRepos } from "./channel-repos";
 import { checkpointSoon, deleteDocument } from "./knowledge";
 
-export type ChannelPurge = { channel: string; documents: number; threads: number; cursors: number; asks: number; searches: number };
+// `repos`: the channel's default repo, 1 or 0.
+export type ChannelPurge = { channel: string; documents: number; threads: number; cursors: number; asks: number; searches: number; repos: number };
 
 const SLACK_DOCS = "kind = 'slack_thread' AND doc_id >= 'slack:' AND doc_id < 'slack;'";
 
-// Every Slack channel Lorehouse keeps something for, sorted.
+// Every Slack channel Lorehouse keeps something for, sorted. A database the doctor reads
+// before the next start has migrated it may have no channel_repos table yet.
 function knownChannels(db: Database): string[] {
   const rows = db.query(
     `SELECT substr(doc_id, 7, instr(substr(doc_id, 7), ':') - 1) AS channel FROM knowledge_documents WHERE ${SLACK_DOCS} AND instr(substr(doc_id, 7), ':') > 1
      UNION SELECT substr(source, 7) FROM ingest_cursors WHERE source >= 'slack:' AND source < 'slack;'
      UNION SELECT channel FROM agent_threads
      UNION SELECT channel FROM agent_asks
-     UNION SELECT channel FROM agent_searches`,
+     UNION SELECT channel FROM agent_searches${hasChannelRepos(db) ? " UNION SELECT channel FROM channel_repos" : ""}`,
   ).all() as { channel: string }[];
   return rows.map((r) => r.channel).filter(Boolean).sort();
 }
@@ -56,6 +60,7 @@ function counts(db: Database, channel: string): ChannelPurge {
     cursors: n(db, "SELECT count(*) AS n FROM ingest_cursors WHERE source = ?", `slack:${channel}`),
     asks: n(db, "SELECT count(*) AS n FROM agent_asks WHERE channel = ?", channel),
     searches: n(db, "SELECT count(*) AS n FROM agent_searches WHERE channel = ?", channel),
+    repos: hasChannelRepos(db) ? n(db, "SELECT count(*) AS n FROM channel_repos WHERE channel = ?", channel) : 0,
   };
 }
 
@@ -78,6 +83,7 @@ export function purgeUnlistedChannels(db: Database, listed: ReadonlySet<string>)
         cursors: db.query("DELETE FROM ingest_cursors WHERE source = ?").run(`slack:${channel}`).changes,
         asks: db.query("DELETE FROM agent_asks WHERE channel = ?").run(channel).changes,
         searches: db.query("DELETE FROM agent_searches WHERE channel = ?").run(channel).changes,
+        repos: db.query("DELETE FROM channel_repos WHERE channel = ?").run(channel).changes,
       };
     }),
   )();
@@ -87,5 +93,5 @@ export function purgeUnlistedChannels(db: Database, listed: ReadonlySet<string>)
 
 // One log line per purged channel: counts only, never what was in them.
 export function describePurge(p: ChannelPurge): string {
-  return `purge: ${p.channel} is no longer in AGENT_CHANNELS: removed ${p.documents} document(s), ${p.threads} joined thread(s), ${p.cursors} ingest cursor(s), ${p.asks} ask(s), ${p.searches} search(es)`;
+  return `purge: ${p.channel} is no longer in AGENT_CHANNELS: removed ${p.documents} document(s), ${p.threads} joined thread(s), ${p.cursors} ingest cursor(s), ${p.asks} ask(s), ${p.searches} search(es)${p.repos ? ", its default repo" : ""}`;
 }
