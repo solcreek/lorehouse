@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { createHmac, generateKeyPairSync } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { getChannelRepo, setChannelRepo } from "../src/channel-repos";
+import { getChannelRepo, listChannelRepos, setChannelRepo } from "../src/channel-repos";
 import { doctor, doctorMain, MANIFEST_SCOPES, report, type Check } from "../src/doctor";
 import { closeKnowledge, countDocuments, openKnowledge, upsertDocument } from "../src/knowledge";
 import { inThread, joinThread } from "../src/threads";
@@ -35,6 +35,8 @@ type World = {
   anthropic?: number; // status of GET /v1/models/…
   appPermissions?: Record<string, string>;
   installations?: number | "http_500" | "not_a_list";
+  repos?: Record<string, "not_installed" | "unreadable" | "down">; // owner/name → why GitHub won't serve it (default: readable)
+  branches?: string[]; // the branches every repo has (default: main)
   app?: { secret?: string; status?: object | number | string; adminToken?: string | null }; // status as a string: a non-JSON body, 200; adminToken null: /api closed
 };
 
@@ -72,6 +74,17 @@ function world(w: World = {}) {
         return Response.json(Array.from({ length: w.installations ?? 1 }, (_, id) => ({ id })));
       }
       if (url.pathname === "/user") return Response.json({ login: "octo" });
+      // A repo and its branches, as a default repo is checked (github-auth.ts, checkRepo).
+      if (url.pathname === "/app/installations/42/access_tokens") return Response.json({ token: "ghs_read", expires_at: new Date(Date.now() + 3600_000).toISOString() }, { status: 201 });
+      const repo = /^\/repos\/([^/]+\/[^/]+)(\/installation|\/branches\/(.+))?$/.exec(url.pathname);
+      if (repo) {
+        const state = w.repos?.[repo[1]!] ?? "readable";
+        if (state === "down") return new Response("oops", { status: 503 });
+        if (repo[2] === "/installation") return state === "not_installed" ? new Response("{}", { status: 404 }) : Response.json({ id: 42 });
+        if (state === "unreadable") return new Response("{}", { status: 404 });
+        if (repo[3]) return (w.branches ?? ["main"]).includes(repo[3]) ? Response.json({ name: repo[3] }) : new Response("{}", { status: 404 });
+        return Response.json({ full_name: repo[1] });
+      }
     }
     if (url.host === "app.test") {
       if (url.pathname === "/healthz") return new Response("ok");
@@ -376,6 +389,118 @@ describe("code tools", () => {
     await doctor({ env: { ...ENV, SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1", GITHUB_API_URL: "http://github.test/api/" }, fetch: f });
     expect(seen).toContain("GET github.test/api/user");
     expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
+  });
+
+  // #126: a channel's default repo was readable when an admin set it, and can go stale.
+  describe("each channel's default repo", () => {
+    // A database where C1 → acme/widgets on main and C2 → acme/gadgets; C3 has none.
+    async function withDefaults(check: (env: Record<string, string>, path: string) => Promise<void>) {
+      const dir = mkdtempSync(`${tmpdir()}/doctor-repos-`);
+      const path = `${dir}/lorehouse.db`;
+      try {
+        const db = openKnowledge(path);
+        setChannelRepo(db, { channel: "C1", repo: { owner: "acme", name: "widgets" }, branch: "main" });
+        setChannelRepo(db, { channel: "C2", repo: { owner: "acme", name: "gadgets" } });
+        db.close();
+        await check({ AGENT_CHANNELS: "C1,C2,C3", LOREHOUSE_DB: path, SESSIONS_DB: `${dir}/sessions.db` }, path);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    const repos = (checks: Check[]) => find(checks, "default repo").map((c) => `${c.level} ${c.detail}`);
+
+    test("is listed with whether the App can read it now, and the channels without one are named", async () => {
+      await withDefaults(async (env, path) => {
+        const { f, seen } = world();
+        const checks = await doctor({ env: { ...ENV, ...app, ...env }, fetch: f });
+        expect(find(checks, "default repo").every((c) => c.section === "github")).toBe(true);
+        expect(repos(checks)).toEqual([
+          "ok C1: acme/widgets, branch main: the GitHub App can read it",
+          "ok C2: acme/gadgets: the GitHub App can read it",
+          "info none for C3: a request there has to name its repo. An admin sets one with PUT /api/v1/channels/<id>/repo (docs/admin-api.md)",
+        ]);
+        expect(levels(checks).has("fail")).toBe(false);
+        // Asked the way setting it asks: the installation, a read token, the repo, its branch.
+        expect(seen).toContain("GET api.github.com/repos/acme/widgets/installation");
+        expect(seen).toContain("GET api.github.com/repos/acme/widgets/branches/main");
+        expect(seen.some((s) => s.includes("/repos/acme/gadgets/branches/"))).toBe(false);
+        // Read-only: what is stored is as it was.
+        const after = openKnowledge(path);
+        expect(listChannelRepos(after).map((r) => `${r.channel} ${r.repo} ${r.branch}`)).toEqual(["C1 acme/widgets main", "C2 acme/gadgets null"]);
+        after.close();
+      });
+    });
+
+    test("fails when the App is no longer installed on it, naming the channel, the repo and the fix", async () => {
+      await withDefaults(async (env) => {
+        const checks = await run({ ...app, ...env }, { repos: { "acme/widgets": "not_installed" } });
+        const [widgets, gadgets] = find(checks, "default repo");
+        expect(widgets).toMatchObject({ section: "github", level: "fail" });
+        expect(widgets!.detail).toStartWith("C1: acme/widgets, branch main: the GitHub App isn't installed on acme/widgets");
+        expect(widgets!.detail).toContain("install the App on that repo");
+        expect(widgets!.detail).toContain("PUT /api/v1/channels/C1/repo");
+        expect(gadgets).toMatchObject({ level: "ok" });
+      });
+    });
+
+    test("fails when its branch is gone, or the repo can't be read, or GitHub doesn't answer for it", async () => {
+      await withDefaults(async (env) => {
+        const gone = find(await run({ ...app, ...env }, { branches: ["trunk"] }), "default repo");
+        expect(gone[0]).toMatchObject({ level: "fail" });
+        expect(gone[0]!.detail).toContain("acme/widgets has no branch main");
+        expect(gone[1]).toMatchObject({ level: "ok" }); // no branch set: none to miss
+        const unreadable = find(await run({ ...app, ...env }, { repos: { "acme/gadgets": "unreadable" } }), "default repo");
+        expect(unreadable.map((c) => c.level)).toEqual(["ok", "fail", "info"]);
+        expect(unreadable[1]!.detail).toContain("can't read acme/gadgets (GitHub answered 404)");
+        const down = find(await run({ ...app, ...env }, { repos: { "acme/widgets": "down" } }), "default repo");
+        expect(down[0]).toMatchObject({ level: "fail" });
+        expect(down[0]!.detail).toContain("run this again once GitHub answers");
+      });
+    });
+
+    test("with the development GITHUB_TOKEN, it is the token that must read it", async () => {
+      await withDefaults(async (env) => {
+        const dev = { SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" };
+        expect(repos(await run({ ...dev, ...env })).slice(0, 2)).toEqual(["ok C1: acme/widgets, branch main: GITHUB_TOKEN can read it", "ok C2: acme/gadgets: GITHUB_TOKEN can read it"]);
+        const { f, seen } = world({ repos: { "acme/widgets": "unreadable" } });
+        const checks = await doctor({ env: { ...ENV, ...dev, ...env }, fetch: f });
+        expect(find(checks, "default repo")[0]).toMatchObject({ level: "fail" });
+        expect(seen.some((s) => s.endsWith("/installation"))).toBe(false); // a token has no installation
+      });
+    });
+
+    test("with a key that can't sign, it is listed and not checked", async () => {
+      await withDefaults(async (env) => {
+        const bad = "-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5\n-----END PRIVATE KEY-----";
+        const checks = await run({ ...app, GITHUB_APP_PRIVATE_KEY: bad, ...env });
+        expect(repos(checks)[0]).toBe("info C1: acme/widgets, branch main: not checked: needs a GitHub App key that signs");
+      });
+    });
+
+    test("with code tools off, one that is set is a warning, and GitHub isn't asked", async () => {
+      await withDefaults(async (env) => {
+        const { f, seen } = world();
+        const checks = await doctor({ env: { ...ENV, ...env }, fetch: f });
+        expect(find(checks, "default repo").map((c) => c.level)).toEqual(["warn", "warn"]);
+        expect(find(checks, "default repo")[0]!.detail).toStartWith("C1: acme/widgets, branch main is set, but code tools are off");
+        expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
+      });
+    });
+
+    test("one of a channel no longer listed isn't checked: the next start purges it", async () => {
+      await withDefaults(async (env) => {
+        const { f, seen } = world();
+        const checks = await doctor({ env: { ...ENV, ...app, ...env, AGENT_CHANNELS: "C2" }, fetch: f });
+        expect(repos(checks)).toEqual(["ok C2: acme/gadgets: the GitHub App can read it"]);
+        expect(seen.some((s) => s.includes("acme/widgets"))).toBe(false);
+        expect(find(checks, "purge on start")[0]!.detail).toContain("C1 (0 documents, and its default repo)");
+      });
+    });
+
+    test("none set anywhere: one line saying so, and nothing fails", async () => {
+      expect(repos(await run(app))).toEqual(["info none for C1: a request there has to name its repo. An admin sets one with PUT /api/v1/channels/<id>/repo (docs/admin-api.md)"]);
+      expect(find(await run({}), "default repo")).toEqual([]); // code tools off, none set: nothing to say
+    });
   });
 
   test("with runners, a running app with none connected fails", async () => {
