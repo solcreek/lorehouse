@@ -51,6 +51,19 @@ export function repoName(s: string): RepoRef | undefined {
   return { owner: m[1]!, name: m[2]! };
 }
 
+// A branch name a channel's default repo may carry: one `git check-ref-format --branch`
+// accepts, that a shell command can carry unquoted (it goes into `git clone --branch`),
+// and that a URL leaves as it is (it goes into /branches/<name>). So: only letters, digits
+// and . _ / - (which rules out spaces, control characters, and git's \ ~ ^ : ? * [ and
+// @{); up to 255 characters; not starting with "-"; no empty path part (no leading,
+// trailing or doubled "/"); no part starting with "." (so no "." or ".." part, which a URL
+// would resolve away); no ".."; no part ending in ".lock"; not ending in ".". Stricter
+// than git: a branch with other characters can't be a default.
+export function validBranch(branch: string): boolean {
+  if (!/^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}$/.test(branch) || branch.includes("..") || branch.endsWith(".")) return false;
+  return branch.split("/").every((part) => part !== "" && !part.startsWith(".") && !part.endsWith(".lock"));
+}
+
 // GitHub's rate limits: a 429, or a 403 that says so (the primary limit's
 // x-ratelimit-remaining: 0; a secondary limit's retry-after). `retryAfterSecs` when it says
 // how long to wait.
@@ -138,9 +151,11 @@ export function githubApp(opts: AppOptions): GithubAccess {
 //                       GITHUB_TOKEN, or an App id and key that don't match. Fix the credential
 //   rate_limited        GitHub is rate limiting the credential: wait (retryAfterSecs when it says)
 //   unavailable         GitHub didn't answer, or failed: try again. Not a verdict on the repo
-// `repo` in an ok answer is the name as GitHub spells it (its case; the new name after a rename).
+// `repo` in an ok answer is the name as GitHub spells it (its case; the new name after a
+// rename); `branch`, when one was asked about, is the name GitHub answered with, which is
+// the name asked for.
 export type RepoCheck =
-  | { ok: true; repo: RepoRef }
+  | { ok: true; repo: RepoRef; branch?: string }
   | { ok: false; reason: "not_installed" | "not_readable" | "branch_not_found" | "credential_refused" | "unavailable"; detail: string }
   | { ok: false; reason: "rate_limited"; detail: string; retryAfterSecs?: number };
 
@@ -162,9 +177,9 @@ export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { bra
     if (e instanceof GithubRefused && e.status === 401) return { ok: false, reason: "credential_refused", detail: `${REFUSED}: ${detail}` };
     return { ok: false, reason: "unavailable", detail };
   }
-  const get = async (path: string): Promise<Response | string> => {
+  const get = async (path: string, init: RequestInit = {}): Promise<Response | string> => {
     try {
-      return await f(`${api}${path}`, { headers: { ...HEADERS, authorization: `Bearer ${token}` } });
+      return await f(`${api}${path}`, { ...init, headers: { ...HEADERS, authorization: `Bearer ${token}` } });
     } catch (e) {
       return `GitHub didn't answer: ${e instanceof Error ? e.message : e}`;
     }
@@ -191,16 +206,27 @@ export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { bra
   const canonical = typeof named === "string" ? repoName(named) : undefined;
   if (!canonical) return { ok: false, reason: "unavailable", detail: `GitHub's answer for ${full} didn't name the repo as owner/name` };
 
-  if (opts.branch !== undefined) {
-    // Each part of the name encoded, the slashes kept: a branch may be "release/2026.11".
-    const b = await get(`/repos/${canonical.owner}/${canonical.name}/branches/${opts.branch.split("/").map(encodeURIComponent).join("/")}`);
-    if (typeof b === "string") return { ok: false, reason: "unavailable", detail: b };
-    const noBranch = refused(b, `the branch ${opts.branch} of ${full}`);
-    if (noBranch) return noBranch;
-    if (b.status === 404) return { ok: false, reason: "branch_not_found", detail: `${canonical.owner}/${canonical.name} has no branch ${opts.branch}` };
-    if (!b.ok) return { ok: false, reason: "unavailable", detail: `GitHub answered ${b.status} for the branch ${opts.branch} of ${full}` };
-  }
-  return { ok: true, repo: canonical };
+  if (opts.branch === undefined) return { ok: true, repo: canonical };
+
+  // The branch that gets stored must be the branch that was asked about, so the answer has
+  // to be about that very name:
+  //   • a name a URL would rewrite ("a/./b" asks about "a/b") is never sent (validBranch);
+  //   • each part is encoded, the slashes kept: a branch may be "release/2026.11";
+  //   • a redirect isn't followed: GitHub redirects a renamed branch to its new name, and
+  //     the old one is no longer there to clone;
+  //   • the name in the answer must be the name asked for.
+  const missing: Failed = { ok: false, reason: "branch_not_found", detail: `${canonical.owner}/${canonical.name} has no branch ${opts.branch}` };
+  if (!validBranch(opts.branch)) return missing;
+  const b = await get(`/repos/${canonical.owner}/${canonical.name}/branches/${opts.branch.split("/").map(encodeURIComponent).join("/")}`, { redirect: "manual" });
+  if (typeof b === "string") return { ok: false, reason: "unavailable", detail: b };
+  const noBranch = refused(b, `the branch ${opts.branch} of ${full}`);
+  if (noBranch) return noBranch;
+  if (b.status === 404) return missing;
+  if (b.status >= 300 && b.status < 400) return { ...missing, detail: `${missing.detail} (GitHub redirects it: the branch was renamed)` };
+  if (!b.ok) return { ok: false, reason: "unavailable", detail: `GitHub answered ${b.status} for the branch ${opts.branch} of ${full}` };
+  const answered = ((await b.json().catch(() => undefined)) as { name?: unknown } | undefined)?.name;
+  if (answered !== opts.branch) return missing;
+  return { ok: true, repo: canonical, branch: answered };
 }
 
 // A PEM from the environment: platforms often store it with literal "\n" escapes.

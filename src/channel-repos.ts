@@ -18,12 +18,8 @@ export type ChannelRepo = { channel: string; repo: string; branch: string | null
 // A Slack channel id, as the admin API takes one.
 export const CHANNEL_ID = /^[A-Z0-9]{1,32}$/;
 
-// A branch name that is safe unquoted in a shell command and that git accepts: the
-// characters branch names are made of, no "..", no leading "-", "/" or ".", no trailing
-// "/", "." or ".lock", no empty path part.
-export function validBranch(branch: string): boolean {
-  return /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$/.test(branch) && !branch.includes("..") && !branch.includes("//") && !/[/.]$/.test(branch) && !branch.endsWith(".lock");
-}
+// What a branch name may be (github-auth.ts): the rule for what is stored here.
+export { validBranch } from "./github-auth";
 
 const SELECT = "SELECT channel, owner || '/' || name AS repo, branch, set_at AS setAt FROM channel_repos";
 

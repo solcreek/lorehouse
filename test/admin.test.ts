@@ -377,7 +377,7 @@ describe("a channel's default repo", () => {
     const checkRepo: NonNullable<AdminOptions["checkRepo"]> = async (repo, branch) => {
       const full = `${repo.owner}/${repo.name}`;
       asked.push(branch === undefined ? full : `${full}@${branch}`);
-      return over?.(full, branch) ?? { ok: true, repo };
+      return over?.(full, branch) ?? { ok: true, repo, ...(branch === undefined ? {} : { branch }) };
     };
     return { checkRepo, asked };
   }
@@ -492,8 +492,15 @@ describe("a channel's default repo", () => {
 
   test("invalid_branch (400): not a branch name", async () => {
     const r = repoSetup();
-    for (const branch of [7, "", "-rf", "a b", "a..b", "$(id)", ["main"]]) await refused(r, { repo: "acme/widgets", branch }, 400, "invalid_branch");
+    for (const branch of [7, "", "-rf", "a b", "a..b", "$(id)", ["main"], "a/./b", "a/../b", "a//b", "a/b.lock", "x".repeat(256)]) await refused(r, { repo: "acme/widgets", branch }, 400, "invalid_branch");
     expect(r.asked).toEqual([]);
+  });
+
+  test("the branch stored is the one GitHub confirmed: an ok that doesn't name the branch asked for stores nothing", async () => {
+    for (const answered of [undefined, "trunk"]) {
+      const r = repoSetup({ checkRepo: github((_, branch) => (branch ? { ok: true, repo: { owner: "acme", name: "widgets" }, ...(answered ? { branch: answered } : {}) } : undefined)).checkRepo });
+      await refused(r, { repo: "acme/widgets", branch: "main" }, 502, "github_unavailable");
+    }
   });
 
   test("code_tools_off (409): with no GitHub credential there is nothing to check with, and nothing to use it", async () => {

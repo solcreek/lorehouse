@@ -66,7 +66,13 @@ describe("a channel's default repo", () => {
   });
 
   test("a branch name is what git accepts and a shell command can carry unquoted", () => {
-    for (const ok of ["main", "release/2026.11", "feat/channel-default-repo", "v1.2.3", "a_b"]) expect([ok, validBranch(ok)]).toEqual([ok, true]);
-    for (const bad of ["", "-rf", "/main", "main/", "a..b", "a//b", "main.lock", "main.", ".hidden", "a b", "a;rm -rf /", "$(id)", "a'b", "a~1", "a^", "a:b", "x".repeat(201)]) expect([bad, validBranch(bad)]).toEqual([bad, false]);
+    for (const ok of ["main", "release/2026.11", "feat/channel-default-repo", "v1.2.3", "a_b", "a/b.c/d", "x".repeat(255)]) expect([ok, validBranch(ok)]).toEqual([ok, true]);
+    for (const bad of ["", "-rf", "/main", "main/", "a..b", "a//b", "main.lock", "main.", ".hidden", "a b", "a;rm -rf /", "$(id)", "a'b", "a~1", "a^", "a:b", "x".repeat(256)]) expect([bad, validBranch(bad)]).toEqual([bad, false]);
+  });
+
+  // What `git check-ref-format --branch` refuses, and what a URL would normalize away: a
+  // name is stored only if it is, part for part, what GitHub was asked about.
+  test("a branch name has no '.' or '..' part, no empty part, no part that starts with '.' or ends in '.lock', and none of git's forbidden characters", () => {
+    for (const bad of ["a/./b", "a/../b", "./a", "a/.", "a/..", "a/.b", "a/b.lock/c", "a.lock/b", "a/b/", "a/b.", "@", "a@{b", "a\\b", "a?b", "a*b", "a[b", "a\tb", "a\nb", "a\u007fb", "a\u0000b", "-a/b"]) expect([JSON.stringify(bad), validBranch(bad)]).toEqual([JSON.stringify(bad), false]);
   });
 });

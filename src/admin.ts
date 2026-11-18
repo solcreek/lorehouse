@@ -245,8 +245,11 @@ export function adminRoutes(opts: AdminOptions) {
       if (check.reason === "rate_limited") throw new Refusal(503, "github_rate_limited", `${check.detail}, so ${full} couldn't be checked and nothing was changed: wait${check.retryAfterSecs !== undefined ? ` ${check.retryAfterSecs} s (Retry-After)` : ""}, then set it again`, check.retryAfterSecs !== undefined ? { "retry-after": String(check.retryAfterSecs) } : {});
       throw new Refusal(502, "github_unavailable", `couldn't check ${full} with GitHub (${check.detail}); nothing was changed, try again`);
     }
+    // Stored: the repo and the branch as GitHub answered them, and the branch only if that
+    // is the one asked for.
+    if (check.branch !== want.branch) throw new Refusal(502, "github_unavailable", `GitHub's answer for ${full} didn't confirm the branch ${want.branch}; nothing was changed, try again`);
     const before = getChannelRepo(db, channel);
-    const now = setChannelRepo(db, { channel, repo: check.repo, branch: want.branch });
+    const now = setChannelRepo(db, { channel, repo: check.repo, branch: check.branch });
     if (before?.repo !== now.repo || before.branch !== now.branch) opts.log?.(`admin: ${channel}'s default repo is now ${now.repo}${now.branch ? ` (branch ${now.branch})` : ""}`);
     return json({ channel, defaultRepo: shown(now) });
   }

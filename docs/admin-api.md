@@ -192,11 +192,11 @@ doesn't change, so a script or an agent can branch on it.
 | 404 | `channel_not_listed` | GET or PUT for a channel that isn't on `AGENT_CHANNELS` (a DM, a private channel, one the agent doesn't work in) | add the channel to `AGENT_CHANNELS` and restart |
 | 400 | `invalid_body` | PUT's body isn't a JSON object, is over 4096 characters, or has a field other than `repo` and `branch` | send `{ "repo": "owner/name" }` |
 | 400 | `invalid_repo` | `repo` is missing or isn't `owner/name` | name the repo as `owner/name`, not its URL |
-| 400 | `invalid_branch` | `branch` isn't a branch name | name a branch, or leave it out |
+| 400 | `invalid_branch` | `branch` isn't a branch name Lorehouse takes: letters, digits and `. _ / -`, up to 255 characters, no part that is empty, starts with `.` or ends in `.lock`, no `..`, no leading `-`, no trailing `.` (stricter than git: a branch with other characters can't be a default) | name such a branch, or leave it out |
 | 409 | `code_tools_off` | PUT on an install with no sandbox and no GitHub credential: there is nothing to check the repo with, and nothing would use it | turn code tools on, restart, set it again |
 | 422 | `app_not_installed` | the GitHub App isn't installed on the repo | install the App on that repo, set it again |
 | 422 | `repo_not_readable` | the credential gets no read of the repo (a 404, or a 403 that isn't a rate limit): there is no such repo, or it has no access | check the name, or give the credential access |
-| 422 | `branch_not_found` | the repo is readable and has no such branch | name a branch that exists, or leave `branch` out |
+| 422 | `branch_not_found` | the repo is readable and has no branch of exactly that name (a renamed branch, which GitHub redirects to its new name, counts as gone) | name a branch that exists, or leave `branch` out |
 | 502 | `credential_refused` | GitHub refused the install's own credential (a 401): `GITHUB_TOKEN` expired or revoked, or an App id and key that don't match | fix the credential (`lorehouse doctor` checks it) and restart; the repo's access is not the problem |
 | 503 | `github_rate_limited` | GitHub is rate limiting the credential (a 429, or a 403 that says so) | wait, then set it again; `Retry-After` carries GitHub's own, in seconds, when it gave one |
 | 502 | `github_unavailable` | GitHub didn't answer in time, or failed (a 5xx) | try again; if it keeps failing, `lorehouse doctor` |

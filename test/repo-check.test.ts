@@ -140,11 +140,43 @@ describe("checkRepo", () => {
 
   test("a branch is looked up only when given: there, or branch_not_found; a slash in its name stays a slash", async () => {
     const api = fakeApi();
-    expect(await checkRepo(token(api), widgets, { fetch: api.f, branch: "release/2026.11" })).toEqual({ ok: true, repo: widgets });
+    expect(await checkRepo(token(api), widgets, { fetch: api.f, branch: "release/2026.11" })).toEqual({ ok: true, repo: widgets, branch: "release/2026.11" });
     expect(api.reqs.at(-1)!.path).toBe("/repos/acme/widgets/branches/release/2026.11");
+    expect((await checkRepo(token(api), widgets, { fetch: api.f }) as { branch?: string }).branch).toBeUndefined();
     const none = fakeApi({ branch: 404 });
     const r = await checkRepo(token(none), widgets, { fetch: none.f, branch: "nope" });
     expect(r).toEqual({ ok: false, reason: "branch_not_found", detail: "acme/widgets has no branch nope" });
+  });
+
+  // The branch stored must be the branch that was checked. A URL is normalized on the way
+  // ("a/./b" asks about "a/b"), and GitHub redirects a renamed branch to its new name.
+  test("a branch GitHub answers under another name isn't that branch: branch_not_found", async () => {
+    // As fetch normalizes it: asked for a/./b, GitHub is asked for, and answers, a/b.
+    const seen: string[] = [];
+    const normalizing = (async (url: string) => {
+      const path = new URL(url).pathname; // "/branches/a/./b" → "/branches/a/b"
+      seen.push(path);
+      return path.includes("/branches/") ? Response.json({ name: path.split("/branches/")[1] }) : Response.json({ full_name: "acme/widgets" });
+    }) as unknown as typeof fetch;
+    expect(await checkRepo(staticToken("t", { fetch: normalizing }), widgets, { fetch: normalizing, branch: "a/./b" })).toMatchObject({ ok: false, reason: "branch_not_found" });
+    // A branch name is never sent as path parts that a URL would resolve.
+    expect(seen.some((p) => p.endsWith("/branches/a/b"))).toBe(false);
+    // An answer naming another branch, or none.
+    for (const body of [{ name: "trunk" }, {}, { name: 7 }]) {
+      const f = (async (url: string) => (new URL(url).pathname.includes("/branches/") ? Response.json(body) : Response.json({ full_name: "acme/widgets" }))) as unknown as typeof fetch;
+      expect(await checkRepo(staticToken("t", { fetch: f }), widgets, { fetch: f, branch: "main" })).toEqual({ ok: false, reason: "branch_not_found", detail: "acme/widgets has no branch main" });
+    }
+  });
+
+  test("a renamed branch, which GitHub redirects (301), is not followed: branch_not_found under its old name", async () => {
+    const asked: (string | undefined)[] = [];
+    const f = (async (url: string, init: RequestInit = {}) => {
+      if (!new URL(url).pathname.includes("/branches/")) return Response.json({ full_name: "acme/widgets" });
+      asked.push(init.redirect);
+      return new Response("", { status: 301, headers: { location: "https://api.github.com/repos/acme/widgets/branches/main" } });
+    }) as unknown as typeof fetch;
+    expect(await checkRepo(staticToken("t", { fetch: f }), widgets, { fetch: f, branch: "master" })).toEqual({ ok: false, reason: "branch_not_found", detail: "acme/widgets has no branch master (GitHub redirects it: the branch was renamed)" });
+    expect(asked).toEqual(["manual"]);
   });
 
   test("asks GitHub where it is told to (GITHUB_API_URL)", async () => {
