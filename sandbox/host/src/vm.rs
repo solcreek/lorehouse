@@ -883,9 +883,6 @@ fn vm_config(cfg: &Config, slot_index: usize, granted: &Granted) -> serde_json::
     })
 }
 
-/// A Firecracker rate limiter: token buckets refilled every second with one second's
-/// worth, plus a one-time burst of five seconds' worth for a boot or the start of a
-/// clone. 0 leaves that bucket out (unlimited); both 0, no limiter.
 /// Whether a new disk cap has to be checked against what the sandbox has written: when it
 /// is less than the cap the sandbox's record names, and whenever no cap is recorded. A
 /// sandbox made with no request has no record: its cap was the host's default when it was
@@ -895,6 +892,9 @@ fn lowers_disk(stored: Option<&Granted>, new_gib: u64) -> bool {
     stored.and_then(|s| s.disk_gib).is_none_or(|old| new_gib < old)
 }
 
+/// A Firecracker rate limiter: token buckets refilled every second with one second's
+/// worth, plus a one-time burst of five seconds' worth for a boot or the start of a
+/// clone. 0 leaves that bucket out (unlimited); both 0, no limiter.
 fn rate_limiter(bytes_per_sec: u64, ops_per_sec: u64) -> Option<serde_json::Value> {
     let bucket = |per_sec: u64| serde_json::json!({ "size": per_sec, "one_time_burst": per_sec * 5, "refill_time": 1000 });
     let mut limiter = serde_json::json!({});
