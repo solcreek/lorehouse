@@ -398,6 +398,22 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    // ADR 0002: today's agent is the first profile, id `lorehouse`, started by Slack. Each
+    // profile is { id, mode, triggers }, a trigger tagged by `kind`; the events are the ones
+    // in force, so a DM is one only while the install answers DMs.
+    name: "GET /status lists the profiles: lorehouse, interactive, started by Slack mentions and follow-ups, and by DMs only with DM_MODE=answer",
+    run: async () => {
+      const profiles = async () => JSON.stringify(((await status()) as Status & { profiles?: unknown }).profiles);
+      const want = (events: string[]) => JSON.stringify([{ id: "lorehouse", mode: "interactive", triggers: [{ kind: "slack", events }] }]);
+      const byDefault = await profiles();
+      if (byDefault !== want(["mention", "follow_up"])) return `/status profiles ${byDefault}, want ${want(["mention", "follow_up"])}`;
+      return inMode({ DM_MODE: "answer" }, async () => {
+        const answering = await profiles();
+        return answering === want(["mention", "follow_up", "direct_message"]) ? null : `DM_MODE=answer: /status profiles ${answering}, want ${want(["mention", "follow_up", "direct_message"])}`;
+      });
+    },
+  },
+  {
     // ADR 0005 §2: the tenant id is in every key, path and log line, and /status names it
     // with the install's data directory. LOREHOUSE_DB is set here, so the data directory is
     // the one it names; the tenant is kept there (<dataDir>/<tenant>/tenant.json), and the

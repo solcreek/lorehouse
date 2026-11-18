@@ -18,7 +18,7 @@ import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
 import { PDF_SKILLS, SKILLS, profilePrompt } from "./prompts";
-import { loadProfiles, PROFILES, selectByName, slackTrigger, type Profile } from "./profiles";
+import { loadProfiles, PROFILES, profileStatus, selectByName, slackTrigger, type Profile } from "./profiles";
 import { renderPdfTool, typstRenderer } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
@@ -446,6 +446,9 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
         if (refusal) return refusal;
         return Response.json({
           agent: identity.name,
+          // The profiles behind that one name (ADR 0002): each one's id, mode, and the
+          // triggers in force on this install. Nothing of their prompts or tools.
+          profiles: profiles.map((profile) => profileStatus(profile, { dm })),
           // Whose data this is, and the install's data directory: the tenant's files are in
           // <dataDir>/<tenant>/ unless LOREHOUSE_DB or SESSIONS_DB name others.
           tenant: tenant.id,
