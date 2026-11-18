@@ -153,7 +153,11 @@ are refused any channel but the one being answered in and the listed ones
 channel no longer listed from `LOREHOUSE_DB` (its documents, joined threads, cursor, asks
 and searches; not June's sessions); `src/threads.ts` decides follow-ups (reply in a joined
 thread without a new mention, but not when it mentions someone else/@channel); `src/dm.ts`
-handles `DM_MODE`. People are named as plain
+handles `DM_MODE`. `src/turns.ts` decides each event that may start a turn, in the two
+steps June calls in order (look the sender up, then answer, refuse or nothing). A thread
+is joined only when its mention is accepted, never for a refused asker's; a reply that
+arrives while that mention is still being looked up waits for it (at most 12 s), then is
+decided as any reply is (#163). People are named as plain
 text, never @-mentioned (`src/tools/slack-names.ts`), and that is enforced in code, not left
 to the prompt: everything posted to Slack goes through `src/slack-guard.ts`, which rewrites
 `<@U…>`, `<!channel>`, `<!here>`, `<!everyone>` and `<!subteam^…>` as plain names, and

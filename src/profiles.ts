@@ -35,6 +35,7 @@ const isCodeTool = (tool: string) => tool.startsWith("workspace_") || tool === "
 //                   the thread, and only a mention that is a trigger does
 //   follow_up       a reply in a thread the agent was mentioned in (src/threads.ts): it
 //                   needs `mention`, since only a mention opens such a thread
+// src/turns.ts decides each event by them (turnGate's `startsOn`).
 //   direct_message  a DM, and only while the install answers them (DM_MODE=answer): a
 //                   profile may ask for DMs, it can't turn them on (ADR 0002 §6)
 export const SLACK_TRIGGER_EVENTS = ["mention", "follow_up", "direct_message"] as const;
@@ -237,22 +238,6 @@ export type ProfileInstall = { dm: DmMode };
 // has off (a DM starts a turn only under DM_MODE=answer).
 export function activeTriggers(profile: Profile, install: ProfileInstall): ProfileTrigger[] {
   return profile.triggers.map((t) => ({ kind: t.kind, events: t.events.filter((e) => e !== "direct_message" || install.dm === "answer") }));
-}
-
-// Which Slack messages start a turn of this profile on this install: its Slack trigger's
-// events, a DM only while the install answers DMs too. A profile Slack doesn't start: none.
-export type SlackStarts = { readonly mention: boolean; readonly followUp: boolean; readonly directMessage: boolean };
-
-export function slackStarts(profile: Profile, install: ProfileInstall): SlackStarts {
-  const events = new Set(activeTriggers(profile, install).flatMap((t) => (t.kind === "slack" ? t.events : [])));
-  return { mention: events.has("mention"), followUp: events.has("follow_up"), directMessage: events.has("direct_message") };
-}
-
-// Whether a Slack event starts a turn. `isFollowUp` (src/threads.ts) is asked only when
-// follow-ups are a trigger and nothing before it matched. A mention that starts no turn
-// must not join its thread either: the caller joins only when `starts.mention`.
-export function startsTurn(starts: SlackStarts, event: { kind: string; channelType?: string }, isFollowUp: () => boolean): boolean {
-  return (starts.mention && event.kind === "app_mention") || (starts.directMessage && event.channelType === "im") || (starts.followUp && isFollowUp());
 }
 
 // A profile as GET /status lists it: ids are strings, and each trigger is tagged by `kind`.

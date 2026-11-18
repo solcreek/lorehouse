@@ -513,7 +513,7 @@ async function mention(): Promise<never> {
   const ts = allocateTs(state);
   const event: Record<string, unknown> = {
     type: "app_mention",
-    user: "U1",
+    user: flag("user") ?? "U1",
     team: "T1",
     text: `<@UBOT> ${text}`,
     ts,
@@ -536,7 +536,7 @@ async function reply(): Promise<never> {
     type: "message",
     channel: flag("channel") ?? state.channel,
     channel_type: "channel",
-    user: "U1",
+    user: flag("user") ?? "U1",
     text,
     ts,
     event_ts: ts,
@@ -707,6 +707,21 @@ async function admin(): Promise<never> {
   await finish(state, { ok: true, status: result.status, body: result.body });
 }
 
+// Hold the stand-in's answer to users.info about one person, as a slow membership lookup
+// (--state on), or let it go (--state off). `waiting` is how many such lookups wait now.
+async function holdLookup(): Promise<never> {
+  const state = loadSelected();
+  const user = flag("user");
+  const hold = flag("state");
+  if (!user || (hold !== "on" && hold !== "off")) fail("hold-lookup needs --user <id> and --state on|off");
+  const result = await mockJson(state, "/fixtures/hold", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ method: "users.info", user, hold: hold === "on" }),
+  });
+  await finish(state, { ok: result.status === 200, user, held: hold === "on", waiting: result.body?.waiting ?? null }, result.status === 200 ? 0 : 1);
+}
+
 async function resetLog(): Promise<never> {
   const state = loadSelected();
   const result = await mockJson(state, "/reset", { method: "POST" });
@@ -806,6 +821,7 @@ const commands: Record<string, () => Promise<never> | never> = {
   status,
   admin,
   "reset-log": resetLog,
+  "hold-lookup": holdLookup,
   list,
   cleanup,
 };
