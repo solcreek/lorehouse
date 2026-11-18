@@ -38,7 +38,12 @@ export type CloneOptions = {
   defaultRepo?: (channel: string) => DefaultRepo | undefined;
 };
 
-const sameRepo = (a: RepoRef, b: RepoRef) => a.owner.toLowerCase() === b.owner.toLowerCase() && a.name.toLowerCase() === b.name.toLowerCase();
+// GitHub's owner and repo names are case-insensitive: "Acme/Widgets" is acme/widgets. Every
+// comparison of two repos here goes through this. Which spelling is cloned and reported:
+// the channel default's (GitHub's own, as the admin API stored it) when the repo is the
+// default, however the request spelt it; the checkout's when one is already there; else
+// the request's.
+export const sameRepo = (a: RepoRef, b: RepoRef) => a.owner.toLowerCase() === b.owner.toLowerCase() && a.name.toLowerCase() === b.name.toLowerCase();
 
 type Chosen = { repo: RepoRef; branch?: string; source: "named" | "channel_default" };
 
@@ -51,8 +56,11 @@ function choose(input: { repo?: unknown } | undefined, ctx: ToolContext, opts: C
   // The default's branch, for the default repo only. It goes into a shell command: one
   // that isn't a plain branch name (a row edited by hand; the admin API refuses it) is
   // never used.
-  const withBranch = (c: Chosen): Chosen | { error: string } => {
-    if (!set?.branch || !fallback || !sameRepo(fallback, c.repo)) return c;
+  const withBranch = (chosen: Chosen): Chosen | { error: string } => {
+    if (!fallback || !sameRepo(fallback, chosen.repo)) return chosen;
+    // The default, however it was spelt: in the default's spelling.
+    const c = { ...chosen, repo: fallback };
+    if (!set?.branch) return c;
     if (!validBranch(set.branch)) return { error: "this channel's default branch isn't a usable branch name; an admin has to set the channel's default repo again (docs/admin-api.md)" };
     return { ...c, branch: set.branch };
   };
@@ -114,15 +122,16 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess, opts: Cl
               return undefined;
             }
           })();
-          if (!current || current.owner !== repo.owner || current.name !== repo.name) {
+          if (!current || !sameRepo(current, repo)) {
             // Named only as owner/name: the remote URL itself may carry a credential.
             const holds = current ? `${current.owner}/${current.name}` : "a different repository";
             return { error: `${WORKDIR} already holds ${holds}; this thread's sandbox has one checkout` };
           }
           const r = await sb.exec(git("fetch --prune origin"), { cwd: WORKDIR, env, timeoutMs: 5 * 60_000 });
           if (r.exitCode !== 0) return { error: `fetch failed: ${r.stderr.slice(-500)}${hint}` };
-          // The checkout stays on whatever branch the thread left it on.
-          return { status: "fetched", repo: `${repo.owner}/${repo.name}`, path: WORKDIR, source, ...(await commitAs(sb)) };
+          // The checkout stays on whatever branch the thread left it on, and is reported as
+          // it was cloned.
+          return { status: "fetched", repo: `${current.owner}/${current.name}`, path: WORKDIR, source, ...(await commitAs(sb)) };
         }
         const r = await sb.exec(git(`clone ${branch ? `--branch ${branch} ` : ""}${url} ${WORKDIR}`), { cwd: "/", env, timeoutMs: 10 * 60_000 });
         if (r.exitCode !== 0) return { error: `clone failed: ${r.stderr.slice(-500)}${hint}` };

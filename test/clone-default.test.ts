@@ -79,6 +79,44 @@ describe("workspace_clone: which repo", () => {
     }
   });
 
+  // GitHub's owner and repo names are case-insensitive: one thread, one checkout, however
+  // each request spells it. A sandbox that remembers what was cloned into it.
+  function thread() {
+    let origin: string | undefined;
+    const sb = {
+      async exec(command: string) {
+        if (command.includes("remote get-url origin")) return origin ? { exitCode: 0, stdout: `${origin}\n`, stderr: "" } : { exitCode: 2, stdout: "", stderr: "" };
+        const clone = / clone (?:--branch \S+ )?(\S+) \/workspace\/repo$/.exec(command);
+        if (clone) origin = clone[1];
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    } as unknown as Sandbox;
+    const tool = cloneTool(() => sb, async () => "ghs_read", { defaultRepo: (channel) => DEFAULTS[channel] });
+    return { tool, origin: () => origin };
+  }
+
+  test("the default named in another case, then no repo named: the same checkout, fetched, not a second repo", async () => {
+    const t = thread();
+    // Named as the channel's default in another case: cloned as GitHub spells it, the default's spelling.
+    expect(await t.tool.run({ repo: "Acme/Widgets" }, inChannel("C1"))).toEqual({ status: "cloned", repo: "acme/widgets", path: "/workspace/repo", source: "named", branch: "main" });
+    expect(t.origin()).toBe("https://github.com/acme/widgets.git");
+    expect(await t.tool.run({}, inChannel("C1"))).toEqual({ status: "fetched", repo: "acme/widgets", path: "/workspace/repo", source: "channel_default" });
+  });
+
+  test("no repo named, then the default named in another case: the same checkout, fetched", async () => {
+    const t = thread();
+    expect(await t.tool.run({}, inChannel("C1"))).toMatchObject({ status: "cloned", repo: "acme/widgets" });
+    expect(await t.tool.run({ repo: "ACME/WIDGETS" }, inChannel("C1"))).toEqual({ status: "fetched", repo: "acme/widgets", path: "/workspace/repo", source: "named" });
+  });
+
+  test("with no default: a repo named twice in different cases is one checkout, reported as it was cloned", async () => {
+    const t = thread();
+    expect(await t.tool.run({ repo: "Acme/Other" }, inChannel("C9"))).toMatchObject({ status: "cloned", repo: "Acme/Other" });
+    expect(await t.tool.run({ repo: "acme/other" }, inChannel("C9"))).toEqual({ status: "fetched", repo: "Acme/Other", path: "/workspace/repo", source: "named" });
+    // A different repo is still refused, naming what is there as it was cloned.
+    expect(await t.tool.run({ repo: "acme/another" }, inChannel("C9"))).toMatchObject({ error: expect.stringContaining("already holds Acme/Other") });
+  });
+
   test("no repo named and no default: the model is told to ask which repo, and nothing runs", async () => {
     const s = setup();
     const r = (await s.tool.run({}, inChannel("C9"))) as { error: string };
