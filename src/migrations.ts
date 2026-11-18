@@ -12,6 +12,7 @@ import m0009 from "../migrations/0009_usage.sql" with { type: "text" };
 import m0010 from "../migrations/0010_fts_secure_delete.sql" with { type: "text" };
 import m0011 from "../migrations/0011_pr_approvals.sql" with { type: "text" };
 import m0012 from "../migrations/0012_sandbox_jobs.sql" with { type: "text" };
+import m0013 from "../migrations/0013_channel_repos.sql" with { type: "text" };
 
 export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   { version: 1, name: "0001_knowledge.sql", sql: m0001 },
@@ -26,4 +27,5 @@ export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
   { version: 10, name: "0010_fts_secure_delete.sql", sql: m0010 },
   { version: 11, name: "0011_pr_approvals.sql", sql: m0011 },
   { version: 12, name: "0012_sandbox_jobs.sql", sql: m0012 },
+  { version: 13, name: "0013_channel_repos.sql", sql: m0013 },
 ];
