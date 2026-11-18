@@ -565,9 +565,9 @@ impl Manager {
         }
         let has = stored.clone().unwrap_or_else(|| self.policy.defaults.clone());
         let capped = quota::capped(&self.quota, &sb.dir);
-        // Less disk than it had: only if what it has written fits. Usage that can't be
-        // read is not taken to fit.
-        if let Some(new) = want.disk_gib.filter(|new| capped && has.disk_gib.is_none_or(|old| *new < old)) {
+        // Less disk than it had (or than it may have had: lowers_disk): only if what it has
+        // written fits. Usage that can't be read is not taken to fit.
+        if let Some(new) = want.disk_gib.filter(|new| capped && lowers_disk(stored.as_ref(), *new)) {
             let used = quota::used_bytes(&sb.dir).await.map_err(|e| AcquireError::Failed(500, format!("sandbox {}'s disk usage couldn't be read, so its cap is not lowered to {new} GiB: {e}", sb.id)))?;
             if used > new << 30 {
                 return Err(resources::disk_in_use(&sb.id, new, used).into());
@@ -886,6 +886,15 @@ fn vm_config(cfg: &Config, slot_index: usize, granted: &Granted) -> serde_json::
 /// A Firecracker rate limiter: token buckets refilled every second with one second's
 /// worth, plus a one-time burst of five seconds' worth for a boot or the start of a
 /// clone. 0 leaves that bucket out (unlimited); both 0, no limiter.
+/// Whether a new disk cap has to be checked against what the sandbox has written: when it
+/// is less than the cap the sandbox's record names, and whenever no cap is recorded. A
+/// sandbox made with no request has no record: its cap was the host's default when it was
+/// made, and that may have been lowered since (SANDBOXD_DISK_QUOTA_GIB), so today's
+/// default is no measure of what it may hold.
+fn lowers_disk(stored: Option<&Granted>, new_gib: u64) -> bool {
+    stored.and_then(|s| s.disk_gib).is_none_or(|old| new_gib < old)
+}
+
 fn rate_limiter(bytes_per_sec: u64, ops_per_sec: u64) -> Option<serde_json::Value> {
     let bucket = |per_sec: u64| serde_json::json!({ "size": per_sec, "one_time_burst": per_sec * 5, "refill_time": 1000 });
     let mut limiter = serde_json::json!({});
@@ -1226,6 +1235,23 @@ pub mod tests {
         assert!(vms.acquire_for("up", Some(&request(serde_json::json!({ "vcpus": 2 }))), false).await.is_ok());
         assert!(vms.acquire_for("up", Some(&asked), true).await.is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_disk_cap_is_checked_against_usage_when_it_is_less_than_the_recorded_one_or_none_is_recorded() {
+        use super::lowers_disk;
+        let with = |disk_gib| crate::resources::Granted { disk_gib, ..stock() };
+        // Less than the record's: what is written has to fit. The same or more: it does.
+        assert!(lowers_disk(Some(&with(Some(8))), 4));
+        assert!(!lowers_disk(Some(&with(Some(8))), 8));
+        assert!(!lowers_disk(Some(&with(Some(8))), 16));
+        // No record (made with no request), or one with no size: the cap it has is not
+        // known here. It was the host's default when it was made, which may have been
+        // lowered since: a sandbox holding 6 GiB under an 8 GiB default, asked for 4 once
+        // the default is 4, is not "the same as it had".
+        assert!(lowers_disk(None, 4));
+        assert!(lowers_disk(None, 8));
+        assert!(lowers_disk(Some(&with(None)), 4));
     }
 
     #[tokio::test]
