@@ -41,9 +41,9 @@ const BASE = {
 const EVERYTHING = { ...BASE, SANDBOX_URL: "http://127.0.0.1:9", SANDBOX_TOKEN: "t", GITHUB_TOKEN: "g", PDF_REPLIES: "1" };
 
 // What June was given by one start with `env`.
-async function agentsOf(env: Record<string, string>) {
+async function agentsOf(env: Record<string, string>, profiles?: unknown[]) {
   defined.length = 0;
-  const app = await createApp(loadConfig(env));
+  const app = await createApp(loadConfig(env), profiles);
   await app.close({ waitMs: 100 });
   return defined.map((a) => ({
     id: a.name,
@@ -62,6 +62,33 @@ describe("what the app hands June", () => {
 
   test("with a sandbox and PDF replies on: the code tools, render_pdf and pdf-report join, in this order", async () => {
     expect(await agentsOf(EVERYTHING)).toEqual(PINNED.everything);
+  });
+});
+
+describe("a profile becomes an agent (src/profiles.ts, ADR 0002)", () => {
+  // A second profile, as #44 will add one: an automation nothing in Slack starts.
+  const second = { id: "second", mode: "automation", prompt: "lorehouse", tools: ["recent_knowledge", "search_knowledge", "open_pull_request"], skills: ["write-a-skill"], triggers: [], sandbox: "write" };
+
+  test("a second profile is a second agent under its own id, beside an unchanged first", async () => {
+    const { LOREHOUSE } = await import("../src/profiles");
+    const agents = await agentsOf(BASE, [LOREHOUSE, second]);
+    expect(agents.map((a) => a.id)).toEqual(["lorehouse", "second"]);
+    expect(agents[0]).toEqual(PINNED.base[0]!);
+  });
+
+  test("it gets the tools and skills it names, in its order, less those the install has off, and no Slack channel", async () => {
+    const { LOREHOUSE } = await import("../src/profiles");
+    const [, off] = await agentsOf(BASE, [LOREHOUSE, second]);
+    // No sandbox: open_pull_request is off. With no channel, none of the channel's tools.
+    expect(off).toMatchObject({ tools: ["recent_knowledge", "search_knowledge", "read_skill"], skills: ["write-a-skill"], channels: [] });
+    const [, on] = await agentsOf(EVERYTHING, [LOREHOUSE, second]);
+    expect(on).toMatchObject({ tools: ["recent_knowledge", "search_knowledge", "open_pull_request", "read_skill"], skills: ["write-a-skill"], channels: [] });
+  });
+
+  test("a wrong profile stops the start before anything is defined, naming the field", async () => {
+    defined.length = 0;
+    await expect(createApp(loadConfig(BASE), [{ ...second, id: "lorehouse", mode: "interactive" }])).rejects.toThrow(/profile "lorehouse": triggers: an interactive profile needs a trigger of kind "slack"/);
+    expect(defined).toEqual([]);
   });
 });
 
