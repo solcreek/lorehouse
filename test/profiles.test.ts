@@ -59,30 +59,6 @@ describe("the lorehouse profile", () => {
   });
 });
 
-describe("June stays in src/app.ts (ADR 0001, ADR 0002 §1)", () => {
-  const SRC = join(import.meta.dir, "..", "src");
-  const read = (file: string) => readFileSync(join(SRC, file), "utf8");
-
-  test("src/profiles.ts imports nothing from June, not even a type", () => {
-    expect(read("profiles.ts")).not.toMatch(/from\s*["']@junejs\//);
-  });
-
-  // The agent framework is @junejs/core and @junejs/server. The tools and guards take
-  // June's types (Tool, Channel), which is not wiring; a value import (defineAgent, a
-  // runtime, a channel) is. @junejs/pdf* is the PDF renderer, a library the render_pdf
-  // tool calls, not the framework.
-  test("only src/app.ts wires June: every other file in src/ imports types alone from @junejs/core and @junejs/server", () => {
-    const files = (readdirSync(SRC, { recursive: true }) as string[]).filter((f) => /\.ts$/.test(f) && f !== "app.ts");
-    const wires = (text: string) =>
-      /\bimport\s+(?!type\s)[^;"']*from\s*["']@junejs\/(?:core|server)\b/.test(text) || /\b(?:import|require)\(\s*["']@junejs\/(?:core|server)\b/.test(text);
-    expect(files.filter((f) => wires(read(f)))).toEqual([]);
-    // The check sees what it is for: app.ts is where the wiring is.
-    expect(wires(read("app.ts"))).toBe(true);
-    expect(wires('import {\n  defineAgent,\n} from "@junejs/core/agent-config";')).toBe(true);
-    expect(wires('import type { Tool } from "@junejs/core/agent-runtime";\nimport { x } from "./y";')).toBe(false);
-  });
-});
-
 describe("a profile is checked on start", () => {
   test("a valid one is returned as it was given", () => {
     expect(loadProfiles([valid], CATALOG)).toEqual([valid]);

@@ -62,8 +62,13 @@ behavior change means a conformance scenario change, reviewed like an API change
 missing it serves a "setup mode" instead of crashing. `src/app.ts` is the **only** file
 that wires June (agent definition, Slack channel, routes for `/slack/events`, `/status`,
 `/api/v1` admin, sandbox runners). Tools, policy, prompts and the knowledge store must not
-import June session internals. A test holds the line: outside `src/app.ts`, `src/` imports
-only types from `@junejs/core` and `@junejs/server` (`test/profiles.test.ts`).
+import June session internals. A test holds the line (`test/june-imports.test.ts`, which
+reads each file's imports with Bun's transpiler): outside `src/app.ts`, no file in `src/`
+has a runtime import from `@junejs/core`, `@junejs/server` or `@junejs/db`. Type-only
+imports are allowed (the tools take June's `Tool` type); `@junejs/pdf*` is a runtime import
+in `src/tools/render-pdf.ts` only; `src/profiles.ts` imports nothing from June at all,
+types included; and nowhere in `src/` is there an `import()` or `require()` of anything but
+a string literal.
 
 **Profiles** (`src/profiles.ts`, ADR 0002). An agent is a profile: plain data, with no June
 import. `id` (durable: it names the sessions), `mode`, `prompt`, `tools` and `skills` (by
