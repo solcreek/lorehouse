@@ -172,16 +172,81 @@ describe("knowledge store", () => {
       });
     }));
 
-    test("an entry with the id of a Slack thread's document is refused, naming its line; the thread is left alone", withInstall(({ seed, write, start, inDb }) => {
+    test("an entry with the id of a document that isn't a seed is refused, naming its line; that document is left alone", withInstall(({ seed, write, start, inDb }) => {
       start(wombat);
+      const other = { ...thread, docId: "kb-3" }; // another kind's document under an id the file also uses
       const before = inDb((k) => {
-        upsertDocument(k, thread);
+        upsertDocument(k, other);
         return stored(k);
       });
-      write(wombat, ibis, { ...emu, id: thread.docId });
+      write(wombat, ibis, emu);
       const message = inDb((k) => refused(() => syncSeed(k, seed)));
-      expect(message).toContain(`line 3: id "${thread.docId}" is already the id of a slack_thread document`);
+      expect(message).toContain('line 3: id "kb-3" is already the id of a slack_thread document');
       expect(inDb(stored)).toEqual(before); // kb-2 wasn't added either
+    }));
+
+    // Ingest writes, and its reconcile removes, whatever is under a Slack thread's id: a
+    // seed there would be taken over by the thread, or dropped when Slack has no such thread.
+    test("an id where Slack threads' ids are is refused, whether or not a thread has it yet", withInstall(({ seed, write, inDb }) => {
+      write(wombat, { ...ibis, id: "slack:C1:1700000000.000100" });
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain('line 2: id "slack:C1:1700000000.000100" starts with "slack:"');
+      expect(message).toContain("give the entry another id");
+      expect(inDb((k) => countDocuments(k))).toBe(0);
+    }));
+
+    // A lone surrogate isn't stored as written, so the entry would differ from the index on
+    // every start (re-indexed each time; in an id, added and removed by turns).
+    test("half of a character in any field is refused, naming the field", withInstall(({ seed, write, inDb }) => {
+      const half = "\ud83d"; // the first half of an emoji, as a cut through one leaves
+      write(wombat, { ...ibis, text: `census ${half}` }, { ...emu, id: `kb-3${half}` }, { ...emu, id: "kb-5", title: `${half}Emus` });
+      const message = inDb((k) => refused(() => syncSeed(k, seed)));
+      expect(message).toContain("3 lines are wrong");
+      expect(message).toContain('line 2: "text" holds half of a character');
+      expect(message).toContain('line 3: "id" holds half of a character');
+      expect(message).toContain('line 4: "title" holds half of a character');
+      expect(inDb((k) => countDocuments(k))).toBe(0);
+    }));
+
+    test("a whole emoji, and text in any script, compares equal on the next start", withInstall(({ start }) => {
+      const entries = [{ ...wombat, text: "袋熊審查每季一次 🦘 quarterly" }, { ...ibis, title: "Ibises 🪶", id: "kb-鳥" }];
+      expect(start(...entries)).toEqual({ entries: 2, added: 2, updated: 0, removed: 0 });
+      expect(start()).toEqual({ entries: 2, added: 0, updated: 0, removed: 0 });
+    }));
+
+    // The failures above are all found before the first write. One found after it (here a
+    // delete the database refuses, once an edit and an addition are written) undoes them too.
+    test("a write that fails part-way leaves the index as it was: the read is one transaction", withInstall(({ seed, write, start, inDb }) => {
+      start(wombat, ibis);
+      const before = inDb(stored);
+      write({ ...wombat, text: "the wombat review is yearly" }, emu); // kb-1 edited, kb-3 added, kb-2 gone
+      inDb((k) => {
+        k.exec("CREATE TRIGGER refuse_delete BEFORE DELETE ON knowledge_documents BEGIN SELECT RAISE(ABORT, 'refused by the test'); END");
+        expect(() => syncSeed(k, seed)).toThrow("refused by the test");
+        k.exec("DROP TRIGGER refuse_delete");
+        expect(stored(k)).toEqual(before);
+        expect(searcher(k)("yearly")).toEqual([]); // the index rows went back with the documents
+        expect(searcher(k)("quarterly")[0]?.id).toBe("kb-1");
+        expect(searcher(k)("emu")).toEqual([]);
+      });
+      expect(start()).toEqual({ entries: 2, added: 1, updated: 1, removed: 1 }); // and the same file is then read whole
+    }));
+
+    test("an edited entry's old text leaves the database's files while the app runs", withInstall(async ({ db, seed, write, start }) => {
+      start(wombat, ibis);
+      const k = openKnowledge(db, MIGRATIONS, { delayMs: 20, retryMs: 20, log: () => {} });
+      try {
+        await Bun.sleep(60);
+        const opened = checkpointRuns(k); // the one every open runs
+        write({ ...wombat, text: "the wombat review is yearly" }, ibis);
+        expect(syncSeed(k, seed).updated).toBe(1);
+        await Bun.sleep(150);
+        expect(checkpointRuns(k)).toBe(opened + 1);
+        expect(readFileSync(`${db}-wal`).length).toBe(0);
+        expect(readFileSync(db).includes("quarterly")).toBe(false);
+      } finally {
+        closeKnowledge(k);
+      }
     }));
 
     test("a malformed line fails the read with its line number, and the index is as it was", withInstall(({ seed, write, start, inDb }) => {

@@ -281,6 +281,7 @@ export class SeedError extends Error {
 const SEED_FIELDS = ["id", "source", "title", "text"] as const;
 const SEED_LINE = '{"id": "…", "source": "…", "title": "…", "text": "…"}';
 const SEED_PROBLEMS_SHOWN = 10;
+const SLACK_ID_PREFIX = "slack:";
 
 function seedError(path: string, problems: string[]): SeedError {
   const shown = problems.slice(0, SEED_PROBLEMS_SHOWN).map((p) => `\n  ${p}`).join("");
@@ -326,6 +327,13 @@ function readSeed(path: string): { line: number; doc: Chunk }[] {
     const entry = value as Record<string, unknown>;
     const wrong = SEED_FIELDS.flatMap((f) => (entry[f] === undefined ? [`"${f}" is missing`] : typeof entry[f] !== "string" ? [`"${f}" is a ${jsonType(entry[f])}, not a string`] : []));
     if (!wrong.length && !(entry.id as string).trim()) wrong.push('"id" is empty');
+    // Half of a character (as a cut made through an emoji leaves, written "\ud83d") is not
+    // stored as written, so the entry would never compare equal to what the index holds:
+    // re-indexed on every start, or with it in the id, removed on every other one.
+    if (!wrong.length) wrong.push(...SEED_FIELDS.filter((f) => !(entry[f] as string).isWellFormed()).map((f) => `"${f}" holds half of a character (a lone surrogate, as text cut through an emoji leaves): write the whole character or drop the half`));
+    // "slack:" ids are Slack threads' (slack:<channel>:<root ts>): ingest writes and removes
+    // documents under them whatever their kind, so a seed there would not stay a seed.
+    if (!wrong.length && (entry.id as string).startsWith(SLACK_ID_PREFIX)) wrong.push(`id "${entry.id as string}" starts with "${SLACK_ID_PREFIX}", which is where Slack threads' ids are: give the entry another id`);
     if (wrong.length) {
       problems.push(`line ${line}: ${wrong.join("; ")}`);
       return;
