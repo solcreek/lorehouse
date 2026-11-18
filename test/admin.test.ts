@@ -477,6 +477,24 @@ describe("a channel's default repo", () => {
     expect(r.asked).toEqual([]);
   });
 
+  // Ingest closes a listed channel it finds private, archived or shared while running: the
+  // agent stops working there until the next start, and its default repo isn't used.
+  test("channel_closed (409): a channel ingest closed since the start can't be given one; GET says it is closed; DELETE still clears", async () => {
+    const status: IngestStatus = { state: "ready", documents: 0, channels: { C1: { threads: 0 }, C2: { threads: 0, closed: "private" } }, reconciled: { refreshed: 0, removed: 0 } };
+    const r = repoSetup({ ingest: () => status });
+    setChannelRepo(r.db, { channel: "C2", repo: { owner: "acme", name: "gadgets" } }, new Date("2026-11-01T00:00:00Z")); // set while it was open
+    const error = await refused(r, { repo: "acme/widgets" }, 409, "channel_closed", "C2");
+    expect(error).toContain("private");
+    expect(error).toContain("until the next start");
+    expect(r.asked).toEqual([]);
+    expect(await r.call("GET", "C2")).toEqual({ status: 200, allow: null, body: { tenant: "t-test", channel: "C2", closed: "private", defaultRepo: { repo: "acme/gadgets", branch: null, setAt: "2026-11-01T00:00:00.000Z" } } });
+    expect((await r.body("/api/v1/channels")).channels.map((c: { id: string; closed?: string }) => [c.id, c.closed])).toEqual([["C1", undefined], ["C2", "private"]]);
+    // An open channel is as before, with no `closed`.
+    expect((await r.call("GET", "C1")).body).toEqual({ tenant: "t-test", channel: "C1", defaultRepo: null });
+    expect((await put(r, { repo: "acme/widgets" })).status).toBe(200);
+    for (let i = 0; i < 2; i++) expect(await r.call("DELETE", "C2")).toEqual({ status: 200, allow: null, body: { tenant: "t-test", channel: "C2", defaultRepo: null } });
+  });
+
   test("invalid_body (400): not JSON, not an object, too long, or a field it doesn't know", async () => {
     const r = repoSetup();
     for (const body of ["", "{", "[]", '"acme/widgets"', "null", JSON.stringify({ repo: "acme/widgets", branch: "x".repeat(5000) })]) await refused(r, body, 400, "invalid_body");

@@ -161,6 +161,8 @@ export function adminRoutes(opts: AdminOptions) {
         threads: c.threads,
         // The cursor is the newest message ts seen.
         lastMessageAt: c.cursor && Number.isFinite(Number(c.cursor)) ? new Date(Number(c.cursor) * 1000).toISOString() : null,
+        // Found private, archived or shared since the start, and closed until the next one.
+        ...(c.closed ? { closed: c.closed } : {}),
         defaultRepo: shown(repos.get(id)),
       }));
       return json({ state: s.state, ...(s.error ? { error: s.error } : {}), channels });
@@ -248,7 +250,13 @@ export function adminRoutes(opts: AdminOptions) {
       return json({ channel, defaultRepo: null });
     }
     if (!opts.channels?.has(channel)) throw new Refusal(404, "channel_not_listed", `${channel} isn't on AGENT_CHANNELS: only a public channel the agent works in can have a default repo (a DM never does). Add it to AGENT_CHANNELS and restart, then set it`);
-    if (req.method === "GET") return json({ channel, defaultRepo: shown(getChannelRepo(db, channel)) });
+    // A listed channel ingest found private, archived or shared since the start is closed
+    // until the next start (ingest/slack.ts): the agent doesn't work there, and
+    // workspace_clone gets no default for it. The API says what is so: GET shows the default
+    // that is stored and that the channel is closed, and PUT is refused.
+    const closed = opts.ingest()?.channels[channel]?.closed;
+    if (req.method === "GET") return json({ channel, ...(closed ? { closed } : {}), defaultRepo: shown(getChannelRepo(db, channel)) });
+    if (closed) throw new Refusal(409, "channel_closed", `${channel} was closed since the start (${closed}): the agent doesn't work there, and a default repo there is unused until the next start, which refuses to start while the channel is listed and not public. Make it public and unshared again, or take it off AGENT_CHANNELS; then restart`);
 
     const want = await wanted(req);
     const full = `${want.repo.owner}/${want.repo.name}`;

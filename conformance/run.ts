@@ -1566,6 +1566,38 @@ const scenarios: Scenario[] = [
       }
     },
   },
+  {
+    // #126: the agent stops working in a channel closed while running, so its default repo
+    // is unused until the next start, and the admin API says so instead of taking a new one.
+    name: "a channel closed while running can't be given a default repo (409 channel_closed): GET says it is closed and shows what is stored, DELETE still clears, and the other channel is unaffected",
+    run: async () => {
+      const db = freshDb();
+      const PUBLIC_C2 = { name: "random", is_channel: true, is_group: false, is_im: false, is_mpim: false, is_private: false, is_archived: false, is_shared: false, is_ext_shared: false, is_org_shared: false, is_pending_ext_shared: false };
+      await stopApp();
+      try {
+        await startApp({ ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github`, AGENT_CHANNELS: `${ALLOWED},${REMOVED}`, LOREHOUSE_DB: db, INGEST_CHANNEL_RECHECK_MS: "300" });
+        const open = await repoCall("PUT", REMOVED, { repo: "acme/gadgets" });
+        if (open.status !== 200) return `while ${REMOVED} was open: ${open.status} ${JSON.stringify(open.body)}`;
+        await post("/fixtures/channel", { channel: REMOVED, info: { ...PUBLIC_C2, is_private: true } });
+        const closed = await until(async () => (await status()).knowledge.channels[REMOVED]?.closed, 5000);
+        if (!closed) return `${REMOVED} never closed: ${JSON.stringify((await status()).knowledge.channels)}`;
+        const refused = await repoCall("PUT", REMOVED, { repo: "acme/widgets" });
+        if (refused.status !== 409 || refused.body.code !== "channel_closed") return `PUT for the closed channel: ${refused.status} ${JSON.stringify(refused.body)}, want 409 channel_closed`;
+        const got = await repoCall("GET", REMOVED);
+        const says = (got.body as { closed?: string }).closed;
+        if (got.status !== 200 || says !== closed || got.body.defaultRepo?.repo !== "acme/gadgets") return `GET for the closed channel: ${got.status} ${JSON.stringify(got.body)}, want closed: ${JSON.stringify(closed)} and the default stored while it was open`;
+        const other = await repoCall("PUT", ALLOWED, { repo: "acme/widgets" });
+        if (other.status !== 200 || (other.body as { closed?: string }).closed !== undefined) return `the open channel: ${other.status} ${JSON.stringify(other.body)}`;
+        const cleared = await repoCall("DELETE", REMOVED);
+        return cleared.status === 200 && cleared.body.defaultRepo === null ? null : `DELETE for the closed channel: ${cleared.status} ${JSON.stringify(cleared.body)}`;
+      } finally {
+        await post("/fixtures/channel", { channel: REMOVED, info: PUBLIC_C2 });
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
   // An empty AGENT_CHANNELS means nowhere, for every event kind; a channel taken off the
   // list leaves the knowledge index on the next start (#82).
   {

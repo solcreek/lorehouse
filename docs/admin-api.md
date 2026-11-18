@@ -144,6 +144,10 @@ All three answer with the channel's default repo as it now is:
 - `branch` is the branch a fresh clone starts on, or `null` for the repo's own default
   branch.
 - `setAt` is when it last changed.
+- `closed`, on a GET only, is there when the channel was closed since the start (found
+  private, archived or shared while running), with why: `private`, `archived`, `shared`,
+  or Slack's error. The default shown is still stored and is not used until the next
+  start; a PUT is refused (`channel_closed`). `GET /api/v1/channels` has the same field.
 
 **Read it:**
 
@@ -190,6 +194,7 @@ doesn't change, so a script or an agent can branch on it.
 | 405 | `method_not_allowed` | anything but GET, PUT or DELETE | use one of those (`Allow` lists them) |
 | 400 | `invalid_channel` | `{id}` isn't a Slack channel id | use the id (`C0123ABCD`), not the name |
 | 404 | `channel_not_listed` | GET or PUT for a channel that isn't on `AGENT_CHANNELS` (a DM, a private channel, one the agent doesn't work in) | add the channel to `AGENT_CHANNELS` and restart |
+| 409 | `channel_closed` | PUT for a listed channel that was closed since the start: Lorehouse found it private, archived or shared with another workspace while running, stopped working there, and uses no default repo there until the next start | make the channel public and unshared again, or take it off `AGENT_CHANNELS`; then restart |
 | 400 | `invalid_body` | PUT's body isn't a JSON object, is over 4096 bytes (refused by its `Content-Length` before it is read), or has a field other than `repo` and `branch` | send `{ "repo": "owner/name" }` |
 | 400 | `invalid_repo` | `repo` is missing or isn't `owner/name` (an owner of up to 39 characters, a name of up to 100) | name the repo as `owner/name`, not its URL |
 | 400 | `invalid_branch` | `branch` isn't a branch name Lorehouse takes: letters, digits and `. _ / -`, up to 255 characters, no part that is empty, starts with `.` or ends in `.lock`, no `..`, no leading `-`, no trailing `.` (stricter than git: a branch with other characters can't be a default) | name such a branch, or leave it out |
