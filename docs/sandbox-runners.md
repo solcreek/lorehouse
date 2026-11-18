@@ -52,6 +52,7 @@ sandboxes on the runner with the most free room.
 
 ```json
 { "type": "status", "runner": "starship", "capacity": 4, "running": 1, "version": "0.1.0",
+  "features": ["resources"],
   "sandboxes": ["acme.slack_C1_1790000001.000100"], "jobs": ["j_…"], "received": ["j_…"],
   "session": "18f3a…-2c41", "started": 1790000000000 }
 ```
@@ -73,6 +74,12 @@ sandboxes on the runner with the most free room.
   dropped, for retention or to make room), `refusedForSpace` and `refreshTimeouts`.
   Lorehouse only shows it, in `/status` and `/api/v1/runners`; an object over 2 KB of JSON
   is dropped (not the status).
+- `features` lists what the runner's sandboxd understands beyond the first protocol, at
+  most 32 short strings. `"resources"`: a job's `resources` (see
+  [Resources](#resources)). The protocol has no version to negotiate on (`version` is
+  sandboxd's own, for people), and a sandboxd reads a job without the fields it doesn't
+  know, so Lorehouse never sends a job that needs a feature to a runner that doesn't list
+  it. A list that isn't an array of strings reads as none.
 - All of these are optional. A runner that omits them loses the guarantees they give but
   still works. A list that is present must be an array of strings, or the whole status
   is refused.
@@ -87,13 +94,18 @@ publishing step (`stage`, `push`; see [Publishing](#publishing)):
 { "id": "j_…", "sandbox": "…", "op": "destroy", "timeoutMs": …, "deadlineMs": … }
 ```
 
+A `guest` job may also carry `"resources"`, what is asked for its sandbox (see
+[Resources](#resources)).
+
 A sandbox id is `<tenant>.<thread>`: the tenant's id (`acme` here; `src/tenant.ts`), a
 dot, then the thread's session id with every character outside `[A-Za-z0-9_.-]` as `_`.
 A tenant id has no dot, so the first dot ends it, and two tenants' threads never share an
 id on one host (ADR 0005 §2). It is at most 128 characters, sandboxd's limit: a longer
 session is cut and a hash of it added.
 
-`timeoutMs` is the command's own limit. `deadlineMs` is how long Lorehouse will still wait
+`timeoutMs` is the command's own limit, as Lorehouse asks it. The runner holds a command
+(`POST /exec`) to its sandbox's command timeout whatever a job says: it rewrites the
+body's `timeoutMs` to that at most before guestd sees it. `deadlineMs` is how long Lorehouse will still wait
 for the result, as of handing the job out. It is relative, so the clocks needn't agree.
 
 A runner accepts only these guest calls, and refuses anything else:
@@ -110,7 +122,11 @@ A **result** answers one job with an HTTP-like status:
 ```json
 { "id": "j_…", "status": 200, "contentType": "application/json", "bodyBase64": "…" }
 { "id": "j_…", "status": 503, "error": "all 4 sandboxes are busy; try again later" }
+{ "id": "j_…", "status": 422, "code": "resource_over_maximum", "error": "resources.memMib 8192 is over this sandbox host's maximum of 4096 (…)" }
 ```
+
+`code` comes only with `error`, and only when the runner refused the resources asked for
+the sandbox (see [Resources](#resources)).
 
 ### Over WebSocket
 
@@ -179,6 +195,76 @@ lost because a connection dropped while the job ran.
   answered with a 500 that says it may have partly run, rather than left to its deadline
   or retried blindly. A job that can't be recorded first isn't run at all.
 - **A runner that disconnects** has 60 s to come back before its pending jobs fail.
+
+## Resources
+
+A sandbox has five resources: its VM's vCPUs and memory, what it may write to its disk,
+the pids of its VM's cgroup, and how long one command may run. The host decides them
+([ADR 0003](adr/0003-sandbox-trust-boundaries.md)); a job can only ask. A profile's
+`sandboxResources` (`src/profiles.ts`) is that request, and every `guest` job for the
+profile's sandbox carries it:
+
+```json
+{ "id": "j_…", "sandbox": "…", "op": "guest", "method": "POST", "path": "/exec", "bodyBase64": "…",
+  "timeoutMs": 1800000, "deadlineMs": 1859000,
+  "resources": { "vcpus": 4, "memMib": 4096, "diskGib": 16, "pids": 128, "commandTimeoutSecs": 1800 } }
+```
+
+| field | asks for | default | least, most | the host's maximum |
+|---|---|---|---|---|
+| `vcpus` | the VM's vCPUs | `SANDBOXD_VCPUS` (2) | 1, 32 | `SANDBOXD_MAX_VCPUS` |
+| `memMib` | the VM's memory, MiB | `SANDBOXD_MEM_MIB` (2048) | 128, 262144 | `SANDBOXD_MAX_MEM_MIB` |
+| `diskGib` | what the sandbox may write to its disk, GiB | `SANDBOXD_DISK_QUOTA_GIB` (8) | 1, 65536 | `SANDBOXD_MAX_DISK_GIB` |
+| `pids` | `pids.max` of the VM's cgroup: the VMM's own threads on the host (one per vCPU and a few), not the guest's processes | 64 | 16, 4096; and at least `vcpus` + 8 | `SANDBOXD_MAX_PIDS` |
+| `commandTimeoutSecs` | the longest one `POST /exec` may run | 600 | 1, 21600 | `SANDBOXD_MAX_COMMAND_TIMEOUT_SECS` |
+
+- **Every field is optional.** One left out gets the host's default. No `resources`, or
+  `{}`, is no request: the sandbox is what it always was.
+- **Each maximum defaults to its default.** A host that sets no `SANDBOXD_MAX_*` grants
+  nothing beyond today's; less than the default can always be asked for.
+- **Never clamped.** A request is granted as asked or the job is refused, before anything
+  is made, booted or run. The result has a 4xx `status`, a `code`, and an `error` that
+  names the field, what was asked, the limit and what to do; sandboxd logs the same line
+  (`sandboxd: <sandbox>: refused (<code>): …`).
+
+  | `code` | `status` | when |
+  |---|---|---|
+  | `invalid_resources` | 400 | not an object, an unknown field, a value that isn't a whole number or is under the field's least, or fewer `pids` than `vcpus` + 8 |
+  | `resource_over_maximum` | 422 | a field over the host's maximum; also a sandbox whose grant is over a maximum lowered since it was created: it isn't started, and isn't shrunk |
+  | `disk_quota_unavailable` | 422 | `diskGib` asked of a host that can't cap disks (`SANDBOXD_DISK_QUOTA_GIB=0`, or a state directory that isn't btrfs with simple quotas), or of a sandbox whose directory predates the quota. A size is never accepted and left unenforced |
+  | `resources_mismatch` | 409 | the sandbox exists already, with other values than the job asks for |
+
+- **Fixed at creation.** A sandbox exists once its disk does. What it was granted is kept
+  beside the disk (`<SANDBOXD_STATE>/<sandbox>/resources.json`) and every later boot uses
+  it: the VM's size, its cgroup's `cpu.max`, `memory.max` and `pids.max`, its subvolume's
+  quota. A sandbox created with no request keeps no record and follows the host's
+  defaults at each boot, as before.
+- **A later request is a statement about the sandbox.** Fine when every field it asks
+  for is what the sandbox has, so a replayed job, a job asking for part of the grant and
+  a job asking for nothing all pass. Anything else is `resources_mismatch`, naming both.
+  Nothing is resized: to change a sandbox's resources, destroy it (its checkout goes
+  with it) and let the next job create it.
+- **`destroy`, `stage` and `push` carry none.** They act on a sandbox that exists, as it
+  is.
+- **The command timeout is enforced on the host and in the guest.** sandboxd sets the
+  `timeoutMs` guestd reads to the sandbox's `commandTimeoutSecs` at most (none sent: that),
+  guestd kills the command's process group at it (exit code 124), and sandboxd drops the
+  call 330 s after it at the latest, which kills the command too. Lorehouse's own wait is
+  only how long it listens. A [background job](#background-jobs) keeps its own limits
+  (1 h by default, 6 h at most).
+- **A runner that doesn't list `"resources"` in `features` is never sent a request.** Its
+  sandboxd would run the job in a sandbox with its own defaults and say nothing. A new
+  sandbox that asks goes only to a runner that lists it; with none connected, or for a
+  sandbox that already lives on one that doesn't, the call fails naming the runner and
+  its version, and nothing runs.
+
+In serve mode the same request is the `X-Lorehouse-Sandbox-Resources` header (the JSON
+object) on the exec, file and jobs calls; a refusal is that status with
+`{ "error", "code", "field", "asked", "maximum" | "minimum" | "has" }`; and
+`GET /v1/capabilities` answers `{ "version", "features": ["resources"], "resources": {
+"defaults", "maxima" } }`, which Lorehouse asks before it sends a request (a 404 there is
+a sandboxd that predates them). `GET /v1/sandboxes` lists each sandbox's `resources`
+(null for a stopped one that follows the defaults).
 
 ## Background jobs
 
