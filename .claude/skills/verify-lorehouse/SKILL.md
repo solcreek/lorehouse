@@ -40,6 +40,7 @@ Exit 0 means this run is worth driving. The report checks the recorded pids are 
 Drive from `features/`. The helper speaks Slack's Events API to this instance and reads the reply the stand-in recorded.
 
 - `ask --text "..."` posts an `app_mention` in `C1` from `U1` and waits until the stand-in finishes the thread stream. It prefixes the Slack text with `[qN]` so the scripted model echoes that nonce. The question a person typed is `--text`. The reply's `cite` and `src` are what the user would see quoted.
+- `mention` and `reply` take `--user <id>` to act as someone other than `U1`: in the stand-in's fixtures `U2` to `U5` are full members, `UG1` and `UG2` guests. `hold-lookup --user <id> --state on` makes Slack slow to say who that person is, until `--state off`.
 - `mention`, `reply`, `dm`, `post`, `edit`, and `delete` perform one Slack action and return. `post`, `edit`, and `delete` also update the stand-in's channel history, which is the Slack history Lorehouse reads back, and deliver the event Slack would deliver.
 - `wait --thread <ts>` reads the streamed reply in that thread.
 - `quiet --ms 1500` waits, then returns the mock call log. Use it to prove the agent stayed silent.
@@ -80,8 +81,9 @@ All of these are `bun .claude/skills/verify-lorehouse/control.ts <command>` from
 | `launch` | start a new isolated instance; print `runId`, URLs, `db`, `evidence` |
 | `doctor` | read-only "worth driving?" report; exit 1 when any check fails |
 | `ask --text "..."` | mention `@scout` in `C1` and wait for the streamed reply |
-| `mention --text "..." [--channel C9] [--channel-type group]` | deliver an `app_mention` without waiting |
-| `reply --thread <ts> --text "..."` | deliver a threaded `message` |
+| `mention --text "..." [--user U2] [--channel C9] [--channel-type group]` | deliver an `app_mention` without waiting, from `U1` or `--user` |
+| `reply --thread <ts> --text "..." [--user U2]` | deliver a threaded `message`, from `U1` or `--user` |
+| `hold-lookup --user <id> --state on\|off` | hold the stand-in's `users.info` answer about that person, as a slow membership lookup, or let it go; `waiting` counts the lookups held |
 | `dm --text "..."` | deliver a DM and wait up to 1500ms for a post or a model call |
 | `post --text "..."` | put a person's message in the channel history and deliver it |
 | `edit --ts <ts> --text "..."` | edit that Slack message and deliver `message_changed` |
