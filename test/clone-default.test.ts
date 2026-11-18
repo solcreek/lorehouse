@@ -140,6 +140,15 @@ describe("workspace_clone: which repo", () => {
     expect(await s.tool.run({ repo: "acme/widgets" }, DM)).toMatchObject({ status: "cloned", source: "named" });
   });
 
+  test("a private channel or a group DM has no default, even if a row existed for its id: the lookup is never made", async () => {
+    const s = setup({ defaults: { G1: { repo: "acme/widgets", branch: null }, C1: { repo: "acme/widgets", branch: null } } });
+    for (const ctx of [inChannel("G1"), inChannel("G1", "group"), inChannel("G1", "mpim"), inChannel("C1", "group"), inChannel("C1", "mpim")]) {
+      expect(await s.tool.run({}, ctx)).toMatchObject({ error: expect.stringContaining("no repo was named") });
+    }
+    expect(s.looked).toEqual([]);
+    expect(s.calls).toEqual([]);
+  });
+
   test("a turn Slack didn't start has no channel, so no default", async () => {
     const s = setup();
     for (const ctx of [{}, { event: { source: "webhook", channelId: "C1" } }, { event: { source: "slack" } }]) {
@@ -206,6 +215,10 @@ describe("the channel a turn is answering in", () => {
     expect(answeredChannel(DM)).toBeUndefined();
     expect(answeredChannel(inChannel("D9"))).toBeUndefined();
     expect(answeredChannel({} as never)).toBeUndefined();
+    // A private channel or a group DM is never one: by its type, as Slack says it on a
+    // message event, and by its id (public channel ids start with C).
+    for (const type of ["group", "mpim", "im"]) expect([type, answeredChannel(inChannel("C1", type))]).toEqual([type, undefined]);
+    for (const id of ["G1", "D1", "W1", "c1", ""]) expect([id, answeredChannel(inChannel(id))]).toEqual([id, undefined]);
     expect(answeredChannel({ event: { source: "email", channelId: "C1" } } as never)).toBeUndefined();
   });
 });

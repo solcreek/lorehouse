@@ -29,14 +29,18 @@ function current(ctx: ToolContext): string | undefined {
   return ctx.event?.source === "slack" ? ctx.event.channelId : undefined;
 }
 
-// The channel a turn is answering in when it isn't a DM: what a per-channel setting (a
-// channel's default repo, tools/clone.ts) is looked up by. It comes from the event Slack
-// signed, never from model input, so the model can't point a tool at another channel's
-// setting. A DM (channel type "im", or a D… id) has none; nor has a turn Slack didn't start.
+// The channel a turn is answering in when it can be a public one: what a per-channel
+// setting (a channel's default repo, tools/clone.ts) is looked up by. It comes from the
+// event Slack signed, never from model input, so the model can't point a tool at another
+// channel's setting. Never a DM, a group DM or a private channel: not by the event's type
+// ("im", "mpim", "group"; a mention carries none, "unknown"), and not by its id (a public
+// channel's starts with C; D is a DM, G a private channel or group DM). Nor a turn Slack
+// didn't start. A C… id can still be a private channel's: whether the agent works there is
+// the caller's to check against AGENT_CHANNELS (channel-repos.ts, defaultRepoFor).
 export function answeredChannel(ctx: ToolContext): string | undefined {
   const e = ctx.event as { source?: string; channelId?: string; channelType?: string } | undefined;
-  if (e?.source !== "slack" || !e.channelId) return undefined;
-  return e.channelType === "im" || e.channelId.startsWith("D") ? undefined : e.channelId;
+  if (e?.source !== "slack" || !e.channelId || !/^C[A-Z0-9]+$/.test(e.channelId)) return undefined;
+  return e.channelType === "im" || e.channelType === "mpim" || e.channelType === "group" ? undefined : e.channelId;
 }
 
 export function takesChannel(tool: Tool): boolean {
