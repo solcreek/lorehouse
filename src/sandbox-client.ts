@@ -29,7 +29,9 @@ export type RemoteSandboxOptions = {
   url: string; // daemon base URL, e.g. https://sandbox.example.com
   token: string; // bearer credential the daemon checks
   fetch?: typeof fetch; // injectable for tests
-  // What to ask for the sandbox; left out, it gets the daemon's defaults.
+  // What to ask for the sandbox. Left out, nothing is asked: a new sandbox gets the
+  // daemon's defaults, and one that already has a grant keeps it (to return such a
+  // sandbox to the defaults, ask for them by name).
   resources?: SandboxResources;
   now?: () => number; // injectable for tests: how long a command took
 };
