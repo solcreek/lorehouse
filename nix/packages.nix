@@ -231,7 +231,7 @@ let
         f: f.hasExt "go" || f.name == "go.mod" || f.name == "go.sum"
       ) ../sandbox/guest;
     };
-    vendorHash = "sha256-Bqs0iBvdK7BeEPf1CuoyHFmFPpXuChAJLqaCW3wi35E=";
+    vendorHash = "sha256-3/tNPMYKxKjwprceoPRjRJuTNBwJSJE4LD8grnh+haI=";
     env.CGO_ENABLED = "0";
     postInstall = "mv $out/bin/guest $out/bin/guestd";
     meta.platforms = lib.platforms.linux;
