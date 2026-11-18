@@ -169,24 +169,40 @@ pub fn limit_args(bytes: u64, dir: &Path) -> Vec<String> {
 /// limit (re)applied, so a raised or lowered SANDBOXD_DISK_QUOTA_GIB reaches existing
 /// sandboxes (0 doesn't lift a limit already set: `btrfs qgroup limit none <dir>`). A
 /// directory made before quotas were on stays as it is, uncapped, and says so, even with
-/// the quota set explicitly.
-pub async fn prepare_dir(quota: &Quota, dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
+/// the quota set explicitly. `granted`: this sandbox's own size (resources.rs), where it
+/// was created with one; else the host's.
+pub async fn prepare_dir(quota: &Quota, dir: &Path, granted: Option<u64>) -> Result<(), String> {
     match quota {
         Quota::Off => tokio::fs::create_dir_all(dir).await.map_err(|e| format!("state dir: {e}")),
-        Quota::Btrfs { bytes } => {
+        Quota::Btrfs { .. } => {
             if !dir.exists() {
                 btrfs(&["subvolume", "create", &dir.to_string_lossy()]).await?;
             }
-            let is_subvolume = tokio::fs::metadata(dir).await.is_ok_and(|m| m.ino() == SUBVOLUME_INO);
-            if !is_subvolume {
+            if !capped(quota, dir) {
                 eprintln!("sandboxd: {} predates the disk quota (not a subvolume); its disk is not capped", dir.display());
                 return Ok(());
             }
-            let args = limit_args(*bytes, dir);
+            let Some(bytes) = limit_bytes(quota, granted) else { return Ok(()) };
+            let args = limit_args(bytes, dir);
             btrfs(&args.iter().map(String::as_str).collect::<Vec<_>>()).await
         }
     }
+}
+
+/// The limit a sandbox's subvolume gets: its own grant, else the host's default; none
+/// where the quota is off.
+pub fn limit_bytes(quota: &Quota, granted: Option<u64>) -> Option<u64> {
+    match quota {
+        Quota::Off => None,
+        Quota::Btrfs { bytes } => Some(granted.unwrap_or(*bytes)),
+    }
+}
+
+/// Whether a limit set on this sandbox's directory would hold: the quota is on, and the
+/// directory is a subvolume (one made before quotas were on is not, and stays uncapped).
+pub fn capped(quota: &Quota, dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!(quota, Quota::Btrfs { .. }) && std::fs::metadata(dir).is_ok_and(|m| m.ino() == SUBVOLUME_INO)
 }
 
 /// After a sandbox's subvolume is deleted: its qgroup, once empty, removed (kernels before
@@ -226,6 +242,16 @@ mod tests {
         // -e: exclusive bytes. Referenced bytes would count the golden's shared extents,
         // which under full qgroups is the whole image the moment it's reflinked.
         assert_eq!(limit_args(8 << 30, Path::new("/s/x")).join(" "), "qgroup limit -e 8589934592 /s/x");
+        // A sandbox granted its own size gets that, more or less than the host's; one
+        // without, the host's; and with the quota off there is no limit to set.
+        let on = Quota::Btrfs { bytes: 8 << 30 };
+        assert_eq!(limit_bytes(&on, None), Some(8 << 30));
+        assert_eq!(limit_bytes(&on, Some(16 << 30)), Some(16 << 30));
+        assert_eq!(limit_args(limit_bytes(&on, Some(2 << 30)).unwrap(), Path::new("/s/y")).join(" "), "qgroup limit -e 2147483648 /s/y");
+        assert_eq!(limit_bytes(&Quota::Off, Some(16 << 30)), None);
+        // A directory that isn't a subvolume (here: any temp directory) isn't capped.
+        assert!(!capped(&on, &std::env::temp_dir()));
+        assert!(!capped(&Quota::Off, &std::env::temp_dir()));
         assert_eq!(fs_kind(BTRFS_SUPER_MAGIC), Some(true));
         assert_eq!(fs_kind(XFS_SUPER_MAGIC), Some(false));
         assert_eq!(fs_kind(0xEF53), None); // ext4

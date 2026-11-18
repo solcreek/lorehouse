@@ -19,6 +19,7 @@
 //! sockets, so it can't use the host's network itself (the ADR has the tradeoff).
 
 use crate::config::Config;
+use crate::resources::Granted;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
@@ -26,8 +27,6 @@ use std::path::{Path, PathBuf};
 pub const JAIL_DIR: &str = "jail";
 /// The controllers each VM's cgroup limits.
 const CONTROLLERS: [&str; 4] = ["cpu", "io", "memory", "pids"];
-/// A VM's processes: one thread per vCPU plus Firecracker's own few. 5 at 2 vCPUs.
-const PIDS_MAX: u32 = 64;
 /// Half the default weight (100), so the host's own work wins IO contention. It only
 /// takes effect where the IO controller acts on weights (BFQ, or iocost enabled).
 const IO_WEIGHT: u32 = 50;
@@ -96,7 +95,7 @@ impl<'a> Jail<'a> {
 
     /// Everything after `jailer`: the jail, then (after `--`) Firecracker's own arguments,
     /// which name paths inside the chroot.
-    pub fn args(&self, vcpus: u32, mem_mib: u32) -> Vec<String> {
+    pub fn args(&self, granted: &Granted) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "--id".into(),
             self.id(),
@@ -113,7 +112,7 @@ impl<'a> Jail<'a> {
             "--parent-cgroup".into(),
             self.host.cgroup_parent.clone(),
         ];
-        for (file, value) in cgroup_limits(vcpus, mem_mib, self.host.mem_headroom_mib) {
+        for (file, value) in cgroup_limits(granted, self.host.mem_headroom_mib) {
             args.push("--cgroup".into());
             args.push(format!("{file}={value}"));
         }
@@ -198,13 +197,15 @@ pub fn jail_id(slot: usize) -> String {
 /// Each VM's cgroup files and values. CPU: its vCPUs plus one for Firecracker's own
 /// threads (device emulation, the API). Memory: the guest's RAM plus headroom, for
 /// Firecracker itself and the host page cache its disk IO is charged with (reclaimed,
-/// not killed for, at the limit).
-pub fn cgroup_limits(vcpus: u32, mem_mib: u32, headroom_mib: u32) -> Vec<(&'static str, String)> {
+/// not killed for, at the limit). Pids: what the sandbox was granted (64 by default); they
+/// are the VMM's own threads, one per vCPU plus Firecracker's few (5 at 2 vCPUs), not the
+/// guest's processes, which the host never sees.
+pub fn cgroup_limits(granted: &Granted, headroom_mib: u32) -> Vec<(&'static str, String)> {
     let period = 100_000u64;
     vec![
-        ("cpu.max", format!("{} {period}", (vcpus as u64 + 1) * period)),
-        ("memory.max", ((mem_mib as u64 + headroom_mib as u64) << 20).to_string()),
-        ("pids.max", PIDS_MAX.to_string()),
+        ("cpu.max", format!("{} {period}", (granted.vcpus + 1) * period)),
+        ("memory.max", ((granted.mem_mib + headroom_mib as u64) << 20).to_string()),
+        ("pids.max", granted.pids.to_string()),
         ("io.weight", IO_WEIGHT.to_string()),
     ]
 }
@@ -383,7 +384,7 @@ pub(crate) async fn setup_cgroups() -> Result<String, String> {
     write(git.join("cgroup.subtree_control"), "+pids +memory".to_string())?;
     // The limits the jailer writes must exist here, or every boot would fail on them.
     // io.weight, for one, needs the kernel's iocost or BFQ.
-    for (file, _) in cgroup_limits(1, 128, 64) {
+    for (file, _) in cgroup_limits(&Granted { vcpus: 1, mem_mib: 128, disk_gib: None, pids: 64, command_timeout_secs: 600 }, 64) {
         if !vms.join(file).exists() {
             return Err(format!("cgroup {own}/{VMS} has no {file}: this kernel can't apply that VM limit"));
         }
@@ -538,7 +539,13 @@ pub mod tests {
     fn the_jailer_drops_to_the_slot_uid_with_limits_and_seccomp_on() {
         let h = host();
         let dir = Path::new("/s/x");
-        let args = Jail::new(&h, dir, 1).args(2, 2048);
+        let stock = Granted { vcpus: 2, mem_mib: 2048, disk_gib: Some(8), pids: 64, command_timeout_secs: 600 };
+        let args = Jail::new(&h, dir, 1).args(&stock);
+        // A sandbox granted more gets it in its own cgroup, and only there.
+        let big = Jail::new(&h, dir, 2).args(&Granted { vcpus: 4, mem_mib: 4096, pids: 128, ..stock.clone() });
+        for limit in ["cpu.max=500000 100000", "memory.max=4831838208", "pids.max=128", "io.weight=50"] {
+            assert!(big.windows(2).any(|w| w[0] == "--cgroup" && w[1] == limit), "{limit} not in {big:?}");
+        }
         let joined = args.join(" ");
         assert_eq!(
             joined,
@@ -558,12 +565,16 @@ pub mod tests {
 
     #[test]
     fn limits_follow_the_vm_size() {
+        let g = |vcpus, mem_mib, pids| Granted { vcpus, mem_mib, disk_gib: None, pids, command_timeout_secs: 600 };
         assert_eq!(
-            cgroup_limits(4, 8192, 256),
+            cgroup_limits(&g(4, 8192, 64), 256),
             vec![("cpu.max", "500000 100000".to_string()), ("memory.max", ((8192u64 + 256) << 20).to_string()), ("pids.max", "64".into()), ("io.weight", "50".into())]
         );
+        // pids.max is the sandbox's own grant, more or less than the default.
+        assert_eq!(cgroup_limits(&g(2, 2048, 256), 512)[2], ("pids.max", "256".to_string()));
+        assert_eq!(cgroup_limits(&g(2, 2048, 16), 512)[2], ("pids.max", "16".to_string()));
         // The memory limit is above the guest's RAM, so a full guest is not OOM-killed.
-        let mem: u64 = cgroup_limits(2, 2048, 512)[1].1.parse().unwrap();
+        let mem: u64 = cgroup_limits(&g(2, 2048, 64), 512)[1].1.parse().unwrap();
         assert!(mem > 2048 << 20);
     }
 

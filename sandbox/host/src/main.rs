@@ -10,13 +10,19 @@
 //!   GET    /v1/sandboxes/{id}/jobs/{job}?waitMs=…&tailBytes=…       → the job: state, exit code, elapsed, output tail
 //!   POST   /v1/sandboxes/{id}/jobs/{job}/cancel                     → the job, once stopped (its process group killed)
 //!   DELETE /v1/sandboxes/{id}                                     → 204 (VM stopped, disk gone, its jobs with it)
-//!   GET    /v1/sandboxes                                          → what exists, running or not
+//!   GET    /v1/sandboxes                                          → what exists, running or not, each with its resources
+//!   GET    /v1/capabilities                                       → {version, features, resources: {defaults, maxima}}
 //!   POST   /v1/sandboxes/{id}/stage  {owner, name, base, branch, token?} → the commits to publish, verified, and a stage id
 //!   POST   /v1/sandboxes/{id}/push   {stage, owner, name, sha, branch, token} → pushed (see publish.rs)
 //!   GET    /healthz                                               → ok (no auth)
 //!
 //! Every /v1 request needs `Authorization: Bearer <SANDBOXD_TOKEN>`. Requests for a
 //! stopped sandbox boot it first; idle ones are stopped with their disk kept.
+//!
+//! An exec, file or jobs request may carry `X-Lorehouse-Sandbox-Resources: {"vcpus":4,…}`
+//! (resources.rs): what the sandbox is created with, within this install's maxima, and
+//! what an existing one must already have. A refusal is 400, 409 or 422 with
+//! `{ "error", "code", "field", … }`.
 
 mod child;
 mod config;
@@ -27,6 +33,7 @@ mod net;
 mod pidfd;
 mod publish;
 mod quota;
+mod resources;
 mod runner;
 #[cfg(test)]
 mod service_unit;
@@ -46,7 +53,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Backstop for one proxied request (Lorehouse's longest command is 10 minutes).
+/// Backstop for one proxied request. A command's is its sandbox's command timeout plus
+/// 5.5 minutes (resources.rs), which for the default 10 minutes is this.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(15 * 60 + 30);
 /// How long requests in flight get after SIGTERM before the VMs are stopped anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -87,18 +95,51 @@ fn error(status: u16, msg: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
 }
 
+/// The resources a request asks for its sandbox (resources.rs): the header, as JSON.
+fn requested(headers: &HeaderMap) -> Result<Option<resources::Request>, resources::Refusal> {
+    match headers.get(resources::HEADER) {
+        None => Ok(None),
+        Some(v) => resources::parse_header(v.to_str().unwrap_or("")).map(Some),
+    }
+}
+
+/// A sandbox that couldn't be reached, as the API answers it: `{ "error" }`, and for a
+/// refused request for resources its `code` and what it names.
+fn refused(e: &vm::AcquireError) -> Response {
+    (StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(e.body())).into_response()
+}
+
+/// A guest call as it goes to guestd, and how long the host waits for it. A command
+/// (`POST /exec`) carries the sandbox's own timeout, never more, whatever the caller sent,
+/// and the host's wait follows it; anything else has the fixed deadline.
+pub fn bounded(granted: &resources::Granted, method: &Method, guest_path: &str, body: Bytes) -> (Bytes, Duration) {
+    if method == Method::POST && guest_path == "/exec" {
+        (granted.cap_exec_timeout(body), granted.exec_backstop())
+    } else {
+        (body, REQUEST_DEADLINE)
+    }
+}
+
 /// Boot the sandbox if needed and pass one request through to its guestd.
-async fn forward(app: &App, id: &str, method: Method, guest_path: String, body: Bytes) -> Response {
+async fn forward(app: &App, id: &str, method: Method, guest_path: String, body: Bytes, headers: &HeaderMap) -> Response {
     if !vm::valid_id(id) {
         return error(400, "sandbox id: 1–128 of [A-Za-z0-9_.-], not starting with a dot");
     }
-    let (_use, uds) = match app.vms.acquire(id).await {
-        Ok(v) => v,
-        Err((status, msg)) => return error(status, msg),
+    let request = match requested(headers) {
+        Ok(r) => r,
+        Err(r) => {
+            eprintln!("sandboxd: {id}: refused ({}): {}", r.code, r.message);
+            return refused(&r.into());
+        }
     };
-    // A host-side deadline, whatever the guest does: Lorehouse's longest command is 10
-    // minutes, and guestd kills it at its own timeout, so this is the backstop.
-    match tokio::time::timeout(REQUEST_DEADLINE, vsock::request(&uds, method, &guest_path, body)).await {
+    let (_use, uds, granted) = match app.vms.acquire_with(id, request.as_ref()).await {
+        Ok(v) => v,
+        Err(e) => return refused(&e),
+    };
+    // A host-side deadline, whatever the guest does: guestd kills a command at the timeout
+    // it is sent (the sandbox's own, see `bounded`), so this is the backstop.
+    let (body, deadline) = bounded(&granted, &method, &guest_path, body);
+    match tokio::time::timeout(deadline, vsock::request(&uds, method, &guest_path, body)).await {
         Ok(Ok(reply)) => {
             let mut headers = HeaderMap::new();
             if let Some(ct) = reply.content_type.and_then(|v| v.parse().ok()) {
@@ -107,28 +148,28 @@ async fn forward(app: &App, id: &str, method: Method, guest_path: String, body: 
             (reply.status, headers, reply.body).into_response()
         }
         Ok(Err(e)) => error(502, e),
-        Err(_) => error(504, format!("the guest didn't answer within {} s", REQUEST_DEADLINE.as_secs())),
+        Err(_) => error(504, format!("the guest didn't answer within {} s", deadline.as_secs())),
     }
 }
 
-async fn exec(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> Response {
-    forward(&app, &id, Method::POST, "/exec".into(), body).await
+async fn exec(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+    forward(&app, &id, Method::POST, "/exec".into(), body, &headers).await
 }
 
 fn file_path(query: Option<String>) -> String {
     format!("/file?{}", query.unwrap_or_default())
 }
 
-async fn read_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): RawQuery) -> Response {
-    forward(&app, &id, Method::GET, file_path(q), Bytes::new()).await
+async fn read_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): RawQuery, headers: HeaderMap) -> Response {
+    forward(&app, &id, Method::GET, file_path(q), Bytes::new(), &headers).await
 }
 
-async fn write_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): RawQuery, body: Bytes) -> Response {
-    forward(&app, &id, Method::PUT, file_path(q), body).await
+async fn write_file(State(app): State<App>, Path(id): Path<String>, RawQuery(q): RawQuery, headers: HeaderMap, body: Bytes) -> Response {
+    forward(&app, &id, Method::PUT, file_path(q), body, &headers).await
 }
 
-async fn job_start(State(app): State<App>, Path(id): Path<String>, body: Bytes) -> Response {
-    forward(&app, &id, Method::POST, "/jobs".into(), body).await
+async fn job_start(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+    forward(&app, &id, Method::POST, "/jobs".into(), body, &headers).await
 }
 
 /// The guestd path for a job route, or why it is refused (a 400). `job` is as Axum decoded it, so
@@ -149,16 +190,16 @@ fn job_guest_path(method: &Method, job: &str, query: Option<String>) -> Result<S
     }
 }
 
-async fn job_status(State(app): State<App>, Path((id, job)): Path<(String, String)>, RawQuery(q): RawQuery) -> Response {
+async fn job_status(State(app): State<App>, Path((id, job)): Path<(String, String)>, RawQuery(q): RawQuery, headers: HeaderMap) -> Response {
     match job_guest_path(&Method::GET, &job, q) {
-        Ok(path) => forward(&app, &id, Method::GET, path, Bytes::new()).await,
+        Ok(path) => forward(&app, &id, Method::GET, path, Bytes::new(), &headers).await,
         Err(why) => error(400, why),
     }
 }
 
-async fn job_cancel(State(app): State<App>, Path((id, job)): Path<(String, String)>) -> Response {
+async fn job_cancel(State(app): State<App>, Path((id, job)): Path<(String, String)>, headers: HeaderMap) -> Response {
     match job_guest_path(&Method::POST, &job, None) {
-        Ok(path) => forward(&app, &id, Method::POST, path, Bytes::new()).await,
+        Ok(path) => forward(&app, &id, Method::POST, path, Bytes::new(), &headers).await,
         Err(why) => error(400, why),
     }
 }
@@ -189,6 +230,17 @@ async fn push(State(app): State<App>, Path(id): Path<String>, Json(req): Json<pu
 
 async fn list(State(app): State<App>) -> Response {
     Json(app.vms.list().await).into_response()
+}
+
+/// What this sandboxd understands beyond the first API, and what a sandbox gets here by
+/// default and at most. A caller with a request for resources asks this first: a sandboxd
+/// that predates it has no such route (404) and would ignore the request.
+pub fn capabilities(policy: &resources::Policy) -> serde_json::Value {
+    serde_json::json!({ "version": runner::VERSION, "features": [resources::FEATURE], "resources": policy })
+}
+
+async fn capabilities_route(State(app): State<App>) -> Response {
+    Json(capabilities(app.vms.policy())).into_response()
 }
 
 #[tokio::main]
@@ -259,6 +311,17 @@ async fn main() {
     }
 
     let vms = Manager::new(cfg.clone(), host, quota, fw.clone());
+    // What a request for resources is held to, for whoever reads a refusal in this log.
+    let policy = vms.policy();
+    let max_disk = if policy.maxima.disk_gib == 0 { "none (disks aren't capped here)".to_string() } else { policy.maxima.disk_gib.to_string() };
+    eprintln!(
+        "sandboxd: a sandbox gets {} unless it asks; a request may ask for up to vcpus {}, memMib {}, diskGib {max_disk}, pids {}, commandTimeoutSecs {} (SANDBOXD_MAX_*)",
+        policy.defaults.describe(),
+        policy.maxima.vcpus,
+        policy.maxima.mem_mib,
+        policy.maxima.pids,
+        policy.maxima.command_timeout_secs
+    );
     // The table, kept as loaded: checked every SANDBOXD_NET_CHECK_SECS (and before every
     // boot, in vm.rs). One that is gone or changed is loaded again; one that can't be takes
     // every tap down and stops every VM, and none boots until it is back (fail closed).
@@ -358,6 +421,7 @@ async fn main() {
             let app = App { vms: vms.clone(), publisher: publisher.clone(), token_digest: digest(token) };
             let v1 = Router::new()
                 .route("/v1/sandboxes", get(list))
+                .route("/v1/capabilities", get(capabilities_route))
                 .route("/v1/sandboxes/{id}", axum::routing::delete(destroy))
                 .route("/v1/sandboxes/{id}/exec", post(exec))
                 .route("/v1/sandboxes/{id}/file", get(read_file).put(write_file))
@@ -432,6 +496,52 @@ mod tests {
         s.read_to_string(&mut reply).await.unwrap();
         let status = reply[9..12].parse().unwrap();
         (status, reply.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+    }
+
+    #[test]
+    fn only_a_command_carries_the_sandboxs_timeout_and_the_hosts_wait_follows_it() {
+        use bytes::Bytes;
+        let granted = crate::resources::Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 1800 };
+        // An exec that asks for more than the sandbox has, or for nothing: the sandbox's.
+        for body in [r#"{"command":"make","timeoutMs":7200000}"#, r#"{"command":"make"}"#] {
+            let (sent, wait) = super::bounded(&granted, &Method::POST, "/exec", Bytes::from(body));
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&sent).unwrap()["timeoutMs"], 1_800_000, "{body}");
+            assert_eq!(wait, std::time::Duration::from_secs(1800 + 330));
+        }
+        // A file write or a job start is not a command: untouched, the fixed deadline.
+        for (m, p) in [(Method::PUT, "/file?path=%2Fw%2Fa"), (Method::POST, "/jobs"), (Method::GET, "/exec")] {
+            let body = Bytes::from_static(br#"{"command":"make","timeoutMs":7200000}"#);
+            assert_eq!(super::bounded(&granted, &m, p, body.clone()), (body, super::REQUEST_DEADLINE), "{m} {p}");
+        }
+    }
+
+    #[test]
+    fn the_resources_header_is_read_as_a_request_and_a_bad_one_is_refused_with_its_code() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let with = |v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-lorehouse-sandbox-resources", HeaderValue::from_static(v));
+            super::requested(&h)
+        };
+        assert_eq!(super::requested(&HeaderMap::new()), Ok(None));
+        assert_eq!(with(r#"{"vcpus":4,"memMib":4096}"#).unwrap().map(|r| (r.vcpus, r.mem_mib)), Some((Some(4), Some(4096))));
+        for bad in ["4", r#"{"vcpus":0}"#, r#"{"gpus":1}"#, "vcpus=4"] {
+            let r = with(bad).unwrap_err();
+            assert_eq!((r.status, r.code), (400, "invalid_resources"), "{bad}");
+            // As the API answers it: the message, the code, the field where there is one.
+            let e = crate::vm::AcquireError::from(r);
+            assert_eq!(e.body()["code"], "invalid_resources");
+            assert!(e.body()["error"].as_str().is_some_and(|m| m.to_lowercase().contains("nothing was created or changed")), "{bad}");
+        }
+        // A sandboxd that understands requests says so, with what it grants.
+        let policy = crate::resources::tests::roomy();
+        assert_eq!(
+            super::capabilities(&policy),
+            serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "features": ["resources"], "resources": {
+                "defaults": { "vcpus": 2, "memMib": 2048, "diskGib": 8, "pids": 64, "commandTimeoutSecs": 600 },
+                "maxima": { "vcpus": 8, "memMib": 8192, "diskGib": 32, "pids": 256, "commandTimeoutSecs": 3600 },
+            } })
+        );
     }
 
     #[tokio::test]
