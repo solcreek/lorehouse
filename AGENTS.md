@@ -68,7 +68,7 @@ only types from `@junejs/core` and `@junejs/server` (`test/profiles.test.ts`).
 **Profiles** (`src/profiles.ts`, ADR 0002). An agent is a profile: plain data, with no June
 import. `id` (durable: it names the sessions), `mode`, `prompt`, `tools` and `skills` (by
 name, in the order the model sees them), `triggers` (a union tagged by `kind`) and
-`sandbox`. Today's agent is the one profile, `lorehouse`. `src/app.ts` turns each entry of
+`sandbox` (`none` or `write`; a profile with `none` can list no code tool). Today's agent is the one profile, `lorehouse`. `src/app.ts` turns each entry of
 `PROFILES` into one June agent, giving it the tools and skills it names out of those the
 install has on (the code tools need a sandbox, `render_pdf` needs `PDF_REPLIES`). Adding a
 profile:
@@ -76,8 +76,8 @@ profile:
   object to `PROFILES`. No change to `src/app.ts` for a profile that uses what exists.
 - `loadProfiles` checks every profile on start, and a wrong one stops the start, naming the
   profile, the field and what it allows. A field of ADR 0002 §1 that nothing reads yet
-  (`delivery`, `credentials`, `knowledge`, `model`) is refused, not ignored: add it to the
-  type together with the code that honors it. A new trigger kind is a new member of
+  (`delivery`, `credentials`, `knowledge`, `model`), and `sandbox: "read"`, is refused, not
+  ignored: accept it together with the code that honors it. A new trigger kind is a new member of
   `ProfileTrigger`, checked in `checkProfile`.
 - Exactly one profile is started by Slack messages (ADR 0002 §2), and it gets the Slack channel.
 - `GET /status` lists each profile's `id`, `mode` and the triggers in force

@@ -17,9 +17,18 @@ import { PROMPT_CATALOG } from "./prompts";
 export const PROFILE_MODES = ["interactive", "automation", "job"] as const;
 export type ProfileMode = (typeof PROFILE_MODES)[number];
 
-// What a profile may do in a sandbox (ADR 0002 §1). Only `write` may open a pull request.
+// What a profile may do in a sandbox (ADR 0002 §1: `none`, `read` or `write`; only `write`
+// may open a pull request):
+//   none   no sandbox: it may list none of the code tools (workspace_*, open_pull_request)
+//   write  today's sandbox: it may list them all
+//   read   in the ADR and in this type, but refused by loadProfiles for now: nothing would
+//          keep its sandbox read-only (the workspace tools write, and a clone takes
+//          credentials). It is accepted once something enforces it.
 export const PROFILE_SANDBOXES = ["none", "read", "write"] as const;
 export type ProfileSandbox = (typeof PROFILE_SANDBOXES)[number];
+const SUPPORTED_SANDBOXES = ["none", "write"];
+// The tools that run in, or publish from, a sandbox.
+const isCodeTool = (tool: string) => tool.startsWith("workspace_") || tool === "open_pull_request";
 
 // The Slack messages that start a turn:
 //   mention         an @-mention in a listed public channel
@@ -156,7 +165,8 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
   oneOf("prompt", catalog.prompts);
   names("tools", input.tools, catalog.tools, "a tool");
   names("skills", input.skills, catalog.skills, "a skill");
-  oneOf("sandbox", PROFILE_SANDBOXES);
+  if (input.sandbox === "read") bad("sandbox", `"read" is in ADR 0002 §1 but not supported yet: nothing would keep the sandbox read-only (allowed for now: ${SUPPORTED_SANDBOXES.join(", ")})`);
+  else oneOf("sandbox", SUPPORTED_SANDBOXES);
 
   if (!Array.isArray(input.triggers)) bad("triggers", `must be a list of triggers, got ${show(input.triggers)}`);
   else {
@@ -182,12 +192,12 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
     }
   }
 
-  // ADR 0002 §1: only a `write` sandbox may open a pull request; the workspace tools need one at all.
-  if (Array.isArray(input.tools) && (PROFILE_SANDBOXES as readonly unknown[]).includes(input.sandbox)) {
-    const tools = input.tools.filter((t: unknown): t is string => typeof t === "string");
-    if (input.sandbox !== "write" && tools.includes("open_pull_request")) bad("sandbox", `must be write for the tool open_pull_request, got "${input.sandbox}"`);
-    const workspace = tools.filter((t) => t.startsWith("workspace_"));
-    if (input.sandbox === "none" && workspace.length) bad("sandbox", `must be read or write for the tool${workspace.length === 1 ? "" : "s"} ${workspace.join(", ")}, got "none"`);
+  // The code tools need a sandbox, and the one kind there is yet is `write` (ADR 0002 §1:
+  // only `write` may open a pull request). This is what honors `none`: such a profile gets
+  // no code tool, since it can't list one.
+  if (input.sandbox === "none" && Array.isArray(input.tools)) {
+    const code = input.tools.filter((t: unknown): t is string => typeof t === "string" && isCodeTool(t));
+    if (code.length) bad("sandbox", `must be write for the tool${code.length === 1 ? "" : "s"} ${code.join(", ")}, got "none"`);
   }
   return problems.length === before ? deepFreeze(structuredClone(input) as Profile) : undefined;
 }

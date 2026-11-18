@@ -122,9 +122,9 @@ describe("a profile is checked on start", () => {
   test("mode, prompt and sandbox each say what they allow", () => {
     expect(problems({ ...valid, mode: "batch" })).toContain('profile "lorehouse": mode: must be one of interactive, automation, job, got "batch"');
     expect(problems({ ...valid, prompt: "system" })).toEqual(['profile "lorehouse": prompt: must be one of lorehouse, review, got "system"']);
-    expect(problems({ ...valid, sandbox: "rw" })).toEqual(['profile "lorehouse": sandbox: must be one of none, read, write, got "rw"']);
+    expect(problems({ ...valid, sandbox: "rw" })).toEqual(['profile "lorehouse": sandbox: must be one of none, write, got "rw"']);
     const { sandbox: _, ...without } = valid;
-    expect(problems(without)).toEqual(['profile "lorehouse": sandbox: must be one of none, read, write, got nothing']);
+    expect(problems(without)).toEqual(['profile "lorehouse": sandbox: must be one of none, write, got nothing']);
   });
 
   test("a tool or skill that doesn't exist, or is listed twice, is named with what does exist", () => {
@@ -160,11 +160,23 @@ describe("a profile is checked on start", () => {
     expect(problems({ ...valid, tools: ["open_pull_request"], sandbox: "write" })).toEqual([]);
   });
 
-  test("only a write sandbox may open a pull request, and the workspace tools need a sandbox (ADR 0002 §1)", () => {
-    expect(problems({ ...valid, tools: ["open_pull_request"], sandbox: "read" })).toEqual(['profile "lorehouse": sandbox: must be write for the tool open_pull_request, got "read"']);
-    expect(problems({ ...valid, tools: ["workspace_exec"], sandbox: "none" })).toEqual(['profile "lorehouse": sandbox: must be read or write for the tool workspace_exec, got "none"']);
-    expect(problems({ ...valid, tools: ["workspace_exec"], sandbox: "read" })).toEqual([]);
+  test("the code tools need a write sandbox: with none, a profile can list no workspace tool and no pull request (ADR 0002 §1)", () => {
+    expect(problems({ ...valid, tools: ["open_pull_request"], sandbox: "none" })).toEqual(['profile "lorehouse": sandbox: must be write for the tool open_pull_request, got "none"']);
+    expect(problems({ ...valid, tools: ["search_knowledge", "workspace_exec", "open_pull_request"], sandbox: "none" })).toEqual(['profile "lorehouse": sandbox: must be write for the tools workspace_exec, open_pull_request, got "none"']);
     expect(problems({ ...valid, tools: ["workspace_exec", "open_pull_request"], sandbox: "write" })).toEqual([]);
+    expect(problems({ ...valid, tools: ["search_knowledge"], sandbox: "write" })).toEqual([]);
+  });
+
+  test("a read sandbox is refused for now, with or without code tools: nothing would keep it read-only", () => {
+    const refusal = 'profile "lorehouse": sandbox: "read" is in ADR 0002 §1 but not supported yet: nothing would keep the sandbox read-only (allowed for now: none, write)';
+    expect(problems({ ...valid, sandbox: "read" })).toEqual([refusal]);
+    expect(problems({ ...valid, tools: ["workspace_exec"], sandbox: "read" })).toEqual([refusal]);
+    expect(problems({ ...valid, tools: ["open_pull_request"], sandbox: "read" })).toEqual([refusal]);
+  });
+
+  test("every profile this build runs has a sandbox the code honors: none or write", () => {
+    for (const p of PROFILES) expect(["none", "write"], p.id).toContain(p.sandbox);
+    expect(LOREHOUSE.sandbox).toBe("write");
   });
 
   test("a field nothing honors yet is refused, not ignored; so is one that isn't a profile's", () => {
