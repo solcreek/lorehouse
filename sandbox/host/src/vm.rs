@@ -457,6 +457,17 @@ impl Manager {
     /// changed, a refusal is logged, and a refused call is not a use of the sandbox.
     /// Returns what the sandbox has.
     pub async fn acquire_with(&self, id: &str, request: Option<&Request>) -> Result<(Use, PathBuf, Granted), AcquireError> {
+        self.acquire_for(id, request, false).await
+    }
+
+    /// `acquire_with`, for a call that says what it is. `watching`: the call only reads or
+    /// stops something a running VM already has (a job's status, a job's cancel, a file
+    /// read): it starts no work and makes nothing, so a VM running with other resources
+    /// than `request` comes to serves it as it is. Otherwise a job started before a
+    /// profile's request changed could be neither watched nor cancelled for as long as it
+    /// holds its VM up (SANDBOXD_JOB_HOLD_SECS, 6 h by default). With the VM stopped the
+    /// call boots it like any other, with the request.
+    pub async fn acquire_for(&self, id: &str, request: Option<&Request>, watching: bool) -> Result<(Use, PathBuf, Granted), AcquireError> {
         let sb = self.get(id).await;
         sb.in_flight.fetch_add(1, Ordering::SeqCst);
         let guard = Use { sandbox: sb.clone(), counts: true };
@@ -467,7 +478,7 @@ impl Manager {
             None => false,
         };
         let request = request.filter(|r| !r.is_empty());
-        let plan = match self.resources_for(&sb, running.as_ref().filter(|_| alive).map(|r| &r.granted), request).await {
+        let plan = match self.resources_for(&sb, running.as_ref().filter(|_| alive).map(|r| &r.granted), request, watching).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("sandboxd: {}: refused ({}): {}", sb.id, e.code().unwrap_or("error"), e.message());
@@ -514,14 +525,16 @@ impl Manager {
     /// Called under the sandbox's lock; makes and changes nothing (the boot does).
     ///
     /// `up`: the grant of its VM, when that runs now. Resources are fixed while it does: a
-    /// request must come to what the VM has. With the VM stopped (or never booted) a
+    /// request must come to what the VM has, unless the call only watches or stops what it
+    /// runs (`watching`). With the VM stopped (or never booted) a
     /// request is granted afresh against the maxima in force and becomes the sandbox's
     /// from that boot on, except less disk than the sandbox already uses, which is never
     /// applied. No request: the sandbox as it is (its record, held to the rules a request
     /// is; or the host's defaults for one that has none).
-    async fn resources_for(&self, sb: &Sandbox, up: Option<&Granted>, request: Option<&Request>) -> Result<Plan, AcquireError> {
+    async fn resources_for(&self, sb: &Sandbox, up: Option<&Granted>, request: Option<&Request>, watching: bool) -> Result<Plan, AcquireError> {
         if let Some(has) = up {
-            if let Some(req) = request {
+            // A call that only watches or stops what the VM runs is served as the VM is.
+            if let Some(req) = request.filter(|_| !watching) {
                 self.policy.check_running(&sb.id, has, req, self.cfg.idle.as_secs())?;
             }
             return Ok(Plan { granted: has.clone(), keep: false, from: None });
@@ -878,7 +891,7 @@ fn rate_limiter(bytes_per_sec: u64, ops_per_sec: u64) -> Option<serde_json::Valu
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use crate::config::{Config, Mode};
     use std::time::Duration;
 
@@ -1107,20 +1120,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A manager (raised maxima, no disk quota) with one sandbox, `up`, whose VM "runs": a
+    /// stand-in process in slot 0, booted with 4 vCPUs, 4096 MiB and a 30-minute command
+    /// timeout. Its guestd socket doesn't exist, so a call that gets as far as the VM
+    /// fails there (a 502), which tells it from one refused before (a 409).
+    pub async fn one_running(dir: &std::path::Path) -> (std::sync::Arc<super::Manager>, crate::resources::Granted) {
+        let vms = never_boots(dir, true, crate::quota::Quota::Off);
+        let grant = crate::resources::Granted { vcpus: 4, mem_mib: 4096, disk_gib: None, pids: 64, command_timeout_secs: 1800 };
+        on_disk(dir, "up", Some(&grant));
+        let sb = vms.get("up").await;
+        let vmm = super::Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
+        vms.slots.lock().await[0] = true;
+        *sb.running.lock().await = Some(vms.track(vmm, 0, grant.clone()));
+        (vms, grant)
+    }
+
+    #[tokio::test]
+    async fn a_call_that_only_watches_or_stops_what_a_running_vm_has_is_served_whatever_it_asks() {
+        let dir = std::env::temp_dir().join(format!("sandboxd-resources-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (vms, grant) = one_running(&dir).await;
+        // The profile's request changed at a deploy; a job started before it still runs.
+        let changed = request(serde_json::json!({ "vcpus": 2, "commandTimeoutSecs": 600 }));
+        // A status, a cancel or a file read: the VM as it is, with what it has.
+        let (_use, uds, has) = vms.acquire_for("up", Some(&changed), true).await.unwrap_or_else(|e| panic!("{}", e.message()));
+        assert_eq!(has, grant);
+        assert!(uds.ends_with("jail/firecracker/lorehouse-0/root/vsock.sock"));
+        // A call that starts work or writes: refused, saying what can still be done.
+        let Err(e) = vms.acquire_for("up", Some(&changed), false).await else { panic!("served") };
+        assert_eq!((e.status(), e.code()), (409, Some(crate::resources::MISMATCH)));
+        assert!(e.message().contains("can still be watched and cancelled, and files read"), "{}", e.message());
+        // Neither changed the record or the VM.
+        assert_eq!(crate::resources::read_stored(&dir.join("state/up")), Ok(Some(grant)));
+        assert_eq!(vms.running_count().await, 1);
+        // A stopped sandbox: a watching call is like any other; one over a maximum is refused.
+        on_disk(&dir, "stopped", None);
+        let over = request(serde_json::json!({ "vcpus": 9 }));
+        let Err(e) = vms.acquire_for("stopped", Some(&over), true).await else { panic!("booted") };
+        assert_eq!((e.status(), e.code()), (422, Some(crate::resources::OVER_MAXIMUM)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_running_sandbox_keeps_its_resources_and_a_refused_request_is_not_activity() {
         use std::sync::atomic::Ordering;
         let dir = std::env::temp_dir().join(format!("sandboxd-resources-up-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let vms = never_boots(&dir, true, crate::quota::Quota::Off);
         // A running VMM (a stand-in), booted with 4 vCPUs and a 30-minute command timeout,
         // last used a while ago: idle for longer than SANDBOXD_IDLE_SECS (60 s here).
-        let grant = crate::resources::Granted { vcpus: 4, mem_mib: 4096, disk_gib: None, pids: 64, command_timeout_secs: 1800 };
-        on_disk(&dir, "up", Some(&grant));
+        let (vms, grant) = one_running(&dir).await;
         let sb = vms.get("up").await;
-        let vmm = super::Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
-        vms.slots.lock().await[0] = true;
-        *sb.running.lock().await = Some(vms.track(vmm, 0, grant.clone()));
         let long_ago = super::now_secs() - 1000;
         sb.last_used.store(long_ago, Ordering::SeqCst);
 

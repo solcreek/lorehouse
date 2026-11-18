@@ -131,6 +131,24 @@ pub fn checked(method: &Method, guest_path: &str, body: Bytes) -> Result<Call, r
     }
 }
 
+/// Whether a guest call only reads or stops something a running VM already has: a job's
+/// status (`GET /jobs/<id>`), a job's cancel (`POST /jobs/<id>/cancel`), a file read
+/// (`GET /file`). Such a call starts no work and makes nothing, so a VM running with other
+/// resources than the call asks for serves it (vm.rs `acquire_for`): a job that was
+/// started before a profile's request changed can still be watched, read from and
+/// cancelled. A file read is one of them because it is how a job's output and artifacts
+/// leave the sandbox, and it changes nothing there. Everything else starts work or
+/// writes: an exec, a job's start, a file write.
+pub fn watches(method: &Method, guest_path: &str) -> bool {
+    let route = guest_path.split_once('?').map_or(guest_path, |(route, _)| route);
+    let job = route.strip_prefix("/jobs/").filter(|rest| !rest.is_empty());
+    match *method {
+        Method::GET => route == "/file" || job.is_some_and(|rest| !rest.contains('/')),
+        Method::POST => job.and_then(|rest| rest.strip_suffix("/cancel")).is_some_and(|id| !id.is_empty() && !id.contains('/')),
+        _ => false,
+    }
+}
+
 /// A checked call as it goes to guestd, and how long the host waits for it. A command is
 /// sent a body sandboxd wrote itself, with the sandbox's own timeout at most, and the
 /// host's wait follows that timeout. Anything else has the fixed deadline.
@@ -161,7 +179,7 @@ async fn forward(app: &App, id: &str, method: Method, guest_path: String, body: 
             return refused(&r.into());
         }
     };
-    let (_use, uds, granted) = match app.vms.acquire_with(id, request.as_ref()).await {
+    let (_use, uds, granted) = match app.vms.acquire_for(id, request.as_ref(), watches(&method, &guest_path)).await {
         Ok(v) => v,
         Err(e) => return refused(&e),
     };
@@ -554,6 +572,57 @@ mod tests {
             let body = Bytes::from_static(br#"{"command":"make","timeoutMs":7200000}"#);
             assert_eq!(sent(&m, p, &body), Ok((body, super::REQUEST_DEADLINE)), "{m} {p}");
         }
+    }
+
+    #[test]
+    fn only_a_jobs_status_its_cancel_and_a_file_read_watch_a_running_vm() {
+        for (m, p) in [(Method::GET, "/jobs/bench-1"), (Method::GET, "/jobs/bench-1?waitMs=60000&tailBytes=8192"), (Method::POST, "/jobs/bench-1/cancel"), (Method::GET, "/file?path=%2Fw%2Fout.txt")] {
+            assert!(super::watches(&m, p), "{m} {p}");
+        }
+        // Whatever starts work or writes, and anything that isn't one of the three.
+        for (m, p) in [
+            (Method::POST, "/exec"),
+            (Method::POST, "/jobs"),
+            (Method::PUT, "/file?path=%2Fw%2Fout.txt"),
+            (Method::GET, "/jobs"),
+            (Method::GET, "/jobs/"),
+            (Method::POST, "/jobs/bench-1"),
+            (Method::POST, "/jobs/bench-1/kill"),
+            (Method::POST, "/jobs//cancel"),
+            (Method::GET, "/jobs/bench-1/cancel"),
+            (Method::DELETE, "/jobs/bench-1"),
+            (Method::GET, "/exec"),
+            (Method::GET, "/filex"),
+        ] {
+            assert!(!super::watches(&m, p), "{m} {p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_running_vm_with_other_resources_serves_a_jobs_status_cancel_and_a_file_read_and_refuses_what_starts_work() {
+        use axum::http::{HeaderMap, HeaderValue};
+        use bytes::Bytes;
+        let dir = std::env::temp_dir().join(format!("sandboxd-serve-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (vms, _grant) = crate::vm::tests::one_running(&dir).await;
+        let (_, publisher) = crate::runner::tests::no_vms(&dir.join("publisher"));
+        let app = super::App { vms, publisher, token_digest: super::digest("t") };
+        // The profile's request changed since the VM booted (4 vCPUs then, 2 asked now).
+        let mut changed = HeaderMap::new();
+        changed.insert("x-lorehouse-sandbox-resources", HeaderValue::from_static(r#"{"vcpus":2}"#));
+        let status = |m: Method, p: &'static str, body: &'static str| {
+            let (app, changed) = (app.clone(), changed.clone());
+            async move { super::forward(&app, "up", m, p.into(), Bytes::from(body), &changed).await.status().as_u16() }
+        };
+        // Served as the VM is: they get as far as its guestd (not there in this test: 502).
+        assert_eq!(status(Method::GET, "/jobs/bench-1?waitMs=0&tailBytes=8192", "").await, 502);
+        assert_eq!(status(Method::POST, "/jobs/bench-1/cancel", "").await, 502);
+        assert_eq!(status(Method::GET, "/file?path=%2Fw%2Fout.txt", "").await, 502);
+        // Refused: they would start work, or write, in a VM that isn't what was asked for.
+        assert_eq!(status(Method::POST, "/exec", r#"{"command":"make"}"#).await, 409);
+        assert_eq!(status(Method::POST, "/jobs", r#"{"id":"b2","command":"make"}"#).await, 409);
+        assert_eq!(status(Method::PUT, "/file?path=%2Fw%2Fa", "x").await, 409);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

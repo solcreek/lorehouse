@@ -168,7 +168,9 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
                     return JobResult::unreachable(&job.id, &r.into());
                 }
             };
-            let (_use, uds, granted) = match vms.acquire_with(&job.sandbox, request.as_ref()).await {
+            // A job's status or cancel, or a file read, is served by a VM running with other
+            // resources than the job asks for: it starts no work there (crate::watches).
+            let (_use, uds, granted) = match vms.acquire_for(&job.sandbox, request.as_ref(), crate::watches(&method, p)).await {
                 Ok(v) => v,
                 Err(e) => return JobResult::unreachable(&job.id, &e),
             };
@@ -999,6 +1001,32 @@ pub mod tests {
         // A destroy carries no request, and one sent with it is not read.
         let destroy: Job = serde_json::from_value(serde_json::json!({ "id": "j_2", "sandbox": "acme.t1", "op": "destroy", "timeoutMs": 60000, "resources": { "gpus": 1 } })).unwrap();
         assert_eq!(execute(&vms, &publisher, destroy, Instant::now()).await.status, 204);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_job_for_a_running_vm_with_other_resources_may_watch_or_stop_but_not_start() {
+        use super::execute;
+        let dir = scratch_dir("job-watch");
+        let (vms, _grant) = crate::vm::tests::one_running(&dir).await;
+        let (_, publisher) = no_vms(&dir.join("publisher"));
+        // The profile's request changed since the VM booted (4 vCPUs then, 2 asked now).
+        let job = |method: &str, path: &str, body: &str| -> Job {
+            serde_json::from_value(serde_json::json!({ "id": "j_1", "sandbox": "up", "op": "guest", "method": method, "path": path, "bodyBase64": super::B64.encode(body), "timeoutMs": 30000, "deadlineMs": 89000, "resources": { "vcpus": 2 } })).unwrap()
+        };
+        use base64::Engine;
+        // A job's status and cancel, and a file read: they reach the VM as it is (its guestd
+        // isn't there in this test: 502, with no code).
+        for (m, p) in [("GET", "/jobs/bench-1?waitMs=0&tailBytes=8192"), ("POST", "/jobs/bench-1/cancel"), ("GET", "/file?path=%2Fw%2Fout.txt")] {
+            let r = execute(&vms, &publisher, job(m, p, ""), Instant::now()).await;
+            assert_eq!((r.status, r.code.as_deref()), (502, None), "{m} {p}: {:?}", r.error);
+        }
+        // What would start work or write there: refused as a mismatch, and told what still works.
+        for (m, p, body) in [("POST", "/exec", r#"{"command":"make"}"#), ("POST", "/jobs", r#"{"id":"b2","command":"make"}"#), ("PUT", "/file?path=%2Fw%2Fa", "x")] {
+            let r = execute(&vms, &publisher, job(m, p, body), Instant::now()).await;
+            assert_eq!((r.status, r.code.as_deref()), (409, Some("resources_mismatch")), "{m} {p}: {:?}", r.error);
+            assert!(r.error.as_deref().unwrap_or("").contains("can still be watched and cancelled"), "{:?}", r.error);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

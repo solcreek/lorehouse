@@ -423,7 +423,7 @@ impl Policy {
             409,
             MISMATCH,
             format!(
-                "sandbox {id} is running with its earlier resources ({}), and this request comes to {}. A sandbox's resources are fixed while its VM runs and change at its next boot: the VM stops after {idle_secs} s without a request (SANDBOXD_IDLE_SECS; a running background job can hold it up longer, SANDBOXD_JOB_HOLD_SECS), and the first request after that starts it with what that request asks for. Wait that long and try again, or ask for what it has. This call was not run and does not count as a request",
+                "sandbox {id} is running with its earlier resources ({}), and this request comes to {}. A sandbox's resources are fixed while its VM runs and change at its next boot: the VM stops after {idle_secs} s without a request (SANDBOXD_IDLE_SECS; a running background job can hold it up longer, SANDBOXD_JOB_HOLD_SECS), and the first request after that starts it with what that request asks for. Wait that long and try again, or ask for what it has. A job already running there can still be watched and cancelled, and files read: only calls that start work or write are refused. This call was not run and does not count as a request",
                 has.describe(),
                 differs.iter().map(show).collect::<Vec<_>>().join(", ")
             ),
