@@ -50,7 +50,8 @@ export type AdminOptions = {
   checkRepo?: (repo: RepoRef, branch?: string) => Promise<RepoCheck>;
   // How long a PUT waits for checkRepo before answering github_unavailable (CHECK_TIMEOUT_MS).
   checkTimeoutMs?: number;
-  // One line per default repo set or cleared: counts and names, never a token.
+  // The audit trail: one line per attempt to set or clear a default repo, with its outcome
+  // (see channelRepo). Never a token or a request body.
   log?: (line: string) => void;
 };
 
@@ -72,6 +73,9 @@ const MAX_BODY = 4096;
 // How long PUT waits for GitHub's answers about a repo, all of them together.
 export const CHECK_TIMEOUT_MS = 10_000;
 const REPO_METHODS = ["GET", "PUT", "DELETE"];
+
+// What a write attempt asked for, as far as it validated: what its audit line may hold.
+type Attempt = { channel?: string; repo?: string; branch?: string };
 
 // A default repo as the API shows it; null when the channel has none.
 const shown = (r: ChannelRepo | undefined) => (r ? { repo: r.repo, branch: r.branch, setAt: r.setAt } : null);
@@ -200,7 +204,7 @@ export function adminRoutes(opts: AdminOptions) {
   // What PUT asks for, from its body: { "repo": "owner/name", "branch": "main" } (branch
   // optional; null or left out: the repo's own default branch). Strict: a field it doesn't
   // know is refused, never ignored, so a misspelt "branch" can't silently set none.
-  async function wanted(req: Request): Promise<{ repo: RepoRef; branch?: string }> {
+  async function wanted(req: Request, seen: Attempt): Promise<{ repo: RepoRef; branch?: string }> {
     const example = 'send JSON like { "repo": "owner/name" } or { "repo": "owner/name", "branch": "main" }';
     // Refused by its declared length before any of it is read, and read no further than
     // the limit when it declares none (or lies).
@@ -231,23 +235,49 @@ export function adminRoutes(opts: AdminOptions) {
     const { repo, branch } = body as { repo?: unknown; branch?: unknown };
     const named = typeof repo === "string" ? repoName(repo) : undefined;
     if (!named) throw new Refusal(400, "invalid_repo", '"repo" must be a GitHub repo as owner/name, e.g. "acme/widgets" (not a URL; an owner is up to 39 characters, a name up to 100)');
+    seen.repo = `${named.owner}/${named.name}`;
     if (branch !== undefined && branch !== null && !(typeof branch === "string" && validBranch(branch))) throw new Refusal(400, "invalid_branch", '"branch" must be a branch name, e.g. "main"; leave it out (or send null) for the repo\'s default branch');
+    if (typeof branch === "string") seen.branch = branch;
     return { repo: named, branch: typeof branch === "string" ? branch : undefined };
   }
 
-  // A channel's default repo: GET reads it, PUT sets it, DELETE clears it.
+  // The audit trail: every attempt to write (anything but a GET) leaves one line, through
+  // opts.log, saying what was asked and what came of it: the channel, the repo, the branch,
+  // the outcome (set, unchanged, cleared, none, refused) and a refusal's code. Only values
+  // that passed validation are written (a Slack id, owner/name, a branch name: none can
+  // hold a space or a newline), so never the body, a header or a token.
   async function channelRepo(req: Request, rawChannel: string): Promise<Response> {
-    if (!REPO_METHODS.includes(req.method)) throw new Refusal(405, "method_not_allowed", "method not allowed: GET reads a channel's default repo, PUT sets it, DELETE clears it", { allow: REPO_METHODS.join(", ") });
+    const seen: Attempt = {};
+    const line = (outcome: string) => {
+      if (req.method === "GET") return;
+      const method = /^[A-Z]{1,10}$/.test(req.method) ? req.method : "?";
+      opts.log?.(["admin: default repo", method, seen.channel && `channel=${seen.channel}`, seen.repo && `repo=${seen.repo}`, seen.branch && `branch=${seen.branch}`, `outcome=${outcome}`].filter(Boolean).join(" "));
+    };
+    try {
+      const { response, outcome } = await answer(req, rawChannel, seen);
+      line(outcome);
+      return response;
+    } catch (e) {
+      if (e instanceof Refusal) line(`refused code=${e.code}`);
+      else line("failed");
+      throw e;
+    }
+  }
+
+  // A channel's default repo: GET reads it, PUT sets it, DELETE clears it.
+  async function answer(req: Request, rawChannel: string, seen: Attempt): Promise<{ response: Response; outcome: string }> {
     let channel = rawChannel;
     try {
       channel = decodeURIComponent(rawChannel);
     } catch { /* not a channel id either way */ }
-    if (!CHANNEL_ID.test(channel)) throw new Refusal(400, "invalid_channel", "the channel must be a Slack channel id, e.g. C0123ABCD (not its name)");
+    if (CHANNEL_ID.test(channel)) seen.channel = channel;
+    if (!REPO_METHODS.includes(req.method)) throw new Refusal(405, "method_not_allowed", "method not allowed: GET reads a channel's default repo, PUT sets it, DELETE clears it", { allow: REPO_METHODS.join(", ") });
+    if (!seen.channel) throw new Refusal(400, "invalid_channel", "the channel must be a Slack channel id, e.g. C0123ABCD (not its name)");
 
     // Clearing is safe for any channel: one off AGENT_CHANNELS has none to clear.
     if (req.method === "DELETE") {
-      if (clearChannelRepo(db, channel)) opts.log?.(`admin: ${channel} has no default repo now (cleared)`);
-      return json({ channel, defaultRepo: null });
+      const cleared = clearChannelRepo(db, channel);
+      return { response: json({ channel, defaultRepo: null }), outcome: cleared ? "cleared" : "none" };
     }
     if (!opts.channels?.has(channel)) throw new Refusal(404, "channel_not_listed", `${channel} isn't on AGENT_CHANNELS: only a public channel the agent works in can have a default repo (a DM never does). Add it to AGENT_CHANNELS and restart, then set it`);
     // A listed channel ingest found private, archived or shared since the start is closed
@@ -255,10 +285,10 @@ export function adminRoutes(opts: AdminOptions) {
     // workspace_clone gets no default for it. The API says what is so: GET shows the default
     // that is stored and that the channel is closed, and PUT is refused.
     const closed = opts.ingest()?.channels[channel]?.closed;
-    if (req.method === "GET") return json({ channel, ...(closed ? { closed } : {}), defaultRepo: shown(getChannelRepo(db, channel)) });
+    if (req.method === "GET") return { response: json({ channel, ...(closed ? { closed } : {}), defaultRepo: shown(getChannelRepo(db, channel)) }), outcome: "read" };
     if (closed) throw new Refusal(409, "channel_closed", `${channel} was closed since the start (${closed}): the agent doesn't work there, and a default repo there is unused until the next start, which refuses to start while the channel is listed and not public. Make it public and unshared again, or take it off AGENT_CHANNELS; then restart`);
 
-    const want = await wanted(req);
+    const want = await wanted(req, seen);
     const full = `${want.repo.owner}/${want.repo.name}`;
     if (!opts.checkRepo) throw new Refusal(409, "code_tools_off", "code tools are off on this install (no sandbox and no GitHub credential), so a default repo would never be used and can't be checked. Turn them on (SANDBOX_RUNNER_TOKEN or SANDBOX_URL, with a GitHub App: docs/github-app.md), restart, then set it");
     // Bounded: a GitHub that stalls (or a check that throws) is an answer, not a hung request.
@@ -283,8 +313,9 @@ export function adminRoutes(opts: AdminOptions) {
     if (check.branch !== want.branch) throw new Refusal(502, "github_unavailable", `GitHub's answer for ${full} didn't confirm the branch ${want.branch}; nothing was changed, try again`);
     const before = getChannelRepo(db, channel);
     const now = setChannelRepo(db, { channel, repo: check.repo, branch: check.branch });
-    if (before?.repo !== now.repo || before.branch !== now.branch) opts.log?.(`admin: ${channel}'s default repo is now ${now.repo}${now.branch ? ` (branch ${now.branch})` : ""}`);
-    return json({ channel, defaultRepo: shown(now) });
+    // Logged as it was stored: GitHub's spelling of the repo.
+    seen.repo = now.repo;
+    return { response: json({ channel, defaultRepo: shown(now) }), outcome: before?.repo !== now.repo || before.branch !== now.branch ? "set" : "unchanged" };
   }
 
   const REPO_PATH = /^\/api\/v1\/channels\/([^/]+)\/repo$/;

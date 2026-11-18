@@ -211,6 +211,19 @@ from any question to GitHub (the installation, the repo, then the branch), and n
 them is a verdict on the repo. With `code_tools_off`,
 GET and DELETE still work.
 
+Every attempt to write (anything but a GET, once past the token) leaves one line in the
+app's log, under the tenant like every other line, whether it changed anything or not:
+
+```
+tenant=<id> admin: default repo PUT channel=C0123ABCD repo=acme/widgets branch=main outcome=set
+tenant=<id> admin: default repo PUT channel=C0123ABCD repo=acme/secret outcome=refused code=app_not_installed
+tenant=<id> admin: default repo DELETE channel=C0123ABCD outcome=cleared
+```
+
+`outcome` is `set`, `unchanged` (a PUT of what was already there), `cleared`, `none` (a
+DELETE with nothing to clear) or `refused` with the `code`. A value is written only once it
+has passed its check, so a line never holds the request's body or a token.
+
 A default can go stale after it is set: the App uninstalled from the repo, the repo
 renamed or deleted, the branch removed. Nothing is cleared for that; a request that
 relies on it then fails with GitHub's reason, in the thread. `lorehouse doctor` lists each

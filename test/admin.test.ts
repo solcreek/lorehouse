@@ -405,7 +405,7 @@ describe("a channel's default repo", () => {
     expect(r.asked).toEqual(["acme/widgets@main"]);
     expect((await r.call("GET", "C1")).body).toEqual(set.body);
     expect((await r.call("GET", "C2")).body.defaultRepo).toBeNull(); // per channel
-    expect(r.log).toEqual(["admin: C1's default repo is now acme/widgets (branch main)"]);
+    expect(r.log).toEqual(["admin: default repo PUT channel=C1 repo=acme/widgets branch=main outcome=set"]);
   });
 
   test("the branch is optional: left out or null, it is the repo's default branch, and no branch is checked", async () => {
@@ -420,11 +420,11 @@ describe("a channel's default repo", () => {
     const first = await put(r, { repo: "acme/widgets", branch: "main" });
     await Bun.sleep(2);
     expect(await put(r, { repo: "acme/widgets", branch: "main" })).toEqual(first);
-    expect(r.log).toHaveLength(1);
+    expect(r.log).toEqual(["admin: default repo PUT channel=C1 repo=acme/widgets branch=main outcome=set", "admin: default repo PUT channel=C1 repo=acme/widgets branch=main outcome=unchanged"]);
     const other = await put(r, { repo: "acme/gadgets" });
     expect(other.body.defaultRepo).toMatchObject({ repo: "acme/gadgets", branch: null });
     expect(listChannelRepos(r.db)).toHaveLength(1);
-    expect(r.log.at(-1)).toBe("admin: C1's default repo is now acme/gadgets");
+    expect(r.log.at(-1)).toBe("admin: default repo PUT channel=C1 repo=acme/gadgets outcome=set");
   });
 
   test("it is stored as GitHub spells the repo", async () => {
@@ -439,7 +439,7 @@ describe("a channel's default repo", () => {
     expect(cleared).toEqual({ status: 200, allow: null, body: { tenant: "t-test", channel: "C1", defaultRepo: null } });
     expect(getChannelRepo(r.db, "C1")).toBeUndefined();
     expect(await r.call("DELETE", "C1")).toEqual(cleared);
-    expect(r.log.filter((l) => l.includes("cleared"))).toEqual(["admin: C1 has no default repo now (cleared)"]);
+    expect(r.log.slice(1)).toEqual(["admin: default repo DELETE channel=C1 outcome=cleared", "admin: default repo DELETE channel=C1 outcome=none"]);
     // A channel off the list has none to clear: the same answer, not an error.
     expect((await r.call("DELETE", "C9")).status).toBe(200);
   });
@@ -615,6 +615,40 @@ describe("a channel's default repo", () => {
       expect([res.status, res.body.code, res.allow]).toEqual([405, "method_not_allowed", "GET, PUT, DELETE"]);
     }
     expect(listChannelRepos(r.db)).toEqual([]);
+  });
+
+  // The audit trail: every write attempt leaves one line saying what was asked and what
+  // came of it. Only values that passed validation are written; never the body or a token.
+  test("every write attempt is logged on one line with its outcome and code; a read isn't; nothing unvalidated is written", async () => {
+    let gone = false;
+    const r = repoSetup({ checkRepo: github((repo) => (gone || repo === "acme/secret" ? { ok: false, reason: "not_installed", detail: "x" } : undefined)).checkRepo });
+    const secret = "ghp_SECRETSECRETSECRET";
+    await r.call("GET", "C1");
+    await put(r, { repo: "acme/secret", branch: "main" });
+    await put(r, { repo: `acme/widgets; ${secret}` });
+    await put(r, { repo: "acme/widgets", branch: `x ${secret}` });
+    await put(r, `{"repo":"acme/widgets","token":"${secret}"}`);
+    await put(r, { repo: "acme/widgets" }, `C1%20${secret}`);
+    await put(r, { repo: "acme/widgets" }, "C9");
+    await r.call("POST", "C1", { repo: "acme/widgets" });
+    await put(r, { repo: "acme/widgets" });
+    gone = true;
+    await put(r, { repo: "acme/widgets" });
+    await r.call("DELETE", "C9");
+    expect(r.log).toEqual([
+      "admin: default repo PUT channel=C1 repo=acme/secret branch=main outcome=refused code=app_not_installed",
+      "admin: default repo PUT channel=C1 outcome=refused code=invalid_repo",
+      "admin: default repo PUT channel=C1 repo=acme/widgets outcome=refused code=invalid_branch",
+      "admin: default repo PUT channel=C1 outcome=refused code=invalid_body",
+      "admin: default repo PUT outcome=refused code=invalid_channel",
+      "admin: default repo PUT channel=C9 outcome=refused code=channel_not_listed",
+      "admin: default repo POST channel=C1 outcome=refused code=method_not_allowed",
+      "admin: default repo PUT channel=C1 repo=acme/widgets outcome=set",
+      "admin: default repo PUT channel=C1 repo=acme/widgets outcome=refused code=app_not_installed",
+      "admin: default repo DELETE channel=C9 outcome=none",
+    ]);
+    expect(r.log.join("\n")).not.toContain(secret);
+    for (const line of r.log) expect(line).not.toContain("\n");
   });
 
   test("it needs the admin token like everything else, and is closed without one", async () => {
