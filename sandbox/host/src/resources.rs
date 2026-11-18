@@ -435,13 +435,18 @@ impl Policy {
     /// rules a request is (each field within its bounds, pids enough for the vCPUs) and to
     /// the maxima in force now. One that fails is not started, and not adjusted either.
     pub fn validate(&self, id: &str, stored: &Granted) -> Result<(), Refusal> {
-        let fix = format!("Send a request this host can grant for sandbox {id} (it replaces the record while the VM is stopped), or destroy the sandbox");
+        // The way out, spelled so it can be done without the source. Asking for nothing is
+        // not it: a sandbox with a record keeps the record when its caller asks for nothing.
+        let defaults = FIELDS.into_iter().filter_map(|f| self.defaults.get(f).map(|v| format!("\"{}\": {v}", f.name()))).collect::<Vec<_>>().join(", ");
+        let fix = format!(
+            "A sandbox keeps its record while it is asked for nothing, so removing the request (a profile's sandboxResources) does not return sandbox {id} to the defaults. Ask for values this host grants, explicitly: to return it to the defaults, name them ({{ {defaults} }}). An explicit request replaces the record at the sandbox's next boot. Or destroy the sandbox"
+        );
         for f in FIELDS {
             // An uncapped disk is no grant; a capped one on a host whose quota is now off
             // would go unenforced.
             let Some(has) = stored.get(f) else { continue };
             if f == Field::DiskGib && self.defaults.disk_gib.is_none() {
-                return Err(no_disk_quota(has, &format!("sandbox {id} was created with that cap, and the host's disk quota has been turned off since; turn it back on, send a request without diskGib, or destroy the sandbox")));
+                return Err(no_disk_quota(has, &format!("sandbox {id}'s record has that cap, and the host's disk quota has been turned off since; turn it back on, send an explicit request without diskGib (it replaces the record at the next boot), or destroy the sandbox")));
             }
             let (min, _) = f.bounds();
             if has < min {
@@ -454,7 +459,7 @@ impl Policy {
             }
             let max = self.maxima.get(f);
             if has > max {
-                return Err(over_maximum(f, has, max, &format!("Sandbox {id} was created with it under a higher maximum; it is not started, and not shrunk. Raise the maximum again, or: {fix}")));
+                return Err(over_maximum(f, has, max, &format!("Sandbox {id}'s record has it, from under a higher maximum; it is not started, and not shrunk. Raise the maximum again, or: {fix}")));
             }
         }
         if stored.pids < stored.vcpus + PIDS_OVER_VCPUS {
@@ -729,7 +734,16 @@ pub mod tests {
         // The maximum lowered since: not started, not shrunk.
         let r = stock().validate("t.s1", &has).unwrap_err();
         assert_eq!((r.status, r.code, r.detail["field"].as_str()), (422, OVER_MAXIMUM, Some("memMib")));
-        assert!(r.message.contains("Sandbox t.s1 was created with it") && r.message.contains("SANDBOXD_MAX_MEM_MIB") && r.message.contains("Send a request"), "{}", r.message);
+        // It says the next step exactly: asking for nothing keeps the record; name the defaults.
+        for part in [
+            "Sandbox t.s1's record has it, from under a higher maximum",
+            "SANDBOXD_MAX_MEM_MIB",
+            "removing the request (a profile's sandboxResources) does not return sandbox t.s1 to the defaults",
+            r#"name them ({ "vcpus": 2, "memMib": 2048, "diskGib": 8, "pids": 64, "commandTimeoutSecs": 600 })"#,
+            "An explicit request replaces the record at the sandbox's next boot",
+        ] {
+            assert!(r.message.contains(part), "{part:?} not in {}", r.message);
+        }
         // A capped disk on a host whose quota is off now: not started uncapped.
         let mut off = roomy();
         off.defaults.disk_gib = None;

@@ -1136,6 +1136,34 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn an_explicit_request_for_the_defaults_regrants_a_stopped_sandbox_whose_record_is_over_a_lowered_maximum() {
+        use crate::resources::{read_stored, Granted, OVER_MAXIMUM};
+        let dir = std::env::temp_dir().join(format!("sandboxd-resources-regrant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // An install that sets no maximum now (2 vCPUs, 2048 MiB); the sandbox's record is
+        // from when it allowed more, and its profile has since stopped asking.
+        let vms = manager(&dir, false, crate::quota::Quota::Off, true);
+        on_disk(&dir, "big", Some(&Granted { vcpus: 4, mem_mib: 4096, disk_gib: None, pids: 64, command_timeout_secs: 600 }));
+        // Asked for nothing, it keeps its record, and the record is over the maximum:
+        // refused every time, saying what to send.
+        for _ in 0..2 {
+            let Err(e) = vms.acquire_with("big", None).await else { panic!("booted over the maximum") };
+            assert_eq!((e.status(), e.code()), (422, Some(OVER_MAXIMUM)));
+            assert!(e.message().contains(r#"name them ({ "vcpus": 2, "memMib": 2048, "pids": 64, "commandTimeoutSecs": 600 })"#), "{}", e.message());
+        }
+        // The defaults, named: granted afresh and recorded, before the boot (which fails
+        // later here, for want of a jail).
+        let defaults = request(serde_json::json!({ "vcpus": 2, "memMib": 2048, "pids": 64, "commandTimeoutSecs": 600 }));
+        let Err(e) = vms.acquire_with("big", Some(&defaults)).await else { panic!("a VM booted in a unit test") };
+        assert_eq!(e.code(), None, "{}", e.message());
+        assert_eq!(read_stored(&dir.join("state/big")), Ok(Some(Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 600 })));
+        // From then on a call that asks for nothing is no longer refused for the record.
+        let Err(e) = vms.acquire_with("big", None).await else { panic!("a VM booted in a unit test") };
+        assert_eq!(e.code(), None, "{}", e.message());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_call_that_only_watches_or_stops_what_a_running_vm_has_is_served_whatever_it_asks() {
         let dir = std::env::temp_dir().join(format!("sandboxd-resources-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
