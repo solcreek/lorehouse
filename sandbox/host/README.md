@@ -364,15 +364,39 @@ codes and the rules; [`src/resources.rs`](src/resources.rs) is the policy).
   the main defence), and gets the second check when it is rebuilt
   (`prepare-golden.sh`).
 
-Run on real KVM with `sandbox/lab/bench.py limits` (GCE, btrfs, `SANDBOXD_IDLE_SECS=20`,
-2026-11-18, by the maintainer; 34 of its 36 checks passed, the 2 misses being the
-script's): each limit in two sandboxes with different requests; the refusals;
-`disk_in_use` on a full 4 GiB sandbox (422, `usedBytes` 4294950912, limit unchanged); a
-sandbox made with no request taking one once stopped, its qgroup limit growing from 3 to
-4 GiB; a running sandbox answering 409 to another request every 5 s and still stopping
-idle (it took the request at 37 s); a guest `reboot -f` followed by a fresh boot in
-1.7 s. Not yet run there: the usage read with `--sync`, a job's status and cancel served
-by a running VM with a changed request, and a refused exec body leaving no sandbox.
+Run on real KVM with `sandbox/lab/bench.py limits` (GCE `n4-standard-16`, btrfs with
+simple quotas, `SANDBOXD_IDLE_SECS=20`, defaults 2 vCPU / 2048 MiB / 3 GiB / 64 pids /
+600 s and maxima 4 / 4096 / 4 / 128 / 900; 2026-11-18): 41 of 41 checks, on the code of
+0b557cf. What it saw:
+
+- **Each limit, in two sandboxes with different requests.** `nproc` 2 and 4; `MemTotal`
+  1991 and 3939 MiB, and `memory.max` 2048 MiB apart; `cpu.max` 300000 and 500000;
+  `pids.max` 64 and 128; direct-IO writes stopped at 3024 MiB of 3 GiB and 4047 MiB of
+  4 GiB; a `sleep 45` ran to its end under 600 s and was stopped at 20 s (exit 124).
+- **The refusals.** Over a maximum (422, no sandbox made), malformed (400), and another
+  request for a running sandbox (409).
+- **A command's timeout can't be chosen.** A second spelling of `timeoutMs` and a body
+  with half a character are refused (400 `invalid_exec_body`); a query on the path
+  doesn't lift the limit; a refused body makes no sandbox and is not activity in one.
+- **A running VM still serves what only reads or stops.** With another request: a job's
+  status (200), a file read (200) and the job's cancel (200), the VM keeping what it has.
+- **A stopped sandbox takes its next request.** After a guest `reboot -f` it booted
+  afresh (1.7 s) with the new vCPUs, memory, pids and a 30 s timeout, the record replaced
+  and the change logged. Less disk than it holds is refused (422 `disk_in_use`,
+  the limit unchanged; `usedBytes` read 4294950912 on a full 4 GiB sandbox in the run
+  before `--sync` was added, and the check passed again with it). A sandbox made with no request took one and its qgroup limit grew from 3
+  to 4 GiB.
+- **Refused requests are not activity.** A running sandbox answered 409 to another
+  request every 5 s and still stopped idle, then took the request (at 37 s in the run
+  where it was timed).
+- **A sandbox at its disk's cap doesn't boot again as it is** (500): the jailer can't
+  make its root directory, which is inside the sandbox's own quota
+  (`MkdirOldRoot … Quota exceeded`). This is so without any request too. Growing its
+  disk is the way out: the same sandbox booted once it asked for 4 GiB.
+
+Not run there: a change to a full sandbox's other resources alone (said above to fail,
+from how the quota counts), and the runner transport (the lab runs serve mode; the
+runner path has the unit tests).
 
 ## Limits
 
