@@ -3,7 +3,7 @@
 //
 // Templates use {{placeholder}}; an unknown placeholder is an error, not a silent blank.
 
-import system from "../prompts/system.md" with { type: "text" };
+import lorehouse from "../prompts/profiles/lorehouse.md" with { type: "text" };
 import searchKnowledge from "../prompts/tools/search_knowledge.md" with { type: "text" };
 import recentKnowledge from "../prompts/tools/recent_knowledge.md" with { type: "text" };
 import workspaceExec from "../prompts/tools/workspace_exec.md" with { type: "text" };
@@ -20,6 +20,12 @@ import channelDigest from "../prompts/skills/channel-digest.md" with { type: "te
 import writeASkill from "../prompts/skills/write-a-skill.md" with { type: "text" };
 import pdfReport from "../prompts/skills/pdf-report.md" with { type: "text" };
 import { branchPrefix, displayName, type AgentIdentity } from "./identity";
+
+// Each profile's system prompt, prompts/profiles/<name>.md: a profile names one by its key
+// here (src/profiles.ts).
+const PROFILES: Record<string, string> = {
+  lorehouse,
+};
 
 const TOOLS: Record<string, string> = {
   search_knowledge: searchKnowledge,
@@ -54,8 +60,20 @@ export function render(template: string, vars: Record<string, string>): string {
   }).trim();
 }
 
-export function systemPrompt(id: AgentIdentity): string {
-  return render(system, {
+// What a profile may name (src/profiles.ts): every profile prompt, tool and skill with a
+// file registered above. Which of the tools and skills an install has on is its settings'
+// to say (src/app.ts).
+export const PROMPT_CATALOG = {
+  prompts: Object.keys(PROFILES),
+  tools: Object.keys(TOOLS),
+  skills: [...Object.keys(SKILLS), ...Object.keys(PDF_SKILLS)],
+};
+
+// A profile's system prompt, by the name it is registered under.
+export function profilePrompt(name: string, id: AgentIdentity): string {
+  const template = PROFILES[name];
+  if (!template) throw new Error(`no prompt file for profile "${name}"`);
+  return render(template, {
     display_name: displayName(id),
     branch_prefix: branchPrefix(id),
     co_author_line: id.coAuthor ? ` End it with the trailer "Co-authored-by: ${id.coAuthor}".` : "",

@@ -17,7 +17,7 @@ import { slackApi } from "./slack-api";
 import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
-import { PDF_SKILLS, SKILLS, systemPrompt } from "./prompts";
+import { PDF_SKILLS, SKILLS, profilePrompt } from "./prompts";
 import { renderPdfTool, typstRenderer } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
@@ -352,7 +352,7 @@ async function startApp(config: Config, keys: Uint8Array[]) {
 
   const agent = defineAgent({
     name: AGENT_ID,
-    instructions: systemPrompt(identity),
+    instructions: profilePrompt(AGENT_ID, identity),
     tools,
     skills: Object.entries({ ...SKILLS, ...(config.pdf ? PDF_SKILLS : {}) }).map(([name, text]) => parseSkill(name, text)),
     channels: [slack],

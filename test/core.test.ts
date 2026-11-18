@@ -9,7 +9,7 @@ import { assertDistinctDatabases, ConfigError, loadConfig } from "../src/config"
 import { loadEnv } from "../src/settings";
 import { countDocuments, deleteDocument, getCursor, indexText, INDEX_VERSION, matchExpression, openKnowledge, searcher, seedFromJsonl, setCursor, upsertDocument } from "../src/knowledge";
 import { MIGRATIONS } from "../src/migrations";
-import { render, systemPrompt, toolDescription } from "../src/prompts";
+import { profilePrompt, render, toolDescription } from "../src/prompts";
 import { agentIdentity } from "../src/identity";
 
 const CORPUS = join(import.meta.dir, "..", "conformance", "fixtures", "corpus.jsonl");
@@ -214,7 +214,7 @@ describe("prompts", () => {
   });
 
   test("the system prompt uses the configured name", () => {
-    expect(systemPrompt(agentIdentity("atlas"))).toStartWith("You are Atlas");
+    expect(profilePrompt("lorehouse", agentIdentity("atlas"))).toStartWith("You are Atlas");
   });
 });
 

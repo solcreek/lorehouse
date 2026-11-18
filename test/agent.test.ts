@@ -19,7 +19,7 @@ import { parseAllowlist, publicChannelsOnly } from "../src/policy";
 import { directMessage, redirectText } from "../src/dm";
 import { remoteSandbox } from "../src/sandbox-client";
 import { agentIdentity, DEFAULT_AGENT_NAME } from "../src/identity";
-import { systemPrompt } from "../src/prompts";
+import { profilePrompt } from "../src/prompts";
 
 // Sandboxes in these tests don't publish.
 const noPublish = { stage: async (): Promise<never> => { throw new Error("no publishing here"); }, push: async (): Promise<never> => { throw new Error("no publishing here"); } };
@@ -1135,11 +1135,11 @@ describe("agent identity — the name is per-install config", () => {
   });
 
   test("instructions carry the name, the prefix, and the trailer only when configured", () => {
-    const withTrailer = systemPrompt(agentIdentity("scout", "Scout <scout@example.com>"));
+    const withTrailer = profilePrompt("lorehouse", agentIdentity("scout", "Scout <scout@example.com>"));
     expect(withTrailer).toContain("You are Scout");
     expect(withTrailer).toContain("scout/<short-slug>");
     expect(withTrailer).toContain("Co-authored-by: Scout <scout@example.com>");
-    expect(systemPrompt(agentIdentity())).not.toContain("Co-authored-by");
+    expect(profilePrompt("lorehouse", agentIdentity())).not.toContain("Co-authored-by");
   });
 
   test("a name that can't be a Slack handle / branch prefix is refused loudly", () => {
