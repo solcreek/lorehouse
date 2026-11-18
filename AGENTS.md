@@ -79,7 +79,9 @@ profile:
   (`delivery`, `credentials`, `knowledge`, `model`), and `sandbox: "read"`, is refused, not
   ignored: accept it together with the code that honors it. A new trigger kind is a new member of
   `ProfileTrigger`, checked in `checkProfile`.
-- Exactly one profile is started by Slack messages (ADR 0002 §2), and it gets the Slack channel.
+- At most one profile is started by Slack messages (ADR 0002 §2). This build requires
+  exactly one, for now, which is its own rule, not the ADR's: that profile gets the Slack
+  channel, and the channel also carries ingest and posting.
 - `GET /status` lists each profile's `id`, `mode` and the triggers in force
   (`profileStatus`). Give a new profile its own conformance scenarios.
 - `test/agent-wiring.test.ts` pins what June is handed for `lorehouse` (system prompt and

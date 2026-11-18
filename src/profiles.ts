@@ -122,12 +122,14 @@ export function loadProfiles(profiles: unknown = PROFILES, catalog: ProfileCatal
     if (seen.has(p.id)) problems.push(`profile "${p.id}": id is used by more than one profile; each id names its own sessions`);
     seen.add(p.id);
   }
-  // ADR 0002 §2: people see one agent in Slack, so one profile is started by Slack
-  // messages. Exactly one, for now: its Slack channel is also how Lorehouse receives the
-  // events it indexes and posts every profile's results.
+  // ADR 0002 §2: people see one agent in Slack, so at most one profile is started by Slack
+  // messages. This build asks for more than the ADR does: there must be one, for now,
+  // because the Slack channel that profile brings is also how Lorehouse receives the events
+  // it indexes, and how anything is posted.
   const bySlack = ok.filter((p) => slackTrigger(p)).map((p) => `"${p.id}"`);
-  if (ok.length === checked.length && bySlack.length !== 1) {
-    problems.push(`triggers: exactly one profile may have a trigger of kind "slack" (ADR 0002 §2), found ${bySlack.length ? bySlack.join(", ") : "none"}`);
+  if (ok.length === checked.length) {
+    if (bySlack.length > 1) problems.push(`triggers: at most one profile may have a trigger of kind "slack" (ADR 0002 §2), found ${bySlack.join(", ")}`);
+    if (bySlack.length === 0) problems.push('triggers: one profile must have a trigger of kind "slack", for now (this build\'s rule, not the ADR\'s): the Slack channel it brings also carries ingest and posting; found none');
   }
   if (problems.length) throw new ProfileError(problems);
   return Object.freeze(ok);

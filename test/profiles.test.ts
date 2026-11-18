@@ -142,11 +142,11 @@ describe("a profile is checked on start", () => {
     expect(problems({ ...valid, triggers: "slack" })).toContain('profile "lorehouse": triggers: must be a list of triggers, got "slack"');
   });
 
-  test("Slack starts the interactive profile and no other (ADR 0002 §2): exactly one profile has a slack trigger", () => {
+  test("Slack starts the interactive profile and no other: at most one profile has a slack trigger (ADR 0002 §2), and this build needs one", () => {
     expect(problems({ ...valid, triggers: [] })).toContain('profile "lorehouse": triggers: an interactive profile needs a trigger of kind "slack"');
     expect(problems(valid, { ...valid, id: "review", mode: "automation" })).toContain('profile "review": triggers: a trigger of kind "slack" is for mode interactive, not automation');
-    expect(problems(valid, { ...valid, id: "second" })).toEqual(['triggers: exactly one profile may have a trigger of kind "slack" (ADR 0002 §2), found "lorehouse", "second"']);
-    expect(problems({ ...valid, id: "digest", mode: "job", triggers: [] })).toEqual(['triggers: exactly one profile may have a trigger of kind "slack" (ADR 0002 §2), found none']);
+    expect(problems(valid, { ...valid, id: "second" })).toEqual(['triggers: at most one profile may have a trigger of kind "slack" (ADR 0002 §2), found "lorehouse", "second"']);
+    expect(problems({ ...valid, id: "digest", mode: "job", triggers: [] })).toEqual(["triggers: one profile must have a trigger of kind \"slack\", for now (this build's rule, not the ADR's): the Slack channel it brings also carries ingest and posting; found none"]);
     // A second profile is one more object: an automation beside the interactive one.
     expect(problems(valid, { ...valid, id: "review", mode: "automation", prompt: "review", triggers: [] })).toEqual([]);
   });

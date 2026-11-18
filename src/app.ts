@@ -85,7 +85,8 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
   // The profiles (profiles.ts, ADR 0002), checked before anything was opened: each becomes
   // one June agent below, under the profile's id. That id is durable and the display name
   // is config: renaming the agent in a workspace must not orphan its threads' sessions.
-  // One profile is started by Slack messages (ADR 0002 §2), and the Slack channel is its.
+  // At most one profile is started by Slack messages (ADR 0002 §2); this build needs one
+  // (loadProfiles), because the Slack channel is its, and ingest and every post go through it.
   const interactive = profiles.find(slackTrigger)!;
   const startsOn = new Set(slackTrigger(interactive)!.events);
 
