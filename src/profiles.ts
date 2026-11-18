@@ -206,7 +206,9 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
 
   if (!Array.isArray(input.triggers)) bad("triggers", `must be a list of triggers, got ${show(input.triggers)}`);
   else {
-    input.triggers.forEach((t: unknown, i: number) => {
+    // By index, every one: forEach would skip a hole, which the copy keeps, and leave it
+    // unchecked (Array.from fills holes with undefined, which is then refused as no trigger).
+    Array.from(input.triggers as unknown[]).forEach((t: unknown, i: number) => {
       const field = `triggers[${i}]`;
       if (!isRecord(t) || t.kind !== "slack") return bad(`${field}.kind`, `must be one of ${TRIGGER_KINDS.join(", ")}, got ${show(isRecord(t) ? t.kind : t)}`);
       for (const key of Object.keys(t)) if (key !== "kind" && key !== "events") bad(`${field}.${key}`, "is not a field of a slack trigger (allowed: kind, events)");
