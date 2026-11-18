@@ -501,7 +501,8 @@ describe("code tools", () => {
         const checks = await doctor({ env: { ...ENV, ...env }, fetch: f });
         expect(find(checks, "default repo").map((c) => c.level)).toEqual(["warn", "warn"]);
         expect(find(checks, "default repo")[0]!.detail).toStartWith("C1: acme/widgets, branch main is set, but code tools are off");
-        expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
+        // Each entry is "METHOD host/path": no request went to GitHub's host.
+        expect(seen.filter((s) => s.split(" ")[1]?.split("/")[0] === "api.github.com")).toEqual([]);
       });
     });
 
