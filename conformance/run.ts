@@ -161,6 +161,10 @@ async function answeredOnce(user: string): Promise<string | null> {
   return (await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`)).ok ? null : `${user}'s own mention was never answered`;
 }
 
+// Whether the admin API lists this thread of the allowed channel as one the agent joined.
+const isJoined = async (thread: string) =>
+  (await admin<{ threads: { channel: string; threadTs: string }[] }>("/api/v1/threads?limit=50")).threads.some((t) => t.channel === ALLOWED && t.threadTs === thread);
+
 // Hold (or let go) the mock's answer to users.info about `user`, as a slow lookup: how
 // many such lookups are waiting.
 const holdLookup = async (user: string, on: boolean) =>
@@ -1330,11 +1334,18 @@ const scenarios: Scenario[] = [
         await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${seq}] when is the quarterly wombat review`, ts: thread, event_ts: thread, channel: ALLOWED });
         if (!(await until(async () => (await holdLookup("U1", true)) || undefined, 5000))) return "U1's mention never had Slack asked who U1 is";
         await threadReply(thread, "and which floor is that on?", { user: "U2" }); // delivered (ACKed) while U1's lookup is out
-        const early = await stats();
-        if (early.modelCalls || early.posts.length) return `something was said before the asker was looked up: ${early.modelCalls} model call(s), posts ${JSON.stringify(early.posts)}`;
+        // The reply's event is ACKed, so the app has it, and U1's lookup is still out. The
+        // thread must not be joined yet: an app that joined on arrival (and undid it on a
+        // refusal) would list it here, every time. That is what this proves. It does not
+        // prove nothing was said yet: a turn started this early could still be on its way
+        // to the model, and only a sleep would show it (the guest scenario below covers a
+        // reply answered when it should not be, by its final counts).
+        if (await isJoined(thread)) return "the thread was joined before its asker was looked up";
         await holdLookup("U1", false);
         const answers = async () => (await stats()).byMethod["chat.stopStream"] ?? 0;
+        // The check that fails without the hold: the reply is dropped, and one answer comes.
         if (!(await until(async () => (await answers()) >= 2 || undefined))) return `answered ${await answers()}× in the thread, want twice: the mention, then the follow-up`;
+        if (!(await isJoined(thread))) return "the thread isn't listed as joined after its mention was answered";
         const s = await stats();
         if (s.posts.length) return `posted ${JSON.stringify(s.posts)}, want only the two answers`;
         const counted = (await usage()).asks - asks;
@@ -1344,12 +1355,18 @@ const scenarios: Scenario[] = [
       }
     }),
   },
+  // What this one proves, and what it doesn't. It fails for an app that joins the thread
+  // when the mention arrives (listed as joined while the lookup is out), that answers the
+  // held reply after the refusal (the model and answer counts), or that leaves the thread
+  // joined. It does NOT tell an app that holds the reply from one that drops it at once
+  // (what #163 fixed): both say nothing, which is the contract here. Only the scenario
+  // above tells them apart.
   {
     name: "a follow-up that arrives while a guest's mention is still being looked up gets nothing, and the guest's thread is never joined",
     run: () => inMode({}, async () => {
       const cached = await answeredOnce("U2");
       if (cached) return cached;
-      const joined = async (thread: string) => (await admin<{ threads: { channel: string; threadTs: string }[] }>("/api/v1/threads?limit=50")).threads.some((t) => t.channel === ALLOWED && t.threadTs === thread);
+      const joined = isJoined;
       await reset();
       await holdLookup("UG1", true);
       try {
