@@ -29,6 +29,16 @@ function current(ctx: ToolContext): string | undefined {
   return ctx.event?.source === "slack" ? ctx.event.channelId : undefined;
 }
 
+// The channel a turn is answering in when it isn't a DM: what a per-channel setting (a
+// channel's default repo, tools/clone.ts) is looked up by. It comes from the event Slack
+// signed, never from model input, so the model can't point a tool at another channel's
+// setting. A DM (channel type "im", or a D… id) has none; nor has a turn Slack didn't start.
+export function answeredChannel(ctx: ToolContext): string | undefined {
+  const e = ctx.event as { source?: string; channelId?: string; channelType?: string } | undefined;
+  if (e?.source !== "slack" || !e.channelId) return undefined;
+  return e.channelType === "im" || e.channelId.startsWith("D") ? undefined : e.channelId;
+}
+
 export function takesChannel(tool: Tool): boolean {
   const props = (tool.spec.input as { properties?: Record<string, unknown> } | undefined)?.properties;
   return !!props && "channelId" in props;

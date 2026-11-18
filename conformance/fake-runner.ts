@@ -3,7 +3,8 @@
 // It speaks the runner protocol (docs/sandbox-runners.md) to the app under test exactly
 // as sandboxd does, but "runs" a job by answering from memory: an exec returns
 // "ran:<command>", so a scenario can tell the command went through the runner, except
-// the git commands open_pull_request runs, answered as a checkout ready for a PR. A file
+// the git commands open_pull_request runs, answered as a checkout ready for a PR, and
+// workspace_clone's, answered as a sandbox with no checkout until one is cloned. A file
 // read answers, for a path ending in .png, a 1×1 PNG (CHART_PNG); in .svg, an SVG with a
 // script in it; any other path is missing (404). The
 // publish ops answer as sandboxd's would for that checkout: stage returns the facts and a
@@ -39,6 +40,22 @@ function file(job: Job) {
   if (path.endsWith(".png")) return { id: job.id, status: 200, contentType: "application/octet-stream", bodyBase64: CHART_PNG.toString("base64") };
   if (path.endsWith(".svg")) return { id: job.id, status: 200, contentType: "application/octet-stream", bodyBase64: b64(SVG) };
   return { id: job.id, status: 404 };
+}
+
+// workspace_clone's two commands, answered per sandbox as a real checkout would: asked
+// what /workspace/repo's origin is, it fails until a clone ran there, then answers that
+// clone's URL; a clone into /workspace/repo (with or without --branch) succeeds and is
+// remembered.
+const cloned = new Map<string, string>();
+function checkout(job: Job, command: string): { exitCode: number; stdout: string } | undefined {
+  if (command === "git -C /workspace/repo remote get-url origin 2>/dev/null") {
+    const url = cloned.get(job.sandbox);
+    return url ? { exitCode: 0, stdout: `${url}\n` } : { exitCode: 2, stdout: "" };
+  }
+  const clone = / clone (?:--branch \S+ )?(https:\/\/github\.com\/\S+\.git) \/workspace\/repo$/.exec(command);
+  if (!clone) return undefined;
+  cloned.set(job.sandbox, clone[1]!);
+  return { exitCode: 0, stdout: "" };
 }
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
@@ -105,8 +122,8 @@ function answer(job: Job) {
   if (job.op === "guest" && (job.path === "/jobs" || job.path?.startsWith("/jobs/"))) return jobCall(job);
   if (job.op === "guest" && job.method === "POST" && job.path === "/exec") {
     const { command } = JSON.parse(Buffer.from(job.bodyBase64 ?? "", "base64").toString());
-    const stdout = git(command) ?? `ran:${command}\n`;
-    return { id: job.id, status: 200, contentType: "application/json", bodyBase64: b64(JSON.stringify({ exitCode: 0, stdout, stderr: "" })) };
+    const { exitCode, stdout } = checkout(job, command) ?? { exitCode: 0, stdout: git(command) ?? `ran:${command}\n` };
+    return { id: job.id, status: 200, contentType: "application/json", bodyBase64: b64(JSON.stringify({ exitCode, stdout, stderr: "" })) };
   }
   if (job.op === "guest" && job.method === "GET" && job.path?.startsWith("/file?")) return file(job);
   return { id: job.id, status: 404 };

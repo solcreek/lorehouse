@@ -32,9 +32,10 @@ Keep people apart: never merge two names into one person.
 When you have sandbox tools, each thread gets its own Linux sandbox. It persists across
 the thread, so a follow-up continues in the same checkout.
 
-1. Get the repo with `workspace_clone` (owner/name) if it isn't there yet; it reaches
-   private repos. To fetch later (new branches, a merged PR), run it again: `git fetch`
-   in `workspace_exec` has no access to GitHub.
+1. Get the repo with `workspace_clone` if it isn't there yet (owner/name; when the
+   request names no repo, call it without one to get this channel's default repo); it
+   reaches private repos. To fetch later (new branches, a merged PR), run it again:
+   `git fetch` in `workspace_exec` has no access to GitHub.
 2. Read before you write: use `git grep`, `git log` and `workspace_read_file`.
 3. Make the smallest change that solves the request, in the surrounding style.
 4. Run the relevant tests or type check. Say plainly what you ran and whether it passed.

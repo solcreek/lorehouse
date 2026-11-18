@@ -40,6 +40,7 @@ import { cachedNames } from "./ingest/slack-users";
 import { pullRequestTool } from "./tools/pull-request";
 import { approvalStore, approverGate } from "./approvals";
 import { cloneTool } from "./tools/clone";
+import { getChannelRepo } from "./channel-repos";
 import { checkRepo, githubApp, staticToken, type GithubAccess } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
@@ -238,7 +239,9 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
     tools.push(
       ...workspaceTools(sandboxFor, { commitAs: github.identity }),
       ...jobTools(sandboxFor, { store: jobs, authority: slackJobAuthority(slackReads, approverName), commitAs: github.identity }),
-      cloneTool(sandboxFor, github),
+      // With no repo named, the default repo of the channel being answered in (#126): only
+      // a listed channel has one, and not one ingest found private or shared since the start.
+      cloneTool(sandboxFor, github, { defaultRepo: (channel) => (config.agent.channels.has(channel) && !ingester?.isClosed(channel) ? getChannelRepo(knowledge, channel) : undefined) }),
       pullRequestTool({ sandboxFor, github, identity, approverName, approver: config.prApprover, approvals, apiUrl }),
     );
   }

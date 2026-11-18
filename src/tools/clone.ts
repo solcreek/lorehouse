@@ -5,12 +5,20 @@
 // never written to .git/config and the remote stays a plain https URL. A repo the
 // GitHub App isn't installed on is cloned anonymously, which works when it's public.
 // Already cloned: the checkout is fetched instead, so the tool also refreshes it.
+//
+// Which repo (#126): the one the model names, from the request; with none named, the
+// default repo of the channel the thread is in (channel-repos.ts), which an admin set. The
+// channel comes from the turn's Slack event, never from the model, and a DM has none. With
+// neither, the model is told to ask, not handed a failed turn. The default's branch is
+// what a fresh clone starts on, also when the model names that same repo itself.
 
 import type { Tool, ToolContext } from "@junejs/core/agent-runtime";
+import { validBranch } from "../channel-repos";
 import type { GithubAccess, RepoRef } from "../github-auth";
 import { toolDescription } from "../prompts";
 import { parseGithubRemote } from "./pull-request";
 import { gitWithToken, tokenEnv } from "./git-credential";
+import { answeredChannel } from "./slack-channels";
 import { WORKDIR, type SandboxFor } from "./workspace";
 
 // "owner/name", or a github.com URL (https or ssh), to a repo reference.
@@ -22,7 +30,44 @@ export function parseRepo(input: string): RepoRef | undefined {
 // Only characters a GitHub login and a noreply address use: it goes into a shell command.
 const PLAIN = /^[A-Za-z0-9._+@[\] -]{1,100}$/;
 
-export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
+// A channel's default repo, as the tool needs it: "owner/name", and the branch a fresh
+// clone starts on (null: the repo's own default branch).
+export type DefaultRepo = { repo: string; branch: string | null };
+export type CloneOptions = {
+  // The default repo of a public channel the agent works in, if an admin set one.
+  defaultRepo?: (channel: string) => DefaultRepo | undefined;
+};
+
+const sameRepo = (a: RepoRef, b: RepoRef) => a.owner.toLowerCase() === b.owner.toLowerCase() && a.name.toLowerCase() === b.name.toLowerCase();
+
+type Chosen = { repo: RepoRef; branch?: string; source: "named" | "channel_default" };
+
+// Which repo a call means: the one named, else the channel's default, else an error that
+// says what to do.
+function choose(input: { repo?: unknown } | undefined, ctx: ToolContext, opts: CloneOptions): Chosen | { error: string } {
+  const channel = answeredChannel(ctx);
+  const set = channel ? opts.defaultRepo?.(channel) : undefined;
+  const fallback = set && parseRepo(set.repo);
+  // The default's branch, for the default repo only. It goes into a shell command: one
+  // that isn't a plain branch name (a row edited by hand; the admin API refuses it) is
+  // never used.
+  const withBranch = (c: Chosen): Chosen | { error: string } => {
+    if (!set?.branch || !fallback || !sameRepo(fallback, c.repo)) return c;
+    if (!validBranch(set.branch)) return { error: "this channel's default branch isn't a usable branch name; an admin has to set the channel's default repo again (docs/admin-api.md)" };
+    return { ...c, branch: set.branch };
+  };
+  const named = input?.repo;
+  if (named !== undefined && named !== null && named !== "") {
+    if (typeof named !== "string") return { error: "`repo` must be a string: owner/name, or its github.com URL" };
+    const repo = parseRepo(named);
+    if (!repo) return { error: `not a GitHub repo: ${named} (use owner/name)` };
+    return withBranch({ repo, source: "named" });
+  }
+  if (fallback) return withBranch({ repo: fallback, source: "channel_default" });
+  return { error: "no repo was named, and there is no default repo here. Ask which GitHub repo (owner/name) to work in, then call workspace_clone with it as `repo`; don't guess one" };
+}
+
+export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess, opts: CloneOptions = {}): Tool {
   // Commits in the checkout are by the account the credential acts as (the App's bot), at
   // its noreply address, so GitHub links them to it. Left unset, the model would make one
   // up. Best effort: without it the clone still stands.
@@ -39,14 +84,16 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
       description: toolDescription("workspace_clone", { workdir: WORKDIR }),
       input: {
         type: "object",
-        properties: { repo: { type: "string", description: "owner/name, or its github.com URL" } },
-        required: ["repo"],
+        properties: { repo: { type: "string", description: "owner/name, or its github.com URL; leave out when the request names no repo, to use this channel's default repo" } },
       },
     },
-    run: async (input: { repo: string }, ctx: ToolContext) => {
-      const repo = parseRepo(input.repo);
-      if (!repo) return { error: `not a GitHub repo: ${input.repo} (use owner/name)` };
+    run: async (input: { repo?: unknown } | undefined, ctx: ToolContext) => {
+      const chosen = choose(input, ctx, opts);
+      if ("error" in chosen) return chosen;
+      const { repo, branch, source } = chosen;
       const url = `https://github.com/${repo.owner}/${repo.name}.git`;
+      // Said with a failure of the default, so the thread learns whose setting it is.
+      const hint = source === "channel_default" ? ` (${repo.owner}/${repo.name}${branch ? `, branch ${branch},` : ""} is this channel's default repo; an admin can change it)` : "";
       let env: Record<string, string> = {};
       let git = (args: string) => `git ${args}`;
       try {
@@ -54,7 +101,7 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
         git = gitWithToken;
       } catch (e) {
         // Not installed there: fine for a public repo, which clones anonymously.
-        if (!/isn't installed/.test((e as Error).message)) return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}` };
+        if (!/isn't installed/.test((e as Error).message)) return { error: `no GitHub credential for ${repo.owner}/${repo.name}: ${(e as Error).message}${hint}` };
       }
       try {
         const sb = sandboxFor(ctx);
@@ -73,12 +120,13 @@ export function cloneTool(sandboxFor: SandboxFor, github: GithubAccess): Tool {
             return { error: `${WORKDIR} already holds ${holds}; this thread's sandbox has one checkout` };
           }
           const r = await sb.exec(git("fetch --prune origin"), { cwd: WORKDIR, env, timeoutMs: 5 * 60_000 });
-          if (r.exitCode !== 0) return { error: `fetch failed: ${r.stderr.slice(-500)}` };
-          return { status: "fetched", repo: `${repo.owner}/${repo.name}`, path: WORKDIR, ...(await commitAs(sb)) };
+          if (r.exitCode !== 0) return { error: `fetch failed: ${r.stderr.slice(-500)}${hint}` };
+          // The checkout stays on whatever branch the thread left it on.
+          return { status: "fetched", repo: `${repo.owner}/${repo.name}`, path: WORKDIR, source, ...(await commitAs(sb)) };
         }
-        const r = await sb.exec(git(`clone ${url} ${WORKDIR}`), { cwd: "/", env, timeoutMs: 10 * 60_000 });
-        if (r.exitCode !== 0) return { error: `clone failed: ${r.stderr.slice(-500)}` };
-        return { status: "cloned", repo: `${repo.owner}/${repo.name}`, path: WORKDIR, ...(await commitAs(sb)) };
+        const r = await sb.exec(git(`clone ${branch ? `--branch ${branch} ` : ""}${url} ${WORKDIR}`), { cwd: "/", env, timeoutMs: 10 * 60_000 });
+        if (r.exitCode !== 0) return { error: `clone failed: ${r.stderr.slice(-500)}${hint}` };
+        return { status: "cloned", repo: `${repo.owner}/${repo.name}`, path: WORKDIR, source, ...(branch ? { branch } : {}), ...(await commitAs(sb)) };
       } catch (e) {
         return { error: (e as Error).message };
       }

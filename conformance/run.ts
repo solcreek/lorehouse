@@ -1750,6 +1750,46 @@ const scenarios: Scenario[] = [
     }),
   },
   {
+    // #126: "@scout run the benchmark" needs no repo name in a channel that has a default
+    // repo. The scripted model calls workspace_clone with no repo ("[clone]") or with one
+    // ("[clone] owner/name"); what reached the runner says which repo was cloned.
+    name: "a mention naming no repo clones the channel's default repo on its branch; one naming another repo clones that one; with no default, the model is told to ask",
+    run: () => withFreshDb(async () => {
+      const runner = await wsRunner(APP, RUNNER_TOKEN, "r-default-repo");
+      // The clones that reached the runner, as git was asked for them.
+      const clones = () => runner.jobs.filter((j) => j.op === "guest" && j.path === "/exec")
+        .map((j) => (JSON.parse(Buffer.from(j.bodyBase64 ?? "", "base64").toString()) as { command: string }).command)
+        .filter((c) => c.includes(" clone ")).map((c) => c.slice(c.lastIndexOf(" clone ") + 1));
+      try {
+        // No default yet: the model is told what to do, and nothing is cloned.
+        const none = await ask("[clone]");
+        if (!/\[toolerror:no repo was named, and there is no default repo here\. Ask which GitHub repo/.test(none.text)) return `with no default: ${none.text.slice(0, 200)}, want the model told to ask which repo`;
+        if (runner.jobs.length) return `with no default, the runner was sent ${runner.jobs.length} job(s)`;
+
+        const set = await repoCall("PUT", ALLOWED, { repo: "acme/widgets", branch: "main" });
+        if (set.status !== 200) return `setting the default: ${set.status} ${JSON.stringify(set.body)}`;
+
+        const byDefault = await ask("[clone]");
+        if (!byDefault.text.includes("[clone:cloned:acme/widgets:main:channel_default]")) return `a mention naming no repo: ${byDefault.text.slice(0, 200)}, want acme/widgets cloned as the channel's default`;
+        const first = JSON.stringify(clones());
+        if (first !== JSON.stringify(["clone --branch main https://github.com/acme/widgets.git /workspace/repo"])) return `the runner was asked for ${first}, want one clone of acme/widgets on main`;
+
+        const named = await ask("[clone] acme/gadgets");
+        if (!named.text.includes("[clone:cloned:acme/gadgets::named]")) return `a mention naming acme/gadgets: ${named.text.slice(0, 200)}, want that repo cloned, not the default`;
+        const second = clones()[1];
+        if (second !== "clone https://github.com/acme/gadgets.git /workspace/repo" || clones().length !== 2) return `the runner was asked for ${JSON.stringify(clones())}, want acme/gadgets second, on its own default branch`;
+
+        // Cleared, a mention naming no repo is back to being asked which.
+        await repoCall("DELETE", ALLOWED);
+        const cleared = await ask("[clone]");
+        if (!cleared.text.includes("[toolerror:no repo was named")) return `after the default was cleared: ${cleared.text.slice(0, 200)}`;
+        return clones().length === 2 ? null : `after the default was cleared, something was cloned: ${JSON.stringify(clones())}`;
+      } finally {
+        await runner.stop();
+      }
+    }, { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github` }),
+  },
+  {
     // ADR 0002 §8: sessions persist by default, so a restart (a deploy, a crash) between
     // the prompt and the click loses nothing.
     name: "a turn parked on Approve survives a restart: approved after it, the pull request opens and the turn completes",

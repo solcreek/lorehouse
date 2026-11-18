@@ -3,6 +3,10 @@
 // descriptions and schemas, and the channels. Captured before the agent became the
 // `lorehouse` profile (#39) and unchanged by it: a change here is a change in what the model
 // is told or may call, to be made on purpose, with these pins updated in the same commit.
+// Changed since, on purpose:
+//   #126  the prompt's "Working in code" step 1 and workspace_clone's description say that
+//         a request naming no repo gets the channel's default repo, and workspace_clone's
+//         `repo` is no longer required.
 //
 // defineAgent is wrapped (and still runs) so the test sees what src/app.ts passes it.
 
@@ -100,7 +104,7 @@ const PINNED: Record<"base" | "everything", Given[]> = {
   base: [
     {
       id: "lorehouse",
-      prompt: "d8b4634745f453f35a00a60c32a44dc88924c4824f0e3b8586f6c525fcc10aeb",
+      prompt: "6afc224f8bcf19d97b066574029bfe3429193af535bd2e3887309762ce35a2e3",
       tools: ["search_knowledge", "recent_knowledge", ...JUNE_TOOLS],
       specs: "1a494bd53ab90ab60646140ffbc480b37d3a7aec05e1cd65b37d7446667afec9",
       skills: ["channel-digest", "write-a-skill"],
@@ -110,7 +114,7 @@ const PINNED: Record<"base" | "everything", Given[]> = {
   everything: [
     {
       id: "lorehouse",
-      prompt: "fea6843f40af46bc68df71c5452999a51fdaf9b0e8de39ee94ff0108e09da3d1",
+      prompt: "f1ab5fe7233dabc5370ddba952e7af8c24e9262a66b823c2296549153084ce92",
       tools: [
         "search_knowledge",
         "recent_knowledge",
@@ -126,7 +130,7 @@ const PINNED: Record<"base" | "everything", Given[]> = {
         "render_pdf",
         ...JUNE_TOOLS,
       ],
-      specs: "591eb3ebb067a1fff47940199e8fd17cf581b206e61dc9147703a48fff5d2364",
+      specs: "3940a37ad419d2816ec69e702b8c561033f929b1ea129e39ab170489dae4469e",
       skills: ["channel-digest", "write-a-skill", "pdf-report"],
       channels: ["slack"],
     },

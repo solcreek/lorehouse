@@ -35,7 +35,10 @@
 // person mentioned; "[skill:<name>]", a read_skill tool_use for that skill; "[pr] <branch>",
 // an open_pull_request tool_use for that branch; "[pdf]", a render_pdf tool_use for a short
 // report in English and Chinese named conformance-report.pdf; "[attach] <path>", a
-// workspace_attach_file tool_use for that path titled "Conformance chart"); turn 2 (tool_result
+// workspace_attach_file tool_use for that path titled "Conformance chart"; "[clone]", a
+// workspace_clone tool_use naming no repo, or "[clone] <owner/name>" naming that one, whose
+// answer is what was cloned and why: "[q7] [clone:<status>:<repo>:<branch>:<source>] …");
+// turn 2 (tool_result
 // present) → a streamed answer that echoes the question's nonce and cites the first hit's
 // id and source from the tool_result ("[q7] [cite:<id>] [src:<source>] w0 w1 …", and with
 // "[quote]" in the question, the hit's text verbatim: "… [quote:<text>] w0 …"), or for
@@ -255,6 +258,10 @@ function answerFor(messages: Msg[], result: Block): string {
   if (value?.id) return `${nonce} [whois:${JSON.stringify({ name: value.name, realName: value.realName })}] ${words.join(" ")}`;
   const exec = value as { exitCode?: number; stdout?: string } | undefined;
   if (typeof exec?.exitCode === "number") return `${nonce} [exec:${exec.exitCode}:${(exec.stdout ?? "").trim().replace(/[\[\]\n]/g, " ")}] ${words.join(" ")}`;
+  // workspace_clone: what was cloned (or fetched), on which branch, and whether the repo
+  // was named or the channel's default.
+  const clone = value as { status?: string; repo?: string; branch?: string; source?: string } | undefined;
+  if (typeof clone?.status === "string" && typeof clone.source === "string") return `${nonce} [clone:${clone.status}:${clone.repo}:${clone.branch ?? ""}:${clone.source}] ${words.join(" ")}`;
   const pr = value as { status?: string; url?: string } | undefined;
   if (typeof pr?.status === "string" && !(pr as { error?: unknown }).error) return `${nonce} [pr:${pr.status}:${pr.url ?? ""}] ${words.join(" ")}`;
   // A tool that failed: its error text, so the harness can check what the model was told.
@@ -333,6 +340,8 @@ async function anthropic(req: Request): Promise<Response> {
     // "[pr] <branch>" → open a pull request from that branch (open_pull_request)
     // "[pdf]" → render a short report as a PDF (render_pdf)
     // "[attach] <path>" → attach that file from the thread's sandbox (workspace_attach_file)
+    // "[clone]" → get the repo with no repo named (workspace_clone); "[clone] <owner/name>" → that one
+    const clone = /\[clone\](?: (\S+))?/.exec(question);
     const pdf = question.includes("[pdf]");
     const attachPath = /\[attach\] (\S+)/.exec(question)?.[1];
     const execCommand = /\[exec\] (.+)$/.exec(question)?.[1];
@@ -345,9 +354,9 @@ async function anthropic(req: Request): Promise<Response> {
     const reactionsIn = /\[reactions:([A-Z0-9]+)\]/.exec(question)?.[1];
     const skillName = /\[skill:([a-z0-9-]+)\]/.exec(question)?.[1];
     const whois = question.includes("[whois]") ? [...question.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]!).find((id) => id !== "UBOT") : undefined;
-    const toolName = jobStart ? "workspace_job_start" : pdf ? "render_pdf" : attachPath ? "workspace_attach_file" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
+    const toolName = clone ? "workspace_clone" : jobStart ? "workspace_job_start" : pdf ? "render_pdf" : attachPath ? "workspace_attach_file" : skillName ? "read_skill" : prBranch ? "open_pull_request" : execCommand ? "workspace_exec" : whois ? "slack_resolve_user" : reactionsIn ? "slack_list_reactions" : thread ? "slack_read_thread" : recent ? "recent_knowledge" : "search_knowledge";
     const query = question.replace(/<@[A-Z0-9]+>/g, "").replace(/\[q\d+\]/, "").trim();
-    const input = jobStart ? { id: jobStart[1], command: jobStart[2] } : pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : attachPath ? { path: attachPath, title: "Conformance chart" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
+    const input = clone ? (clone[1] ? { repo: clone[1] } : {}) : jobStart ? { id: jobStart[1], command: jobStart[2] } : pdf ? { markdown: "# Conformance report 報告\n\nOne paragraph. 一段中文。\n\n| a | b |\n|---|--:|\n| x | 1 |", filename: "conformance-report.pdf", lang: "zh-TW" } : attachPath ? { path: attachPath, title: "Conformance chart" } : skillName ? { name: skillName } : prBranch ? { branch: prBranch, title: "Conformance pull request" } : execCommand ? { command: execCommand } : whois ? { userId: whois } : reactionsIn ? { channelId: reactionsIn, ts: "1700000000.000100" } : threadIn ? { channelId: threadIn, threadId: "1700000000.000100" } : recent || thread ? {} : { query };
     return toolUse(id, toolName, input, !!body.stream);
   }
 
