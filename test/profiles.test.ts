@@ -265,7 +265,7 @@ describe("a profile is checked on start", () => {
     for (const field of ["delivery", "credentials", "knowledge", "model"]) {
       expect(problems({ ...valid, [field]: "x" }), field).toEqual([`profile "lorehouse": ${field}: is in ADR 0002 §1 but not supported yet: nothing would honor it`]);
     }
-    expect(problems({ ...valid, instructions: "be brief" })).toEqual(['profile "lorehouse": instructions: is not a profile field (allowed: id, mode, prompt, tools, skills, triggers, sandbox)']);
+    expect(problems({ ...valid, instructions: "be brief" })).toEqual(['profile "lorehouse": instructions: is not a profile field (allowed: id, mode, prompt, tools, skills, triggers, sandbox, sandboxResources)']);
     expect(problems("lorehouse")).toEqual(["profile #0: must be an object with id, mode, prompt, tools, skills, triggers, sandbox"]);
   });
 

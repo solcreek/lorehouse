@@ -246,9 +246,13 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
     // One sandbox per thread, keyed off the tenant and the session (never model input):
     // "<tenant>.<session>", so two tenants' threads never share an id on a host (tenant.ts).
     const sandboxId = (ctx: ToolContext) => sandboxIdFor(tenant.id, ctx.sessionId);
+    // What the sandbox is asked to be created with: the request of the profile Slack
+    // starts (the only one that may make one, loadProfiles), or nothing, and then the
+    // host's defaults. The host grants it within its maxima or refuses the tool call.
+    const resources = interactive.sandboxResources;
     const sandboxFor = sb.mode === "runners"
-      ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx))
-      : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token });
+      ? (ctx: ToolContext) => hub!.sandbox(sandboxId(ctx), { resources })
+      : (ctx: ToolContext) => remoteSandbox(sandboxId(ctx), { url: sb.url, token: sb.token, resources });
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
     const apiUrl = config.githubApiUrl;
     // The credential's own requests to GitHub (the installation lookup, the token exchange,

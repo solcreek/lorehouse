@@ -11,8 +11,9 @@
 // runner on the job's connection or a newer one, and after a reconnect fails at once the
 // jobs the runner says it never got (they never ran, so a retry is safe).
 
+import { RESOURCES_FEATURE, ResourcesUnsupported, SandboxRefusal, commandTimeoutMs, wireResources, type SandboxResources } from "../sandbox-resources";
 import type { Database } from "../sqlite";
-import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
+import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, JobCallError, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
 
 // `jobs`: ids the runner holds (running, or finished with a result not yet delivered).
 // `received` (long poll only): ids from the last poll answer the runner got, so jobs whose
@@ -23,16 +24,21 @@ import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT
 // `mirrors`: the host's publish mirrors, as it last measured them (count, bytes, quotas,
 // free space, the last gc, evictions and refusals; sandbox/host/src/publish/upkeep.rs).
 // For operators only: passed through to /status, never acted on.
-export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number; sandboxes?: string[]; mirrors?: Record<string, unknown> };
+// `features`: what the runner's sandboxd understands beyond the first protocol. A job
+// that needs one it doesn't list is never sent to it (submit).
+export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number; sandboxes?: string[]; mirrors?: Record<string, unknown>; features?: string[] };
 
+// `resources`, on a guest job: what is asked for the job's sandbox. The runner creates the
+// sandbox with it, or refuses the job with a `code` (sandbox/host/src/resources.rs).
 type JobBody =
-  | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string }
+  | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string; resources?: SandboxResources }
   | { op: "destroy" }
   // Publishing (sandbox/host/src/publish.rs): the request as JSON, answered with JSON.
   | { op: "stage" | "push"; bodyBase64: string };
 // `deadlineMs`: set as a job goes out, how long Lorehouse will still wait for it.
 export type Job = JobBody & { id: string; sandbox: string; timeoutMs: number; deadlineMs?: number };
-export type JobResult = { id: string; status: number; contentType?: string; bodyBase64?: string; error?: string };
+// `code`, with `error`: the runner refused the sandbox's resources, and why, stably named.
+export type JobResult = { id: string; status: number; contentType?: string; bodyBase64?: string; error?: string; code?: string };
 
 // How a job reaches the runner: pushed down its WebSocket, or queued for its next poll.
 // `gen` orders a runner's connections: each new one gets a higher number.
@@ -197,7 +203,7 @@ export class RunnerHub {
   private touch(name: string, status: RunnerStatus): void {
     const r = this.runners.get(name);
     if (!r) return;
-    r.status = { runner: name, capacity: status.capacity, running: status.running, version: status.version, mirrors: status.mirrors };
+    r.status = { runner: name, capacity: status.capacity, running: status.running, version: status.version, mirrors: status.mirrors, features: status.features };
     r.lastSeen = this.now();
     if (status.session) {
       r.session = status.session;
@@ -248,7 +254,9 @@ export class RunnerHub {
   }
 
   // Where a sandbox lives: where it was placed, or (new) the online runner with the most room.
-  private place(sandbox: string): Runner {
+  // `asks`: the job asks for resources, so a new sandbox goes only to a runner that honors
+  // them (and none is recorded when there is none: a later, updated runner can take it).
+  private place(sandbox: string, asks = false): Runner {
     const placed = (this.db.query("SELECT runner FROM sandbox_placements WHERE sandbox = ?").get(sandbox) as { runner: string } | null)?.runner;
     if (placed) {
       const r = this.runners.get(placed);
@@ -264,15 +272,33 @@ export class RunnerHub {
     const free = (r: Runner) => r.status.capacity - r.status.running - taken(r);
     const online = [...this.runners.values()].filter((r) => this.online(r));
     if (!online.length) throw new Error("no sandbox runner is connected");
-    const best = online.filter((r) => free(r) > 0).sort((a, b) => free(b) - free(a) || a.name.localeCompare(b.name))[0];
+    const able = asks ? online.filter((r) => r.status.features?.includes(RESOURCES_FEATURE)) : online;
+    if (!able.length) {
+      const names = online.map((r) => `${r.name} (version ${r.status.version ?? "unknown"})`).join(", ");
+      throw new ResourcesUnsupported(`every connected sandbox runner: ${names}`, `none lists "${RESOURCES_FEATURE}" among its features, and each would run the sandbox with its defaults`);
+    }
+    const best = able.filter((r) => free(r) > 0).sort((a, b) => free(b) - free(a) || a.name.localeCompare(b.name))[0];
     if (!best) throw new Error("every sandbox runner is full; try again in a few minutes");
     this.db.query("INSERT INTO sandbox_placements (sandbox, runner, placed_at) VALUES (?, ?, ?)").run(sandbox, best.name, new Date(this.now()).toISOString());
     this.reserved.set(sandbox, { runner: best.name, at: this.now() });
     return best;
   }
 
+  // A job that asks for resources goes only to a runner that says it understands them
+  // (`features` in its status). An older sandboxd reads the job without the field and would
+  // run it in a sandbox with its own defaults, silently: refused here instead, before the
+  // job exists, so nothing ran. The protocol has no version to negotiate on; the status's
+  // `version` is sandboxd's, for people.
+  private understands(runner: Runner, body: JobBody): void {
+    if (body.op !== "guest" || !body.resources || runner.status.features?.includes(RESOURCES_FEATURE)) return;
+    const host = `sandbox runner ${runner.name}`;
+    if (runner.status.version === undefined && runner.status.capacity === 0) throw new Error(`${host} just connected and hasn't said yet whether it honors sandbox resources, so nothing was run there; try again in a few seconds`);
+    throw new ResourcesUnsupported(host, `its sandboxd (version ${runner.status.version ?? "unknown"}) doesn't list "${RESOURCES_FEATURE}" among its features and would run the sandbox with its defaults`);
+  }
+
   submit(sandbox: string, body: JobBody, timeoutMs: number): Promise<JobResult> {
-    const runner = this.place(sandbox);
+    const runner = this.place(sandbox, body.op === "guest" && !!body.resources);
+    this.understands(runner, body);
     // Random, not a counter: the runner remembers ids across Lorehouse restarts, and skips
     // one it has seen as a redelivery.
     const job = { ...body, id: `j_${crypto.randomUUID()}`, sandbox, timeoutMs } as Job;
@@ -297,17 +323,26 @@ export class RunnerHub {
   }
 
   // A Sandbox (the tools' seam) whose calls become jobs. Same behavior as the direct HTTP
-  // client (sandbox-client.ts), so the tools can't tell them apart.
-  sandbox(id: string): Sandbox {
+  // client (sandbox-client.ts), so the tools can't tell them apart. `resources`: what to
+  // ask for the sandbox (the profile's request); every guest job carries it, so whichever
+  // call creates the sandbox creates it with them, and a refusal is thrown whole.
+  sandbox(id: string, opts: { resources?: SandboxResources } = {}): Sandbox {
+    const resources = opts.resources ? wireResources(opts.resources) : undefined;
+    // One guest job; a refused request for resources is thrown with the runner's reason.
+    const call = async (method: "POST" | "GET" | "PUT", path: string, bodyBase64: string | undefined, timeoutMs: number) => {
+      const r = await this.submit(id, { op: "guest", method, path, bodyBase64, ...(resources ? { resources } : {}) }, timeoutMs);
+      if (r.code) throw new SandboxRefusal(r.code, r.status, r.error ?? decode(r));
+      return r;
+    };
     const guest = async (method: "POST" | "GET" | "PUT", path: string, body: string | undefined, timeoutMs: number) => {
-      const r = await this.submit(id, { op: "guest", method, path, bodyBase64: body === undefined ? undefined : Buffer.from(body).toString("base64") }, timeoutMs);
+      const r = await call(method, path, body === undefined ? undefined : Buffer.from(body).toString("base64"), timeoutMs);
       if ((r.status < 200 || r.status > 299) && r.status !== 404) {
         throw new Error(`sandbox ${method} ${path}: ${r.status} ${(r.error ?? decode(r)).slice(0, 200)}`);
       }
       return r;
     };
     // A file read as it came back, any status: readBytes tells 404 and 413 apart.
-    const read = (path: string) => this.submit(id, { op: "guest", method: "GET", path: `/file?path=${encodeURIComponent(path)}` }, 30_000);
+    const read = (path: string) => call("GET", `/file?path=${encodeURIComponent(path)}`, undefined, 30_000);
     // A publish op: the request (tokens included, so never logged) as JSON; the host's
     // answer as JSON, or its reason as the error.
     const publish = async (op: "stage" | "push", request: object, timeoutMs: number): Promise<unknown> => {
@@ -318,7 +353,10 @@ export class RunnerHub {
     // A background job call: every status is guestd's (or the runner's) to explain, so
     // none is turned into an error here (jobReply does that).
     const job = async (op: string, method: "POST" | "GET", path: string, body: object | undefined, timeoutMs: number) => {
-      const r = await this.submit(id, { op: "guest", method, path, bodyBase64: body === undefined ? undefined : Buffer.from(JSON.stringify(body)).toString("base64") }, timeoutMs);
+      // A refusal is a 4xx: nothing ran, which is what a JobCallError's status tells the job tools.
+      const r = await call(method, path, body === undefined ? undefined : Buffer.from(JSON.stringify(body)).toString("base64"), timeoutMs).catch((err) => {
+        throw err instanceof SandboxRefusal ? new JobCallError(`job ${op}: ${err.message}`, err.status) : err;
+      });
       return jobReply(op, r.status, r.bodyBase64 ? decode(r) : JSON.stringify({ error: r.error ?? "" }));
     };
     return {
@@ -329,7 +367,7 @@ export class RunnerHub {
       },
       async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
         // One timeout for both: the guest's limit, and (plus boot slack) this call's deadline.
-        const timeoutMs = o.timeoutMs ?? EXEC_TIMEOUT_MS;
+        const timeoutMs = o.timeoutMs ?? commandTimeoutMs(resources, EXEC_TIMEOUT_MS);
         const r = await guest("POST", "/exec", JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs }), timeoutMs);
         return JSON.parse(decode(r)) as ExecResult;
       },
