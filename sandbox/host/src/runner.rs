@@ -122,7 +122,8 @@ impl JobResult {
 fn allowed(method: &str, path: &str) -> Option<Method> {
     let (route, _) = path.split_once('?').unwrap_or((path, ""));
     match (method, route) {
-        ("POST", "/exec") => Some(Method::POST),
+        // A command's path is that and nothing more: with a query it is refused, not run.
+        ("POST", "/exec") if path == "/exec" => Some(Method::POST),
         ("GET", "/file") if path.starts_with("/file?") => Some(Method::GET),
         ("PUT", "/file") if path.starts_with("/file?") => Some(Method::PUT),
         // Background jobs: start, status, cancel (vm::job_call says which paths).
@@ -162,8 +163,15 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
                 Ok(v) => v,
                 Err(e) => return JobResult::unreachable(&job.id, &e),
             };
-            // A command gets its sandbox's timeout, never more, whatever the job's body says.
-            let (body, backstop) = crate::bounded(&granted, &method, p, body);
+            // A command gets its sandbox's timeout, never more: guestd is sent a body written
+            // here, and a job whose body can't be rewritten is refused, not forwarded.
+            let (body, backstop) = match crate::bounded(&granted, &method, p, body) {
+                Ok(v) => v,
+                Err(r) => {
+                    eprintln!("sandboxd: {}: refused ({}): {}", job.sandbox, r.code, r.message);
+                    return JobResult::unreachable(&job.id, &r.into());
+                }
+            };
             // Bounded by the job's deadline at Lorehouse: once it has told the caller the job
             // timed out, the job must not go on changing the checkout. Dropping the request
             // closes the vsock connection, and guestd stops: an exec's process group is killed
@@ -679,6 +687,10 @@ mod tests {
     #[test]
     fn only_the_listed_guest_calls_are_allowed() {
         assert!(allowed("POST", "/exec").is_some());
+        // With a query it would be a command the timeout cap doesn't recognise: refused.
+        for path in ["/exec?x=1", "/exec?", "/exec?timeoutMs=86400000"] {
+            assert!(allowed("POST", path).is_none(), "{path}");
+        }
         assert!(allowed("GET", "/file?path=%2Fw%2Fa").is_some());
         assert!(allowed("PUT", "/file?path=%2Fw%2Fa").is_some());
         assert!(allowed("GET", "/exec").is_none());
@@ -930,7 +942,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_jobs_request_for_resources_is_refused_with_its_code_before_anything_runs() {
-        use super::execute;
+        use super::{execute, B64};
+        use base64::Engine;
         let dir = scratch_dir("job-resources");
         // An install that sets no maximum: 1 vCPU, 128 MiB, no disk quota here.
         let (vms, publisher) = no_vms(&dir);
@@ -961,6 +974,14 @@ mod tests {
         // older sandboxd (no `code`) still reads.
         assert_eq!(serde_json::to_string(&JobResult::error("j", 503, "busy")).unwrap(), r#"{"id":"j","status":503,"error":"busy"}"#);
         assert_eq!(serde_json::from_str::<JobResult>(r#"{"id":"j","status":503,"error":"busy"}"#).unwrap(), JobResult::error("j", 503, "busy"));
+        // A command with a query on its path, which the timeout cap wouldn't have known for
+        // a command: refused before any sandbox is reached, whatever its body asks.
+        let mut sneaky = wire(serde_json::json!({}));
+        sneaky.path = Some("/exec?x=1".into());
+        sneaky.body_base64 = Some(B64.encode(r#"{"command":"sleep 86400","timeoutMs":86400000}"#));
+        let r = execute(&vms, &publisher, sneaky, Instant::now()).await;
+        assert_eq!((r.status, r.error.as_deref()), (400, Some("guest call not allowed: POST /exec?x=1")));
+        assert!(!dir.join("state/acme.t1").exists());
         // A destroy carries no request, and one sent with it is not read.
         let destroy: Job = serde_json::from_value(serde_json::json!({ "id": "j_2", "sandbox": "acme.t1", "op": "destroy", "timeoutMs": 60000, "resources": { "gpus": 1 } })).unwrap();
         assert_eq!(execute(&vms, &publisher, destroy, Instant::now()).await.status, 204);

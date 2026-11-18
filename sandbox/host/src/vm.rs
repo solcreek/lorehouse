@@ -315,12 +315,34 @@ impl Sandbox {
 }
 
 /// Marks a sandbox busy for the lifetime of one request; the reaper never stops a busy VM.
-pub struct Use(Arc<Sandbox>);
+/// Its end is the sandbox's last use, unless the request was refused before it reached
+/// the VM (`refused`): a caller repeating a request the VM can't serve must not keep the
+/// VM from the idle stop that would let the request through.
+pub struct Use {
+    sandbox: Arc<Sandbox>,
+    counts: bool,
+}
+impl Use {
+    fn refused(mut self) {
+        self.counts = false;
+    }
+}
 impl Drop for Use {
     fn drop(&mut self) {
-        self.0.last_used.store(now_secs(), Ordering::SeqCst);
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if self.counts {
+            self.sandbox.last_used.store(now_secs(), Ordering::SeqCst);
+        }
+        self.sandbox.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// What a boot is to give a sandbox, and whether that is news.
+struct Plan {
+    granted: Granted,
+    /// Record it beside the disk: a request decided it, and it isn't what is recorded.
+    keep: bool,
+    /// What the sandbox had until now, when it existed and this differs (for the log).
+    from: Option<Granted>,
 }
 
 pub struct Manager {
@@ -436,7 +458,7 @@ impl Manager {
     pub async fn acquire_with(&self, id: &str, request: Option<&Request>) -> Result<(Use, PathBuf, Granted), AcquireError> {
         let sb = self.get(id).await;
         sb.in_flight.fetch_add(1, Ordering::SeqCst);
-        let guard = Use(sb.clone());
+        let guard = Use { sandbox: sb.clone(), counts: true };
         let mut running = sb.running.lock().await;
         let alive = match running.as_mut() {
             // An error reading its state is not proof it's gone: treat it as alive.
@@ -444,16 +466,20 @@ impl Manager {
             None => false,
         };
         let request = request.filter(|r| !r.is_empty());
-        let (granted, new) = match self.resources_for(&sb, running.as_ref().filter(|_| alive).map(|r| &r.granted), request) {
+        let plan = match self.resources_for(&sb, running.as_ref().filter(|_| alive).map(|r| &r.granted), request).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("sandboxd: {}: refused ({}): {}", sb.id, e.code().unwrap_or("error"), e.message());
                 if running.is_none() {
                     self.forget_if_never_created(&sb).await;
                 }
+                // Not a use of the VM: it never reached it.
+                drop(running);
+                guard.refused();
                 return Err(e);
             }
         };
+        let granted = plan.granted.clone();
         if !alive {
             if let Some(dead) = running.take() {
                 self.release(&sb, dead.slot).await;
@@ -462,10 +488,7 @@ impl Manager {
                 self.forget_if_never_created(&sb).await;
                 return Err(AcquireError::Failed(503, format!("all {} sandboxes are busy; try again later", self.cfg.max_vms)));
             };
-            // Kept with the disk only for a sandbox created with a request: one created
-            // without follows the host's defaults at every boot, as it always has.
-            let keep = new && request.is_some();
-            match self.boot(&sb, slot, &granted, keep).await {
+            match self.boot(&sb, slot, &plan).await {
                 Ok(vmm) => *running = Some(self.track(vmm, slot, granted.clone())),
                 Err(BootError { msg, unstopped: Some(vmm) }) => {
                     // A VMM whose exit couldn't be confirmed keeps its slot, jail and disk
@@ -486,34 +509,49 @@ impl Manager {
         Ok((guard, self.jail(&sb, slot).uds(), granted))
     }
 
-    /// What this sandbox has, or (not created yet: `true`) would be created with, given
-    /// what the caller asks for. Called under the sandbox's lock; makes and changes nothing.
+    /// What the sandbox's VM has, or is to be booted with, given what the caller asks for.
+    /// Called under the sandbox's lock; makes and changes nothing (the boot does).
     ///
-    /// A sandbox exists once its disk does. From then on its resources are fixed: the
-    /// grant kept beside the disk, or, for one created with no request, the host's
-    /// defaults. A request must ask for what it has; a grant over a maximum lowered since
-    /// is not booted. `up`: the grant of its VM, when that runs now.
-    fn resources_for(&self, sb: &Sandbox, up: Option<&Granted>, request: Option<&Request>) -> Result<(Granted, bool), AcquireError> {
-        let created = up.is_some() || sb.rootfs().exists();
-        if !created {
-            return Ok((self.policy.grant(request.unwrap_or(&Request::default()))?, true));
+    /// `up`: the grant of its VM, when that runs now. Resources are fixed while it does: a
+    /// request must come to what the VM has. With the VM stopped (or never booted) a
+    /// request is granted afresh against the maxima in force and becomes the sandbox's
+    /// from that boot on, except less disk than the sandbox already uses, which is never
+    /// applied. No request: the sandbox as it is (its record, held to the rules a request
+    /// is; or the host's defaults for one that has none).
+    async fn resources_for(&self, sb: &Sandbox, up: Option<&Granted>, request: Option<&Request>) -> Result<Plan, AcquireError> {
+        if let Some(has) = up {
+            if let Some(req) = request {
+                self.policy.check_running(&sb.id, has, req, self.cfg.idle.as_secs())?;
+            }
+            return Ok(Plan { granted: has.clone(), keep: false, from: None });
         }
-        let stored = match up {
-            Some(_) => None,
-            None => resources::read_stored(&sb.dir).map_err(|e| AcquireError::Failed(500, e))?,
+        let created = sb.rootfs().exists();
+        let stored = if created { resources::read_stored(&sb.dir).map_err(|e| AcquireError::Failed(500, e))? } else { None };
+        let Some(req) = request else {
+            if let Some(stored) = &stored {
+                self.policy.validate(&sb.id, stored)?;
+            }
+            return Ok(Plan { granted: stored.unwrap_or_else(|| self.policy.defaults.clone()), keep: false, from: None });
         };
-        let has = up.cloned().or_else(|| stored.clone()).unwrap_or_else(|| self.policy.defaults.clone());
-        if let Some(req) = request {
-            self.policy.check_existing(&sb.id, &has, req)?;
-            // The numbers agree, but a directory made before the quota was on has no cap.
-            if let Some(asked) = req.disk_gib.filter(|_| !quota::capped(&self.quota, &sb.dir)) {
-                return Err(resources::uncapped_directory(&sb.id, asked).into());
+        let want = self.policy.grant(req)?;
+        if !created {
+            return Ok(Plan { granted: want, keep: true, from: None });
+        }
+        let has = stored.clone().unwrap_or_else(|| self.policy.defaults.clone());
+        let capped = quota::capped(&self.quota, &sb.dir);
+        // A size for a directory no limit holds on (made before the quota was on).
+        if let Some(asked) = req.disk_gib.filter(|_| !capped) {
+            return Err(resources::uncapped_directory(&sb.id, asked).into());
+        }
+        // Less disk than it had: only if what it has written fits. Usage that can't be
+        // read is not taken to fit.
+        if let Some(new) = want.disk_gib.filter(|new| capped && has.disk_gib.is_none_or(|old| *new < old)) {
+            let used = quota::used_bytes(&sb.dir).await.map_err(|e| AcquireError::Failed(500, format!("sandbox {}'s disk usage couldn't be read, so its cap is not lowered to {new} GiB: {e}", sb.id)))?;
+            if used > new << 30 {
+                return Err(resources::disk_in_use(&sb.id, new, used).into());
             }
         }
-        if let Some(stored) = &stored {
-            self.policy.recheck(&sb.id, stored)?;
-        }
-        Ok((has, false))
+        Ok(Plan { keep: stored.as_ref() != Some(&want), from: (has != want).then_some(has), granted: want })
     }
 
     /// A sandbox that was refused before it ever got a disk leaves no trace in the listing,
@@ -528,9 +566,10 @@ impl Manager {
         }
     }
 
-    /// `granted`: what the VM gets (its size, its cgroup's limits, its disk's cap). `keep`:
-    /// record it beside the disk, for a sandbox being created with a request.
-    async fn boot(&self, sb: &Sandbox, slot_index: usize, granted: &Granted, keep: bool) -> Result<Vmm, BootError> {
+    /// `plan.granted`: what the VM gets (its size, its cgroup's limits, its disk's cap).
+    /// `plan.keep`: record it beside the disk first, as the sandbox's resources from now on.
+    async fn boot(&self, sb: &Sandbox, slot_index: usize, plan: &Plan) -> Result<Vmm, BootError> {
+        let granted = &plan.granted;
         let t0 = Instant::now();
         let slot = Slot { index: slot_index };
         // No VM boots unfiltered: the table is checked (and loaded again if it was flushed)
@@ -541,15 +580,19 @@ impl Manager {
         }
         quota::prepare_dir(&self.quota, &sb.dir, granted.disk_bytes()).await?;
         let rootfs = sb.rootfs();
-        if !rootfs.exists() {
-            // The grant goes down before the disk: a sandbox that exists always has the
-            // record of what it was created with. One created with no request keeps none
-            // (and loses one a creation that failed before its disk was made left).
-            if keep {
-                resources::store(&sb.dir, granted)?;
-            } else {
-                let _ = std::fs::remove_file(sb.dir.join(resources::FILE));
+        // The record goes down after the disk's cap is set and before the disk is made or
+        // the VM started: what a sandbox runs with is always what its record says. One
+        // created with no request keeps none (and loses one a creation that failed before
+        // its disk was made left), and follows the host's defaults at every boot.
+        if plan.keep {
+            resources::store(&sb.dir, granted)?;
+            if let Some(from) = &plan.from {
+                eprintln!("sandboxd: {}: resources changed from ({}) to ({}), as its request asks; they apply from this boot", sb.id, from.describe(), granted.describe());
             }
+        } else if !rootfs.exists() {
+            let _ = std::fs::remove_file(sb.dir.join(resources::FILE));
+        }
+        if !rootfs.exists() {
             let out = crate::child::command("cp").arg("--reflink=always").arg(&self.cfg.golden).arg(&rootfs).output().await.map_err(|e| format!("cp: {e}"))?;
             if !out.status.success() {
                 return Err(format!("reflink golden: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
@@ -871,9 +914,21 @@ mod tests {
     /// A manager whose every boot stops at its first step (the network rules can't be
     /// loaded), before anything is made: an acquire that gets that far passed the policy.
     fn never_boots(dir: &std::path::Path, raise: bool, quota: crate::quota::Quota) -> std::sync::Arc<super::Manager> {
+        manager(dir, raise, quota, false)
+    }
+
+    /// A manager whose boots get past the network rules and the sandbox's directory and
+    /// record, and fail after: a new sandbox's at its disk (there is no golden to
+    /// reflink), an existing one's at its jail (the disk can't be given to root's uid,
+    /// or, as root, at its tap). No VM ever starts.
+    fn boots_as_far_as_the_disk(dir: &std::path::Path) -> std::sync::Arc<super::Manager> {
+        manager(dir, true, crate::quota::Quota::Off, true)
+    }
+
+    fn manager(dir: &std::path::Path, raise: bool, quota: crate::quota::Quota, rules_load: bool) -> std::sync::Arc<super::Manager> {
         use crate::net::fake::{Fake, Shared};
         let fake = std::sync::Arc::new(Fake::default());
-        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.fail.store(!rules_load, std::sync::atomic::Ordering::SeqCst);
         let mut cfg = config(dir);
         if raise {
             cfg.maxima = crate::resources::tests::roomy().maxima;
@@ -930,7 +985,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_is_decided_before_anything_is_made() {
         use crate::quota::Quota;
-        use crate::resources::{MISMATCH, NO_DISK_QUOTA, OVER_MAXIMUM};
+        use crate::resources::{INVALID_STORED, NO_DISK_QUOTA, OVER_MAXIMUM};
         let dir = std::env::temp_dir().join(format!("sandboxd-resources-vm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let vms = never_boots(&dir, true, Quota::Btrfs { bytes: 8 << 30 });
@@ -948,37 +1003,42 @@ mod tests {
             assert_eq!(outcome(&vms, "new", req).await, PASSED);
         }
 
-        // A stopped sandbox created with a request: it has that grant, whatever is asked now.
+        // A stopped sandbox created with a request. Another request, more or less, is
+        // granted afresh (its VM isn't running, so nothing is resized under it); one over a
+        // maximum is refused as for a new sandbox; none leaves it as it is.
         let grant = crate::resources::Granted { vcpus: 4, mem_mib: 4096, disk_gib: Some(8), pids: 64, command_timeout_secs: 1800 };
         on_disk(&dir, "kept", Some(&grant));
-        assert_eq!(outcome(&vms, "kept", j(serde_json::json!({ "vcpus": 2 }))).await, (409, Some(MISMATCH)));
-        assert_eq!(outcome(&vms, "kept", j(serde_json::json!({ "vcpus": 4, "memMib": 2048 }))).await, (409, Some(MISMATCH)));
-        // The same request again (a replay), a part of it, or none: fine.
-        for req in [j(serde_json::json!({ "vcpus": 4, "memMib": 4096, "commandTimeoutSecs": 1800 })), j(serde_json::json!({ "memMib": 4096 })), None] {
+        for req in [j(serde_json::json!({ "vcpus": 2 })), j(serde_json::json!({ "vcpus": 8, "memMib": 8192 })), j(serde_json::json!({ "vcpus": 4, "memMib": 4096, "commandTimeoutSecs": 1800 })), None] {
             assert_eq!(outcome(&vms, "kept", req).await, PASSED);
         }
-        // A refusal never touches the record.
+        assert_eq!(outcome(&vms, "kept", j(serde_json::json!({ "vcpus": 9 }))).await, (422, Some(OVER_MAXIMUM)));
+        // A request that got no further than this changes no record.
         assert_eq!(crate::resources::read_stored(&dir.join("state/kept")), Ok(Some(grant.clone())));
         assert_eq!(vms.list().await.iter().find(|l| l.id == "kept").and_then(|l| l.resources.clone()), Some(grant.clone()));
 
-        // One created with no request has the host's defaults, and is held to them.
+        // One created with no request: any request this host can grant is fine too.
         on_disk(&dir, "plain", None);
-        assert_eq!(outcome(&vms, "plain", j(serde_json::json!({ "vcpus": 2, "memMib": 2048, "pids": 64 }))).await, PASSED);
-        assert_eq!(outcome(&vms, "plain", j(serde_json::json!({ "memMib": 4096 }))).await, (409, Some(MISMATCH)));
-        // A disk size its directory can't hold it to (not a subvolume): refused, though the
-        // number is the default's.
+        assert_eq!(outcome(&vms, "plain", j(serde_json::json!({ "memMib": 4096 }))).await, PASSED);
+        // A disk size its directory can't hold it to (made before the quota, not a
+        // subvolume): refused, though the number is the default's.
         assert_eq!(outcome(&vms, "plain", j(serde_json::json!({ "diskGib": 8 }))).await, (422, Some(NO_DISK_QUOTA)));
 
-        // The maxima lowered since (an install that sets none): a grant over them isn't booted.
+        // The maxima lowered since (an install that sets none): with no request to replace
+        // it, a recorded grant over them isn't booted; a request within them is.
         let lowered = never_boots(&dir, false, Quota::Btrfs { bytes: 8 << 30 });
         assert_eq!(outcome(&lowered, "kept", None).await, (422, Some(OVER_MAXIMUM)));
+        assert_eq!(outcome(&lowered, "kept", j(serde_json::json!({ "vcpus": 2 }))).await, PASSED);
         assert_eq!(outcome(&lowered, "plain", None).await, PASSED);
         // The quota off: a disk size is refused for a new sandbox and an existing one.
         let uncapped = never_boots(&dir, true, Quota::Off);
         assert_eq!(outcome(&uncapped, "new2", j(serde_json::json!({ "diskGib": 4 }))).await, (422, Some(NO_DISK_QUOTA)));
         assert_eq!(outcome(&uncapped, "plain", j(serde_json::json!({ "diskGib": 8 }))).await, (422, Some(NO_DISK_QUOTA)));
         assert_eq!(outcome(&uncapped, "new2", j(serde_json::json!({ "memMib": 4096 }))).await, PASSED);
-        // A record that can't be read: not booted on a guess.
+        // A record no request could have been granted (vcpus 0, 1 MiB, no pids, no time):
+        // read, and refused with its code.
+        std::fs::write(dir.join("state/kept/resources.json"), r#"{"vcpus":0,"memMib":1,"diskGib":null,"pids":0,"commandTimeoutSecs":0}"#).unwrap();
+        assert_eq!(outcome(&vms, "kept", None).await, (500, Some(INVALID_STORED)));
+        // A record that can't be read at all: not booted on a guess.
         std::fs::write(dir.join("state/kept/resources.json"), "{").unwrap();
         assert_eq!(outcome(&vms, "kept", None).await.0, 500);
         let Err(e) = vms.acquire_with("kept", None).await else { panic!("booted") };
@@ -987,30 +1047,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_running_sandbox_answers_with_its_grant_and_refuses_a_request_for_another() {
+    async fn a_request_for_a_stopped_sandbox_is_recorded_before_its_disk_is_made_or_its_vm_started() {
+        use crate::resources::{read_stored, Granted};
+        let dir = std::env::temp_dir().join(format!("sandboxd-resources-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vms = boots_as_far_as_the_disk(&dir);
+        let failed = |r: Result<(super::Use, std::path::PathBuf, Granted), super::AcquireError>| match r {
+            Ok(_) => panic!("a VM booted in a unit test"),
+            Err(e) => (e.status(), e.code(), e.message().to_string()),
+        };
+
+        // A new sandbox created with a request: the record is down before the disk is made
+        // (here the disk can't be: there is no golden), whole.
+        let asked = request(serde_json::json!({ "vcpus": 4, "memMib": 4096, "commandTimeoutSecs": 1800 }));
+        let (status, code, msg) = failed(vms.acquire_with("fresh", Some(&asked)).await);
+        assert_eq!((status, code), (500, None), "{msg}");
+        assert!(msg.contains("reflink golden") || msg.starts_with("cp:"), "the boot didn't get as far as the disk: {msg}");
+        let granted = Granted { vcpus: 4, mem_mib: 4096, disk_gib: None, pids: 64, command_timeout_secs: 1800 };
+        assert_eq!(read_stored(&dir.join("state/fresh")), Ok(Some(granted.clone())));
+        // Created again with no request: it follows the host's defaults, so the record a
+        // creation that failed left is removed, not inherited.
+        failed(vms.acquire_with("fresh", None).await);
+        assert_eq!(read_stored(&dir.join("state/fresh")), Ok(None));
+
+        // A stopped sandbox with a disk, created with `granted`. No request, or the same
+        // one again: its record stays as it is.
+        on_disk(&dir, "old", Some(&granted));
+        for req in [None, Some(&asked)] {
+            failed(vms.acquire_with("old", req).await);
+            assert_eq!(read_stored(&dir.join("state/old")), Ok(Some(granted.clone())));
+        }
+        // Another request: granted afresh (what it names, the defaults for the rest), and
+        // recorded as the sandbox's resources before the VM is started with them.
+        let more = request(serde_json::json!({ "memMib": 8192, "pids": 128 }));
+        failed(vms.acquire_with("old", Some(&more)).await);
+        let now = Granted { vcpus: 2, mem_mib: 8192, disk_gib: None, pids: 128, command_timeout_secs: 600 };
+        assert_eq!(read_stored(&dir.join("state/old")), Ok(Some(now.clone())));
+        assert_eq!(vms.list().await.iter().find(|l| l.id == "old").and_then(|l| l.resources.clone()), Some(now));
+        // One created with no request (no record) gets one with its first request.
+        on_disk(&dir, "plain", None);
+        failed(vms.acquire_with("plain", Some(&asked)).await);
+        assert_eq!(read_stored(&dir.join("state/plain")), Ok(Some(granted.clone())));
+        // No VM, no slot and no request in flight is left by any of it.
+        assert_eq!((vms.running_count().await, vms.in_flight().await), (0, 0));
+
+        // Two first requests for one id at once, each asking for something else: one after
+        // the other under the sandbox's lock, never interleaved. The record is one
+        // request's grant, whole, and nothing is left held.
+        let (a, b) = (request(serde_json::json!({ "vcpus": 4 })), request(serde_json::json!({ "memMib": 8192 })));
+        let (ra, rb) = tokio::join!(vms.acquire_with("twice", Some(&a)), vms.acquire_with("twice", Some(&b)));
+        failed(ra);
+        failed(rb);
+        let one_of = [Granted { vcpus: 4, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 600 }, Granted { vcpus: 2, mem_mib: 8192, disk_gib: None, pids: 64, command_timeout_secs: 600 }];
+        let recorded = read_stored(&dir.join("state/twice")).unwrap().expect("no record");
+        assert!(one_of.contains(&recorded), "{recorded:?}");
+        assert_eq!((vms.running_count().await, vms.in_flight().await), (0, 0));
+        assert!(!vms.list().await.iter().any(|l| l.id == "twice"), "a sandbox with no disk is listed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_running_sandbox_keeps_its_resources_and_a_refused_request_is_not_activity() {
+        use std::sync::atomic::Ordering;
         let dir = std::env::temp_dir().join(format!("sandboxd-resources-up-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let vms = never_boots(&dir, true, crate::quota::Quota::Off);
-        // A running VMM (a stand-in), booted with 4 vCPUs and a 30-minute command timeout.
+        // A running VMM (a stand-in), booted with 4 vCPUs and a 30-minute command timeout,
+        // last used a while ago: idle for longer than SANDBOXD_IDLE_SECS (60 s here).
         let grant = crate::resources::Granted { vcpus: 4, mem_mib: 4096, disk_gib: None, pids: 64, command_timeout_secs: 1800 };
         on_disk(&dir, "up", Some(&grant));
         let sb = vms.get("up").await;
         let vmm = super::Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
         vms.slots.lock().await[0] = true;
         *sb.running.lock().await = Some(vms.track(vmm, 0, grant.clone()));
+        let long_ago = super::now_secs() - 1000;
+        sb.last_used.store(long_ago, Ordering::SeqCst);
+
+        // A request for other resources: refused, saying it runs with its earlier ones and
+        // when they can change. The VM is left as it is, and the call is not a use of it:
+        // it is as idle as it was, so the idle stop that lets the request through still comes.
+        for other in [serde_json::json!({ "vcpus": 2 }), serde_json::json!({ "vcpus": 4, "commandTimeoutSecs": 1800, "memMib": 8192 }), serde_json::json!({ "vcpus": 4 })] {
+            let other = request(other);
+            let Err(e) = vms.acquire_with("up", Some(&other)).await else { panic!("resized?") };
+            assert_eq!((e.status(), e.code()), (409, Some(crate::resources::MISMATCH)));
+            assert_eq!(e.body()["idleSecs"], 60);
+            assert!(e.message().contains("is running with its earlier resources") && e.message().contains("stops after 60 s without a request"), "{}", e.message());
+        }
+        assert_eq!(sb.last_used.load(Ordering::SeqCst), long_ago, "a refused request counted as activity");
+        assert_eq!((vms.running_count().await, vms.in_flight().await), (1, 0));
+        assert_eq!(crate::resources::read_stored(&dir.join("state/up")), Ok(Some(grant.clone())), "a refused request changed the record");
+        let idle = super::now_secs() - sb.last_used.load(Ordering::SeqCst);
+        assert!(idle >= vms.cfg.idle.as_secs(), "the reaper would not stop it");
+
         // No request, or the same one again: its socket, and what it has (the caller caps
-        // each command's timeout with it).
-        for req in [None, Some(request(serde_json::json!({ "vcpus": 4, "commandTimeoutSecs": 1800 })))] {
-            let (_use, uds, has) = vms.acquire_with("up", req.as_ref()).await.unwrap_or_else(|e| panic!("{}", e.message()));
+        // each command's timeout with it). That is a use.
+        for req in [None, Some(request(serde_json::json!({ "vcpus": 4, "memMib": 4096, "commandTimeoutSecs": 1800 })))] {
+            sb.last_used.store(long_ago, Ordering::SeqCst);
+            let (used, uds, has) = vms.acquire_with("up", req.as_ref()).await.unwrap_or_else(|e| panic!("{}", e.message()));
             assert_eq!(has, grant);
             assert!(uds.ends_with("jail/firecracker/lorehouse-0/root/vsock.sock"), "{}", uds.display());
+            drop(used);
+            assert!(sb.last_used.load(Ordering::SeqCst) > long_ago, "a served request is activity");
         }
-        // Another size: refused, and the VM is left running as it is.
-        let other = request(serde_json::json!({ "vcpus": 2 }));
-        let Err(e) = vms.acquire_with("up", Some(&other)).await else { panic!("resized?") };
-        assert_eq!((e.status(), e.code()), (409, Some(crate::resources::MISMATCH)));
-        assert_eq!(e.body()["has"], 4);
-        assert_eq!(vms.running_count().await, 1);
         assert_eq!(vms.list().await[0].resources, Some(grant));
         let _ = std::fs::remove_dir_all(&dir);
     }

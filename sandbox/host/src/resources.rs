@@ -16,12 +16,21 @@
 //!                                defaults to the default, so an install that sets none
 //!                                grants nothing beyond it)
 //!   disk_quota_unavailable  422  a disk size asked of a host that can't cap disks
-//!   resources_mismatch      409  the sandbox exists already, with other values
+//!   resources_mismatch      409  the sandbox's VM is running now, with other values
+//!   disk_in_use             422  less disk than the sandbox already uses
+//!   invalid_stored_resources 500 the record of a sandbox's resources is not one a
+//!                                request could have been granted
+//!   invalid_exec_body       400  a command's body that isn't the JSON object guestd is
+//!                                sent (see `exec_body`)
 //!
-//! Resources are fixed when the sandbox is created (its disk is made): the grant is kept
-//! in `<state>/<id>/resources.json` and every later boot uses it. A later request for the
-//! same sandbox is a statement about it: fine if every field it asks for is what the
-//! sandbox has (so a replay is fine), refused as a mismatch otherwise. Nothing is resized.
+//! A request, when there is one, says what the whole sandbox is: what it names, and the
+//! defaults for the rest. Resources are fixed only while the sandbox's VM runs: a request
+//! for other values than a running VM has is refused as a mismatch (and is not activity
+//! that keeps the VM up). Once the VM has stopped, the next request is granted afresh
+//! against the maxima in force and is what the next boot uses: it replaces
+//! `<state>/<id>/resources.json`, where the grant is kept. So a profile whose request
+//! changes reaches its existing sandboxes after their idle stop. A call with no request
+//! leaves the sandbox as it is.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -181,18 +190,45 @@ impl Granted {
         std::time::Duration::from_secs(self.command_timeout_secs + BACKSTOP_SLACK_SECS)
     }
 
-    /// A `POST /exec` body as guestd gets it: `timeoutMs` is what the caller asked, and
-    /// never more than this sandbox's command timeout (none asked: that timeout). guestd
-    /// kills the command's process group at it (exit code 124). A body that isn't a JSON
-    /// object goes through as it is, for guestd to refuse.
-    pub fn cap_exec_timeout(&self, body: Bytes) -> Bytes {
-        let Ok(Value::Object(mut o)) = serde_json::from_slice::<Value>(&body) else { return body };
+    /// A `POST /exec` body as guestd gets it, made here from nothing but what was parsed:
+    /// exactly `command`, `cwd`, `env` and `timeoutMs`, the last what the caller asked and
+    /// never more than this sandbox's command timeout (none asked, or not a whole number of
+    /// milliseconds: that timeout). guestd kills the command's process group at it (exit
+    /// code 124).
+    ///
+    /// The caller's bytes never reach guestd: a body this parser and guestd's could read
+    /// differently (another spelling of `timeoutMs`, which Go's decoder would take for it;
+    /// a string Go repairs and serde refuses; a second copy of a key) would let the caller
+    /// choose the timeout. So a body that isn't a JSON object, or has any other key, is
+    /// refused, and what goes out has each key once, spelled exactly.
+    pub fn exec_body(&self, body: &[u8]) -> Result<Bytes, Refusal> {
+        let bad = |why: String| Refusal::new(400, INVALID_EXEC, format!("{why}. A command's body is a JSON object with command, and optionally cwd, env and timeoutMs, spelled exactly so; nothing was run"), json!({}));
+        let o = match serde_json::from_slice::<Value>(body) {
+            Ok(Value::Object(o)) => o,
+            Ok(other) => return Err(bad(format!("the exec body must be a JSON object, got {}", shown(&other)))),
+            Err(e) => return Err(bad(format!("the exec body is not JSON sandboxd can read ({e})"))),
+        };
         let limit = self.command_timeout_secs.saturating_mul(1000);
+        // The one `timeoutMs` the parsed object has (a key given twice: the last).
         let asked = o.get("timeoutMs").and_then(Value::as_u64).filter(|ms| *ms > 0).unwrap_or(limit);
-        o.insert("timeoutMs".into(), json!(asked.min(limit)));
-        serde_json::to_vec(&o).map(Bytes::from).unwrap_or(body)
+        let mut out = Map::new();
+        for (key, value) in o {
+            if !EXEC_KEYS.contains(&key.as_str()) {
+                let mut r = bad(format!("the exec body has a key {} that is not one guestd is sent", shown(&json!(key))));
+                r.detail.insert("field".into(), json!(key));
+                return Err(r);
+            }
+            if key != "timeoutMs" {
+                out.insert(key, value);
+            }
+        }
+        out.insert("timeoutMs".into(), json!(asked.min(limit)));
+        serde_json::to_vec(&out).map(Bytes::from).map_err(|e| bad(format!("the exec body can't be written again ({e})")))
     }
 }
+
+/// The keys of a `POST /exec` body: guestd's execReq (sandbox/guest/main.go), exactly.
+const EXEC_KEYS: [&str; 4] = ["command", "cwd", "env", "timeoutMs"];
 
 /// This install's maxima, from sandboxd's own environment.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -239,6 +275,9 @@ pub const INVALID: &str = "invalid_resources";
 pub const OVER_MAXIMUM: &str = "resource_over_maximum";
 pub const NO_DISK_QUOTA: &str = "disk_quota_unavailable";
 pub const MISMATCH: &str = "resources_mismatch";
+pub const DISK_IN_USE: &str = "disk_in_use";
+pub const INVALID_STORED: &str = "invalid_stored_resources";
+pub const INVALID_EXEC: &str = "invalid_exec_body";
 
 impl Refusal {
     fn new(status: u16, code: &'static str, message: String, detail: Value) -> Refusal {
@@ -346,43 +385,75 @@ impl Policy {
         Ok(g)
     }
 
-    /// A request for a sandbox that exists, which has `has`: every field it asks for
-    /// must be what the sandbox has.
-    pub fn check_existing(&self, id: &str, has: &Granted, req: &Request) -> Result<(), Refusal> {
-        if let Some(asked) = req.disk_gib.filter(|_| self.defaults.disk_gib.is_none() && has.disk_gib.is_none()) {
-            return Err(no_disk_quota(asked, "its disk quota is off (SANDBOXD_DISK_QUOTA_GIB=0, or the state directory's filesystem has no quota sandboxd can use)"));
-        }
-        let differs: Vec<Field> = FIELDS.into_iter().filter(|f| req.get(*f).is_some_and(|asked| has.get(*f) != Some(asked))).collect();
+    /// A request for a sandbox whose VM runs now with `has`: it must come to what the VM
+    /// has (what it names, the defaults for the rest), since nothing is resized under a
+    /// running VM. `idle_secs`: how long without a request until the VM stops, after which
+    /// the request is granted afresh.
+    pub fn check_running(&self, id: &str, has: &Granted, req: &Request, idle_secs: u64) -> Result<(), Refusal> {
+        let want = self.grant(req)?;
+        let differs: Vec<Field> = FIELDS.into_iter().filter(|f| want.get(*f) != has.get(*f)).collect();
         let Some(first) = differs.first() else { return Ok(()) };
-        let asked = differs.iter().map(|f| format!("{} {}", f.name(), req.get(*f).unwrap_or_default())).collect::<Vec<_>>().join(", ");
+        let show = |f: &Field| format!("{} {}", f.name(), want.get(*f).map_or("uncapped".to_string(), |v| v.to_string()));
         Err(Refusal::new(
             409,
             MISMATCH,
             format!(
-                "sandbox {id} already exists with {}, and this request asks for {asked}. A sandbox's resources are fixed when it is created and it is never resized: ask for what it has, or destroy the sandbox (its checkout goes with it) so the next request creates it anew. Nothing was changed",
-                has.describe()
+                "sandbox {id} is running with its earlier resources ({}), and this request comes to {}. A sandbox's resources are fixed while its VM runs and change at its next boot: the VM stops after {idle_secs} s without a request (SANDBOXD_IDLE_SECS; a running background job can hold it up longer, SANDBOXD_JOB_HOLD_SECS), and the first request after that starts it with what that request asks for. Wait that long and try again, or ask for what it has. This call was not run and does not count as a request",
+                has.describe(),
+                differs.iter().map(show).collect::<Vec<_>>().join(", ")
             ),
-            json!({ "field": first.name(), "asked": req.get(*first), "has": has.get(*first) }),
+            json!({ "field": first.name(), "asked": want.get(*first), "has": has.get(*first), "idleSecs": idle_secs }),
         ))
     }
 
-    /// Before a boot: a grant made under higher maxima than the install has now is not
-    /// honored, and not shrunk either.
-    pub fn recheck(&self, id: &str, stored: &Granted) -> Result<(), Refusal> {
+    /// A recorded grant, before it is booted with no request to replace it: held to the
+    /// rules a request is (each field within its bounds, pids enough for the vCPUs) and to
+    /// the maxima in force now. One that fails is not started, and not adjusted either.
+    pub fn validate(&self, id: &str, stored: &Granted) -> Result<(), Refusal> {
+        let fix = format!("Send a request this host can grant for sandbox {id} (it replaces the record while the VM is stopped), or destroy the sandbox");
         for f in FIELDS {
             // An uncapped disk is no grant; a capped one on a host whose quota is now off
             // would go unenforced.
             let Some(has) = stored.get(f) else { continue };
             if f == Field::DiskGib && self.defaults.disk_gib.is_none() {
-                return Err(no_disk_quota(has, &format!("sandbox {id} was created with that cap, and the host's disk quota has been turned off since; destroy the sandbox, or turn the quota back on")));
+                return Err(no_disk_quota(has, &format!("sandbox {id} was created with that cap, and the host's disk quota has been turned off since; turn it back on, send a request without diskGib, or destroy the sandbox")));
+            }
+            let (min, _) = f.bounds();
+            if has < min {
+                return Err(Refusal::new(
+                    500,
+                    INVALID_STORED,
+                    format!("sandbox {id}'s record of its resources ({FILE}) has {} {has}, under the least there is ({min}): no request could have been granted that, so the record is damaged and the sandbox is not started with it. {fix}", f.name()),
+                    json!({ "field": f.name(), "has": has, "minimum": min }),
+                ));
             }
             let max = self.maxima.get(f);
             if has > max {
-                return Err(over_maximum(f, has, max, &format!("Sandbox {id} was created with it under a higher maximum; it is not started, and not shrunk. Destroy the sandbox (its checkout goes with it), or raise the maximum again")));
+                return Err(over_maximum(f, has, max, &format!("Sandbox {id} was created with it under a higher maximum; it is not started, and not shrunk. Raise the maximum again, or: {fix}")));
             }
+        }
+        if stored.pids < stored.vcpus + PIDS_OVER_VCPUS {
+            return Err(Refusal::new(
+                500,
+                INVALID_STORED,
+                format!("sandbox {id}'s record of its resources ({FILE}) has pids {} for {} vCPUs, fewer than a VM can boot with ({}): the record is damaged and the sandbox is not started with it. {fix}", stored.pids, stored.vcpus, stored.vcpus + PIDS_OVER_VCPUS),
+                json!({ "field": "pids", "has": stored.pids, "minimum": stored.vcpus + PIDS_OVER_VCPUS }),
+            ));
         }
         Ok(())
     }
+}
+
+/// Less disk asked than the sandbox has already written: a limit under its usage would
+/// fail every write, so it is not applied.
+pub fn disk_in_use(id: &str, asked_gib: u64, used_bytes: u64) -> Refusal {
+    let used_gib = used_bytes.div_ceil(1 << 30);
+    Refusal::new(
+        422,
+        DISK_IN_USE,
+        format!("resources.diskGib {asked_gib} is less than sandbox {id} already uses ({used_bytes} bytes of its own writes, {used_gib} GiB rounded up): a cap under that would fail every write, so it is not applied. Ask for at least {used_gib}, free space in the sandbox first, or destroy the sandbox. Nothing was changed"),
+        json!({ "field": "diskGib", "asked": asked_gib, "usedBytes": used_bytes, "minimum": used_gib }),
+    )
 }
 
 fn over_maximum(f: Field, asked: u64, max: u64, then: &str) -> Refusal {
@@ -420,12 +491,19 @@ pub fn read_stored(dir: &Path) -> Result<Option<Granted>, String> {
     }
 }
 
-/// Written whole or not at all, before the sandbox's disk is made.
+/// Written whole or not at all, and on the disk before it counts: the file is synced
+/// before the rename and the directory after it, so a power cut leaves the old record or
+/// the new one, never an empty or missing one (the rack this runs on loses power uncleanly).
 pub fn store(dir: &Path, granted: &Granted) -> Result<(), String> {
+    use std::io::Write;
     let (path, tmp) = (dir.join(FILE), dir.join(format!("{FILE}.tmp")));
     let write = || -> std::io::Result<()> {
-        std::fs::write(&tmp, serde_json::to_vec(granted).map_err(std::io::Error::other)?)?;
-        std::fs::rename(&tmp, &path)
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec(granted).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(dir)?.sync_all()
     };
     write().map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -574,66 +652,123 @@ pub mod tests {
         let g = p.grant(&req(json!({ "memMib": 4096 }))).unwrap();
         assert_eq!((g.mem_mib, g.disk_gib), (4096, None));
         assert!(g.describe().contains("diskGib uncapped"));
-        // A later request for a sandbox there: the same answer, not a mismatch.
-        assert_eq!(p.check_existing("s", &g, &req(json!({ "diskGib": 4 }))).unwrap_err().code, NO_DISK_QUOTA);
+        // A request for a sandbox running there: the same answer, not a mismatch.
+        assert_eq!(p.check_running("s", &g, &req(json!({ "diskGib": 4 })), 900).unwrap_err().code, NO_DISK_QUOTA);
     }
 
     #[test]
-    fn a_later_request_must_ask_for_what_the_sandbox_has() {
+    fn a_request_for_a_running_sandbox_must_come_to_what_its_vm_has() {
         let p = roomy();
         let asked = req(json!({ "vcpus": 4, "memMib": 4096, "commandTimeoutSecs": 1800 }));
         let has = p.grant(&asked).unwrap();
-        // The same request again (a replay), a part of it, the whole grant, or none.
-        p.check_existing("t.s1", &has, &asked).unwrap();
-        p.check_existing("t.s1", &has, &req(json!({ "vcpus": 4 }))).unwrap();
-        p.check_existing("t.s1", &has, &req(json!({ "vcpus": 4, "memMib": 4096, "diskGib": 8, "pids": 64, "commandTimeoutSecs": 1800 }))).unwrap();
-        p.check_existing("t.s1", &has, &Request::default()).unwrap();
-        // Other values, more or less: refused, naming both.
-        for (v, field, want, got) in [(json!({ "vcpus": 2 }), "vcpus", 2, 4), (json!({ "vcpus": 4, "memMib": 8192 }), "memMib", 8192, 4096), (json!({ "diskGib": 16 }), "diskGib", 16, 8), (json!({ "pids": 128 }), "pids", 128, 64)] {
-            let r = p.check_existing("t.s1", &has, &req(v.clone())).unwrap_err();
+        // The same request again (a replay), or the whole grant spelled out.
+        p.check_running("t.s1", &has, &asked, 900).unwrap();
+        p.check_running("t.s1", &has, &req(json!({ "vcpus": 4, "memMib": 4096, "diskGib": 8, "pids": 64, "commandTimeoutSecs": 1800 })), 900).unwrap();
+        // Other values, more or less, and a request that leaves out what the VM was given
+        // (it comes to the default there): refused, naming both and when it can change.
+        for (v, field, want, got) in [
+            (json!({ "vcpus": 2, "memMib": 4096, "commandTimeoutSecs": 1800 }), "vcpus", 2, 4),
+            (json!({ "vcpus": 4, "memMib": 8192, "commandTimeoutSecs": 1800 }), "memMib", 8192, 4096),
+            (json!({ "vcpus": 4, "memMib": 4096, "commandTimeoutSecs": 1800, "diskGib": 16 }), "diskGib", 16, 8),
+            (json!({ "vcpus": 4, "memMib": 4096, "commandTimeoutSecs": 1800, "pids": 128 }), "pids", 128, 64),
+            (json!({ "vcpus": 4, "memMib": 4096 }), "commandTimeoutSecs", 600, 1800),
+        ] {
+            let r = p.check_running("t.s1", &has, &req(v.clone()), 900).unwrap_err();
             assert_eq!((r.status, r.code), (409, MISMATCH), "{v}");
-            assert_eq!(r.body(), json!({ "error": r.message, "code": "resources_mismatch", "field": field, "asked": want, "has": got }));
-            for part in ["sandbox t.s1 already exists with vcpus 4, memMib 4096, diskGib 8, pids 64, commandTimeoutSecs 1800".to_string(), format!("asks for {field} {want}"), "never resized".into(), "destroy the sandbox".into()] {
+            assert_eq!(r.body(), json!({ "error": r.message, "code": "resources_mismatch", "field": field, "asked": want, "has": got, "idleSecs": 900 }));
+            for part in [
+                "sandbox t.s1 is running with its earlier resources (vcpus 4, memMib 4096, diskGib 8, pids 64, commandTimeoutSecs 1800)".to_string(),
+                format!("comes to {field} {want}"),
+                "stops after 900 s without a request (SANDBOXD_IDLE_SECS".into(),
+                "does not count as a request".into(),
+            ] {
                 assert!(r.message.contains(&part), "{part:?} not in {}", r.message);
             }
         }
-        // A mismatch is told before a maximum: the sandbox is what the request is about.
-        assert_eq!(p.check_existing("t.s1", &has, &req(json!({ "vcpus": 64 }))).unwrap_err().code, MISMATCH);
-        // A sandbox created with no request has the defaults, and is held to them.
-        p.check_existing("t.s2", &p.defaults, &req(json!({ "vcpus": 2, "pids": 64 }))).unwrap();
-        assert_eq!(p.check_existing("t.s2", &p.defaults, &req(json!({ "vcpus": 4 }))).unwrap_err().code, MISMATCH);
+        // One this host couldn't grant anyway says that, not a mismatch.
+        assert_eq!(p.check_running("t.s1", &has, &req(json!({ "vcpus": 64 })), 900).unwrap_err().code, OVER_MAXIMUM);
+        // A VM running with the defaults: a request that comes to them is fine.
+        p.check_running("t.s2", &p.defaults, &req(json!({ "vcpus": 2, "pids": 64 })), 900).unwrap();
+        assert_eq!(p.check_running("t.s2", &p.defaults, &req(json!({ "vcpus": 4 })), 900).unwrap_err().code, MISMATCH);
     }
 
     #[test]
-    fn a_grant_from_under_a_higher_maximum_is_not_started_once_the_maximum_is_lowered() {
+    fn a_recorded_grant_is_held_to_a_requests_rules_and_todays_maxima_before_it_is_booted() {
         let has = roomy().grant(&req(json!({ "memMib": 8192 }))).unwrap();
-        roomy().recheck("t.s1", &has).unwrap();
-        let r = stock().recheck("t.s1", &has).unwrap_err();
+        roomy().validate("t.s1", &has).unwrap();
+        // The maximum lowered since: not started, not shrunk.
+        let r = stock().validate("t.s1", &has).unwrap_err();
         assert_eq!((r.status, r.code, r.detail["field"].as_str()), (422, OVER_MAXIMUM, Some("memMib")));
-        assert!(r.message.contains("Sandbox t.s1 was created with it") && r.message.contains("SANDBOXD_MAX_MEM_MIB"), "{}", r.message);
+        assert!(r.message.contains("Sandbox t.s1 was created with it") && r.message.contains("SANDBOXD_MAX_MEM_MIB") && r.message.contains("Send a request"), "{}", r.message);
         // A capped disk on a host whose quota is off now: not started uncapped.
         let mut off = roomy();
         off.defaults.disk_gib = None;
-        assert_eq!(off.recheck("t.s1", &has).unwrap_err().code, NO_DISK_QUOTA);
+        assert_eq!(off.validate("t.s1", &has).unwrap_err().code, NO_DISK_QUOTA);
+        // A record no request could have been granted (a damaged or hand-edited file):
+        // each field under its least, and too few pids for the vCPUs.
+        let ok = stock().defaults;
+        for (bad, field) in [
+            (Granted { vcpus: 0, ..ok.clone() }, "vcpus"),
+            (Granted { mem_mib: 1, ..ok.clone() }, "memMib"),
+            (Granted { disk_gib: Some(0), ..ok.clone() }, "diskGib"),
+            (Granted { pids: 0, ..ok.clone() }, "pids"),
+            (Granted { command_timeout_secs: 0, ..ok.clone() }, "commandTimeoutSecs"),
+            (Granted { vcpus: 0, mem_mib: 1, disk_gib: None, pids: 0, command_timeout_secs: 0 }, "vcpus"),
+        ] {
+            let r = roomy().validate("t.s1", &bad).unwrap_err();
+            assert_eq!((r.status, r.code, r.detail["field"].as_str()), (500, INVALID_STORED, Some(field)), "{bad:?}");
+            assert!(r.message.contains("resources.json") && r.message.contains("not started"), "{}", r.message);
+        }
+        let mut wide = roomy();
+        wide.maxima.vcpus = 32;
+        let r = wide.validate("t.s1", &Granted { vcpus: 16, pids: 16, ..ok.clone() }).unwrap_err();
+        assert_eq!((r.code, r.detail["field"].as_str(), r.detail["minimum"].as_u64()), (INVALID_STORED, Some("pids"), Some(24)));
+        // Less disk than is in use: its own code, naming both.
+        let r = disk_in_use("t.s1", 2, (3 << 30) + 1);
+        assert_eq!((r.status, r.code), (422, DISK_IN_USE));
+        assert_eq!(r.body(), json!({ "error": r.message, "code": "disk_in_use", "field": "diskGib", "asked": 2, "usedBytes": (3u64 << 30) + 1, "minimum": 4 }));
+        assert!(r.message.contains("resources.diskGib 2 is less than sandbox t.s1 already uses (3221225473 bytes") && r.message.contains("at least 4"), "{}", r.message);
     }
 
     #[test]
-    fn the_granted_command_timeout_is_what_guestd_is_told() {
-        let g = Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 120 };
-        let sent = |body: &str| serde_json::from_slice::<Value>(&g.cap_exec_timeout(Bytes::from(body.to_string()))).unwrap();
-        // None asked, zero, or more than granted: the grant. Less: as asked.
-        assert_eq!(sent(r#"{"command":"make"}"#), json!({ "command": "make", "timeoutMs": 120_000 }));
-        assert_eq!(sent(r#"{"command":"make","timeoutMs":0}"#)["timeoutMs"], 120_000);
-        assert_eq!(sent(r#"{"command":"make","timeoutMs":600000}"#)["timeoutMs"], 120_000);
-        assert_eq!(sent(r#"{"command":"make","timeoutMs":-5}"#)["timeoutMs"], 120_000);
-        assert_eq!(sent(r#"{"command":"make","timeoutMs":"forever"}"#)["timeoutMs"], 120_000);
+    fn the_granted_command_timeout_is_what_guestd_is_told_whatever_the_caller_sends() {
+        let g = Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 60 };
+        let sent = |body: &str| serde_json::from_slice::<Value>(&g.exec_body(body.as_bytes()).unwrap_or_else(|r| panic!("{body}: {}", r.message))).unwrap();
+        // None asked, zero, more than granted, or not a whole number: the grant. Less: as asked.
+        assert_eq!(sent(r#"{"command":"make"}"#), json!({ "command": "make", "timeoutMs": 60_000 }));
+        assert_eq!(sent(r#"{"command":"make","timeoutMs":0}"#)["timeoutMs"], 60_000);
+        assert_eq!(sent(r#"{"command":"make","timeoutMs":86400000}"#)["timeoutMs"], 60_000);
+        assert_eq!(sent(r#"{"command":"make","timeoutMs":-5}"#)["timeoutMs"], 60_000);
+        assert_eq!(sent(r#"{"command":"make","timeoutMs":"forever"}"#)["timeoutMs"], 60_000);
+        assert_eq!(sent(r#"{"command":"make","timeoutMs":1e30}"#)["timeoutMs"], 60_000);
         assert_eq!(sent(r#"{"command":"make","timeoutMs":30000}"#)["timeoutMs"], 30_000);
-        // The rest of the body is untouched.
+        // The rest of the body is what was parsed, each key once.
         assert_eq!(sent(r#"{"command":"make","cwd":"/w","env":{"A":"b"},"timeoutMs":30000}"#), json!({ "command": "make", "cwd": "/w", "env": { "A": "b" }, "timeoutMs": 30_000 }));
-        // Not an object: guestd's to refuse.
-        assert_eq!(g.cap_exec_timeout(Bytes::from_static(b"not json")), Bytes::from_static(b"not json"));
+        // A key given twice: one goes out, and never over the grant.
+        let twice = g.exec_body(br#"{"command":"make","timeoutMs":1000,"timeoutMs":86400000}"#).unwrap();
+        assert_eq!(String::from_utf8_lossy(&twice).matches("timeoutMs").count(), 1);
+        assert_eq!(serde_json::from_slice::<Value>(&twice).unwrap()["timeoutMs"], 60_000);
+
+        // Another spelling of timeoutMs, which Go's decoder would read as it (it matches
+        // keys case-insensitively, the last one winning, and folds U+017F to s and U+212A
+        // to k): refused, never forwarded beside the capped one.
+        for key in ["timeoutms", "TIMEOUTMS", "TimeoutMs", "timeoutM\u{017f}", "Command", "CWD", "extra"] {
+            let body = format!(r#"{{"command":"make","{key}":86400000}}"#);
+            let r = g.exec_body(body.as_bytes()).unwrap_err();
+            assert_eq!((r.status, r.code), (400, INVALID_EXEC), "{key}");
+            assert!(r.message.contains("is not one guestd is sent") && r.message.contains("nothing was run"), "{key}: {}", r.message);
+        }
+        // A body serde refuses and Go would repair and run (a lone surrogate, bytes that
+        // aren't UTF-8), or that isn't an object: refused, never passed through as it is.
+        let lone_surrogate = br#"{"command":"sleep 3600 #\ud800","timeoutMs":86400000}"#.to_vec();
+        let not_utf8 = [br#"{"command":"sleep 3600 #"#.to_vec(), vec![0xff, 0xfe], br#"","timeoutMs":86400000}"#.to_vec()].concat();
+        for body in [lone_surrogate, not_utf8, b"not json".to_vec(), b"".to_vec(), br#"["sleep 3600"]"#.to_vec(), b"null".to_vec(), br#"{"command":"make"} {"timeoutMs":1}"#.to_vec()] {
+            let r = g.exec_body(&body).unwrap_err();
+            assert_eq!((r.status, r.code), (400, INVALID_EXEC), "{}", String::from_utf8_lossy(&body));
+            assert!(r.body()["error"].as_str().unwrap().contains("nothing was run"));
+        }
         // The host's own deadline follows: the default's is the 15.5 minutes it always was.
-        assert_eq!(g.exec_backstop(), std::time::Duration::from_secs(450));
+        assert_eq!(g.exec_backstop(), std::time::Duration::from_secs(390));
         assert_eq!(stock().defaults.exec_backstop(), crate::REQUEST_DEADLINE);
     }
 
@@ -648,6 +783,21 @@ pub mod tests {
         assert_eq!(std::fs::read_to_string(dir.join(FILE)).unwrap(), r#"{"vcpus":4,"memMib":4096,"diskGib":null,"pids":128,"commandTimeoutSecs":1800}"#);
         assert_eq!(read_stored(&dir), Ok(Some(g)));
         assert!(!dir.join("resources.json.tmp").exists());
+        // Replaced whole by a later grant: the new one, and no leftover.
+        let later = Granted { vcpus: 2, mem_mib: 2048, disk_gib: Some(16), pids: 64, command_timeout_secs: 600 };
+        store(&dir, &later).unwrap();
+        assert_eq!(read_stored(&dir), Ok(Some(later)));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // Synced before it is renamed into place, and its directory after (a power cut
+        // leaves the old record or the new one): pinned in the source, since a test can't
+        // cut the power.
+        let src = include_str!("resources.rs");
+        let body = &src[src.find("pub fn store(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let (sync, rename, dirsync) = (body.find("file.sync_all()").unwrap(), body.find("std::fs::rename(").unwrap(), body.find("File::open(dir)?.sync_all()").unwrap());
+        assert!(sync < rename && rename < dirsync, "store() must sync the file, rename, then sync the directory");
+        // A directory that isn't there: an error that names the file, nothing written.
+        assert!(store(&dir.join("gone"), &Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 600 }).unwrap_err().contains("resources.json"));
         for damaged in ["", "{}", r#"{"vcpus":4,"memMib":4096,"diskGib":null,"pids":128,"commandTimeoutSecs":1800,"gpus":1}"#] {
             std::fs::write(dir.join(FILE), damaged).unwrap();
             assert!(read_stored(&dir).unwrap_err().contains("resources.json"), "{damaged:?}");

@@ -205,6 +205,23 @@ pub fn capped(quota: &Quota, dir: &Path) -> bool {
     matches!(quota, Quota::Btrfs { .. }) && std::fs::metadata(dir).is_ok_and(|m| m.ino() == SUBVOLUME_INO)
 }
 
+/// What a sandbox has written to its own subvolume, in bytes: its qgroup's exclusive
+/// usage, the number its limit is checked against. Asked before a limit is lowered.
+pub async fn used_bytes(dir: &Path) -> Result<u64, String> {
+    let out = command("btrfs").args(["qgroup", "show", "--raw", "-f"]).arg(dir).output().await.map_err(|e| format!("btrfs: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("btrfs qgroup show {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    exclusive_bytes(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| format!("btrfs qgroup show {}: no usage in its output", dir.display()))
+}
+
+/// The exclusive bytes in `btrfs qgroup show --raw -f <subvolume>`: the third column of
+/// the subvolume's own row (`0/<id>`), under either header btrfs-progs prints
+/// ("Qgroupid Referenced Exclusive Path", or the older "qgroupid rfer excl").
+pub fn exclusive_bytes(show: &str) -> Option<u64> {
+    show.lines().map(|l| l.split_whitespace().collect::<Vec<_>>()).find(|cols| cols.first().is_some_and(|c| c.starts_with("0/")))?.get(2)?.parse().ok()
+}
+
 /// After a sandbox's subvolume is deleted: its qgroup, once empty, removed (kernels before
 /// 6.10 leave it). Best effort.
 pub async fn after_destroy(quota: &Quota, state_dir: &Path) {
@@ -249,6 +266,13 @@ mod tests {
         assert_eq!(limit_bytes(&on, Some(16 << 30)), Some(16 << 30));
         assert_eq!(limit_args(limit_bytes(&on, Some(2 << 30)).unwrap(), Path::new("/s/y")).join(" "), "qgroup limit -e 2147483648 /s/y");
         assert_eq!(limit_bytes(&Quota::Off, Some(16 << 30)), None);
+        // What a sandbox uses, read from either form of `btrfs qgroup show --raw -f`.
+        let new = "Qgroupid    Referenced    Exclusive   Path \n--------    ----------    ---------   ---- \n0/257       3221241856   3221225473   t.s1\n";
+        let old = "qgroupid         rfer         excl \n--------         ----         ---- \n0/257           16384        16384 \n";
+        assert_eq!(exclusive_bytes(new), Some(3_221_225_473));
+        assert_eq!(exclusive_bytes(old), Some(16_384));
+        assert_eq!(exclusive_bytes("ERROR: can't list qgroups: quotas not enabled\n"), None);
+        assert_eq!(exclusive_bytes("0/257 16.00KiB 16.00KiB x\n"), None, "not --raw: refused, not guessed");
         // A directory that isn't a subvolume (here: any temp directory) isn't capped.
         assert!(!capped(&on, &std::env::temp_dir()));
         assert!(!capped(&Quota::Off, &std::env::temp_dir()));
