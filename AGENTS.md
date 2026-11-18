@@ -86,7 +86,13 @@ profile:
   `ProfileTrigger`, checked in `checkProfile`.
 - At most one profile is started by Slack messages (ADR 0002 §2). This build requires
   exactly one, for now, which is its own rule, not the ADR's: that profile gets the Slack
-  channel, and the channel also carries ingest and posting.
+  channel, and the channel also carries ingest and posting. Its Slack trigger's `events`
+  (`mention`, `follow_up`, `direct_message`) reach `src/turns.ts` as `turnGate`'s
+  `startsOn`, which decides each event by them: `follow_up` needs `mention`, a mention
+  that is not a trigger joins no thread, and a DM also needs `DM_MODE=answer`.
+- Only that profile may list `open_pull_request`: an Approve click reaches June through
+  the Slack channel and resumes the agent mounted with it, so a card from any other
+  profile could never be answered.
 - `GET /status` lists each profile's `id`, `mode` and the triggers in force
   (`profileStatus`). Give a new profile its own conformance scenarios.
 - `test/agent-wiring.test.ts` pins what June is handed for `lorehouse` (system prompt and
