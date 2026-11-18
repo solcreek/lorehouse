@@ -532,10 +532,19 @@ impl Manager {
     /// applied. No request: the sandbox as it is (its record, held to the rules a request
     /// is; or the host's defaults for one that has none).
     async fn resources_for(&self, sb: &Sandbox, up: Option<&Granted>, request: Option<&Request>, watching: bool) -> Result<Plan, AcquireError> {
+        // A size asked for a directory no limit holds on: one made before the quota was on,
+        // or left by a creation that failed then, which the next creation would use as it
+        // is. The number may agree with what the sandbox is said to have; the cap isn't
+        // there. Asked wherever a request names a size: the VM running, its disk made, or
+        // neither. (With the quota off altogether, the grant itself refuses a size.)
+        let no_cap = |req: &Request| req.disk_gib.filter(|_| matches!(self.quota, Quota::Btrfs { .. }) && sb.dir.exists() && !quota::capped(&self.quota, &sb.dir));
         if let Some(has) = up {
             // A call that only watches or stops what the VM runs is served as the VM is.
             if let Some(req) = request.filter(|_| !watching) {
                 self.policy.check_running(&sb.id, has, req, self.cfg.idle.as_secs())?;
+                if let Some(asked) = no_cap(req) {
+                    return Err(resources::uncapped_directory(&sb.id, asked).into());
+                }
             }
             return Ok(Plan { granted: has.clone(), keep: false, from: None });
         }
@@ -548,15 +557,14 @@ impl Manager {
             return Ok(Plan { granted: stored.unwrap_or_else(|| self.policy.defaults.clone()), keep: false, from: None });
         };
         let want = self.policy.grant(req)?;
+        if let Some(asked) = no_cap(req) {
+            return Err(resources::uncapped_directory(&sb.id, asked).into());
+        }
         if !created {
             return Ok(Plan { granted: want, keep: true, from: None });
         }
         let has = stored.clone().unwrap_or_else(|| self.policy.defaults.clone());
         let capped = quota::capped(&self.quota, &sb.dir);
-        // A size for a directory no limit holds on (made before the quota was on).
-        if let Some(asked) = req.disk_gib.filter(|_| !capped) {
-            return Err(resources::uncapped_directory(&sb.id, asked).into());
-        }
         // Less disk than it had: only if what it has written fits. Usage that can't be
         // read is not taken to fit.
         if let Some(new) = want.disk_gib.filter(|new| capped && has.disk_gib.is_none_or(|old| *new < old)) {
@@ -1186,6 +1194,37 @@ pub mod tests {
         let over = request(serde_json::json!({ "vcpus": 9 }));
         let Err(e) = vms.acquire_for("stopped", Some(&over), true).await else { panic!("booted") };
         assert_eq!((e.status(), e.code()), (422, Some(crate::resources::OVER_MAXIMUM)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_disk_size_is_refused_for_a_directory_no_limit_holds_on_whatever_state_the_sandbox_is_in() {
+        use crate::quota::Quota;
+        use crate::resources::NO_DISK_QUOTA;
+        let dir = std::env::temp_dir().join(format!("sandboxd-resources-uncapped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The quota is on, and these directories were made before it was (plain
+        // directories, not subvolumes): no limit holds on them.
+        let vms = never_boots(&dir, true, Quota::Btrfs { bytes: 8 << 30 });
+        let size = serde_json::json!({ "diskGib": 8 });
+        // Left by a creation that failed before its disk was made: no disk yet, and a
+        // directory the next creation would use as it is.
+        std::fs::create_dir_all(dir.join("state/left")).unwrap();
+        assert_eq!(outcome(&vms, "left", Some(size.clone())).await, (422, Some(NO_DISK_QUOTA)));
+        assert_eq!(outcome(&vms, "left", Some(serde_json::json!({ "memMib": 4096 }))).await, PASSED);
+        // Running with the host's defaults, which name 8 GiB where nothing enforces it: the
+        // same size asked for is not a match to be served, it is a cap that isn't there.
+        on_disk(&dir, "up", None);
+        let sb = vms.get("up").await;
+        let vmm = super::Vmm::spawn(tokio::process::Command::new("sleep").arg("60")).unwrap();
+        vms.slots.lock().await[0] = true;
+        *sb.running.lock().await = Some(vms.track(vmm, 0, stock()));
+        let asked = request(size);
+        let Err(e) = vms.acquire_for("up", Some(&asked), false).await else { panic!("served") };
+        assert_eq!((e.status(), e.code()), (422, Some(NO_DISK_QUOTA)));
+        // A request that names no size is served, and so is a call that only watches.
+        assert!(vms.acquire_for("up", Some(&request(serde_json::json!({ "vcpus": 2 }))), false).await.is_ok());
+        assert!(vms.acquire_for("up", Some(&asked), true).await.is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
