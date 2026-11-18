@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentIdentity } from "../src/identity";
-import { activeTriggers, loadProfiles, LOREHOUSE, PROFILES, profileStatus, ProfileError, selectByName, show, slackTrigger, type Profile, type SlackTriggerEvent } from "../src/profiles";
+import { activeTriggers, loadProfiles, LOREHOUSE, PROFILES, profileStatus, ProfileError, selectByName, show, slackTrigger, unansweredDmNotice, type Profile, type SlackTriggerEvent } from "../src/profiles";
 import { profilePrompt, PROMPT_CATALOG } from "../src/prompts";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -204,7 +204,7 @@ describe("a profile is checked on start", () => {
 
   test("a trigger is tagged by a kind that exists, and a Slack one names its events", () => {
     expect(problems({ ...valid, triggers: [{ kind: "webhook", provider: "github" }] })).toContain('profile "lorehouse": triggers[0].kind: must be one of slack, got "webhook"');
-    expect(problems({ ...valid, triggers: [{ kind: "slack", events: ["reaction"] }] })).toEqual(['profile "lorehouse": triggers[0].events: "reaction" is not a Slack trigger event (allowed: mention, follow_up, direct_message)']);
+    expect(problems({ ...valid, triggers: [{ kind: "slack", events: ["mention", "reaction"] }] })).toEqual(['profile "lorehouse": triggers[0].events: "reaction" is not a Slack trigger event (allowed: mention, follow_up, direct_message)']);
     expect(problems({ ...valid, triggers: [{ kind: "slack", events: [] }] })).toEqual(['profile "lorehouse": triggers[0].events: must name at least one of mention, follow_up, direct_message']);
     expect(problems({ ...valid, triggers: [{ kind: "slack", events: ["mention"], channel: "C1" }] })).toEqual(['profile "lorehouse": triggers[0].channel: is not a field of a slack trigger (allowed: kind, events)']);
     expect(problems({ ...valid, triggers: "slack" })).toContain('profile "lorehouse": triggers: must be a list of triggers, got "slack"');
@@ -270,16 +270,37 @@ describe("a profile is checked on start", () => {
 
 describe("which Slack messages a profile may be started by", () => {
   // What each accepted set of events then starts is src/turns.ts's (test/turns.test.ts).
-  test("a follow-up needs a mention: without it the profile is refused, since only a mention opens the thread", () => {
-    const refusal = 'profile "lorehouse": triggers[0].events: "follow_up" needs "mention": a follow-up is a reply in a thread a mention opened';
-    expect(problems({ ...valid, triggers: [{ kind: "slack", events: ["follow_up"] }] })).toEqual([refusal]);
-    expect(problems({ ...valid, triggers: [{ kind: "slack", events: ["follow_up", "direct_message"] }] })).toEqual([refusal]);
+  test("a Slack trigger must list mention: without it nothing starts in a channel, and a redirected DM would point to one", () => {
+    const refusal = 'profile "lorehouse": triggers[0].events: must list "mention": a follow-up is a reply in a thread a mention opened, and a DM is pointed to a channel, where only a mention starts a turn';
+    const without: SlackTriggerEvent[][] = [["follow_up"], ["direct_message"], ["follow_up", "direct_message"]];
+    for (const events of without) expect(problems({ ...valid, triggers: [{ kind: "slack", events }] }), events.join("+")).toEqual([refusal]);
   });
 
-  test("every other set of events is accepted: mention alone, with follow_up, with direct_message, all three, and direct_message alone", () => {
-    const sets: SlackTriggerEvent[][] = [["mention"], ["mention", "follow_up"], ["mention", "direct_message"], ["mention", "follow_up", "direct_message"], ["direct_message"]];
+  test("the sets accepted are mention alone, with follow_up, with direct_message, and all three", () => {
+    const sets: SlackTriggerEvent[][] = [["mention"], ["mention", "follow_up"], ["mention", "direct_message"], ["mention", "follow_up", "direct_message"]];
     for (const events of sets) expect(problems({ ...valid, triggers: [{ kind: "slack", events }] }), events.join("+")).toEqual([]);
     expect(slackTrigger(LOREHOUSE)!.events).toEqual(["mention", "follow_up", "direct_message"]);
+  });
+
+  test("so /status never lists a trigger with no events, under any DM_MODE", () => {
+    const sets: SlackTriggerEvent[][] = [["mention"], ["mention", "follow_up"], ["mention", "direct_message"], ["mention", "follow_up", "direct_message"]];
+    for (const events of sets) {
+      const [profile] = loadProfiles([{ ...valid, triggers: [{ kind: "slack", events }] }], CATALOG) as [Profile];
+      for (const dm of ["redirect", "ignore", "answer"] as const) expect(activeTriggers(profile, { dm })[0]!.events, `${events.join("+")} ${dm}`).toContain("mention");
+    }
+  });
+
+  test("DM_MODE=answer with a profile that doesn't list direct_message is said in one line on start; any other pairing says nothing", () => {
+    const [noDms] = loadProfiles([{ ...valid, triggers: [{ kind: "slack", events: ["mention", "follow_up"] }] }], CATALOG) as [Profile];
+    expect(unansweredDmNotice(noDms, { dm: "answer" })).toBe(
+      'lorehouse: DM_MODE=answer, but profile "lorehouse" does not list direct_message in its Slack trigger: DMs are accepted by the install and start no turn for this profile, so a DM gets no answer and no pointer to a channel',
+    );
+    expect(unansweredDmNotice(noDms, { dm: "redirect" })).toBeUndefined();
+    expect(unansweredDmNotice(noDms, { dm: "ignore" })).toBeUndefined();
+    for (const dm of ["redirect", "ignore", "answer"] as const) expect(unansweredDmNotice(LOREHOUSE, { dm }), dm).toBeUndefined();
+    // A profile Slack doesn't start has no DMs to speak of.
+    const [, job] = loadProfiles([valid, { ...valid, id: "digest", mode: "job", triggers: [] }], CATALOG) as [Profile, Profile];
+    expect(unansweredDmNotice(job, { dm: "answer" })).toBeUndefined();
   });
 });
 

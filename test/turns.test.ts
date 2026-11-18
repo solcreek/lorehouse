@@ -326,8 +326,10 @@ describe("turnGate", () => {
 
 // The profile Slack starts says which kinds of message start a turn (profiles.ts): its
 // Slack trigger's events, given to the gate as `startsOn`. Every set loadProfiles accepts
-// is here (follow_up without mention is refused there). Left out, as in every test above,
-// it is all three: the lorehouse profile's.
+// is here: mention; mention and follow_up; mention and direct_message; all three. Left out,
+// as in every test above, it is all three: the lorehouse profile's. loadProfiles refuses a
+// trigger without mention, so no profile gives the gate direct_message alone; the gate is
+// kept general, and the last tests here hold it to something coherent even then.
 describe("turnGate, by the profile's trigger events", () => {
   const dm = (user: string): TurnEvent => { const ts = nextTs(); return { kind: "message", channelId: "D1", channelType: "im", threadId: ts, ts, text: "hello", user: { id: user } }; };
 
@@ -403,7 +405,7 @@ describe("turnGate, by the profile's trigger events", () => {
     expect(off.asked).toEqual([]);
   });
 
-  test("direct_message only: a mention starts nothing, joins no thread and is not looked up, so a reply there is nothing; a DM is answered with DMs on", async () => {
+  test("without mention (no profile's, the gate alone): a mention starts nothing, joins no thread and is not looked up, so a reply there is nothing; a DM is answered with DMs on", async () => {
     const t = setup({ startsOn: ["direct_message"], dms: true });
     const asked = mention("U1");
     expect(await t.deliver(asked)).toEqual(NONE);
@@ -415,7 +417,7 @@ describe("turnGate, by the profile's trigger events", () => {
     expect(t.asked).toEqual(["U1"]);
   });
 
-  test("direct_message only: a mention joins nothing even in a thread joined before, where a reply stays nothing", async () => {
+  test("without mention (no profile's, the gate alone): a mention joins nothing even in a thread joined before, where a reply stays nothing", async () => {
     const t = setup({ startsOn: ["direct_message"], dms: true });
     joinThread(t.db, "C1", "1.1"); // as a profile that listed follow-ups once left it
     expect(await t.deliver(mention("U1", "1.1"))).toEqual(NONE);
@@ -426,18 +428,34 @@ describe("turnGate, by the profile's trigger events", () => {
     expect(joins).toBe(0);
   });
 
-  test("direct_message only, with DMs off: nothing starts a turn, and nobody is looked up", async () => {
+  test("without mention (no profile's, the gate alone), with DMs off: nothing starts a turn, and nobody is looked up", async () => {
     const t = setup({ startsOn: ["direct_message"], dms: false });
     expect(await t.deliver(mention("U1"))).toEqual(NONE);
     expect(await t.deliver(dm("U1"))).toEqual(NONE);
     expect(t.asked).toEqual([]);
   });
 
+  // The one odd pairing left: the install answers DMs (DM_MODE=answer) and the profile
+  // doesn't list direct_message. The DM is ignored: no turn, no refusal, no lookup, for a
+  // member or a guest alike (app.ts says so in one line on start).
   test("direct_message not listed: a DM starts nothing under DM_MODE=answer, whatever else is listed", async () => {
     for (const startsOn of [["mention"], ["mention", "follow_up"]] as SlackTriggerEvent[][]) {
       const t = setup({ startsOn, dms: true });
       expect(await t.deliver(dm("U1")), startsOn.join("+")).toEqual(NONE);
+      expect(await t.deliver(dm("UG1")), startsOn.join("+")).toEqual(NONE);
       expect(t.asked).toEqual([]);
+      // Mentions are answered as ever.
+      expect(await t.deliver(mention("U1"))).toEqual(ANSWER);
     }
+  });
+
+  test("mention only: the thread is joined though no reply there starts a turn, so it is a follow-up's thread once the profile lists follow_up", async () => {
+    const before = setup({ startsOn: ["mention"] });
+    const asked = mention("U1");
+    expect(await before.deliver(asked)).toEqual(ANSWER);
+    expect(await before.deliver(reply("U2", asked.ts))).toEqual(NONE);
+    // The same joined threads, read by a gate whose profile now lists follow_up.
+    const after = setup({ startsOn: ["mention", "follow_up"], joined: () => before.joined(asked.ts) });
+    expect(await after.deliver(reply("U2", asked.ts))).toEqual(ANSWER);
   });
 });

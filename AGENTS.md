@@ -88,8 +88,10 @@ profile:
   exactly one, for now, which is its own rule, not the ADR's: that profile gets the Slack
   channel, and the channel also carries ingest and posting. Its Slack trigger's `events`
   (`mention`, `follow_up`, `direct_message`) reach `src/turns.ts` as `turnGate`'s
-  `startsOn`, which decides each event by them: `follow_up` needs `mention`, a mention
-  that is not a trigger joins no thread, and a DM also needs `DM_MODE=answer`.
+  `startsOn`, which decides each event by them. Every Slack trigger lists `mention`
+  (`loadProfiles` refuses one without: nothing would start in a channel), and a DM also
+  needs `DM_MODE=answer`; with `DM_MODE=answer` and no `direct_message` listed, DMs start
+  no turn, which the app says in one line on start.
 - Only that profile may list `open_pull_request`: an Approve click reaches June through
   the Slack channel and resumes the agent mounted with it, so a card from any other
   profile could never be answered.

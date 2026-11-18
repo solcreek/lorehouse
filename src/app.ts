@@ -18,7 +18,7 @@ import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
 import { PDF_SKILLS, SKILLS, profilePrompt } from "./prompts";
-import { loadProfiles, PROFILES, profileStatus, selectByName, slackTrigger, type Profile } from "./profiles";
+import { loadProfiles, PROFILES, profileStatus, selectByName, slackTrigger, unansweredDmNotice, type Profile } from "./profiles";
 import { renderPdfTool, typstRenderer } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
@@ -89,6 +89,9 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
   // At most one profile is started by Slack messages (ADR 0002 §2); this build needs one
   // (loadProfiles), because the Slack channel is its, and ingest and every post go through it.
   const interactive = profiles.find(slackTrigger)!;
+  // DM_MODE=answer with a profile that isn't started by DMs: said once, on start.
+  const dmNotice = unansweredDmNotice(interactive, { dm: config.agent.dm });
+  if (dmNotice) console.warn(dmNotice);
 
   // Every listed channel must be public, as Slack says (channel-check.ts): before the
   // database is opened or purged, and before anything listens. A ConfigError names each.

@@ -7,7 +7,7 @@
 //
 // defineAgent is wrapped (and still runs) so the test sees what src/app.ts passes it.
 
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as agentConfig from "@junejs/core/agent-config";
 import type { AgentDefinition } from "@junejs/core/agent-config";
@@ -157,6 +157,28 @@ describe("a profile becomes an agent (src/profiles.ts, ADR 0002)", () => {
     defined.length = 0;
     await expect(createApp(loadConfig(BASE), [{ ...second, id: "lorehouse", mode: "interactive" }])).rejects.toThrow(/profile "lorehouse": triggers: an interactive profile needs a trigger of kind "slack"/);
     expect(defined).toEqual([]);
+  });
+
+  test("DM_MODE=answer with a profile that doesn't list direct_message is said once on start, and not otherwise", async () => {
+    const { LOREHOUSE } = await import("../src/profiles");
+    const noDms = { ...LOREHOUSE, triggers: [{ kind: "slack", events: ["mention", "follow_up"] }] };
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const said = () => warn.mock.calls.map((c) => String(c[0])).filter((line) => line.includes("direct_message"));
+      await agentsOf({ ...BASE, DM_MODE: "answer" }, [noDms]);
+      expect(said()).toEqual([expect.stringMatching(/^lorehouse: DM_MODE=answer, but profile "lorehouse" does not list direct_message in its Slack trigger: DMs are accepted by the install and start no turn/)]);
+      warn.mockClear();
+      await agentsOf(BASE, [noDms]);
+      await agentsOf({ ...BASE, DM_MODE: "answer" });
+      expect(said()).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("a trigger without mention stops the start", async () => {
+    const { LOREHOUSE } = await import("../src/profiles");
+    await expect(createApp(loadConfig(BASE), [{ ...LOREHOUSE, triggers: [{ kind: "slack", events: ["direct_message"] }] }])).rejects.toThrow(/triggers\[0\]\.events: must list "mention"/);
   });
 
   test("a profile with no Slack channel that lists open_pull_request stops the start: its Approve could never be answered", async () => {

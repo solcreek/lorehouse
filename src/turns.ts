@@ -26,9 +26,10 @@
 // Which kinds of message start a turn at all is the profile's to say (profiles.ts): the
 // events of the Slack trigger of the profile Slack starts, given here as `startsOn`.
 //   • A mention that is not a trigger starts nothing, and so is never accepted: its thread
-//     is not joined, its sender is not looked up, and it holds no reply.
-//   • A follow-up is a reply in a thread a mention opened, so `follow_up` means something
-//     only with `mention` (loadProfiles refuses it alone). Not a trigger: a reply in a
+//     is not joined, its sender is not looked up, and it holds no reply. No profile gets
+//     here that way: loadProfiles requires `mention` in every Slack trigger. The gate
+//     stays coherent without it all the same.
+//   • A follow-up is a reply in a thread a mention opened. Not a trigger: a reply in a
 //     joined thread starts nothing, is not looked up and is never held.
 //   • A DM starts a turn only when it is a trigger AND the install answers DMs (`dms`,
 //     DM_MODE=answer): a profile can ask for DMs, it can't turn them on.
@@ -107,6 +108,9 @@ export function turnGate(o: {
     // member's reply there is not a follow-up. The join is bookkeeping for later replies:
     // if recording it fails, the mention is still answered (as when the join was an
     // observer beside the turn), and replies there go unanswered until a new mention.
+    // The thread is joined whether or not follow-ups are a trigger (`startsOn: ["mention"]`
+    // joins too): the joined threads are also what the admin API lists. So if the profile
+    // later lists `follow_up`, replies in threads joined before then become follow-ups.
     if (e.kind === "app_mention") {
       try {
         o.join(e.channelId, e.threadId ?? e.ts);
