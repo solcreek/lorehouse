@@ -94,6 +94,55 @@ export function githubApp(opts: AppOptions): GithubAccess {
   return tokenFor;
 }
 
+// Whether the credential can read a repo now, and whether a branch exists there: asked
+// before a channel's default repo is stored (admin.ts) and again by `lorehouse doctor`,
+// since it can go stale (the App uninstalled, the repo renamed or deleted).
+//   not_installed     the GitHub App isn't installed on the repo
+//   not_readable      the credential got no read of it (a token without access, or no such repo)
+//   branch_not_found  the repo is readable and has no such branch
+//   unavailable       GitHub didn't answer, or refused the credential itself: not a verdict
+// `repo` in an ok answer is the name as GitHub spells it (its case; the new name after a rename).
+export type RepoCheck =
+  | { ok: true; repo: RepoRef }
+  | { ok: false; reason: "not_installed" | "not_readable" | "branch_not_found" | "unavailable"; detail: string };
+
+export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { branch?: string; fetch?: typeof fetch; apiUrl?: string } = {}): Promise<RepoCheck> {
+  const f = opts.fetch ?? fetch;
+  const api = (opts.apiUrl ?? "https://api.github.com").replace(/\/$/, "");
+  const full = `${repo.owner}/${repo.name}`;
+  let token: string;
+  try {
+    token = await github(repo, "read");
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    return { ok: false, reason: /isn't installed/.test(detail) ? "not_installed" : "unavailable", detail };
+  }
+  const get = async (path: string): Promise<Response | string> => {
+    try {
+      return await f(`${api}${path}`, { headers: { ...HEADERS, authorization: `Bearer ${token}` } });
+    } catch (e) {
+      return `GitHub didn't answer: ${e instanceof Error ? e.message : e}`;
+    }
+  };
+
+  const res = await get(`/repos/${repo.owner}/${repo.name}`);
+  if (typeof res === "string") return { ok: false, reason: "unavailable", detail: res };
+  if (res.status === 401 || res.status === 403 || res.status === 404) return { ok: false, reason: "not_readable", detail: `the GitHub credential can't read ${full} (GitHub answered ${res.status}): no such repo, or no access to it` };
+  if (!res.ok) return { ok: false, reason: "unavailable", detail: `GitHub answered ${res.status} for ${full}` };
+  const named = ((await res.json().catch(() => undefined)) as { full_name?: unknown } | undefined)?.full_name;
+  const [owner, name, ...more] = typeof named === "string" ? named.split("/") : [];
+  const canonical = owner && name && !more.length && /^[A-Za-z0-9_.-]+$/.test(owner) && /^[A-Za-z0-9_.-]+$/.test(name) ? { owner, name } : repo;
+
+  if (opts.branch !== undefined) {
+    // Each part of the name encoded, the slashes kept: a branch may be "release/2026.11".
+    const b = await get(`/repos/${canonical.owner}/${canonical.name}/branches/${opts.branch.split("/").map(encodeURIComponent).join("/")}`);
+    if (typeof b === "string") return { ok: false, reason: "unavailable", detail: b };
+    if (b.status === 404) return { ok: false, reason: "branch_not_found", detail: `${canonical.owner}/${canonical.name} has no branch ${opts.branch}` };
+    if (!b.ok) return { ok: false, reason: "unavailable", detail: `GitHub answered ${b.status} for the branch ${opts.branch} of ${full}` };
+  }
+  return { ok: true, repo: canonical };
+}
+
 // A PEM from the environment: platforms often store it with literal "\n" escapes.
 export function normalizePem(pem: string): string {
   return pem.includes("\\n") ? pem.replace(/\\n/g, "\n") : pem;
