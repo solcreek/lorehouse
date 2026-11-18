@@ -24,7 +24,11 @@ impl Pidfd {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: fd was just returned by pidfd_open and nothing else owns it.
-        Ok(Pidfd(AsyncFd::new(unsafe { OwnedFd::from_raw_fd(fd as i32) })?))
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        // SAFETY: the OwnedFd is a valid, open descriptor, and the AsyncFd owns it from here
+        // to its drop: nothing closes or replaces it, and as_raw_fd always returns it.
+        let registered = unsafe { AsyncFd::register(fd) };
+        Ok(Pidfd(registered.map_err(io::Error::from)?))
     }
 
     #[cfg(not(target_os = "linux"))]
