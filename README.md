@@ -204,7 +204,7 @@ To set up Slack:
 | `AGENT_CHANNELS` | (none) | the public channel ids it works in: answers mentions and follow-ups, counts reactions, and learns from. Empty means **nowhere**. Only public channels: on start, each one is looked up (`conversations.info`, needs `channels:read`) and the app **refuses to start** while any is private, archived, or can't be looked up, naming each; a channel that turns private or is archived while the app runs (Slack then answers that it's private, archived, or not visible to the bot) is found at the next recheck (`INGEST_CHANNEL_RECHECK_MS`), then no longer read and its mentions refused (best effort for work already running at that moment: a turn admitted before the close finishes, and may still read its own thread; a reconcile in progress may finish its reads); what was learned there goes once it is taken off this list. ⚠️ On each start, what was learned from a channel no longer listed is purged from `LOREHOUSE_DB`: its threads leave the index (and `LOREHOUSE_DB`'s files, the `-wal` included), with the threads it was asked into there, its ingest cursor, and usage's asks and searches there. Seeded documents stay, as do 👍/👎 counts (no text). Other copies of its text can remain, among them usage records, until usage's 90-day retention prunes them ([#98](https://github.com/solcreek/lorehouse/issues/98)), and the agent's saved conversations in `SESSIONS_DB` (below), until June supports redaction ([junebuild/june#360](https://github.com/junebuild/june/issues/360)). **An empty list purges every thread learned from Slack.** `lorehouse doctor` shows what the next start would purge |
 | `DM_MODE` | `redirect` | what a DM gets: `redirect` (a one-line pointer to the public channel, no model call, nothing read), `ignore`, or `answer` (from the knowledge index, the same as a public answer, plus the DM conversation itself; not with the code tools). A DM is never indexed |
 | `STATUS_TOKEN` | (none) | bearer token for `GET /status` (`Authorization: Bearer …`). Unset, `/status` is closed (404). It reports the ingest, the tenant, and the profiles the install runs, each with its id, mode and triggers ([shape](docs/admin-api.md#get-status-beside-it)). `/healthz` is always open and says only `ok` |
-| `ADMIN_TOKEN` | (none) | bearer token for the read-only [admin API](docs/admin-api.md) under `/api/v1`: the indexed threads and their text, search, the agent's threads, the sandboxes. 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |
+| `ADMIN_TOKEN` | (none) | bearer token for the [admin API](docs/admin-api.md) under `/api/v1`. It reads the indexed threads and their text, search, the agent's threads and the sandboxes, and sets [each channel's default repo](#a-channels-default-repo). 32+ characters, and not the `STATUS_TOKEN`. Unset, `/api/` is closed (404) |
 | `USAGE_RECORD_PEOPLE` | (off) | `1` makes [usage](docs/admin-api.md#usage) record who asks the agent things; each channel is told, and turning it off erases them. Off, usage never says who asked |
 | `PDF_REPLIES` | (off) | `1` lets the agent attach a PDF to its reply when asked for a report or document (`render_pdf`). Needs the `files:write` scope (in `slack/manifest.yaml`; `lorehouse doctor` checks it while this or code tools are on) |
 | `PDF_FONTS` | `local` | where PDF fonts come from, which decides where a document's text goes. `local`: Noto Sans TC, bundled in the binary and image (~11 MB); rendering contacts no one. `google`: Noto Sans TC subsets from Google Fonts, so fonts.googleapis.com and fonts.gstatic.com see every distinct non-ASCII character of each document, in the order each first appears. Either way, a character no font covers fails the PDF with an error the agent passes on, never a PDF with it missing. `lorehouse doctor` says which is in use |
@@ -225,6 +225,31 @@ To set up Slack:
 | `GITHUB_APP_ID` `GITHUB_APP_PRIVATE_KEY` | (none) | the GitHub App the code tools clone and open pull requests as: a short-lived token per repo, and write access only once a pull request is approved ([setup](docs/github-app.md)). Required with a sandbox |
 | `GITHUB_TOKEN` | (none) | instead of an App, for development only: one long-lived token with everything it can reach |
 | `PR_APPROVER` | `requester` | who may click Approve or Deny on a pull request card: only the `requester`; `anyone` in the thread, the requester included; or `not-requester`, anyone but the requester (who can't click Deny either). The requester is the person whose message got the agent to post the card. Approve opens a draft pull request; merging it is up to GitHub's review. `GET /status` shows it (`pullRequestApprover`), and `lorehouse doctor` says it |
+
+### A channel's default repo
+
+One setting is per channel, not in the environment. With code tools on, an admin gives a
+channel a default repo, so a request there needs no repo name (`@scout run the
+benchmark`):
+
+```bash
+curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "repo": "acme/widgets", "branch": "main" }' \
+  https://<app>/api/v1/channels/C0123ABCD/repo
+```
+
+- `branch` is optional: the branch a fresh clone starts on, else the repo's own default.
+- A repo named in the request wins. With no default and none named, the agent asks which.
+- The GitHub App must be installed on the repo (and the branch must exist), or setting it
+  is refused with an error that says so, and nothing is stored.
+- It names which repo a request means. It is not a limit: any repo the App is installed
+  on can still be named in any listed channel ([what installing allows](docs/github-app.md#what-installing-on-a-repository-allows)).
+- `DELETE` clears it, `GET` reads it, and taking the channel off `AGENT_CHANNELS` removes
+  it on the next start. A DM never has one.
+- `lorehouse doctor` lists each channel's default repo and fails while the App can't read
+  one (it can go stale after it is set).
+
+The requests, answers and error codes are in [the admin API](docs/admin-api.md#a-channels-default-repo).
 
 ## One contract, more than one implementation
 

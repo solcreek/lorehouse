@@ -96,6 +96,11 @@ To limit it:
   purges what was indexed from it. The code tools are on in every listed channel or in none; there is
   no per-channel switch.
 
+A [channel's default repo](admin-api.md#a-channels-default-repo) is not such a limit. It
+says which repo a request in that channel means when it names none, and setting it needs
+the App installed on that repo; any other repo the App is installed on can still be named
+there.
+
 Until profiles exist, the install's repository selection is the only limit on which
 private repositories can be read. A per-profile repository allowlist (the `credentials`
 field in [ADR 0002](adr/0002-profiles.md)) can narrow it later.
