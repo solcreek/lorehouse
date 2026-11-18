@@ -91,7 +91,7 @@ type Stats = {
   posts: { channel: string; thread_ts?: string; text: string; blocks?: Block[]; ts: string }[];
   updates: { channel: string; ts: string; text: string }[];
   responses: { path: string; text?: string; response_type?: string; replace_original?: boolean }[];
-  github: { method: string; path: string; body?: unknown }[];
+  github: { method: string; path: string; body?: unknown; auth?: string }[];
   uploads: { fileId: string; filename: string; length: number; bytes?: number; contentType?: string; head?: string; channel?: string; thread_ts?: string; title?: string }[];
 };
 const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as Stats;
@@ -617,12 +617,17 @@ const scenarios: Scenario[] = [
       const env = { ...RUNNER_ENV, GITHUB_API_URL: `${MOCK}/github`, LOREHOUSE_DB: db };
       try {
         return await inMode(env, async () => {
+          await reset();
           const none = await repoCall("GET", ALLOWED);
           if (none.status !== 200 || none.body.channel !== ALLOWED || none.body.defaultRepo !== null) return `before any set: ${none.status} ${JSON.stringify(none.body)}, want defaultRepo null`;
           const set = await repoCall("PUT", ALLOWED, { repo: "acme/widgets", branch: "main" });
           const d = set.body.defaultRepo;
           if (set.status !== 200 || d?.repo !== "acme/widgets" || d?.branch !== "main" || typeof d?.setAt !== "string") return `PUT: ${set.status} ${JSON.stringify(set.body)}`;
           if (typeof set.body.tenant !== "string") return "the answer doesn't name the tenant";
+          // GitHub was asked about the repo and its branch, with the install's credential
+          // (here the development token) on each request: the mock refuses a read without one.
+          const asked = (await stats()).github.filter((c) => c.method === "GET" && c.path.startsWith("/repos/acme/widgets")).map((c) => `${c.path} ${c.auth}`);
+          if (JSON.stringify(asked) !== JSON.stringify(["/repos/acme/widgets token", "/repos/acme/widgets/branches/main token"])) return `GitHub was asked ${JSON.stringify(asked)}, want the repo then its branch, each with the token`;
           const again = await repoCall("PUT", ALLOWED, { repo: "acme/widgets", branch: "main" });
           if (JSON.stringify(again.body) !== JSON.stringify(set.body)) return `the same PUT again answered ${JSON.stringify(again.body)}, want the same as the first ${JSON.stringify(set.body)}`;
           const listed = (await admin<{ channels: { id: string; defaultRepo: unknown }[] }>("/api/v1/channels")).channels.find((c) => c.id === ALLOWED);

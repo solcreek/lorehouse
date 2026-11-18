@@ -84,7 +84,7 @@ type SlackCall = { t: number; method: string; body: Record<string, unknown> };
 const holds = new Map<string, { waiting: number; released: Promise<void>; release: () => void }>();
 let calls: SlackCall[] = [];
 let modelCalls = 0;
-let githubCalls: { method: string; path: string; body?: unknown }[] = [];
+let githubCalls: { method: string; path: string; body?: unknown; auth: string }[] = [];
 // Files uploaded through files.getUploadURLExternal: the reserved name and length, then
 // the bytes POSTed to the upload_url.
 type Upload = { fileId: string; filename: string; length: number; bytes?: number; contentType?: string; head?: string };
@@ -393,14 +393,21 @@ async function anthropic(req: Request): Promise<Response> {
 const REPOS: Record<string, string[]> = { "acme/widgets": ["main", "release/1.x"], "acme/gadgets": ["main"] };
 
 // The token's user (who the commits must be by), the repos it can read and their branches,
-// and pull requests: none open yet, and a new one is always number 7. Records every request.
+// and pull requests: none open yet, and a new one is always number 7. Records every
+// request, with the kind of credential it carried (`auth` in /stats' github list).
 async function github(req: Request, url: URL): Promise<Response> {
   const path = url.pathname.slice("/github".length) + url.search;
   const raw = await req.text();
-  githubCalls.push({ method: req.method, path, body: raw ? safeJson(raw) : undefined });
+  // What the request authenticated with, by its shape only (never the value): none, an
+  // App's JWT, an installation token (ghs_…), or any other bearer token.
+  const bearer = /^Bearer (.+)$/.exec(req.headers.get("authorization") ?? "")?.[1];
+  const auth = !bearer ? "none" : /^[\w-]+\.[\w-]+\.[\w-]+$/.test(bearer) ? "app_jwt" : bearer.startsWith("ghs_") ? "installation" : "token";
+  githubCalls.push({ method: req.method, path, body: raw ? safeJson(raw) : undefined, auth });
   if (url.pathname === "/github/user") return Response.json({ id: 1, login: "octo" });
   const repo = /^\/github\/repos\/([^/]+)\/([^/]+)(?:\/branches\/(.+))?$/.exec(url.pathname);
   if (repo && req.method === "GET") {
+    // As GitHub: a repo read with no credential is refused, not answered as a public repo.
+    if (auth === "none") return Response.json({ message: "Requires authentication" }, { status: 401 });
     const full = `${repo[1]}/${repo[2]}`;
     const branches = REPOS[full.toLowerCase()];
     if (!branches) return Response.json({ message: "Not Found" }, { status: 404 });
