@@ -132,8 +132,9 @@ describe("what the app hands June", () => {
 });
 
 describe("a profile becomes an agent (src/profiles.ts, ADR 0002)", () => {
-  // A second profile, as #44 will add one: an automation nothing in Slack starts.
-  const second = { id: "second", mode: "automation", prompt: "lorehouse", tools: ["recent_knowledge", "search_knowledge", "open_pull_request"], skills: ["write-a-skill"], triggers: [], sandbox: "write" };
+  // A second profile: an automation nothing in Slack starts. It has no Slack channel, so no
+  // Approve click can reach it, and it may not open a pull request (the last test here).
+  const second = { id: "second", mode: "automation", prompt: "lorehouse", tools: ["recent_knowledge", "search_knowledge", "render_pdf"], skills: ["write-a-skill"], triggers: [], sandbox: "none" };
 
   test("a second profile is a second agent under its own id, beside an unchanged first", async () => {
     const { LOREHOUSE } = await import("../src/profiles");
@@ -145,15 +146,24 @@ describe("a profile becomes an agent (src/profiles.ts, ADR 0002)", () => {
   test("it gets the tools and skills it names, in its order, less those the install has off, and no Slack channel", async () => {
     const { LOREHOUSE } = await import("../src/profiles");
     const [, off] = await agentsOf(BASE, [LOREHOUSE, second]);
-    // No sandbox: open_pull_request is off. With no channel, none of the channel's tools.
+    // PDF replies off: no render_pdf. With no channel, none of the channel's tools.
     expect(off).toMatchObject({ tools: ["recent_knowledge", "search_knowledge", "read_skill"], skills: ["write-a-skill"], channels: [] });
+    // A sandbox and PDF replies on: render_pdf joins; the code tools it doesn't list do not.
     const [, on] = await agentsOf(EVERYTHING, [LOREHOUSE, second]);
-    expect(on).toMatchObject({ tools: ["recent_knowledge", "search_knowledge", "open_pull_request", "read_skill"], skills: ["write-a-skill"], channels: [] });
+    expect(on).toMatchObject({ tools: ["recent_knowledge", "search_knowledge", "render_pdf", "read_skill"], skills: ["write-a-skill"], channels: [] });
   });
 
   test("a wrong profile stops the start before anything is defined, naming the field", async () => {
     defined.length = 0;
     await expect(createApp(loadConfig(BASE), [{ ...second, id: "lorehouse", mode: "interactive" }])).rejects.toThrow(/profile "lorehouse": triggers: an interactive profile needs a trigger of kind "slack"/);
+    expect(defined).toEqual([]);
+  });
+
+  test("a profile with no Slack channel that lists open_pull_request stops the start: its Approve could never be answered", async () => {
+    const { LOREHOUSE } = await import("../src/profiles");
+    defined.length = 0;
+    const opensPrs = { ...second, tools: ["search_knowledge", "open_pull_request"], sandbox: "write" };
+    await expect(createApp(loadConfig(EVERYTHING), [LOREHOUSE, opensPrs])).rejects.toThrow(/profile "second": tools: "open_pull_request" needs a trigger of kind "slack"/);
     expect(defined).toEqual([]);
   });
 });

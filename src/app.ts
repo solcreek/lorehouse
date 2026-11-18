@@ -206,7 +206,10 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
     workspace ??= ingester?.ownTeamId ?? (await slackReads.call<{ team_id?: string }>("auth.test").catch(() => undefined))?.team_id;
     return workspace;
   };
-  // One gate per profile: a card is parked in a session of the agent that posted it.
+  // The gate looks the card's session up under the profile's id. Only the profile Slack
+  // starts can post a card: a click reaches June through the Slack channel, and June resumes
+  // the agent mounted with it, so no other profile may open a pull request (loadProfiles
+  // refuses one that lists the tool). Every agent still carries a gate, so none is ungated.
   const authorizeAnswerFor = (profile: Profile) => approverGate(config.prApprover, approvals, (session) => runtime?.session(profile.id, session), async (user) => {
     const m = await memberCheck.check(user, await workspaceTeam());
     if (!m.member) console.error(`approvals: a click by ${user} was refused: not a full member of the workspace (${m.reason}${m.reason === "lookup_failed" ? `: ${m.error}` : ""})`);

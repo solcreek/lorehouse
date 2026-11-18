@@ -151,6 +151,15 @@ describe("a profile is checked on start", () => {
     expect(problems(valid, { ...valid, id: "review", mode: "automation", prompt: "review", triggers: [] })).toEqual([]);
   });
 
+  test("only the profile Slack starts may open a pull request: an Approve click can't reach another", () => {
+    const automation = { ...valid, id: "review", mode: "automation", triggers: [], sandbox: "write" };
+    expect(problems(valid, { ...automation, tools: ["search_knowledge", "open_pull_request"] })).toEqual([
+      'profile "review": tools: "open_pull_request" needs a trigger of kind "slack": an Approve click can only reach the profile Slack starts, for now',
+    ]);
+    expect(problems(valid, { ...automation, tools: ["search_knowledge", "workspace_exec"] })).toEqual([]);
+    expect(problems({ ...valid, tools: ["open_pull_request"], sandbox: "write" })).toEqual([]);
+  });
+
   test("only a write sandbox may open a pull request, and the workspace tools need a sandbox (ADR 0002 §1)", () => {
     expect(problems({ ...valid, tools: ["open_pull_request"], sandbox: "read" })).toEqual(['profile "lorehouse": sandbox: must be write for the tool open_pull_request, got "read"']);
     expect(problems({ ...valid, tools: ["workspace_exec"], sandbox: "none" })).toEqual(['profile "lorehouse": sandbox: must be read or write for the tool workspace_exec, got "none"']);

@@ -172,6 +172,14 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
     // ADR 0002 §2 and §3: Slack messages start the interactive profile, and only it.
     if (input.mode === "interactive" && slack === 0) bad("triggers", 'an interactive profile needs a trigger of kind "slack"');
     if ((input.mode === "automation" || input.mode === "job") && slack > 0) bad("triggers", `a trigger of kind "slack" is for mode interactive, not ${input.mode}`);
+    // An Approve is a click in Slack, and it reaches only the agent that has the Slack
+    // channel: June resumes that agent's session and asks that agent's gate (src/app.ts
+    // mounts no other). A card posted by any other profile would park in its own session,
+    // and the click would resume the wrong one. So only the profile Slack starts may open a
+    // pull request, until an approval can find the profile that asked for it.
+    if (slack === 0 && Array.isArray(input.tools) && input.tools.includes("open_pull_request")) {
+      bad("tools", '"open_pull_request" needs a trigger of kind "slack": an Approve click can only reach the profile Slack starts, for now');
+    }
   }
 
   // ADR 0002 §1: only a `write` sandbox may open a pull request; the workspace tools need one at all.
