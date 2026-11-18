@@ -1,6 +1,6 @@
 # Continue a thread
 
-Continuing a thread lets a teammate reply, without a new mention, in a thread where they already mentioned `@scout`, and get one answer there. A reply in a thread the agent was never asked into gets nothing.
+Continuing a thread lets a teammate reply, without a new mention, in a thread where `@scout` already answered a mention, and get one answer there. A reply in a thread the agent was never asked into gets nothing, and a mention it refused (a guest's) does not ask it in.
 
 ## Sub-features
 

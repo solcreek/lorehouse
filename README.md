@@ -47,9 +47,10 @@ You name it per install; it defaults to `scout`.
 - **Knows people by name, and never pings them.**
   - It credits each message to whoever wrote it, by name.
   - It names people as plain text. A summary never @-mentions everyone in it.
-- **Carries on the conversation.** Once it's mentioned in a thread, a plain reply there
-  gets an answer, no new mention needed. It stays out of threads it wasn't asked into,
-  and out of replies that mention someone else, a group, or @channel / @here.
+- **Carries on the conversation.** Once it has answered a mention in a thread, a plain
+  reply there gets an answer, no new mention needed. It stays out of threads it wasn't
+  asked into (a mention it refused, a guest's say, doesn't ask it in), and out of replies
+  that mention someone else, a group, or @channel / @here.
 - **Learns procedures you review.** A skill is a Markdown file in `prompts/skills/`:
   frontmatter with `name`, `description` and `when-to-use`, then the steps. The agent sees
   every skill's name, description and when-to-use, and loads the steps with `read_skill`

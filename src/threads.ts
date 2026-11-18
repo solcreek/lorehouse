@@ -1,11 +1,13 @@
 // threads.ts — carrying on a conversation in a thread without being @-mentioned again.
 //
-// Once someone mentions the agent in a thread, it has been asked in. A later reply there
+// Once a mention in a thread is accepted (its asker a full member, the channel still
+// listed: turns.ts), the agent has been asked in. A later reply there
 // is a follow-up for the agent, so it answers without a new mention, which is what makes a
 // back-and-forth (a question, then "and the tests?", then "now open the PR") read
 // naturally. It stays out of everything else:
 //   • top-level channel messages: knowledge, never a turn
-//   • threads it was never asked into
+//   • threads it was never asked into, among them one where the only mentions were
+//     refused (a guest's, say): a member's plain reply there gets nothing
 //   • a reply that @-mentions the agent: Slack also sends that as an app_mention, which is
 //     already answered, so answering the message too would reply twice
 //   • a reply that @-mentions someone else, a user group, or the whole channel
