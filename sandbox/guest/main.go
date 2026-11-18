@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -94,10 +96,73 @@ func main() {
 	log.Fatal(http.Serve(ln, mux))
 }
 
-func handleExec(w http.ResponseWriter, r *http.Request) {
+// The keys of a POST /exec body, exactly as execReq's tags spell them.
+var execKeys = map[string]bool{"command": true, "cwd": true, "env": true, "timeoutMs": true}
+
+// decodeExec reads a POST /exec body: one JSON object, valid UTF-8, whose keys are
+// exactly execReq's, each at most once, and nothing after it.
+//
+// encoding/json alone would take more: it matches a key to a field whatever its case
+// ("timeoutms", "TIMEOUTMS", and "timeoutMſ", whose long s folds to s), and of two
+// keys for one field the last wins. The host caps timeoutMs to what the sandbox was
+// granted (sandbox/host/src/resources.rs); a second spelling after it would set the
+// timeout back to whatever the caller chose. So the keys are read one by one here, and
+// any other spelling, any other key and any repeat is refused before a field is set.
+func decodeExec(body io.Reader) (execReq, error) {
 	var req execReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Command == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		return req, fmt.Errorf("reading the body: %v", err)
+	}
+	if !utf8.Valid(raw) {
+		return req, errors.New("the body is not valid UTF-8")
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return req, errors.New("the body must be a JSON object with command, and optionally cwd, env and timeoutMs")
+	}
+	fields := map[string]json.RawMessage{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return req, fmt.Errorf("the body is not JSON: %v", err)
+		}
+		key, _ := tok.(string)
+		if !execKeys[key] {
+			return req, fmt.Errorf("key %q is not one of command, cwd, env, timeoutMs (spelled exactly so)", key)
+		}
+		if _, twice := fields[key]; twice {
+			return req, fmt.Errorf("key %q is given twice", key)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return req, fmt.Errorf("the body is not JSON: %v", err)
+		}
+		fields[key] = value
+	}
+	if _, err := dec.Token(); err != nil { // the closing brace
+		return req, fmt.Errorf("the body is not JSON: %v", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return req, errors.New("the body has something after its JSON object")
+	}
+	for key, into := range map[string]any{"command": &req.Command, "cwd": &req.Cwd, "env": &req.Env, "timeoutMs": &req.TimeoutMs} {
+		if value, ok := fields[key]; ok {
+			if err := json.Unmarshal(value, into); err != nil {
+				return req, fmt.Errorf("%s: %v", key, err)
+			}
+		}
+	}
+	if req.Command == "" {
+		return req, errors.New("command is empty")
+	}
+	return req, nil
+}
+
+func handleExec(w http.ResponseWriter, r *http.Request) {
+	req, err := decodeExec(r.Body)
+	if err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	timeout := 10 * time.Minute
