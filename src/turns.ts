@@ -68,11 +68,20 @@ export function turnGate(o: {
       // mention comes to.
       const thread = sender.threadId ?? sender.ts;
       if (sender.kind === "app_mention" && !o.joined(sender.channelId, thread)) holds.open(sender.channelId, thread, sender.ts);
-      if (sender.userId && mayStartTurn(sender, o.dms)) waits.push(o.members.check(sender.userId, sender.teamId));
+      const lookUp = sender.userId && mayStartTurn(sender, o.dms) ? () => o.members.check(sender.userId!, sender.teamId) : undefined;
+      if (lookUp) waits.push(lookUp());
       // A reply waits for the mentions pending in its thread, while its own sender is looked
-      // up: both are over within MENTION_HOLD_MS, well inside the verdict's time in the cache.
-      if (sender.kind === "message" && thread !== sender.ts && !o.joined(sender.channelId, thread)) waits.push(holds.settled(sender.channelId, thread));
+      // up (so a sender not cached costs no extra wait).
+      const held = sender.kind === "message" && thread !== sender.ts && !o.joined(sender.channelId, thread);
+      if (held) waits.push(holds.settled(sender.channelId, thread));
       await Promise.all(waits);
+      // The wait can outlast the sender's verdict: a cache hit made 5 s before it ran out
+      // is gone after an 8 s hold, and decide() would refuse a member as "not looked up".
+      // So the sender is checked again once the reply is let go: the cached verdict if it
+      // is still within its own lifetime (no call), else a new lookup, whose answer is the
+      // one that counts (a member turned guest meanwhile is refused). Never a verdict older
+      // than the cache allows.
+      if (held && lookUp) await lookUp();
     },
     // A mention's hold ends as it is decided, after the thread is joined (or not): the
     // replies it held are decided next, each as any reply is.

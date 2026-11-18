@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { openKnowledge } from "../src/knowledge";
-import { members, type UserInfo } from "../src/members";
+import { members, TTL_MS, type UserInfo } from "../src/members";
 import { SlackApiError, type SlackApi } from "../src/slack-api";
 import { inThread, joinThread } from "../src/threads";
 import { turnGate, type TurnDecision, type TurnEvent } from "../src/turns";
@@ -13,9 +13,13 @@ const USERS: Record<string, UserInfo> = { U1: MEMBER, U2: MEMBER, UG1: { ...MEMB
 // A gate over a database of its own and a Slack whose users.info can be held per user, as
 // a slow lookup is. deliver() takes an event through the gate the way June does: before()
 // awaited, then decide().
-function setup(opts: { dms?: boolean; listed?: string[]; holdMs?: number } = {}) {
+function setup(opts: { dms?: boolean; listed?: string[]; holdMs?: number; join?: () => void; joined?: () => boolean } = {}) {
   const db = openKnowledge(":memory:");
   const asked: string[] = [];
+  // What Slack says of each person now (a test may change it), and the members cache's clock.
+  const users: Record<string, UserInfo> = { ...USERS };
+  const clock = { now: 1_000_000 };
+  const errors: string[] = [];
   const held = new Map<string, { arrived: () => void; release: Promise<void> }>();
   const api = {
     call: async (_method: string, params: { user: string }) => {
@@ -25,18 +29,18 @@ function setup(opts: { dms?: boolean; listed?: string[]; holdMs?: number } = {})
         hold.arrived();
         await hold.release;
       }
-      const user = USERS[params.user];
+      const user = users[params.user];
       if (!user) throw new SlackApiError("users.info", "user_not_found");
       return { user: { id: params.user, ...user } };
     },
   } as unknown as SlackApi;
   const listed = new Set(opts.listed ?? ["C1"]);
   const gate = turnGate({
-    members: members(api),
+    members: members(api, { now: () => clock.now }),
     listed,
     dms: opts.dms ?? false,
-    joined: (channel, thread) => inThread(db, channel, thread),
-    join: (channel, thread) => joinThread(db, channel, thread),
+    joined: opts.joined ?? ((channel, thread) => inThread(db, channel, thread)),
+    join: opts.join ?? ((channel, thread) => joinThread(db, channel, thread)),
     holdMs: opts.holdMs,
   });
   const deliver = async (e: TurnEvent): Promise<TurnDecision> => {
@@ -51,7 +55,7 @@ function setup(opts: { dms?: boolean; listed?: string[]; holdMs?: number } = {})
     held.set(user, { arrived, release: new Promise<void>((r) => { release = r; }) });
     return { pending, release: () => { held.delete(user); release(); } };
   };
-  return { db, gate, deliver, hold, asked, listed, joined: (thread: string) => inThread(db, "C1", thread) };
+  return { db, gate, deliver, hold, asked, listed, users, clock, errors, joined: (thread: string) => inThread(db, "C1", thread) };
 }
 
 let n = 0;
@@ -193,6 +197,42 @@ describe("turnGate", () => {
     expect(await accepted).toEqual(ANSWER);
     closing.listed.delete("C1"); // closed after the mention was accepted, before the follow-up is decided
     expect(await held).toEqual(NONE);
+  });
+
+  // The sender's verdict was cached 9 min 55 s ago (TTL_MS is 10 min) and runs out while
+  // the reply is held: it is judged on a verdict valid when it is let go, looked up anew.
+  test("a held reply whose sender's cached verdict expires during the hold is looked up again: still a member, answered", async () => {
+    const t = setup();
+    await t.deliver(mention("U2"));
+    t.clock.now += TTL_MS - 5000;
+    const lookup = t.hold("U1");
+    const asked = mention("U1");
+    const first = t.deliver(asked);
+    await lookup.pending;
+    const second = t.deliver(reply("U2", asked.ts)); // a cache hit, 5 s before it runs out
+    await Bun.sleep(1);
+    expect(t.asked.filter((u) => u === "U2")).toHaveLength(1);
+    t.clock.now += 8000; // U1's lookup took 8 s
+    lookup.release();
+    expect(await first).toEqual(ANSWER);
+    expect(await second).toEqual(ANSWER);
+    expect(t.asked.filter((u) => u === "U2")).toHaveLength(2);
+  });
+
+  test("a held reply whose sender's verdict expired during the hold, and who is a guest now, is refused as one", async () => {
+    const t = setup();
+    await t.deliver(mention("U2"));
+    t.clock.now += TTL_MS - 5000;
+    const lookup = t.hold("U1");
+    const asked = mention("U1");
+    const first = t.deliver(asked);
+    await lookup.pending;
+    const second = t.deliver(reply("U2", asked.ts));
+    t.users.U2 = { ...MEMBER, is_restricted: true };
+    t.clock.now += 8000;
+    lookup.release();
+    expect(await first).toEqual(ANSWER);
+    expect(await second).toEqual({ turn: "refuse", verdict: { user: "U2", member: false, reason: "guest" } });
   });
 
   test("a hold expires: a mention that is never decided lets the follow-up go, unanswered", async () => {
