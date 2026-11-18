@@ -79,6 +79,41 @@ describe("a profile is checked on start", () => {
     expect(Object.isFrozen(LOREHOUSE)).toBe(false);
   });
 
+  // What is checked is the copy that runs, not the object given: one that answers
+  // differently each time it is read, or keeps its fields somewhere a copy doesn't reach,
+  // can't pass the check and then run as something else.
+  test("a field behind a getter is read once: the value checked is the value that runs", () => {
+    let reads = 0;
+    const shifty = { ...valid, get mode() { return reads++ === 0 ? "interactive" : "job"; }, get tools() { return reads++ < 2 ? ["search_knowledge"] : ["open_pull_request"]; } };
+    const [loaded] = loadProfiles([shifty], CATALOG) as [Profile];
+    expect(loaded).toEqual(valid);
+    expect(reads).toBe(2); // once each, by the copy; never again
+    expect(loaded.mode).toBe("interactive");
+    expect(loaded.tools).toEqual(["search_knowledge"]);
+    expect(Object.getOwnPropertyDescriptor(loaded, "mode")).toMatchObject({ value: "interactive", writable: false });
+  });
+
+  test("fields kept on a prototype, by getters or by Object.create, don't count: the copy has none and is refused, with a ProfileError", () => {
+    class Proto { get id() { return "lorehouse"; } get mode() { return "interactive"; } }
+    const inherited = Object.assign(new Proto(), { prompt: "lorehouse", tools: [], skills: [], triggers: valid.triggers, sandbox: "none" });
+    expect(problems(inherited)).toEqual([
+      "profile #0: id: must match ^[a-z][a-z0-9-]{0,31}$ (a lowercase handle, at most 32 characters), got nothing",
+      "profile #0: mode: must be one of interactive, automation, job, got nothing",
+    ]);
+    const created = problems(Object.create(valid));
+    expect(created).toContain("profile #0: id: must match ^[a-z][a-z0-9-]{0,31}$ (a lowercase handle, at most 32 characters), got nothing");
+    expect(created).toContain("profile #0: triggers: must be a list of triggers, got nothing");
+    expect(() => loadProfiles([Object.create(valid)], CATALOG)).toThrow(ProfileError);
+  });
+
+  test("a profile that isn't plain data can't be copied, and is refused by name with a ProfileError", () => {
+    expect(problems({ ...valid, tools: ["search_knowledge", () => "open_pull_request"] })).toEqual([expect.stringMatching(/^profile "lorehouse": must be plain data, and can't be copied: /)]);
+    expect(problems(valid, { ...valid, id: "review", mode: Symbol("job") })).toEqual([expect.stringMatching(/^profile "review": must be plain data, and can't be copied: /)]);
+    expect(problems({ ...valid, id: () => "lorehouse" })).toEqual([expect.stringMatching(/^profile #0: must be plain data, and can't be copied: /)]);
+    const throws = { ...valid, get id(): string { throw new Error("no id for you"); } };
+    expect(problems(throws)).toEqual(["profile #0: must be plain data, and can't be copied: no id for you"]);
+  });
+
   test("something that isn't a list of profiles is a ProfileError too, not a crash", () => {
     for (const given of [valid, "lorehouse", null, 7]) {
       expect(() => loadProfiles(given, CATALOG), JSON.stringify(given)).toThrow(ProfileError);

@@ -111,13 +111,25 @@ export class ProfileError extends Error {
   }
 }
 
-// The profiles to run (this build's, unless given), checked: frozen copies, so what was
-// checked is what runs, whatever the caller does with its own objects after. Throws a
-// ProfileError listing every problem.
+// The profiles to run (this build's, unless given), checked. Each is copied first, as plain
+// data (structuredClone: a getter is read once, and only an object's own fields come
+// along), then the copy is checked, frozen and returned: what was checked is what runs,
+// whatever the caller's object is or does after. Throws a ProfileError listing every problem.
 export function loadProfiles(profiles: unknown = PROFILES, catalog: ProfileCatalog = PROMPT_CATALOG): readonly Profile[] {
   if (!Array.isArray(profiles)) throw new ProfileError([`profiles: must be a list of profiles, got ${show(profiles)}`]);
   const problems: string[] = [];
-  const checked = profiles.map((p, i) => checkProfile(p, i, catalog, problems));
+  const checked: (Profile | undefined)[] = [];
+  for (let i = 0; i < profiles.length; i++) {
+    let copy: unknown;
+    try {
+      copy = structuredClone(profiles[i]);
+    } catch (err) {
+      problems.push(`${nameOf(profiles[i], i)}: must be plain data, and can't be copied: ${err instanceof Error ? err.message : String(err)}`);
+      checked.push(undefined);
+      continue;
+    }
+    checked.push(checkProfile(copy, i, catalog, problems));
+  }
   const ok = checked.filter((p): p is Profile => p !== undefined);
 
   const seen = new Set<string>();
@@ -138,12 +150,25 @@ export function loadProfiles(profiles: unknown = PROFILES, catalog: ProfileCatal
   return Object.freeze(ok);
 }
 
+// How a problem names the profile it is about: by its id when it has a valid one (read
+// defensively: reading it may throw), else by its place in the list.
+function nameOf(profile: unknown, index: number): string {
+  try {
+    const id = isRecord(profile) ? profile.id : undefined;
+    if (typeof id === "string" && PROFILE_ID.test(id)) return `profile "${id}"`;
+  } catch {
+    // by its place, then
+  }
+  return `profile #${index}`;
+}
+
+// Checks one profile, already copied, and freezes it. `input` is the copy that is returned.
 function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, problems: string[]): Profile | undefined {
   if (!isRecord(input)) {
     problems.push(`profile #${index}: must be an object with ${FIELDS.join(", ")}`);
     return undefined;
   }
-  const who = typeof input.id === "string" && PROFILE_ID.test(input.id) ? `profile "${input.id}"` : `profile #${index}`;
+  const who = nameOf(input, index);
   const before = problems.length;
   const bad = (field: string, problem: string) => void problems.push(`${who}: ${field}: ${problem}`);
   const oneOf = (field: string, allowed: readonly string[]) => {
@@ -205,7 +230,7 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
     const code = input.tools.filter((t: unknown): t is string => typeof t === "string" && isCodeTool(t));
     if (code.length) bad("sandbox", `must be write for the tool${code.length === 1 ? "" : "s"} ${code.join(", ")}, got "none"`);
   }
-  return problems.length === before ? deepFreeze(structuredClone(input) as Profile) : undefined;
+  return problems.length === before ? deepFreeze(input as Profile) : undefined;
 }
 
 function deepFreeze<T>(value: T): T {
