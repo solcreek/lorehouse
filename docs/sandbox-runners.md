@@ -263,8 +263,11 @@ profile's sandbox carries it:
   `<sandbox>: resources changed from (…) to (…)`. So a profile whose `sandboxResources`
   is added or changed reaches a thread's existing sandbox at its next boot, at the latest
   an idle stop after the change; until then that thread's calls are refused with the
-  reason above. The disk may grow; `disk_in_use` refuses one that would shrink under what
-  is there.
+  reason above. The disk may grow; `disk_in_use` refuses a size the request names, or the
+  default it leaves a recorded larger size for, that is under what is there. (A sandbox
+  made with no request has no record and follows the host's default at each boot: a
+  default lowered on the host reaches it, and its first request that names no size takes
+  that default, unchecked, as its recorded size.)
 - **No request leaves the sandbox as it is**: its record if it has one (held to the same
   rules before it is booted), else the host's defaults at each boot, as before.
   `destroy`, `stage` and `push` carry none.

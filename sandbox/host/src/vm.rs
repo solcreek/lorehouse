@@ -528,9 +528,13 @@ impl Manager {
     /// request must come to what the VM has, unless the call only watches or stops what it
     /// runs (`watching`). With the VM stopped (or never booted) a
     /// request is granted afresh against the maxima in force and becomes the sandbox's
-    /// from that boot on, except less disk than the sandbox already uses, which is never
-    /// applied. No request: the sandbox as it is (its record, held to the rules a request
-    /// is; or the host's defaults for one that has none).
+    /// from that boot on, except a disk size the request names (or one less than the
+    /// record's) that is under what the sandbox already uses, which is never applied. A
+    /// sandbox with no record whose request names no size goes on today's default
+    /// unchecked, as it does at a boot with no request: a lowered SANDBOXD_DISK_QUOTA_GIB
+    /// is the host's own setting reaching it (lowers_disk). No request: the sandbox as it
+    /// is (its record, held to the rules a request is; or the host's defaults for one that
+    /// has none).
     async fn resources_for(&self, sb: &Sandbox, up: Option<&Granted>, request: Option<&Request>, watching: bool) -> Result<Plan, AcquireError> {
         // A size asked for a directory no limit holds on: one made before the quota was on,
         // or left by a creation that failed then, which the next creation would use as it
@@ -1243,7 +1247,7 @@ pub mod tests {
     }
 
     #[test]
-    fn a_new_disk_cap_is_checked_against_usage_when_it_is_less_than_the_recorded_one_or_none_is_recorded() {
+    fn a_new_disk_cap_is_checked_against_usage_when_it_is_less_than_the_recorded_one_or_a_size_is_named_with_none_recorded() {
         use super::lowers_disk;
         let with = |disk_gib| crate::resources::Granted { disk_gib, ..stock() };
         // Less than the record's: what is written has to fit, whether the size was named

@@ -336,9 +336,15 @@ codes and the rules; [`src/resources.rs`](src/resources.rs) is the policy).
 - **Where each is enforced.** vCPUs and memory: the VM's `machine-config` and its cgroup's
   `cpu.max` (vCPUs + 1) and `memory.max` (RAM + headroom). pids: its cgroup's `pids.max`,
   which counts the VMM's threads on the host, not the guest's processes. Disk: its btrfs
-  subvolume's qgroup limit, set at every boot; it can grow, and is never set under what
-  the sandbox has written (`disk_in_use`, read with `btrfs qgroup show --sync --raw -f`;
-  usage that can't be read is not taken to fit).
+  subvolume's qgroup limit, set at every boot; it can grow, and a request never sets it
+  under what the sandbox has written (`disk_in_use`, read with
+  `btrfs qgroup show --sync --raw -f`; usage that can't be read is not taken to fit): not
+  by a size it names, nor by leaving out a size the sandbox's record has more of. The one
+  thing that can is the host's own setting: a sandbox with no record (made with no
+  request) follows `SANDBOXD_DISK_QUOTA_GIB` at each boot, so lowering that under what
+  such a sandbox holds makes its writes fail, as it did before requests existed. Its
+  first request that names no size is no check on that either: it takes today's default,
+  unread against usage, and records it as the sandbox's size from then on.
   Command timeout: the `timeoutMs` in the body sandboxd writes for guestd with each
   `POST /exec` (never the caller's bytes), and sandboxd's own wait 330 s past it. A body
   that can't be rewritten is refused before the sandbox is reached, so it boots nothing
