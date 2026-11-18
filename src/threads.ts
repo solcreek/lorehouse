@@ -38,6 +38,66 @@ export function isFollowUp(e: FollowUpEvent, joined: (channel: string, threadTs:
   return joined(e.channelId, e.threadId);
 }
 
+// A mention is decided only after its asker is looked up (members.ts), which can take as
+// long as Slack does; a plain reply by someone already looked up would be decided first,
+// find the thread not joined yet, and be dropped (#163). So a mention holds its thread
+// from the moment it arrives until it is decided, and a reply there waits for the holds
+// open when it arrived. The thread is not joined meanwhile: a reply let go finds it joined
+// only if the mention was accepted.
+//
+// A hold ends when its mention is decided (close), or by itself after `holdMs`, so a
+// mention that is never decided keeps nothing waiting, and nothing in memory, for longer.
+export const MENTION_HOLD_MS = 12_000; // past the asker's lookup (members.ts, LOOKUP_TIMEOUT_MS)
+
+export type MentionHolds = {
+  // A mention arrived in this thread and is not decided yet.
+  open(channel: string, threadTs: string, mentionTs: string): void;
+  // It was decided, either way. Harmless for a mention with no hold (or one that expired).
+  close(channel: string, threadTs: string, mentionTs: string): void;
+  // Resolves once every hold open on the thread now has ended: at once if there is none.
+  settled(channel: string, threadTs: string): Promise<void>;
+  // How many holds are open.
+  readonly size: number;
+};
+
+export function mentionHolds(holdMs = MENTION_HOLD_MS): MentionHolds {
+  // Per thread, each undecided mention's hold, by the mention's ts.
+  const open = new Map<string, Map<string, { ended: Promise<void>; end: () => void }>>();
+  const key = (channel: string, threadTs: string) => `${channel}:${threadTs}`;
+  const close = (channel: string, threadTs: string, mentionTs: string) => {
+    const k = key(channel, threadTs);
+    const holds = open.get(k);
+    const hold = holds?.get(mentionTs);
+    if (!holds || !hold) return;
+    holds.delete(mentionTs);
+    if (!holds.size) open.delete(k);
+    hold.end();
+  };
+  return {
+    open(channel, threadTs, mentionTs) {
+      const k = key(channel, threadTs);
+      const holds = open.get(k) ?? new Map();
+      open.set(k, holds);
+      if (holds.has(mentionTs)) return;
+      let resolve = () => {};
+      const ended = new Promise<void>((r) => { resolve = r; });
+      const timer = setTimeout(() => close(channel, threadTs, mentionTs), holdMs);
+      timer.unref?.(); // never keeps the process up
+      holds.set(mentionTs, { ended, end: () => { clearTimeout(timer); resolve(); } });
+    },
+    close,
+    async settled(channel, threadTs) {
+      const holds = open.get(key(channel, threadTs));
+      if (holds) await Promise.all([...holds.values()].map((h) => h.ended));
+    },
+    get size() {
+      let n = 0;
+      for (const holds of open.values()) n += holds.size;
+      return n;
+    },
+  };
+}
+
 // The threads the agent was asked into, newest first, each with its document when the
 // thread is indexed (a thread holding only a question to the agent isn't knowledge), and
 // what usage recorded there: the messages that asked it something, its searches, and how

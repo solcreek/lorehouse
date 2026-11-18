@@ -37,6 +37,7 @@ function setup(opts: { dms?: boolean; listed?: string[]; holdMs?: number } = {})
     dms: opts.dms ?? false,
     joined: (channel, thread) => inThread(db, channel, thread),
     join: (channel, thread) => joinThread(db, channel, thread),
+    holdMs: opts.holdMs,
   });
   const deliver = async (e: TurnEvent): Promise<TurnDecision> => {
     await gate.before({ userId: e.user?.id, teamId: "T1", channelId: e.channelId, threadId: e.threadId, kind: e.kind, ts: e.ts });
@@ -129,6 +130,98 @@ describe("turnGate", () => {
     // So a member's reply there is not a follow-up.
     t.listed.add("C1");
     expect(await t.deliver(reply("U2", guest.ts))).toEqual(NONE);
+  });
+
+  // #163. U2's verdict is cached, so nothing but the hold keeps U2's reply from being
+  // decided while U1's lookup is still out.
+  test("a follow-up that arrives while the mention that opened its thread is still being looked up is answered once the mention is accepted", async () => {
+    const t = setup();
+    await t.deliver(mention("U2")); // U2 is cached
+    const lookup = t.hold("U1");
+    const asked = mention("U1");
+    const order: string[] = [];
+    const first = t.deliver(asked).then((d) => { order.push("mention"); return d; });
+    await lookup.pending;
+    const second = t.deliver(reply("U2", asked.ts)).then((d) => { order.push("follow-up"); return d; });
+    await Bun.sleep(5);
+    expect(order).toEqual([]); // neither is decided while U1's lookup is out
+    expect(t.joined(asked.ts)).toBe(false);
+    lookup.release();
+    expect(await second).toEqual(ANSWER);
+    expect(await first).toEqual(ANSWER);
+    expect(order).toEqual(["mention", "follow-up"]);
+    expect(t.asked.filter((u) => u === "U2")).toHaveLength(1); // the follow-up cost no lookup
+  });
+
+  test("a follow-up held for a mention that is then refused is nothing, and the thread is never joined", async () => {
+    for (const asker of ["UG1", "U404"]) { // a guest; a lookup that fails
+      const t = setup();
+      await t.deliver(mention("U2"));
+      const lookup = t.hold(asker);
+      const asked = mention(asker);
+      const first = t.deliver(asked);
+      await lookup.pending;
+      const second = t.deliver(reply("U2", asked.ts));
+      expect(t.joined(asked.ts)).toBe(false); // not while the lookup is out
+      lookup.release();
+      expect(await first).toMatchObject({ turn: "refuse" });
+      expect(await second).toEqual(NONE);
+      expect(t.joined(asked.ts)).toBe(false);
+      expect(await t.deliver(reply("U2", asked.ts))).toEqual(NONE); // nor later
+    }
+  });
+
+  test("a held follow-up still passes the members check and the channel check", async () => {
+    const t = setup();
+    const lookup = t.hold("U1");
+    const asked = mention("U1");
+    const first = t.deliver(asked);
+    await lookup.pending;
+    const guest = t.deliver(reply("UG1", asked.ts));
+    lookup.release();
+    expect(await first).toEqual(ANSWER);
+    expect(await guest).toMatchObject({ turn: "refuse", verdict: { reason: "guest" } });
+
+    const closing = setup();
+    await closing.deliver(mention("U2"));
+    const slow = closing.hold("U1");
+    const opened = mention("U1");
+    const accepted = closing.deliver(opened);
+    await slow.pending;
+    const held = closing.deliver(reply("U2", opened.ts));
+    slow.release();
+    expect(await accepted).toEqual(ANSWER);
+    closing.listed.delete("C1"); // closed after the mention was accepted, before the follow-up is decided
+    expect(await held).toEqual(NONE);
+  });
+
+  test("a hold expires: a mention that is never decided lets the follow-up go, unanswered", async () => {
+    const t = setup({ holdMs: 20 });
+    await t.deliver(mention("U2"));
+    const lookup = t.hold("U1");
+    const asked = mention("U1");
+    const first = t.deliver(asked);
+    await lookup.pending;
+    const t0 = Date.now();
+    expect(await t.deliver(reply("U2", asked.ts))).toEqual(NONE);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    lookup.release();
+    expect(await first).toEqual(ANSWER); // the mention itself is still answered, and joins
+    expect(await t.deliver(reply("U2", asked.ts))).toEqual(ANSWER);
+  });
+
+  test("a follow-up in a thread already joined doesn't wait for a mention pending there, nor for one in another thread", async () => {
+    const t = setup();
+    await t.deliver(mention("U2"));
+    joinThread(t.db, "C1", "1.1");
+    const lookup = t.hold("UG1");
+    const there = t.deliver(mention("UG1", "1.1"));
+    const elsewhere = t.deliver(mention("UG1"));
+    await lookup.pending;
+    expect(await t.deliver(reply("U2", "1.1"))).toEqual(ANSWER);
+    expect(await t.deliver(reply("U2", "9.9"))).toEqual(NONE);
+    lookup.release();
+    await Promise.all([there, elsewhere]);
   });
 
   test("a channel closed while the sender was looked up gets nothing, not even a refusal", async () => {

@@ -6,10 +6,14 @@
 //   2. decide(): answer, refuse with one line, or nothing. Synchronous: it reads the verdict
 //      the lookup cached, and whether the thread is one the agent was asked into.
 // Events are independent: another event's decide() can run while this one's before() is
-// still waiting on Slack.
+// still waiting on Slack. One case must not: a plain reply in a thread whose opening
+// mention is still being looked up would be decided before the thread is joined, and
+// dropped (#163). before() holds such a reply until the mention is decided (threads.ts,
+// mentionHolds); the thread is joined only if the mention is accepted, in decide(), so a
+// reply held for a refused asker's mention finds no joined thread and gets nothing.
 
 import { decideTurn, mayStartTurn, type Members, type Membership } from "./members";
-import { isFollowUp } from "./threads";
+import { isFollowUp, mentionHolds } from "./threads";
 
 // The sender facts an event carries, before it is decided (June's SlackIdentity).
 export type TurnSender = { userId?: string; teamId?: string; channelId: string; threadId?: string; kind: string; ts: string };
@@ -33,28 +37,51 @@ export function turnGate(o: {
   joined: (channel: string, threadTs: string) => boolean;
   // Record that it was: called for a mention that is answered, and for no other.
   join: (channel: string, threadTs: string) => void;
+  // How long an undecided mention holds the replies in its thread (threads.ts).
+  holdMs?: number;
 }): TurnGate {
   // Mentions start a turn, and so do follow-ups in a thread the agent was mentioned in
   // (threads.ts); with DMs answered, DMs too.
   const mayRespond = (e: TurnEvent) => e.kind === "app_mention" || (o.dms && e.channelType === "im") || isFollowUp(e, o.joined);
+  // A reply in a thread whose opening mention is not decided yet waits for it (#163).
+  const holds = mentionHolds(o.holdMs);
+  const decide = (e: TurnEvent): TurnDecision => {
+    if (!mayRespond(e)) return { turn: "none" };
+    // Fails closed: a sender not looked up, or not a full member, is refused. The channel
+    // is checked again first: the lookup awaited Slack, and an hourly recheck may have
+    // closed the channel meanwhile (decideTurn).
+    const verdict = e.user?.id ? o.members.peek(e.user.id) : undefined;
+    const decision = decideTurn(e, o.listed, verdict);
+    if (decision === "skip") return { turn: "none" };
+    if (decision === "refuse") return { turn: "refuse", verdict };
+    // A mention asks the agent into its thread, once it is accepted: a thread a guest
+    // opened, or one in a channel closed meanwhile, is never one the agent joined, so a
+    // member's reply there is not a follow-up.
+    if (e.kind === "app_mention") o.join(e.channelId, e.threadId ?? e.ts);
+    return { turn: "answer" };
+  };
   return {
     async before(sender) {
-      if (sender.userId && mayStartTurn(sender, o.dms)) await o.members.check(sender.userId, sender.teamId);
+      const waits: Promise<unknown>[] = [];
+      // The hold opens before anything is awaited, so a reply that arrives next finds it. A
+      // thread already joined needs none: replies there are follow-ups whatever this
+      // mention comes to.
+      const thread = sender.threadId ?? sender.ts;
+      if (sender.kind === "app_mention" && !o.joined(sender.channelId, thread)) holds.open(sender.channelId, thread, sender.ts);
+      if (sender.userId && mayStartTurn(sender, o.dms)) waits.push(o.members.check(sender.userId, sender.teamId));
+      // A reply waits for the mentions pending in its thread, while its own sender is looked
+      // up: both are over within MENTION_HOLD_MS, well inside the verdict's time in the cache.
+      if (sender.kind === "message" && thread !== sender.ts && !o.joined(sender.channelId, thread)) waits.push(holds.settled(sender.channelId, thread));
+      await Promise.all(waits);
     },
+    // A mention's hold ends as it is decided, after the thread is joined (or not): the
+    // replies it held are decided next, each as any reply is.
     decide(e) {
-      if (!mayRespond(e)) return { turn: "none" };
-      // Fails closed: a sender not looked up, or not a full member, is refused. The channel
-      // is checked again first: the lookup awaited Slack, and an hourly recheck may have
-      // closed the channel meanwhile (decideTurn).
-      const verdict = e.user?.id ? o.members.peek(e.user.id) : undefined;
-      const decision = decideTurn(e, o.listed, verdict);
-      if (decision === "skip") return { turn: "none" };
-      if (decision === "refuse") return { turn: "refuse", verdict };
-      // A mention asks the agent into its thread, once it is accepted: a thread a guest
-      // opened, or one in a channel closed meanwhile, is never one the agent joined, so a
-      // member's reply there is not a follow-up.
-      if (e.kind === "app_mention") o.join(e.channelId, e.threadId ?? e.ts);
-      return { turn: "answer" };
+      try {
+        return decide(e);
+      } finally {
+        if (e.kind === "app_mention") holds.close(e.channelId, e.threadId ?? e.ts, e.ts);
+      }
     },
   };
 }
