@@ -486,7 +486,7 @@ describe("a channel's default repo", () => {
 
   test("invalid_repo (400): anything but owner/name", async () => {
     const r = repoSetup();
-    for (const repo of [undefined, 7, "", "widgets", "acme/", "acme/widgets/x", "https://github.com/acme/widgets", "acme/widgets.git", "acme/widgets; rm -rf /", "../x", "acme/.."]) await refused(r, { repo }, 400, "invalid_repo");
+    for (const repo of [undefined, 7, "", "widgets", "acme/", "acme/widgets/x", "https://github.com/acme/widgets", "acme/widgets.git", "acme/widgets; rm -rf /", "../x", "acme/..", `${"o".repeat(40)}/widgets`, `acme/${"n".repeat(101)}`]) await refused(r, { repo }, 400, "invalid_repo");
     expect(r.asked).toEqual([]);
   });
 

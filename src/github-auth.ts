@@ -40,6 +40,17 @@ export function staticToken(token: string, opts: { fetch?: typeof fetch; apiUrl?
   return access;
 }
 
+// A repo named exactly as owner/name: the one form a channel's default repo is taken in
+// (admin.ts), stored in, and accepted back from GitHub (checkRepo). The characters GitHub
+// names are made of, within its lengths (owner 39, name 100); no leading "." (so never
+// "." or ".."), and no ".git" suffix. Not a URL: workspace_clone's own input is looser
+// (tools/clone.ts, parseRepo).
+export function repoName(s: string): RepoRef | undefined {
+  const m = /^([A-Za-z0-9_.-]{1,39})\/([A-Za-z0-9_.-]{1,100})$/.exec(s);
+  if (!m || m[1]!.startsWith(".") || m[2]!.startsWith(".") || m[2]!.endsWith(".git")) return undefined;
+  return { owner: m[1]!, name: m[2]! };
+}
+
 // GitHub's rate limits: a 429, or a 403 that says so (the primary limit's
 // x-ratelimit-remaining: 0; a secondary limit's retry-after). `retryAfterSecs` when it says
 // how long to wait.
@@ -174,9 +185,11 @@ export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { bra
   if (no) return no;
   if (res.status === 403 || res.status === 404) return { ok: false, reason: "not_readable", detail: `the GitHub credential can't read ${full} (GitHub answered ${res.status}): no such repo, or no access to it` };
   if (!res.ok) return { ok: false, reason: "unavailable", detail: `GitHub answered ${res.status} for ${full}` };
+  // GitHub's spelling is what gets stored, so it is held to the same rule as an admin's
+  // input: an answer that names no usable repo is not a yes.
   const named = ((await res.json().catch(() => undefined)) as { full_name?: unknown } | undefined)?.full_name;
-  const [owner, name, ...more] = typeof named === "string" ? named.split("/") : [];
-  const canonical = owner && name && !more.length && /^[A-Za-z0-9_.-]+$/.test(owner) && /^[A-Za-z0-9_.-]+$/.test(name) ? { owner, name } : repo;
+  const canonical = typeof named === "string" ? repoName(named) : undefined;
+  if (!canonical) return { ok: false, reason: "unavailable", detail: `GitHub's answer for ${full} didn't name the repo as owner/name` };
 
   if (opts.branch !== undefined) {
     // Each part of the name encoded, the slashes kept: a branch may be "release/2026.11".

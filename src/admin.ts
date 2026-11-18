@@ -25,7 +25,7 @@
 import type { Database } from "./sqlite";
 import type { IngestStatus } from "./ingest/slack";
 import { CHANNEL_ID, clearChannelRepo, getChannelRepo, listChannelRepos, setChannelRepo, validBranch, type ChannelRepo } from "./channel-repos";
-import type { RepoCheck, RepoRef } from "./github-auth";
+import { repoName, type RepoCheck, type RepoRef } from "./github-auth";
 import { getDocument, listDocuments, searcher } from "./knowledge";
 import { listPlacements } from "./runners/hub";
 import { bearerMatches } from "./status-auth";
@@ -67,7 +67,6 @@ class Refusal extends Error {
 
 // PUT's body is one small JSON object.
 const MAX_BODY = 4096;
-const REPO = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/;
 const REPO_METHODS = ["GET", "PUT", "DELETE"];
 
 // A default repo as the API shows it; null when the channel has none.
@@ -209,10 +208,10 @@ export function adminRoutes(opts: AdminOptions) {
     const unknown = Object.keys(body).filter((k) => k !== "repo" && k !== "branch");
     if (unknown.length) throw new Refusal(400, "invalid_body", `unknown field ${unknown.map((k) => JSON.stringify(k)).join(", ")}: the fields are "repo" and "branch"`);
     const { repo, branch } = body as { repo?: unknown; branch?: unknown };
-    const m = typeof repo === "string" ? REPO.exec(repo) : null;
-    if (!m || m[1]!.startsWith(".") || m[2]!.startsWith(".") || m[2]!.endsWith(".git")) throw new Refusal(400, "invalid_repo", '"repo" must be a GitHub repo as owner/name, e.g. "acme/widgets" (not a URL)');
+    const named = typeof repo === "string" ? repoName(repo) : undefined;
+    if (!named) throw new Refusal(400, "invalid_repo", '"repo" must be a GitHub repo as owner/name, e.g. "acme/widgets" (not a URL; an owner is up to 39 characters, a name up to 100)');
     if (branch !== undefined && branch !== null && !(typeof branch === "string" && validBranch(branch))) throw new Refusal(400, "invalid_branch", '"branch" must be a branch name, e.g. "main"; leave it out (or send null) for the repo\'s default branch');
-    return { repo: { owner: m[1]!, name: m[2]! }, branch: typeof branch === "string" ? branch : undefined };
+    return { repo: named, branch: typeof branch === "string" ? branch : undefined };
   }
 
   // A channel's default repo: GET reads it, PUT sets it, DELETE clears it.

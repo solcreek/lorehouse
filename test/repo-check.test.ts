@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { checkRepo, githubApp, staticToken } from "../src/github-auth";
+import { checkRepo, githubApp, repoName, staticToken } from "../src/github-auth";
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 
@@ -120,11 +120,22 @@ describe("checkRepo", () => {
   test("the name comes back as GitHub spells it: its case, or the new name after a rename", async () => {
     const api = fakeApi({ repo: { full_name: "Acme/Widgets" } });
     expect(await checkRepo(token(api), { owner: "acme", name: "widgets" }, { fetch: api.f })).toEqual({ ok: true, repo: { owner: "Acme", name: "Widgets" } });
-    // An answer without a usable name keeps what was asked for.
-    for (const repo of [{}, { full_name: 7 }, { full_name: "a/b/c" }, { full_name: "a b/c" }]) {
+  });
+
+  // What GitHub names is what gets stored, so it is held to the rule the admin API holds
+  // its input to (repoName): an answer that names no usable repo is not an ok.
+  test("an answer that doesn't name a repo as owner/name is unavailable, never stored", async () => {
+    for (const repo of [{}, { full_name: 7 }, { full_name: "a/b/c" }, { full_name: "a b/c" }, { full_name: "../.." }, { full_name: ".a/b" }, { full_name: "a/.b" }, { full_name: "a/b.git" }, { full_name: `${"o".repeat(40)}/b` }, { full_name: `a/${"n".repeat(101)}` }]) {
       const odd = fakeApi({ repo });
-      expect(await checkRepo(token(odd), widgets, { fetch: odd.f })).toEqual({ ok: true, repo: widgets });
+      const r = await checkRepo(token(odd), widgets, { fetch: odd.f });
+      expect([JSON.stringify(repo).slice(0, 40), r]).toEqual([JSON.stringify(repo).slice(0, 40), { ok: false, reason: "unavailable", detail: expect.stringContaining("didn't name the repo") }]);
     }
+  });
+
+  test("repoName: owner/name exactly, within GitHub's lengths (owner 39, name 100)", () => {
+    expect(repoName("acme/widgets")).toEqual({ owner: "acme", name: "widgets" });
+    expect(repoName(`${"o".repeat(39)}/${"n".repeat(100)}`)).toBeDefined();
+    for (const bad of ["", "acme", "acme/", "/widgets", "acme/widgets/x", "https://github.com/acme/widgets", "acme/widgets.git", "../..", ".acme/widgets", "acme/.widgets", "acme/wid gets", "acme/widgets; rm -rf /", `${"o".repeat(40)}/n`, `o/${"n".repeat(101)}`]) expect([bad.slice(0, 50), repoName(bad)]).toEqual([bad.slice(0, 50), undefined]);
   });
 
   test("a branch is looked up only when given: there, or branch_not_found; a slash in its name stays a slash", async () => {
