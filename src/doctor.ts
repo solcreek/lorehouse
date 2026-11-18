@@ -235,6 +235,8 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
   // Each listed channel's default repo (#126), checked against GitHub below; one of a
   // channel no longer listed is in the purge instead.
   const defaults = typeof stored === "string" ? [] : stored.repos.filter((r) => config.agent.channels.has(r.channel));
+  // Why the database couldn't be read, when it couldn't: then the defaults are unknown, not none.
+  const unread = typeof stored === "string" ? stored : undefined;
   if (typeof purge === "string") add("channels", "purge on start", "info", purge);
   else if (purge.length) {
     const docs = (k: number) => `${k} document${k === 1 ? "" : "s"}`;
@@ -333,7 +335,10 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       add("github", "default repo", "fail", `${what}: ${check.detail}. A request in ${d.channel} that names no repo fails until then: ${fix}, or set another (PUT /api/v1/channels/${d.channel}/repo, docs/admin-api.md), or clear it (DELETE)`);
     }
     const without = [...config.agent.channels].filter((c) => !defaults.some((d) => d.channel === c));
-    if (without.length) add("github", "default repo", "info", `none for ${without.join(", ")}: a request there has to name its repo. An admin sets one with PUT /api/v1/channels/<id>/repo (docs/admin-api.md)`);
+    // A database that couldn't be read may hold defaults this can't see: not checked, said
+    // as the purge preview says it, and never "none".
+    if (unread) add("github", "default repo", "info", unread);
+    else if (without.length) add("github", "default repo", "info", `none for ${without.join(", ")}: a request there has to name its repo. An admin sets one with PUT /api/v1/channels/<id>/repo (docs/admin-api.md)`);
 
     // ── sandbox ──
     // loadConfig has refused a SANDBOX_URL that isn't https:// or plain http:// to this
@@ -349,6 +354,7 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
       add("sandbox", "runners", "info", opts.url && config.statusToken ? "runners connect in: see deployment below" : "runners connect in, so they can only be seen on the running app: pass --url, with STATUS_TOKEN set");
     }
   } else {
+    if (unread) add("github", "default repo", "info", unread);
     // Set while code tools were on, and nothing uses it now; there is no credential to
     // check it with, so GitHub isn't asked.
     for (const d of defaults) add("github", "default repo", "warn", `${d.channel}: ${d.repo}${d.branch ? `, branch ${d.branch}` : ""} is set, but code tools are off, so nothing uses it and it isn't checked: turn code tools on (docs/sandbox-runners.md), or clear it (DELETE /api/v1/channels/${d.channel}/repo, docs/admin-api.md)`);

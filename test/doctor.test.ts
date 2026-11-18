@@ -515,6 +515,24 @@ describe("code tools", () => {
       });
     });
 
+    // A database that can't be read holds defaults doctor can't see: "none" would be a lie.
+    test("a database that can't be read: the default repos are not checked, said as the purge preview says it, never 'none'", async () => {
+      const dir = mkdtempSync(`${tmpdir()}/doctor-unreadable-`);
+      try {
+        writeFileSync(`${dir}/lorehouse.db`, "this is not a database, and never was one. ".repeat(200));
+        for (const env of [app, {}]) {
+          const checks = await run({ ...env, AGENT_CHANNELS: "C1,C2", LOREHOUSE_DB: `${dir}/lorehouse.db`, SESSIONS_DB: `${dir}/sessions.db` });
+          const purge = find(checks, "purge on start");
+          const repos = find(checks, "default repo");
+          expect(purge).toHaveLength(1);
+          expect(purge[0]!.detail).toStartWith("not checked: couldn't read");
+          expect(repos).toEqual([{ section: "github", name: "default repo", level: purge[0]!.level, detail: purge[0]!.detail }]);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     test("none set anywhere: one line saying so, and nothing fails", async () => {
       expect(repos(await run(app))).toEqual(["info none for C1: a request there has to name its repo. An admin sets one with PUT /api/v1/channels/<id>/repo (docs/admin-api.md)"]);
       expect(find(await run({}), "default repo")).toEqual([]); // code tools off, none set: nothing to say
