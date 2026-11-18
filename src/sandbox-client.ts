@@ -14,7 +14,7 @@
 //
 // With `resources` (what the profile asks for its sandbox, src/sandbox-resources.ts), every
 // exec, file and jobs call carries them in X-Lorehouse-Sandbox-Resources: the daemon
-// creates the sandbox with them, or refuses the call with a code and its reason
+// boots the sandbox with them, or refuses the call with a code and its reason
 // (400, 409, 422 `{ error, code }`), which is thrown whole as a SandboxRefusal. A daemon
 // that predates the header would ignore it, so it is asked first, once:
 //
@@ -22,7 +22,7 @@
 //
 // Feasibility numbers (boot, exec, persistence): sandbox/spike/.
 
-import { RESOURCES_FEATURE, RESOURCES_HEADER, ResourcesUnsupported, commandTimeoutMs, refusalFrom, wireResources, type SandboxResources } from "./sandbox-resources";
+import { RESOURCES_FEATURE, RESOURCES_HEADER, ResourcesUnsupported, execTimeoutMs, explainTimeout, refusalFrom, wireResources, type SandboxResources } from "./sandbox-resources";
 import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, JobCallError, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type SandboxJob, type Staged } from "./tools/workspace";
 
 export type RemoteSandboxOptions = {
@@ -109,12 +109,14 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
       cancel: (j) => job("cancel", "POST", `/jobs/${encodeURIComponent(j)}/cancel`, undefined, JOB_CANCEL_MS),
     },
     async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
+      // Never more than the sandbox's command timeout: the daemon stops it there anyway.
+      const timeoutMs = execTimeoutMs(opts.resources, o.timeoutMs, EXEC_TIMEOUT_MS);
       const res = await call("/exec", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs: o.timeoutMs ?? commandTimeoutMs(opts.resources, EXEC_TIMEOUT_MS) }),
+        body: JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs }),
       });
-      return (await res.json()) as ExecResult;
+      return explainTimeout((await res.json()) as ExecResult, timeoutMs, opts.resources);
     },
     async readFile(path: string): Promise<string> {
       const res = await call(`/file?path=${encodeURIComponent(path)}`, { method: "GET" });

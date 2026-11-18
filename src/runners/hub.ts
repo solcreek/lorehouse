@@ -11,7 +11,7 @@
 // runner on the job's connection or a newer one, and after a reconnect fails at once the
 // jobs the runner says it never got (they never ran, so a retry is safe).
 
-import { RESOURCES_FEATURE, ResourcesUnsupported, SandboxRefusal, commandTimeoutMs, wireResources, type SandboxResources } from "../sandbox-resources";
+import { RESOURCES_FEATURE, ResourcesUnsupported, SandboxRefusal, execTimeoutMs, explainTimeout, wireResources, type SandboxResources } from "../sandbox-resources";
 import type { Database } from "../sqlite";
 import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, JobCallError, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type Staged } from "../tools/workspace";
 
@@ -28,7 +28,7 @@ import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, JobCallError
 // that needs one it doesn't list is never sent to it (submit).
 export type RunnerStatus = { runner: string; capacity: number; running: number; version?: string; jobs?: string[]; received?: string[]; session?: string; started?: number; sandboxes?: string[]; mirrors?: Record<string, unknown>; features?: string[] };
 
-// `resources`, on a guest job: what is asked for the job's sandbox. The runner creates the
+// `resources`, on a guest job: what is asked for the job's sandbox. The runner boots the
 // sandbox with it, or refuses the job with a `code` (sandbox/host/src/resources.rs).
 type JobBody =
   | { op: "guest"; method: "POST" | "GET" | "PUT"; path: string; bodyBase64?: string; resources?: SandboxResources }
@@ -37,7 +37,8 @@ type JobBody =
   | { op: "stage" | "push"; bodyBase64: string };
 // `deadlineMs`: set as a job goes out, how long Lorehouse will still wait for it.
 export type Job = JobBody & { id: string; sandbox: string; timeoutMs: number; deadlineMs?: number };
-// `code`, with `error`: the runner refused the sandbox's resources, and why, stably named.
+// `code`, with `error`: the runner refused the job before anything ran (the sandbox's
+// resources, or a command's body), and why, stably named.
 export type JobResult = { id: string; status: number; contentType?: string; bodyBase64?: string; error?: string; code?: string };
 
 // How a job reaches the runner: pushed down its WebSocket, or queued for its next poll.
@@ -325,10 +326,10 @@ export class RunnerHub {
   // A Sandbox (the tools' seam) whose calls become jobs. Same behavior as the direct HTTP
   // client (sandbox-client.ts), so the tools can't tell them apart. `resources`: what to
   // ask for the sandbox (the profile's request); every guest job carries it, so whichever
-  // call creates the sandbox creates it with them, and a refusal is thrown whole.
+  // call boots the sandbox's VM boots it with them, and a refusal is thrown whole.
   sandbox(id: string, opts: { resources?: SandboxResources } = {}): Sandbox {
     const resources = opts.resources ? wireResources(opts.resources) : undefined;
-    // One guest job; a refused request for resources is thrown with the runner's reason.
+    // One guest job; one the runner refused with a code is thrown with its reason.
     const call = async (method: "POST" | "GET" | "PUT", path: string, bodyBase64: string | undefined, timeoutMs: number) => {
       const r = await this.submit(id, { op: "guest", method, path, bodyBase64, ...(resources ? { resources } : {}) }, timeoutMs);
       if (r.code) throw new SandboxRefusal(r.code, r.status, r.error ?? decode(r));
@@ -367,9 +368,10 @@ export class RunnerHub {
       },
       async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
         // One timeout for both: the guest's limit, and (plus boot slack) this call's deadline.
-        const timeoutMs = o.timeoutMs ?? commandTimeoutMs(resources, EXEC_TIMEOUT_MS);
+        // And never more than the sandbox's command timeout: the runner stops it there anyway.
+        const timeoutMs = execTimeoutMs(resources, o.timeoutMs, EXEC_TIMEOUT_MS);
         const r = await guest("POST", "/exec", JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs }), timeoutMs);
-        return JSON.parse(decode(r)) as ExecResult;
+        return explainTimeout(JSON.parse(decode(r)) as ExecResult, timeoutMs, resources);
       },
       async readFile(path: string): Promise<string> {
         const r = await guest("GET", `/file?path=${encodeURIComponent(path)}`, undefined, 30_000);

@@ -1,10 +1,15 @@
 // sandbox-resources.ts — what a profile may ask for its sandbox, and how a refusal reads.
 //
-// The sandbox host decides (ADR 0003): Lorehouse only asks. A request travels with the
-// calls that create a sandbox, over both transports (a job's `resources` to a runner, the
-// X-Lorehouse-Sandbox-Resources header to a host called directly), and sandboxd grants it
-// within its own maxima or refuses it with a code; it never clamps
-// (sandbox/host/src/resources.rs, docs/sandbox-runners.md). Plain data and no June: the
+// The sandbox host decides (ADR 0003): Lorehouse only asks. A request travels with every
+// call that can start a sandbox's VM, over both transports (a job's `resources` to a
+// runner, the X-Lorehouse-Sandbox-Resources header to a host called directly), and
+// sandboxd grants it within its own maxima or refuses it with a code; it never clamps
+// (sandbox/host/src/resources.rs, docs/sandbox-runners.md). The request says what the
+// whole sandbox is: what it names, and the host's defaults for the rest. It takes effect
+// when the sandbox's VM next boots, so a profile whose request is added or changed
+// reaches its existing threads once their VM has had its idle stop; while that VM still
+// runs with other resources the call is refused (resources_mismatch), saying when to
+// try again. Plain data and no June: the
 // profile type, the two sandbox backends and their tests all read this file.
 
 // Every field is optional: one left out gets the host's default (2 vCPUs, 2048 MiB,
@@ -16,18 +21,28 @@ export type SandboxResources = {
   readonly diskGib?: number;
   // The VM's own threads on the host (one per vCPU and a few), not the guest's processes.
   readonly pids?: number;
-  // The longest one workspace_exec command may run. A background job has its own limits.
+  // The longest ANY one command may run in the sandbox: a workspace_exec command, and
+  // every command the other tools run there, workspace_clone's clone and fetch and
+  // open_pull_request's git commands included. The host stops a command at it whatever
+  // Lorehouse sends, so the tools never wait longer than it (execTimeoutMs). It only
+  // shortens: a tool's own shorter limit stays (a clone's 10 minutes, a fetch's 5).
+  // Background jobs (workspace_job_start) are not commands in this sense and keep their
+  // own limits (1 h by default, 6 h at most).
   readonly commandTimeoutSecs?: number;
 };
 
-// The least and the most any host may grant: sandboxd's own bounds. A host's maxima sit
-// inside them, so a request outside them could never be granted anywhere.
+// The least and the most a profile may ask: sandboxd's own bounds, a host's maxima sitting
+// inside them, so a request outside them could never be granted anywhere. One is tighter
+// here than sandboxd's: a command timeout under a minute (sandboxd takes 1 s) would stop
+// every clone and fetch too (a small repository's clone took 8 s and a 129 MB one 34 s on
+// the first sandbox host, sandbox/host/README.md), leaving a sandbox that can't get its
+// checkout. A minute is the least that leaves the code tools usable.
 export const RESOURCE_BOUNDS = {
   vcpus: [1, 32],
   memMib: [128, 262_144],
   diskGib: [1, 65_536],
   pids: [16, 4096],
-  commandTimeoutSecs: [1, 6 * 3600],
+  commandTimeoutSecs: [60, 6 * 3600],
 } as const satisfies Record<keyof SandboxResources, readonly [number, number]>;
 
 export const RESOURCE_FIELDS = Object.keys(RESOURCE_BOUNDS) as (keyof SandboxResources)[];
@@ -46,13 +61,14 @@ export function resourceProblems(v: unknown, at: string): string[] {
   const o = v as Record<string, unknown>;
   const problems: string[] = [];
   for (const key of Object.keys(o)) {
-    if (!(key in RESOURCE_BOUNDS)) {
+    // Its own keys only: `in` would find toString, constructor and __proto__ on the object.
+    if (!Object.hasOwn(RESOURCE_BOUNDS, key)) {
       problems.push(`${at}.${key}: is not a sandbox resource (allowed: ${RESOURCE_FIELDS.join(", ")})`);
       continue;
     }
     const [min, max] = RESOURCE_BOUNDS[key as keyof SandboxResources];
     const n = o[key];
-    if (typeof n !== "number" || !Number.isInteger(n) || n < min || n > max) problems.push(`${at}.${key}: must be a whole number from ${min} to ${max}, got ${quote(n)}`);
+    if (typeof n !== "number" || !Number.isInteger(n) || n < min || n > max) problems.push(`${at}.${key}: must be a whole number from ${min} to ${max}${key === "commandTimeoutSecs" ? COMMAND_TIMEOUT_MEANS : ""}, got ${quote(n)}`);
   }
   if (!problems.length && Object.keys(o).length === 0) problems.push(`${at}: asks for nothing; leave it out to get the sandbox host's defaults`);
   const { vcpus, pids } = o as SandboxResources;
@@ -61,6 +77,9 @@ export function resourceProblems(v: unknown, at: string): string[] {
   }
   return problems;
 }
+
+// What the field bounds, said where a wrong value is refused: it is wider than its name.
+const COMMAND_TIMEOUT_MEANS = " (seconds; it bounds every command run in the sandbox, a clone and a fetch included, so under a minute the code tools could not work; background jobs keep their own limits)";
 
 function quote(v: unknown): string {
   if (v === undefined) return "nothing";
@@ -76,19 +95,36 @@ export function wireResources(r: SandboxResources): SandboxResources {
   return Object.fromEntries(RESOURCE_FIELDS.filter((f) => r[f] !== undefined).map((f) => [f, r[f]]));
 }
 
-// How long one command may run when the caller names no timeout: what the profile asked
-// for its sandbox, else `fallback` (the host's default, 10 minutes).
-export function commandTimeoutMs(r: SandboxResources | undefined, fallback: number): number {
-  return r?.commandTimeoutSecs !== undefined ? r.commandTimeoutSecs * 1000 : fallback;
+// The timeout one command is sent with, and how long its caller waits: what the tool
+// asked (`asked`), or with none the sandbox's own; and never more than the command
+// timeout the profile asked for its sandbox, since the host stops every command there
+// whatever is sent. With no such request: `asked`, else `fallback` (the host's default,
+// 10 minutes), as it always was.
+export function execTimeoutMs(r: SandboxResources | undefined, asked: number | undefined, fallback: number): number {
+  if (r?.commandTimeoutSecs === undefined) return asked ?? fallback;
+  const limit = r.commandTimeoutSecs * 1000;
+  return Math.min(asked ?? limit, limit);
 }
 
-// sandboxd refused the sandbox's resources. `code` is stable (invalid_resources,
-// resource_over_maximum, disk_quota_unavailable, resources_mismatch); the message is
-// sandboxd's own, whole: it names the field, what was asked, the limit and what to do.
-// `status` is its HTTP-like status (400, 409, 422): nothing ran.
+// A command's result, saying which limit stopped it when that was the sandbox's command
+// timeout (guestd's exit code 124 and its marker, at exactly that timeout): otherwise a
+// clone cut short by a profile's 120 s reads like a clone that hung. Any other result is
+// returned as it is.
+export function explainTimeout<T extends { exitCode: number; stderr: string }>(result: T, timeoutMs: number, r: SandboxResources | undefined): T {
+  if (r?.commandTimeoutSecs === undefined || timeoutMs !== r.commandTimeoutSecs * 1000) return result;
+  if (result.exitCode !== 124 || !result.stderr.includes("[guestd] command timed out")) return result;
+  return { ...result, stderr: `${result.stderr}\n[lorehouse] stopped at this sandbox's command timeout, ${r.commandTimeoutSecs} s (the profile's sandboxResources.commandTimeoutSecs): it bounds every command run in the sandbox, a clone or a fetch included. A command that needs longer can run as a background job (workspace_job_start)` };
+}
+
+// sandboxd refused the call before anything ran. `code` is stable: for the sandbox's
+// resources invalid_resources, resource_over_maximum, disk_quota_unavailable,
+// resources_mismatch (its VM is running with other resources; they change after its idle
+// stop), disk_in_use and invalid_stored_resources; for a command's body
+// invalid_exec_body. The message is sandboxd's own, whole: it names the field, what was
+// asked, the limit and what to do. `status` is its HTTP-like status (400, 409, 422, 500).
 export class SandboxRefusal extends Error {
   constructor(readonly code: string, readonly status: number, readonly reason: string) {
-    super(`the sandbox host refused this sandbox's resources (${code}): ${reason}`);
+    super(`the sandbox host refused this call (${code}): ${reason}`);
   }
 }
 

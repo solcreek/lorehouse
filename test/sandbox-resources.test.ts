@@ -26,6 +26,7 @@ function problems(...profiles: unknown[]): string[] {
 // sandboxd's own sentence for a request over a maximum (sandbox/host/src/resources.rs).
 const OVER = "resources.memMib 8192 is over this sandbox host's maximum of 4096 (MiB of memory; SANDBOXD_MAX_MEM_MIB). Ask for at most 4096, or have the host's operator raise SANDBOXD_MAX_MEM_MIB in sandboxd's environment. Nothing was created or changed";
 const ASK = { vcpus: 4, memMib: 8192, commandTimeoutSecs: 1800 } as const;
+const MEANS = " (seconds; it bounds every command run in the sandbox, a clone and a fetch included, so under a minute the code tools could not work; background jobs keep their own limits)";
 
 describe("a profile's sandboxResources", () => {
   test("the shipped profiles ask for nothing, so their sandboxes are the host's defaults", () => {
@@ -38,7 +39,7 @@ describe("a profile's sandboxResources", () => {
     const [p] = loadProfiles([{ ...coder, sandboxResources: all }], CATALOG);
     expect(p!.sandboxResources).toEqual(all);
     expect(Object.isFrozen(p!.sandboxResources)).toBe(true);
-    for (const one of [{ vcpus: 1 }, { memMib: 128 }, { diskGib: 65_536 }, { pids: 16 }, { commandTimeoutSecs: 21_600 }]) expect(problems({ ...coder, sandboxResources: one }), JSON.stringify(one)).toEqual([]);
+    for (const one of [{ vcpus: 1 }, { memMib: 128 }, { diskGib: 65_536 }, { pids: 16 }, { commandTimeoutSecs: 21_600 }, { commandTimeoutSecs: 60 }]) expect(problems({ ...coder, sandboxResources: one }), JSON.stringify(one)).toEqual([]);
   });
 
   test("a wrong one stops the start, naming the field and what it allows", () => {
@@ -51,8 +52,15 @@ describe("a profile's sandboxResources", () => {
       [{ memMib: "4096" }, `${at}.memMib: must be a whole number from 128 to 262144, got "4096"`],
       [{ diskGib: null }, `${at}.diskGib: must be a whole number from 1 to 65536, got null`],
       [{ pids: 8 }, `${at}.pids: must be a whole number from 16 to 4096, got 8`],
-      [{ commandTimeoutSecs: 86_400 }, `${at}.commandTimeoutSecs: must be a whole number from 1 to 21600, got 86400`],
-      [{ commandTimeoutSecs: Number.NaN }, `${at}.commandTimeoutSecs: must be a whole number from 1 to 21600, got null`],
+      [{ commandTimeoutSecs: 86_400 }, `${at}.commandTimeoutSecs: must be a whole number from 60 to 21600${MEANS}, got 86400`],
+      [{ commandTimeoutSecs: Number.NaN }, `${at}.commandTimeoutSecs: must be a whole number from 60 to 21600${MEANS}, got null`],
+      // Under a minute no clone could finish: refused here, though sandboxd would take it.
+      [{ commandTimeoutSecs: 59 }, `${at}.commandTimeoutSecs: must be a whole number from 60 to 21600${MEANS}, got 59`],
+      // A name every object has is still not a resource: a problem, never a TypeError.
+      [{ toString: 1 }, `${at}.toString: is not a sandbox resource (allowed: vcpus, memMib, diskGib, pids, commandTimeoutSecs)`],
+      [{ constructor: 4 }, `${at}.constructor: is not a sandbox resource (allowed: vcpus, memMib, diskGib, pids, commandTimeoutSecs)`],
+      [{ hasOwnProperty: 2 }, `${at}.hasOwnProperty: is not a sandbox resource (allowed: vcpus, memMib, diskGib, pids, commandTimeoutSecs)`],
+      [JSON.parse('{"__proto__":1}'), `${at}.__proto__: is not a sandbox resource (allowed: vcpus, memMib, diskGib, pids, commandTimeoutSecs)`],
       [{ gpus: 1 }, `${at}.gpus: is not a sandbox resource (allowed: vcpus, memMib, diskGib, pids, commandTimeoutSecs)`],
       [{ mem_mib: 4096 }, `${at}.mem_mib: is not a sandbox resource (allowed: vcpus, memMib, diskGib, pids, commandTimeoutSecs)`],
       [{ vcpus: 16, pids: 16 }, `${at}.pids: must be at least 24 for 16 vCPUs (the VM's own threads count against it: one per vCPU and a few more), got 16`],
@@ -135,7 +143,7 @@ describe("the request over the runner protocol", () => {
     const err = await ran.catch((e) => e);
     expect(err).toBeInstanceOf(SandboxRefusal);
     expect(err).toMatchObject({ code: "resource_over_maximum", status: 422, reason: OVER });
-    expect(err.message).toBe(`the sandbox host refused this sandbox's resources (resource_over_maximum): ${OVER}`);
+    expect(err.message).toBe(`the sandbox host refused this call (resource_over_maximum): ${OVER}`);
     // A file read and a background job: the same reason; a job's as a 4xx (nothing started).
     const read = sb.readBytes("/w/chart.png");
     link.result(refusedBy(sent[1]!));
@@ -152,7 +160,7 @@ describe("the request over the runner protocol", () => {
     const result = exec!.run({ command: "make" }, { sessionId: "s1" } as never) as Promise<{ error: string }>;
     await new Promise((r) => setTimeout(r, 0)); // the tool's job goes out after its own awaits
     link.result(refusedBy(sent[3]!));
-    expect(await result).toEqual({ error: `the sandbox host refused this sandbox's resources (resource_over_maximum): ${OVER}` });
+    expect(await result).toEqual({ error: `the sandbox host refused this call (resource_over_maximum): ${OVER}` });
   });
 
   test("a runner whose sandboxd would ignore the request is never sent it", async () => {
@@ -195,6 +203,61 @@ describe("the request over the runner protocol", () => {
     const res = await quick.handle(new Request("http://x/runners/results", { method: "POST", headers: { authorization: "Bearer tok", "x-lorehouse-runner": "p1" }, body: JSON.stringify({ results: [refusedBy(jobs[0]!)] }) }));
     expect(res!.status).toBe(204);
     expect(await ran.catch((e) => e)).toMatchObject({ code: "resource_over_maximum", reason: OVER });
+  });
+});
+
+describe("commandTimeoutSecs bounds every command the tools run, not only workspace_exec", () => {
+  const TIMED_OUT = { exitCode: 124, stdout: "", stderr: "Cloning into '/workspace/repo'...\n[guestd] command timed out" };
+  const NOTE = "\n[lorehouse] stopped at this sandbox's command timeout, 120 s (the profile's sandboxResources.commandTimeoutSecs): it bounds every command run in the sandbox, a clone or a fetch included. A command that needs longer can run as a background job (workspace_job_start)";
+  const bodyOf = (job: Job) => JSON.parse(Buffer.from((job as { bodyBase64: string }).bodyBase64, "base64").toString()) as { timeoutMs: number };
+  const reply = (job: Job, result: unknown): JobResult => ({ id: job.id, status: 200, bodyBase64: b64(JSON.stringify(result)) });
+
+  test("through a runner: a tool's own longer timeout is cut to it, so the app never waits past what the host allows, and a stop there says which limit it was", async () => {
+    const hub = hubWith();
+    const { sent, link } = wsRunner(hub, "r1", ["resources"]);
+    const sb = hub.sandbox("s1", { resources: { commandTimeoutSecs: 120 } });
+    // workspace_clone's clone asks for 10 minutes: sent, and waited for, as 120 s.
+    const clone = sb.exec("git clone https://github.com/acme/big /workspace/repo", { cwd: "/", timeoutMs: 10 * 60_000 });
+    expect([sent[0]!.timeoutMs, bodyOf(sent[0]!).timeoutMs]).toEqual([120_000, 120_000]);
+    link.result(reply(sent[0]!, TIMED_OUT));
+    expect(await clone).toEqual({ ...TIMED_OUT, stderr: TIMED_OUT.stderr + NOTE });
+    // A shorter one of its own stays, and a stop at it is the command's own, unremarked.
+    const quick = sb.exec("git config user.name x", { timeoutMs: 30_000 });
+    expect([sent[1]!.timeoutMs, bodyOf(sent[1]!).timeoutMs]).toEqual([30_000, 30_000]);
+    link.result(reply(sent[1]!, TIMED_OUT));
+    expect(await quick).toEqual(TIMED_OUT);
+    // Any other exit at the limit is not a timeout.
+    const failed = sb.exec("make");
+    link.result(reply(sent[2]!, { exitCode: 2, stdout: "", stderr: "make: *** [all] Error 2" }));
+    expect((await failed).stderr).toBe("make: *** [all] Error 2");
+
+    // Asking for more than a tool's own limit doesn't lengthen the tool's: a clone keeps
+    // its 10 minutes under a 30-minute command timeout; a command with none gets the 30.
+    const long = hub.sandbox("s2", { resources: { commandTimeoutSecs: 1800 } });
+    void long.exec("git clone …", { timeoutMs: 10 * 60_000 });
+    void long.exec("make test");
+    expect([sent[3]!.timeoutMs, sent[4]!.timeoutMs]).toEqual([600_000, 1_800_000]);
+    // With no request, every timeout is what it was.
+    void hub.sandbox("s3").exec("git fetch", { timeoutMs: 5 * 60_000 });
+    void hub.sandbox("s3").exec("make");
+    expect([sent[5]!.timeoutMs, sent[6]!.timeoutMs]).toEqual([300_000, EXEC_TIMEOUT_MS]);
+  });
+
+  test("called directly: the same cut, and the same sentence", async () => {
+    const bodies: { timeoutMs: number }[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      if (url.endsWith("/v1/capabilities")) return Response.json({ features: ["resources"] });
+      bodies.push(JSON.parse(init.body as string));
+      return Response.json(TIMED_OUT);
+    }) as typeof fetch;
+    const sb = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f, resources: { commandTimeoutSecs: 120 } });
+    expect(await sb.exec("git clone …", { timeoutMs: 10 * 60_000 })).toEqual({ ...TIMED_OUT, stderr: TIMED_OUT.stderr + NOTE });
+    expect(await sb.exec("git config …", { timeoutMs: 30_000 })).toEqual(TIMED_OUT);
+    expect(await sb.exec("make")).toEqual({ ...TIMED_OUT, stderr: TIMED_OUT.stderr + NOTE });
+    expect(bodies.map((b) => b.timeoutMs)).toEqual([120_000, 30_000, 120_000]);
+    const plain = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f });
+    expect(await plain.exec("git clone …", { timeoutMs: 10 * 60_000 })).toEqual(TIMED_OUT);
+    expect(bodies[3]!.timeoutMs).toBe(600_000);
   });
 });
 
@@ -263,9 +326,9 @@ describe("the request over the direct API", () => {
     const jobErr = await sb.jobs!.start({ id: "b1", command: "make bench", cwd: "/w" }).catch((e) => e);
     expect(jobErr).toBeInstanceOf(JobCallError);
     expect(jobErr).toMatchObject({ status: 422 });
-    expect(jobErr.message).toBe(`job start: the sandbox host refused this sandbox's resources (resource_over_maximum): ${OVER}`);
+    expect(jobErr.message).toBe(`job start: the sandbox host refused this call (resource_over_maximum): ${OVER}`);
     const [exec] = workspaceTools(() => sb);
-    expect(await exec!.run({ command: "make" }, { sessionId: "s1" } as never)).toEqual({ error: `the sandbox host refused this sandbox's resources (resource_over_maximum): ${OVER}` });
+    expect(await exec!.run({ command: "make" }, { sessionId: "s1" } as never)).toEqual({ error: `the sandbox host refused this call (resource_over_maximum): ${OVER}` });
     // A mismatch with the sandbox that exists reads the same way.
     const mismatch = daemon(able, () => Response.json({ error: "sandbox s1 already exists with vcpus 2, …", code: "resources_mismatch", field: "vcpus", asked: 4, has: 2 }, { status: 409 }));
     await expect(remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: mismatch.f, resources: ASK }).exec("make")).rejects.toMatchObject({ code: "resources_mismatch", status: 409 });
