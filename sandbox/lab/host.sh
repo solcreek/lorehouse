@@ -2,21 +2,27 @@
 # Runs as root on a lab host (Ubuntu 24.04 with /dev/kvm); lab.sh copies it there with
 # the sources in /tmp/lab-src.tgz.
 #
-#   host.sh setup    XFS data disk at /srv/sbx, packages, Firecracker + jailer, toolchains,
-#                    and sandboxd + guestd built from /tmp/lab-src.tgz
+#   host.sh setup    data disk at /srv/sbx (XFS, or btrfs with simple quotas on: LAB_FS),
+#                    packages, Firecracker + jailer, toolchains, and sandboxd + guestd built
+#                    from /tmp/lab-src.tgz
 #   host.sh golden   an 8 GiB Ubuntu 24.04 golden (git, build tools, Node 24, Go 1.26) from
 #                    Firecracker's CI rootfs, plus guestd via prepare-golden.sh; kept if present
 #   host.sh start    serve-mode sandboxd on loopback with the repo's unit, its API token a
 #                    systemd credential generated here (it never leaves the host)
 #
+# Env (lab.sh passes them): LAB_FS (xfs | btrfs), LAB_DISK_QUOTA_GIB (btrfs only, 8), and
+# LAB_SANDBOXD, more sandboxd settings as "SANDBOXD_X=1 SANDBOXD_Y=2".
+#
 # Each prints one JSON line last. Versions match starship (2026-10-16).
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
-FC=v1.15.1 GO=1.26.0 NODE=v24.11.0
+FC=v1.15.1 GO=1.26.0 NODE=v24.11.0 BTRFS_PROGS=v7.1
 BUCKET=https://s3.amazonaws.com/spec.ccfc.min
 FC_CI=$BUCKET/firecracker-ci/v1.15/x86_64
 SRC=/opt/lorehouse
 MAX_VMS=${MAX_VMS:-64}
+FS=${LAB_FS:-xfs}
+case "$FS" in xfs|btrfs) ;; *) echo '{"ok":false,"error":"LAB_FS must be xfs or btrfs"}'; exit 2 ;; esac
 
 # A failing command still ends the output with one JSON line, naming what failed.
 trap 'rc=$?; [ "$BASH_SUBSHELL" -eq 0 ] || exit $rc; echo "{\"ok\":false,\"step\":\"${STEP:-}\",\"error\":\"line $LINENO: $(printf %s "$BASH_COMMAND" | tr -d \"\\\\ | cut -c1-160)\"}"; exit $rc' ERR
@@ -25,10 +31,39 @@ setup() {
   if ! mountpoint -q /srv/sbx; then
     dev=/dev/disk/by-id/google-data
     [ -e "$dev" ] || { echo '{"ok":false,"error":"no data disk at /dev/disk/by-id/google-data"}'; exit 1; }
-    blkid "$dev" >/dev/null 2>&1 || mkfs.xfs -q -f -m reflink=1 "$dev"
+    # A new disk is formatted as LAB_FS asks; one already formatted is never reformatted.
+    if ! blkid "$dev" >/dev/null 2>&1; then
+      if [ "$FS" = btrfs ]; then
+        apt-get update -qq && apt-get install -y -qq btrfs-progs >/dev/null
+        mkfs.btrfs -q -f "$dev"
+      else
+        mkfs.xfs -q -f -m reflink=1 "$dev"
+      fi
+    fi
     mkdir -p /srv/sbx
-    grep -q google-data /etc/fstab || echo "$dev /srv/sbx xfs defaults,noatime 0 2" >>/etc/fstab
+    grep -q google-data /etc/fstab || echo "$dev /srv/sbx $(blkid -o value -s TYPE "$dev") defaults,noatime 0 2" >>/etc/fstab
     mount /srv/sbx
+  fi
+  # The data disk is what LAB_FS says, or the lab stops: a disk quota is proved on btrfs
+  # only (sandboxd sets none on XFS), and a boot benchmark compares like with like.
+  has=$(findmnt -n -o FSTYPE /srv/sbx)
+  [ "$has" = "$FS" ] || { echo "{\"ok\":false,\"step\":\"setup\",\"error\":\"/srv/sbx is $has and LAB_FS is $FS: give the other filesystem a VM of its own (LAB_NAME); this disk is not reformatted\"}"; exit 1; }
+  if [ "$FS" = btrfs ]; then
+    # Simple quotas (kernel 6.7+), the only kind sandboxd caps a sandbox's disk with
+    # (sandbox/host/src/quota.rs). Once per filesystem.
+    command -v mkfs.btrfs >/dev/null || { apt-get update -qq && apt-get install -y -qq btrfs-progs >/dev/null; }
+    # sandboxd asks `btrfs quota status`, which Ubuntu 24.04's btrfs-progs (6.6.3) doesn't
+    # have: upstream's static build, the version starship runs, checked against its
+    # published sum, goes ahead of it on the PATH.
+    if ! btrfs quota status /srv/sbx >/dev/null 2>&1; then
+      rel=https://github.com/kdave/btrfs-progs/releases/download/$BTRFS_PROGS
+      curl -fsSL -o /tmp/btrfs.static "$rel/btrfs.static"
+      want=$(curl -fsSL "$rel/btrfs.static.sha256" | awk '{print $1}')
+      [ -n "$want" ] && [ "$(sha256sum /tmp/btrfs.static | awk '{print $1}')" = "$want" ] || { echo '{"ok":false,"step":"setup","error":"btrfs.static does not match its published sha256"}'; exit 1; }
+      install -m 0755 /tmp/btrfs.static /usr/local/bin/btrfs && hash -r
+    fi
+    btrfs quota status /srv/sbx | grep -q 'Mode: *squota' || btrfs quota enable --simple /srv/sbx
+    btrfs quota status /srv/sbx | grep -q 'Mode: *squota' || { echo '{"ok":false,"step":"setup","error":"simple quotas are not on for /srv/sbx after btrfs quota enable --simple"}'; exit 1; }
   fi
   mkdir -p /srv/sbx/state /usr/local/lib/lorehouse
   apt-get update -qq
@@ -103,6 +138,10 @@ start() {
     head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >/etc/lorehouse/sandboxd-api-token
   fi
   install -m 0600 /dev/null /etc/lorehouse/sandboxd.env
+  # XFS: off, since sandboxd sets no quota there. btrfs: set, so sandboxd refuses to start
+  # rather than run uncapped if the quota can't be enforced.
+  quota=0; [ "$FS" != btrfs ] || quota=${LAB_DISK_QUOTA_GIB:-8}
+  [[ "$quota" =~ ^[0-9]+$ ]] || { echo '{"ok":false,"step":"start","error":"LAB_DISK_QUOTA_GIB must be a whole number of GiB"}'; exit 2; }
   cat >/etc/lorehouse/sandboxd.env <<EOF
 SANDBOXD_GOLDEN=/srv/sbx/golden.ext4
 SANDBOXD_KERNEL=/usr/local/lib/lorehouse/vmlinux
@@ -110,8 +149,14 @@ SANDBOXD_UPLINK=$uplink
 SANDBOXD_STATE=/srv/sbx/state
 SANDBOXD_MAX_VMS=$MAX_VMS
 SANDBOXD_IDLE_SECS=900
-SANDBOXD_DISK_QUOTA_GIB=0
+SANDBOXD_DISK_QUOTA_GIB=$quota
 EOF
+  # More settings for this deploy (LAB_SANDBOXD), each checked: the file is sandboxd's
+  # environment, and it is rewritten on every start, so a setting left out next time is gone.
+  for kv in ${LAB_SANDBOXD:-}; do
+    [[ "$kv" =~ ^SANDBOXD_[A-Z0-9_]+=[A-Za-z0-9._:/-]*$ ]] || { echo '{"ok":false,"step":"start","error":"LAB_SANDBOXD takes SANDBOXD_NAME=value pairs separated by spaces"}'; exit 2; }
+    echo "$kv" >>/etc/lorehouse/sandboxd.env
+  done
   # The repo's unit, with two lab-only changes: the API token as a credential, and the
   # state directory on the data disk.
   sed -e 's|^#LoadCredential=runner-token:.*|LoadCredential=api-token:/etc/lorehouse/sandboxd-api-token|' \
@@ -121,7 +166,7 @@ EOF
   systemctl restart sandboxd
   for _ in $(seq 1 20); do curl -fsS -m 1 http://127.0.0.1:8787/healthz >/dev/null 2>&1 && break; sleep 0.5; done
   if systemctl is-active -q sandboxd && curl -fsS -m 2 http://127.0.0.1:8787/healthz >/dev/null 2>&1; then
-    echo "{\"ok\":true,\"step\":\"start\",\"max_vms\":$MAX_VMS,\"uplink\":\"$uplink\"}"
+    echo "{\"ok\":true,\"step\":\"start\",\"max_vms\":$MAX_VMS,\"uplink\":\"$uplink\",\"fs\":\"$FS\",\"disk_quota_gib\":$quota}"
   else
     journalctl -u sandboxd -n 20 --no-pager -o cat | grep -v -i token >&2
     echo '{"ok":false,"step":"start","error":"sandboxd did not come up; see the journal above"}'

@@ -13,6 +13,10 @@
 #
 # Env: LAB_PROJECT (required), LAB_ZONE (us-east4-a), LAB_NAME (sbx-lab),
 # LAB_TYPE (n4-standard-16), LAB_DISK_GB (200).
+# For deploy: LAB_FS (xfs; btrfs turns simple quotas on, so a sandbox's disk is capped: a
+# new VM's data disk is formatted so, an existing one is never reformatted, so give the
+# other filesystem a LAB_NAME of its own), LAB_DISK_QUOTA_GIB (btrfs only, 8), and
+# LAB_SANDBOXD, more sandboxd settings for this deploy ("SANDBOXD_X=1 SANDBOXD_Y=2").
 # Every command ends with one JSON line on stdout; progress goes to stderr.
 set -Eeuo pipefail
 # Any command that fails and stops the script (a create refused for quota, a stop or delete
@@ -100,7 +104,8 @@ case "$cmd" in
     t0=$(now)
     for step in setup golden start; do
       echo "lab: host.sh $step" >&2
-      out=$(remote "sudo bash /tmp/host.sh $step") || { echo "$out" | tail -1; exit 1; }
+      # Quoted for the remote shell; host.sh checks each value itself.
+      out=$(remote "sudo LAB_FS=$(printf %q "${LAB_FS:-xfs}") LAB_DISK_QUOTA_GIB=$(printf %q "${LAB_DISK_QUOTA_GIB:-8}") LAB_SANDBOXD=$(printf %q "${LAB_SANDBOXD:-}") bash /tmp/host.sh $step") || { echo "$out" | tail -1; exit 1; }
       echo "$out" | tail -1 >&2
     done
     printf '{"ok":true,"commit":"%s","deploy_s":%.1f}\n' "$(cat "$tmp/COMMIT")" "$(python3 -c "print($(now)-$t0)")" ;;
