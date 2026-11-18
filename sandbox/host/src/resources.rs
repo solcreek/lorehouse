@@ -481,11 +481,11 @@ pub fn uncapped_directory(id: &str, asked: u64) -> Refusal {
     no_disk_quota(asked, &format!("sandbox {id}'s directory has no quota: it was made before the host's disk quota was on, and stays uncapped; destroy the sandbox so the next request creates it capped"))
 }
 
-/// The grant a sandbox was created with, if it was created with a request.
+/// The sandbox's record: what its last request came to, if it ever had one.
 pub fn read_stored(dir: &Path) -> Result<Option<Granted>, String> {
     let path = dir.join(FILE);
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("{}: {e}; it records what the sandbox was created with, so the sandbox isn't started without it. Destroy the sandbox, or restore the file", path.display())),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("{}: {e}; it records the sandbox's resources, so the sandbox isn't started on a guess. Restore or remove the file (removed, the sandbox follows the host's defaults until a request names others), or destroy the sandbox", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }

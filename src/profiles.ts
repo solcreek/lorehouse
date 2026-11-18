@@ -264,9 +264,9 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
     if (input.sandboxResources === undefined) bad(at, "is set to nothing; leave the field out to get the sandbox host's defaults");
     else {
       for (const problem of resourceProblems(input.sandboxResources, at)) problems.push(`${who}: ${problem}`);
-      if (input.sandbox === "none") bad(at, 'needs a sandbox: this profile\'s sandbox is "none", so nothing would be created with them');
+      if (input.sandbox === "none") bad(at, 'needs a sandbox: this profile\'s sandbox is "none", so nothing would be booted with them');
       else if (Array.isArray(input.triggers) && !input.triggers.some((t: unknown) => isRecord(t) && t.kind === "slack")) {
-        bad(at, 'needs a trigger of kind "slack", for now: only the sandbox of the profile Slack starts is created with a request, so nothing would honor this one');
+        bad(at, 'needs a trigger of kind "slack", for now: only the sandbox of the profile Slack starts is asked for with a request, so nothing would honor this one');
       }
     }
   }

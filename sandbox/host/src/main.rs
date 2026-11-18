@@ -21,7 +21,7 @@
 //!
 //! An exec, file or jobs request may carry `X-Lorehouse-Sandbox-Resources: {"vcpus":4,…}`
 //! (resources.rs): what the sandbox is, within this install's maxima, from its next boot
-//! (a running one must already have it). A refusal is 400, 409 or 422 with
+//! (a running one must already have it). A refusal is 400, 409, 422 or 500 with
 //! `{ "error", "code", "field", … }`. An exec's body is rewritten with the sandbox's
 //! command timeout at most; one that isn't the JSON object guestd is sent is a 400.
 

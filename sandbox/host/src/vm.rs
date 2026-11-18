@@ -367,8 +367,8 @@ pub struct Listing {
     running: bool,
     idle_secs: u64,
     in_flight: usize,
-    /// What it was created with, where it was created with a request (or runs now): null
-    /// for a stopped sandbox that follows the host's defaults.
+    /// What it runs with now, or (stopped) what its record says its last request came to:
+    /// null for a stopped sandbox with no record, which follows the host's defaults.
     resources: Option<Granted>,
 }
 
@@ -451,10 +451,11 @@ impl Manager {
 
     /// Boot the sandbox if it isn't running, and mark it in use. Errors are client-facing.
     ///
-    /// `request`: the resources the caller asks for (resources.rs). A sandbox that doesn't
-    /// exist yet is created with them, within this install's maxima; one that exists must
-    /// already have what is asked. Either is decided before anything is made, booted or
-    /// changed, and a refusal is logged. Returns what the sandbox has.
+    /// `request`: the resources the caller asks for (resources.rs). A sandbox whose VM
+    /// isn't running is booted with them, within this install's maxima; one whose VM runs
+    /// must already have them. Either is decided before anything is made, booted or
+    /// changed, a refusal is logged, and a refused call is not a use of the sandbox.
+    /// Returns what the sandbox has.
     pub async fn acquire_with(&self, id: &str, request: Option<&Request>) -> Result<(Use, PathBuf, Granted), AcquireError> {
         let sb = self.get(id).await;
         sb.in_flight.fetch_add(1, Ordering::SeqCst);

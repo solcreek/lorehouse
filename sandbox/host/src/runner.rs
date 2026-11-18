@@ -52,8 +52,8 @@ struct Job {
     /// How long Lorehouse will still wait for this job, as of handing it out.
     #[serde(rename = "deadlineMs")]
     deadline_ms: Option<u64>,
-    /// The resources asked for the job's sandbox (resources.rs), on a `guest` job: what it
-    /// is created with, and what an existing one must already have. Kept as it arrived, so
+    /// The resources asked for the job's sandbox (resources.rs), on a `guest` job: what its
+    /// VM is next booted with, and what a running one must already have. Kept as it arrived, so
     /// a malformed one is refused with its reason instead of failing the whole frame.
     resources: Option<serde_json::Value>,
 }

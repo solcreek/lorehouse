@@ -82,7 +82,7 @@ sudo sysctl --system && sudo systemctl restart systemd-modules-load
 | `SANDBOXD_MAX_VMS` | `4` | running at once (1–64); more gets a 503 |
 | `SANDBOXD_IDLE_SECS` | `900` | idle time before a VM is stopped |
 | `SANDBOXD_JOB_HOLD_SECS` | `21600` | how long after its last request a VM with a running background job is kept from its idle stop (0–604800; 0: jobs don't hold a VM). The guest says whether a job runs, so this caps how long a guest can keep its slot that way; 6 h is guestd's longest job timeout |
-| `SANDBOXD_VCPUS` `SANDBOXD_MEM_MIB` | `2`, `2048` | per VM, unless its sandbox was created with a request for others ([Resources](#resources-per-sandbox)) |
+| `SANDBOXD_VCPUS` `SANDBOXD_MEM_MIB` | `2`, `2048` | per VM, unless its sandbox's request asks for others ([Resources](#resources-per-sandbox)) |
 | `SANDBOXD_MAX_VCPUS` `SANDBOXD_MAX_MEM_MIB` | the two above | the most a sandbox may be granted when it asks (up to 32 and 262144); never under the default |
 | `SANDBOXD_MAX_DISK_GIB` | `SANDBOXD_DISK_QUOTA_GIB` | the most disk a sandbox may ask for (up to 65536). Only where the quota is on: with `SANDBOXD_DISK_QUOTA_GIB=0` setting it refuses the start, and where the filesystem has no quota no size is granted whatever it says |
 | `SANDBOXD_MAX_PIDS` | `64` | the most `pids.max` a sandbox may ask for its VM's cgroup (64–4096) |
@@ -286,8 +286,8 @@ not as a loop.
 ## Resources, per sandbox
 
 A sandbox gets 2 vCPUs, 2048 MiB, 8 GiB of disk (where the quota is on), `pids.max` 64
-and 10 minutes a command, unless the call that creates it asks for others: a job's
-`resources` in runner mode, the `X-Lorehouse-Sandbox-Resources` header in serve mode
+and 10 minutes a command, unless a call asks for others: a job's `resources` in runner
+mode, the `X-Lorehouse-Sandbox-Resources` header in serve mode
 ([`docs/sandbox-runners.md`](../../docs/sandbox-runners.md#resources) has the fields, the
 codes and the rules; [`src/resources.rs`](src/resources.rs) is the policy).
 
@@ -296,29 +296,52 @@ codes and the rules; [`src/resources.rs`](src/resources.rs) is the policy).
   defaults to its default, so a host that sets none grants nothing more than it always
   did. sandboxd logs what it grants at start
   (`sandboxd: a sandbox gets … unless it asks; a request may ask for up to …`), each boot
-  with what the VM got, and each refusal (`sandboxd: <id>: refused (<code>): …`).
-- **Sizing is yours.** Nothing checks the sum: `SANDBOXD_MAX_VMS` sandboxes may each be
-  granted `SANDBOXD_MAX_MEM_MIB` (plus `SANDBOXD_VM_MEM_HEADROOM_MIB`) and
-  `SANDBOXD_MAX_VCPUS`. Raise a maximum only as far as the host has room for all of them
-  at once (ADR 0003, layer 5).
+  with what the VM got, each change (`<id>: resources changed from (…) to (…)`), and each
+  refusal (`<id>: refused (<code>): …`).
+- **Fixed while a VM runs; a stopped sandbox takes its next request.** A request for
+  other values than a running VM has is refused (`resources_mismatch`) and does not count
+  as activity, so the VM still stops after `SANDBOXD_IDLE_SECS`. The first request after
+  that is granted afresh against the maxima and recorded in
+  `<SANDBOXD_STATE>/<id>/resources.json` (written and synced before the boot that uses
+  it). A call with no request leaves the sandbox as it is: that record, or, for a sandbox
+  that has none, the host's defaults at each boot, so changing `SANDBOXD_VCPUS`,
+  `SANDBOXD_MEM_MIB` or `SANDBOXD_DISK_QUOTA_GIB` still reaches those. There is no call
+  that stops a VM and keeps its disk; a guest that reboots (`reboot -f`) stops its own.
+- **A record is checked before it is booted.** One over a maximum lowered since
+  (`resource_over_maximum`), or that no request could have been granted
+  (`invalid_stored_resources`: a damaged file), is not started and not adjusted. A request
+  the host can grant replaces it; so does destroying the sandbox.
 - **Where each is enforced.** vCPUs and memory: the VM's `machine-config` and its cgroup's
   `cpu.max` (vCPUs + 1) and `memory.max` (RAM + headroom). pids: its cgroup's `pids.max`,
   which counts the VMM's threads on the host, not the guest's processes. Disk: its btrfs
-  subvolume's qgroup limit, set at every boot. Command timeout: the `timeoutMs` sandboxd
-  sends guestd with each `POST /exec`, and sandboxd's own wait 330 s past it.
-- **Kept with the disk.** `<SANDBOXD_STATE>/<id>/resources.json` is what a sandbox was
-  created with; it is not resized, and a request for other values is refused
-  (`resources_mismatch`). Lowering a maximum under a sandbox's grant keeps that sandbox
-  from starting until the maximum is raised again or the sandbox is destroyed. Changing
-  `SANDBOXD_VCPUS`, `SANDBOXD_MEM_MIB` or `SANDBOXD_DISK_QUOTA_GIB` still reaches, at
-  their next boot, the sandboxes created with no request (they have no such file).
+  subvolume's qgroup limit, set at every boot; it can grow, and is never set under what
+  the sandbox has written (`disk_in_use`, read with `btrfs qgroup show --raw -f`).
+  Command timeout: the `timeoutMs` in the body sandboxd writes for guestd with each
+  `POST /exec` (never the caller's bytes), and sandboxd's own wait 330 s past it.
 - **Disk sizes need the quota.** Where disks aren't capped (below), a request with
   `diskGib` is refused (`disk_quota_unavailable`); without it the sandbox runs uncapped,
   as every sandbox there does.
+- **Sizing is yours.** Nothing checks a sum.
+  - Memory and CPU: `SANDBOXD_MAX_VMS` sandboxes may each be granted
+    `SANDBOXD_MAX_MEM_MIB` (plus `SANDBOXD_VM_MEM_HEADROOM_MIB`) and `SANDBOXD_MAX_VCPUS`.
+    Raise a maximum only as far as the host has room for all of them at once (ADR 0003,
+    layer 5).
+  - Disk: a stopped sandbox holds no VM slot and keeps its disk, and nothing caps how
+    many sandboxes there are or removes old ones (no retention yet). So the most the
+    state directory can come to is the number of sandboxes ever made and not destroyed,
+    times `SANDBOXD_MAX_DISK_GIB`, on top of the golden and the mirrors. A cap bounds one
+    sandbox, not the host: watch the filesystem, and destroy sandboxes of threads that are
+    over.
+- **Update guestd with sandboxd.** guestd reads an exec body by its exact keys since the
+  same change; a golden image made before it still works (sandboxd's rewritten body is
+  the main defence), and gets the second check when it is rebuilt
+  (`prepare-golden.sh`).
 
-Not yet verified on real KVM (2026-11-18): the unit tests assert the VM config, the
-jailer's arguments, the qgroup limit and the body guestd is sent; `sandbox/lab` proves
-them on a host.
+Proved on real KVM by `sandbox/lab/bench.py limits` (2026-11-18, before the two changes
+above): each limit in two sandboxes with different requests, and the refusals. Not yet
+proved there: a stopped sandbox taking a new request, the disk growing and
+`disk_in_use` (its usage is read from `btrfs qgroup show`, parsed from sample output
+only), and the rewritten exec body.
 
 ## Limits
 
@@ -335,7 +358,7 @@ What one sandbox can take from the host and send to the internet, each per VM:
   IPv6 too, though a guest has none.
 - **Disk**: a sandbox's disk is a reflink of the golden, so it costs only what the guest
   writes, and that is capped at `SANDBOXD_DISK_QUOTA_GIB` (8 GiB), or at the size its
-  sandbox was created with ([Resources](#resources-per-sandbox)). A write past it fails:
+  sandbox's request asks for ([Resources](#resources-per-sandbox)). A write past it fails:
   the guest sees I/O errors on its disk, and ext4 may abort its journal and go read-only
   until the next boot (in the run below, guestd kept answering and small writes still
   worked). [`quota.rs`](src/quota.rs). Booting a sandbox that is already full wasn't

@@ -77,11 +77,11 @@ describe("a profile's sandboxResources", () => {
 
   test("nothing is accepted unless something honors it: no sandbox, or not the profile Slack starts, is refused", () => {
     expect(problems({ ...coder, tools: ["search_knowledge"], sandbox: "none", sandboxResources: { memMib: 4096 } })).toEqual([
-      'profile "lorehouse": sandboxResources: needs a sandbox: this profile\'s sandbox is "none", so nothing would be created with them',
+      'profile "lorehouse": sandboxResources: needs a sandbox: this profile\'s sandbox is "none", so nothing would be booted with them',
     ]);
     const review = { ...coder, id: "review", mode: "automation", prompt: "review", triggers: [], sandboxResources: { memMib: 4096 } };
     expect(problems(coder, review)).toEqual([
-      'profile "review": sandboxResources: needs a trigger of kind "slack", for now: only the sandbox of the profile Slack starts is created with a request, so nothing would honor this one',
+      'profile "review": sandboxResources: needs a trigger of kind "slack", for now: only the sandbox of the profile Slack starts is asked for with a request, so nothing would honor this one',
     ]);
     // The sandbox's access level is still the one word it was.
     expect(problems({ ...coder, sandbox: { access: "write", resources: { memMib: 4096 } } })[0]).toMatch(/sandbox: must be one of none, write/);
