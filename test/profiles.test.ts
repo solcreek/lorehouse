@@ -126,6 +126,17 @@ describe("a profile is checked on start", () => {
     expect(problems({ ...valid, tools: ["search_knowledge", , ] })).toEqual(['profile "lorehouse": tools: nothing is not a tool (allowed: search_knowledge, workspace_exec, open_pull_request)']);
   });
 
+  // The copy keeps a hole, and a loop that skips holes would leave it unchecked: after the
+  // trigger it would reach /status as a null trigger, before it slackTrigger would throw.
+  test("a hole among a profile's triggers is refused, after the trigger or before it", () => {
+    const slack = { kind: "slack", events: ["mention"] };
+    expect(problems({ ...valid, triggers: [slack, , ] })).toEqual(['profile "lorehouse": triggers[1].kind: must be one of slack, got nothing']);
+    const first: unknown[] = [];
+    first[1] = slack;
+    expect(problems({ ...valid, triggers: first })).toEqual(['profile "lorehouse": triggers[0].kind: must be one of slack, got nothing']);
+    expect(problems({ ...valid, triggers: new Array(1) })).toEqual(['profile "lorehouse": triggers[0].kind: must be one of slack, got nothing', 'profile "lorehouse": triggers: an interactive profile needs a trigger of kind "slack"']);
+  });
+
   test("every bad input is a ProfileError, whatever it is: a bigint, a circular object, a symbol", () => {
     const circular: Record<string, unknown> = { ...valid };
     circular.self = circular;
