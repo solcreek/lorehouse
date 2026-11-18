@@ -40,6 +40,27 @@ export function staticToken(token: string, opts: { fetch?: typeof fetch; apiUrl?
   return access;
 }
 
+// GitHub's rate limits: a 429, or a 403 that says so (the primary limit's
+// x-ratelimit-remaining: 0; a secondary limit's retry-after). `retryAfterSecs` when it says
+// how long to wait.
+function rateLimit(res: Response): { retryAfterSecs?: number } | undefined {
+  const retry = res.headers.get("retry-after");
+  if (res.status !== 429 && !(res.status === 403 && (res.headers.get("x-ratelimit-remaining") === "0" || retry !== null))) return undefined;
+  return retry !== null && /^\d{1,6}$/.test(retry) ? { retryAfterSecs: Number(retry) } : {};
+}
+
+// An answer from GitHub that wasn't the one asked for: its status, and whether it was a
+// rate limit, so a caller can tell a refused credential (401) from a busy GitHub.
+export class GithubRefused extends Error {
+  readonly status: number;
+  readonly rateLimit?: { retryAfterSecs?: number };
+  constructor(res: Response, message: string) {
+    super(message);
+    this.status = res.status;
+    this.rateLimit = rateLimit(res);
+  }
+}
+
 type AppOptions = { appId: string; privateKey: string; fetch?: typeof fetch; now?: () => number; apiUrl?: string };
 
 // A JWT for the App itself (RS256): valid 9 minutes, backdated 60 s for clock skew.
@@ -71,12 +92,12 @@ export function githubApp(opts: AppOptions): GithubAccess {
 
     const install = await call(`/repos/${repo.owner}/${repo.name}/installation`);
     if (install.status === 404) throw new Error(`the GitHub App isn't installed on ${repo.owner}/${repo.name}; install it there (Only select repositories) and try again`);
-    if (!install.ok) throw new Error(`GitHub App: looking up ${repo.owner}/${repo.name}: ${install.status} ${(await install.text()).slice(0, 200)}`);
+    if (!install.ok) throw new GithubRefused(install, `GitHub App: looking up ${repo.owner}/${repo.name}: ${install.status} ${(await install.text()).slice(0, 200)}`);
     const { id } = (await install.json()) as { id: number };
 
     const permissions = access === "write" ? { contents: "write", pull_requests: "write" } : { contents: "read" };
     const res = await call(`/app/installations/${id}/access_tokens`, { method: "POST", body: JSON.stringify({ repositories: [repo.name], permissions }) });
-    if (!res.ok) throw new Error(`GitHub App: a ${access} token for ${repo.owner}/${repo.name}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+    if (!res.ok) throw new GithubRefused(res, `GitHub App: a ${access} token for ${repo.owner}/${repo.name}: ${res.status} ${(await res.text()).slice(0, 200)}`);
     const { token, expires_at } = (await res.json()) as { token: string; expires_at: string };
     cache.set(key, { token, expiresAt: Date.parse(expires_at) });
     return token;
@@ -96,15 +117,25 @@ export function githubApp(opts: AppOptions): GithubAccess {
 
 // Whether the credential can read a repo now, and whether a branch exists there: asked
 // before a channel's default repo is stored (admin.ts) and again by `lorehouse doctor`,
-// since it can go stale (the App uninstalled, the repo renamed or deleted).
-//   not_installed     the GitHub App isn't installed on the repo
-//   not_readable      the credential got no read of it (a token without access, or no such repo)
-//   branch_not_found  the repo is readable and has no such branch
-//   unavailable       GitHub didn't answer, or refused the credential itself: not a verdict
+// since it can go stale (the App uninstalled, the repo renamed or deleted). Each outcome
+// has its own next step:
+//   not_installed       the GitHub App isn't installed on the repo: install it there
+//   not_readable        no read of it (404, or a 403 that isn't a rate limit): no such
+//                       repo, or the credential has no access to it
+//   branch_not_found    the repo is readable and has no such branch
+//   credential_refused  GitHub refused the credential itself (401): an expired or revoked
+//                       GITHUB_TOKEN, or an App id and key that don't match. Fix the credential
+//   rate_limited        GitHub is rate limiting the credential: wait (retryAfterSecs when it says)
+//   unavailable         GitHub didn't answer, or failed: try again. Not a verdict on the repo
 // `repo` in an ok answer is the name as GitHub spells it (its case; the new name after a rename).
 export type RepoCheck =
   | { ok: true; repo: RepoRef }
-  | { ok: false; reason: "not_installed" | "not_readable" | "branch_not_found" | "unavailable"; detail: string };
+  | { ok: false; reason: "not_installed" | "not_readable" | "branch_not_found" | "credential_refused" | "unavailable"; detail: string }
+  | { ok: false; reason: "rate_limited"; detail: string; retryAfterSecs?: number };
+
+type Failed = Extract<RepoCheck, { ok: false }>;
+const REFUSED = "GitHub refused the credential itself (401)";
+const limited = (l: { retryAfterSecs?: number }): Failed => ({ ok: false, reason: "rate_limited", detail: `GitHub is applying a rate limit to the credential${l.retryAfterSecs !== undefined ? ` (it says to wait ${l.retryAfterSecs} s)` : ""}`, ...l });
 
 export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { branch?: string; fetch?: typeof fetch; apiUrl?: string } = {}): Promise<RepoCheck> {
   const f = opts.fetch ?? fetch;
@@ -115,7 +146,10 @@ export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { bra
     token = await github(repo, "read");
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
-    return { ok: false, reason: /isn't installed/.test(detail) ? "not_installed" : "unavailable", detail };
+    if (/isn't installed/.test(detail)) return { ok: false, reason: "not_installed", detail };
+    if (e instanceof GithubRefused && e.rateLimit) return limited(e.rateLimit);
+    if (e instanceof GithubRefused && e.status === 401) return { ok: false, reason: "credential_refused", detail: `${REFUSED}: ${detail}` };
+    return { ok: false, reason: "unavailable", detail };
   }
   const get = async (path: string): Promise<Response | string> => {
     try {
@@ -125,9 +159,20 @@ export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { bra
     }
   };
 
+  // What an answer that isn't the thing asked for means, apart from "not there", which
+  // is the caller's to name: a rate limit, or the credential refused.
+  const refused = (r: Response, what: string): Failed | undefined => {
+    const l = rateLimit(r);
+    if (l) return limited(l);
+    if (r.status === 401) return { ok: false, reason: "credential_refused", detail: `${REFUSED} when asked for ${what}` };
+    return undefined;
+  };
+
   const res = await get(`/repos/${repo.owner}/${repo.name}`);
   if (typeof res === "string") return { ok: false, reason: "unavailable", detail: res };
-  if (res.status === 401 || res.status === 403 || res.status === 404) return { ok: false, reason: "not_readable", detail: `the GitHub credential can't read ${full} (GitHub answered ${res.status}): no such repo, or no access to it` };
+  const no = refused(res, full);
+  if (no) return no;
+  if (res.status === 403 || res.status === 404) return { ok: false, reason: "not_readable", detail: `the GitHub credential can't read ${full} (GitHub answered ${res.status}): no such repo, or no access to it` };
   if (!res.ok) return { ok: false, reason: "unavailable", detail: `GitHub answered ${res.status} for ${full}` };
   const named = ((await res.json().catch(() => undefined)) as { full_name?: unknown } | undefined)?.full_name;
   const [owner, name, ...more] = typeof named === "string" ? named.split("/") : [];
@@ -137,6 +182,8 @@ export async function checkRepo(github: GithubAccess, repo: RepoRef, opts: { bra
     // Each part of the name encoded, the slashes kept: a branch may be "release/2026.11".
     const b = await get(`/repos/${canonical.owner}/${canonical.name}/branches/${opts.branch.split("/").map(encodeURIComponent).join("/")}`);
     if (typeof b === "string") return { ok: false, reason: "unavailable", detail: b };
+    const noBranch = refused(b, `the branch ${opts.branch} of ${full}`);
+    if (noBranch) return noBranch;
     if (b.status === 404) return { ok: false, reason: "branch_not_found", detail: `${canonical.owner}/${canonical.name} has no branch ${opts.branch}` };
     if (!b.ok) return { ok: false, reason: "unavailable", detail: `GitHub answered ${b.status} for the branch ${opts.branch} of ${full}` };
   }

@@ -195,12 +195,15 @@ doesn't change, so a script or an agent can branch on it.
 | 400 | `invalid_branch` | `branch` isn't a branch name | name a branch, or leave it out |
 | 409 | `code_tools_off` | PUT on an install with no sandbox and no GitHub credential: there is nothing to check the repo with, and nothing would use it | turn code tools on, restart, set it again |
 | 422 | `app_not_installed` | the GitHub App isn't installed on the repo | install the App on that repo, set it again |
-| 422 | `repo_not_readable` | the credential gets no read of the repo: there is no such repo, or it has no access | check the name, or give the credential access |
+| 422 | `repo_not_readable` | the credential gets no read of the repo (a 404, or a 403 that isn't a rate limit): there is no such repo, or it has no access | check the name, or give the credential access |
 | 422 | `branch_not_found` | the repo is readable and has no such branch | name a branch that exists, or leave `branch` out |
-| 502 | `github_unavailable` | GitHub didn't answer, or refused the credential itself | try again; if it keeps failing, `lorehouse doctor` |
+| 502 | `credential_refused` | GitHub refused the install's own credential (a 401): `GITHUB_TOKEN` expired or revoked, or an App id and key that don't match | fix the credential (`lorehouse doctor` checks it) and restart; the repo's access is not the problem |
+| 503 | `github_rate_limited` | GitHub is rate limiting the credential (a 429, or a 403 that says so) | wait, then set it again; `Retry-After` carries GitHub's own, in seconds, when it gave one |
+| 502 | `github_unavailable` | GitHub didn't answer in time, or failed (a 5xx) | try again; if it keeps failing, `lorehouse doctor` |
 
-The checks run in that order, and the first that fails answers; `github_unavailable` can
-come from either question to GitHub (the repo, then the branch). With `code_tools_off`,
+The checks run in that order, and the first that fails answers; the last three can come
+from any question to GitHub (the installation, the repo, then the branch), and none of
+them is a verdict on the repo. With `code_tools_off`,
 GET and DELETE still work.
 
 A default can go stale after it is set: the App uninstalled from the repo, the repo

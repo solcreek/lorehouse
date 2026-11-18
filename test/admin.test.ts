@@ -527,6 +527,22 @@ describe("a channel's default repo", () => {
     expect(await refused(r, { repo: "acme/widgets" }, 502, "github_unavailable")).toContain("try again");
   });
 
+  test("credential_refused (502): GitHub refused the install's own credential, so the fix is the credential, not the repo's access", async () => {
+    const r = repoSetup({ checkRepo: github(() => ({ ok: false, reason: "credential_refused", detail: "GitHub refused the credential itself (401) when asked for acme/widgets" })).checkRepo });
+    const error = await refused(r, { repo: "acme/widgets" }, 502, "credential_refused");
+    expect(error).toContain("GITHUB_TOKEN has expired or been revoked");
+    expect(error).not.toContain("access to it");
+  });
+
+  test("github_rate_limited (503): GitHub is rate limiting; Retry-After is passed on when GitHub gave one", async () => {
+    const r = repoSetup({ checkRepo: github(() => ({ ok: false, reason: "rate_limited", detail: "GitHub is applying a rate limit to the credential (it says to wait 60 s)", retryAfterSecs: 60 })).checkRepo });
+    expect(await refused(r, { repo: "acme/widgets" }, 503, "github_rate_limited")).toContain("wait 60 s");
+    expect((await r.get("/api/v1/channels/C1/repo", { method: "PUT", body: '{"repo":"acme/widgets"}' })).headers.get("retry-after")).toBe("60");
+    const unsaid = repoSetup({ checkRepo: github(() => ({ ok: false, reason: "rate_limited", detail: "GitHub is applying a rate limit to the credential" })).checkRepo });
+    await refused(unsaid, { repo: "acme/widgets" }, 503, "github_rate_limited");
+    expect((await unsaid.get("/api/v1/channels/C1/repo", { method: "PUT", body: '{"repo":"acme/widgets"}' })).headers.get("retry-after")).toBeNull();
+  });
+
   test("a refused set leaves the default that was there", async () => {
     let gone = false;
     const r = repoSetup({ checkRepo: github(() => (gone ? { ok: false, reason: "not_installed", detail: "x" } : undefined)).checkRepo });

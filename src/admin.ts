@@ -241,6 +241,9 @@ export function adminRoutes(opts: AdminOptions) {
       if (check.reason === "not_installed") throw new Refusal(422, "app_not_installed", `the GitHub App isn't installed on ${full}: install it there (the App's settings, Install App, Only select repositories), then set it again`);
       if (check.reason === "not_readable") throw new Refusal(422, "repo_not_readable", `${check.detail}. Check the name, or give the credential access to it, then set it again`);
       if (check.reason === "branch_not_found") throw new Refusal(422, "branch_not_found", `${check.detail}: name a branch that exists, or leave "branch" out for the repo's default branch`);
+      // Not verdicts on the repo: the install's own credential, or GitHub, is what to fix or wait for.
+      if (check.reason === "credential_refused") throw new Refusal(502, "credential_refused", `GitHub refused this install's own credential (401), so ${full} couldn't be checked and nothing was changed: GITHUB_TOKEN has expired or been revoked, or GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY aren't the same App's. Fix the credential (\`lorehouse doctor\` checks it), restart, then set it again`);
+      if (check.reason === "rate_limited") throw new Refusal(503, "github_rate_limited", `${check.detail}, so ${full} couldn't be checked and nothing was changed: wait${check.retryAfterSecs !== undefined ? ` ${check.retryAfterSecs} s (Retry-After)` : ""}, then set it again`, check.retryAfterSecs !== undefined ? { "retry-after": String(check.retryAfterSecs) } : {});
       throw new Refusal(502, "github_unavailable", `couldn't check ${full} with GitHub (${check.detail}); nothing was changed, try again`);
     }
     const before = getChannelRepo(db, channel);

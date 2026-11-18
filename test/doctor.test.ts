@@ -35,7 +35,7 @@ type World = {
   anthropic?: number; // status of GET /v1/models/…
   appPermissions?: Record<string, string>;
   installations?: number | "http_500" | "not_a_list";
-  repos?: Record<string, "not_installed" | "unreadable" | "down">; // owner/name → why GitHub won't serve it (default: readable)
+  repos?: Record<string, "not_installed" | "unreadable" | "down" | "limited" | "refused">; // owner/name → why GitHub won't serve it (default: readable)
   branches?: string[]; // the branches every repo has (default: main)
   app?: { secret?: string; status?: object | number | string; adminToken?: string | null }; // status as a string: a non-JSON body, 200; adminToken null: /api closed
 };
@@ -80,6 +80,8 @@ function world(w: World = {}) {
       if (repo) {
         const state = w.repos?.[repo[1]!] ?? "readable";
         if (state === "down") return new Response("oops", { status: 503 });
+        if (state === "limited") return new Response("{}", { status: 403, headers: { "x-ratelimit-remaining": "0" } });
+        if (state === "refused" && repo[2] !== "/installation") return new Response("{}", { status: 401 });
         if (repo[2] === "/installation") return state === "not_installed" ? new Response("{}", { status: 404 }) : Response.json({ id: 42 });
         if (state === "unreadable") return new Response("{}", { status: 404 });
         if (repo[3]) return (w.branches ?? ["main"]).includes(repo[3]) ? Response.json({ name: repo[3] }) : new Response("{}", { status: 404 });
@@ -455,6 +457,22 @@ describe("code tools", () => {
         const down = find(await run({ ...app, ...env }, { repos: { "acme/widgets": "down" } }), "default repo");
         expect(down[0]).toMatchObject({ level: "fail" });
         expect(down[0]!.detail).toContain("run this again once GitHub answers");
+      });
+    });
+
+    // The advice must fit the cause: an expired token or a rate limit isn't the repo's access.
+    test("a refused credential or a rate limit fails with its own advice, never 'give the credential access'", async () => {
+      await withDefaults(async (env) => {
+        const dev = { SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1" };
+        const refused = find(await run({ ...dev, ...env }, { repos: { "acme/widgets": "refused" } }), "default repo")[0]!;
+        expect(refused.level).toBe("fail");
+        expect(refused.detail).toContain("GitHub refused the credential itself (401)");
+        expect(refused.detail).toContain("fix the credential itself");
+        const limited = find(await run({ ...dev, ...env }, { repos: { "acme/widgets": "limited" } }), "default repo")[0]!;
+        expect(limited.level).toBe("fail");
+        expect(limited.detail).toContain("rate limit");
+        expect(limited.detail).toContain("run this again once the rate limit has passed");
+        for (const c of [refused, limited]) expect(c.detail).not.toContain("give the credential access");
       });
     });
 

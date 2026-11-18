@@ -326,6 +326,8 @@ export async function doctor(opts: DoctorOptions = {}): Promise<Check[]> {
         not_installed: "install the App on that repo",
         not_readable: "give the credential access to it",
         branch_not_found: "restore the branch",
+        credential_refused: "fix the credential itself (GITHUB_TOKEN expired or revoked, or an App id and key that don't match: see the checks above), not the repo's access",
+        rate_limited: "run this again once the rate limit has passed",
         unavailable: "run this again once GitHub answers",
       }[check.reason];
       add("github", "default repo", "fail", `${what}: ${check.detail}. A request in ${d.channel} that names no repo fails until then: ${fix}, or set another (PUT /api/v1/channels/${d.channel}/repo, docs/admin-api.md), or clear it (DELETE)`);

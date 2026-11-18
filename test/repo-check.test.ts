@@ -7,7 +7,18 @@ import { checkRepo, githubApp, staticToken } from "../src/github-auth";
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 
-type Api = { installed?: boolean; repo?: number | "network" | object; branch?: number | "network"; installation?: number };
+// How GitHub refuses: a status, or one of its two ways of saying "rate limited" on a 403
+// (the primary limit's x-ratelimit-remaining: 0; a secondary limit's retry-after), or a 429.
+type Refuse = number | "limit403" | "retry403" | "retry429";
+type Api = { installed?: boolean; repo?: Refuse | "network" | object; branch?: Refuse | "network"; installation?: Refuse; token?: Refuse };
+
+function refusal(r: Refuse): Response {
+  if (r === "limit403") return new Response("{}", { status: 403, headers: { "x-ratelimit-remaining": "0" } });
+  if (r === "retry403") return new Response("{}", { status: 403, headers: { "retry-after": "60" } });
+  if (r === "retry429") return new Response("{}", { status: 429, headers: { "retry-after": "30" } });
+  return new Response("{}", { status: r });
+}
+const refuses = (v: unknown): v is Refuse => typeof v === "number" || v === "limit403" || v === "retry403" || v === "retry429";
 
 // A fake GitHub: the App's installation lookup and token exchange, a repo and its branches.
 function fakeApi(o: Api = {}) {
@@ -15,16 +26,16 @@ function fakeApi(o: Api = {}) {
   const f = (async (url: string, init: RequestInit = {}) => {
     const path = new URL(url).pathname;
     reqs.push({ path, auth: new Headers(init.headers).get("authorization") ?? "" });
-    if (path.endsWith("/installation")) return o.installation ? new Response("no", { status: o.installation }) : o.installed === false ? new Response("not found", { status: 404 }) : Response.json({ id: 42 });
-    if (path === "/app/installations/42/access_tokens") return Response.json({ token: "ghs_read", expires_at: new Date(Date.now() + 3600_000).toISOString() }, { status: 201 });
+    if (path.endsWith("/installation")) return o.installation ? refusal(o.installation) : o.installed === false ? new Response("not found", { status: 404 }) : Response.json({ id: 42 });
+    if (path === "/app/installations/42/access_tokens") return o.token ? refusal(o.token) : Response.json({ token: "ghs_read", expires_at: new Date(Date.now() + 3600_000).toISOString() }, { status: 201 });
     if (/^\/repos\/[^/]+\/[^/]+$/.test(path)) {
       if (o.repo === "network") throw new Error("connection refused");
-      if (typeof o.repo === "number") return new Response("{}", { status: o.repo });
+      if (refuses(o.repo)) return refusal(o.repo);
       return Response.json(o.repo ?? { full_name: path.slice("/repos/".length), default_branch: "main" });
     }
     if (path.includes("/branches/")) {
       if (o.branch === "network") throw new Error("connection reset");
-      return o.branch ? new Response("{}", { status: o.branch }) : Response.json({ name: path.split("/branches/")[1] });
+      return o.branch ? refusal(o.branch) : Response.json({ name: path.split("/branches/")[1] });
     }
     return new Response("unexpected", { status: 500 });
   }) as unknown as typeof fetch;
@@ -51,9 +62,34 @@ describe("checkRepo", () => {
     expect(api.reqs.map((r) => r.path)).toEqual(["/repos/acme/widgets/installation"]);
   });
 
-  test("the App's own credential refused, or GitHub down: unavailable, not a verdict on the repo", async () => {
-    expect(await checkRepo(app(fakeApi({ installation: 401 })), widgets)).toMatchObject({ ok: false, reason: "unavailable" });
+  test("GitHub down for the App: unavailable, not a verdict on the repo", async () => {
     expect(await checkRepo(app(fakeApi({ installation: 503 })), widgets)).toMatchObject({ ok: false, reason: "unavailable" });
+    expect(await checkRepo(app(fakeApi({ token: 500 })), widgets)).toMatchObject({ ok: false, reason: "unavailable" });
+  });
+
+  // An expired GITHUB_TOKEN, or an App id and key that don't match: the credential is what
+  // needs fixing, not the repo's access.
+  test("a 401 is the credential itself refused: credential_refused, never 'can't read the repo'", async () => {
+    for (const api of [fakeApi({ repo: 401 }), fakeApi({ branch: 401 })]) {
+      const r = await checkRepo(token(api), widgets, { fetch: api.f, branch: "main" });
+      expect(r).toMatchObject({ ok: false, reason: "credential_refused" });
+      expect((r as { detail: string }).detail).toContain("401");
+    }
+    for (const api of [fakeApi({ installation: 401 }), fakeApi({ token: 401 })]) {
+      expect(await checkRepo(app(api), widgets, { fetch: api.f })).toMatchObject({ ok: false, reason: "credential_refused" });
+    }
+  });
+
+  // GitHub's rate limits come as a 403 too; they say nothing about the repo.
+  test("a rate limit (429, or a 403 with x-ratelimit-remaining: 0 or retry-after) is rate_limited, with how long to wait when GitHub says", async () => {
+    for (const how of ["limit403", "retry403", "retry429"] as const) {
+      const onRepo = fakeApi({ repo: how });
+      expect([how, await checkRepo(token(onRepo), widgets, { fetch: onRepo.f })]).toEqual([how, { ok: false, reason: "rate_limited", detail: expect.stringContaining("rate limit"), ...(how === "limit403" ? {} : { retryAfterSecs: how === "retry403" ? 60 : 30 }) }]);
+      const onBranch = fakeApi({ branch: how });
+      expect(await checkRepo(token(onBranch), widgets, { fetch: onBranch.f, branch: "main" })).toMatchObject({ ok: false, reason: "rate_limited" });
+      const onApp = fakeApi({ installation: how });
+      expect(await checkRepo(app(onApp), widgets, { fetch: onApp.f })).toMatchObject({ ok: false, reason: "rate_limited" });
+    }
   });
 
   test("with a plain token: readable when GitHub serves the repo to it", async () => {
@@ -62,8 +98,8 @@ describe("checkRepo", () => {
     expect(api.reqs).toEqual([{ path: "/repos/acme/widgets", auth: "Bearer ghp_dev" }]);
   });
 
-  test("a repo the credential gets no read of (404, 403, 401): not_readable", async () => {
-    for (const status of [404, 403, 401]) {
+  test("a repo the credential gets no read of (404, or a 403 that isn't a rate limit): not_readable", async () => {
+    for (const status of [404, 403]) {
       const api = fakeApi({ repo: status });
       const r = await checkRepo(token(api), widgets, { fetch: api.f });
       expect(r).toMatchObject({ ok: false, reason: "not_readable" });
@@ -72,7 +108,7 @@ describe("checkRepo", () => {
   });
 
   test("GitHub failing or unreachable: unavailable", async () => {
-    for (const repo of [500, 429, "network"] as const) {
+    for (const repo of [500, 502, "network"] as const) {
       const api = fakeApi({ repo });
       expect(await checkRepo(token(api), widgets, { fetch: api.f })).toMatchObject({ ok: false, reason: "unavailable" });
     }
