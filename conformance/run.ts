@@ -1665,6 +1665,77 @@ const scenarios: Scenario[] = [
     }),
   },
   {
+    // #166: the seed file is read on every start, not only into an empty index. Three
+    // starts on one database: the file as it is; then with an entry edited, one removed and
+    // one added, while Slack threads are already indexed; then with a malformed line, which
+    // must fail the start and change nothing (the start after it, on the file from before,
+    // finds nothing to add, update or remove).
+    name: "the index follows KNOWLEDGE_SEED on every start: an edited entry is re-indexed, a removed one is gone (404), a new one is found, and GET /status counts them; a malformed line fails the start, naming its line, and changes nothing; with it unset the file is not read and the seeds stay",
+    run: async () => {
+      const db = freshDb();
+      const seed = join(dirname(db), "seed.jsonl");
+      const corpus = readFileSync(join(HERE, "fixtures/corpus.jsonl"), "utf8").split("\n").filter((l) => l.trim());
+      const write = (lines: string[]) => writeFileSync(seed, lines.join("\n") + "\n");
+      const env = { LOREHOUSE_DB: db, KNOWLEDGE_SEED: seed };
+      type Seed = { entries: number; added: number; updated: number; removed: number };
+      const seedStatus = async () => ((await status()) as Status & { seed?: Seed }).seed;
+      const differs = (got: Seed | undefined, want: Seed) => (JSON.stringify(got) === JSON.stringify(want) ? null : `/status seed ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+      try {
+        await stopApp();
+        write(corpus);
+        await startApp(env);
+        const first = differs(await seedStatus(), { entries: SEED_DOCS, added: SEED_DOCS, updated: 0, removed: 0 });
+        if (first) return `the first start: ${first}`;
+        const documents = (await status()).knowledge.documents;
+        if (documents <= SEED_DOCS) return `documents ${documents}, want the ${SEED_DOCS} seeds and Slack threads, so the next start reads the seed into an index that isn't empty`;
+
+        // c1 edited (a word found nowhere else), c2 removed, one entry added.
+        const edited = JSON.parse(corpus[0]!) as { id: string; source: string; title: string; text: string };
+        const removed = (JSON.parse(corpus[1]!) as { id: string }).id;
+        const changed = [JSON.stringify({ ...edited, text: `${edited.text}\n\nThe numbatseedword rota is weekly.` }), ...corpus.slice(2), JSON.stringify({ id: "seed-new", source: "help/bilbies.md", title: "Bilbies", text: "The bilbyseedword burrow is surveyed yearly." })];
+        await stopApp();
+        write(changed);
+        await startApp(env);
+        const second = differs(await seedStatus(), { entries: SEED_DOCS, added: 1, updated: 1, removed: 1 });
+        if (second) return `after the file changed: ${second}`;
+        const found = async (word: string) => (await admin<{ results: { id: string }[] }>(`/api/v1/search?q=${word}`)).results[0]?.id;
+        if ((await found("numbatseedword")) !== edited.id) return `the edited entry's new text found ${await found("numbatseedword")}, want ${edited.id}`;
+        if ((await found("bilbyseedword")) !== "seed-new") return `the added entry found ${await found("bilbyseedword")}, want seed-new`;
+        const gone = await adminAs(`/api/v1/documents/${removed}`);
+        if (gone.status !== 404) return `the removed entry ${removed}: got ${gone.status}, want 404`;
+        const thread = await adminAs(`/api/v1/documents/${WOMBAT_THREAD}`);
+        if (thread.status !== 200) return `the Slack thread ${WOMBAT_THREAD}: got ${thread.status}, want 200 (never touched)`;
+        const after = (await status()).knowledge.documents;
+        if (after !== documents) return `documents ${after}, want ${documents}: one seed removed, one added, the Slack threads untouched`;
+
+        // A malformed last line, in a file that would also drop an entry and add another.
+        await stopApp();
+        write([...changed.slice(1), JSON.stringify({ id: "seed-never", source: "s", title: "t", text: "never indexed" }), '{"id":"seed-cut","source":"s","title":"t","text":"cut off he']);
+        const refused = await refusedStart(env);
+        if (typeof refused === "string") return `a malformed line: ${refused}`;
+        const line = `line ${changed.length + 1}: not JSON`;
+        for (const want of [seed, line, "the index is as it was"]) if (!refused.stderr.includes(want)) return `a malformed line: stderr doesn't say "${want}": ${refused.stderr.slice(0, 400)}`;
+        write(changed);
+        await startApp(env);
+        const third = differs(await seedStatus(), { entries: SEED_DOCS, added: 0, updated: 0, removed: 0 });
+        if (third) return `after the refused start, on the file from before it: ${third}`;
+
+        // With KNOWLEDGE_SEED unset the file isn't read: /status has no seed, and the seeds
+        // already indexed stay (removal is something the file says, never a missing setting).
+        await stopApp();
+        await startApp({ LOREHOUSE_DB: db, KNOWLEDGE_SEED: "" });
+        const unset = await seedStatus();
+        if (unset !== undefined) return `with KNOWLEDGE_SEED unset: /status seed ${JSON.stringify(unset)}, want none`;
+        if ((await found("bilbyseedword")) !== "seed-new") return `with KNOWLEDGE_SEED unset: the seed indexed before found ${await found("bilbyseedword")}, want seed-new`;
+        return null;
+      } finally {
+        await stopApp();
+        removeDb(db);
+        await startApp();
+      }
+    },
+  },
+  {
     name: "answers a Slack redelivery only once",
     run: async () => {
       await reset();

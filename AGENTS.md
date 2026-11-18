@@ -116,7 +116,11 @@ embeds them; the binary conformance run proves it. Consequences:
 (`INGEST_BACKFILL_DAYS`), re-checks recent threads on every start (`INGEST_REFRESH_DAYS`)
 to catch edits/deletes made while down, and re-indexes a thread live after it goes quiet
 (`INGEST_DEBOUNCE_MS`). One document per thread (`slack:<channel>:<root ts>`).
-`src/knowledge.ts` is SQLite FTS with CJK bigram indexing. Deleted messages must leave the
+`src/knowledge.ts` is SQLite FTS with CJK bigram indexing. `KNOWLEDGE_SEED`, a JSONL file
+of documents from outside Slack, is read on every start (`syncSeed`): the `kind = 'seed'`
+documents follow it (added, re-indexed when changed, deleted when gone from the file), in
+one transaction, and a wrong line fails the start with the index as it was; documents of
+any other kind are never touched. Deleted messages must leave the
 index and `LOREHOUSE_DB`'s files, the `-wal` included (`checkpointSoon` after whatever
 removes text, `closeKnowledge` on SIGTERM or SIGINT). Other copies can remain, among
 them usage records, until `pruneUsage` drops them past `USAGE_RETENTION_DAYS` (#98), and

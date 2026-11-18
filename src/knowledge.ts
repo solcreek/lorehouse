@@ -257,20 +257,133 @@ export function setCursor(db: Database, source: string, cursor: string): void {
     .run(source, cursor, new Date().toISOString());
 }
 
-// Seed from a JSONL file of {id, source, title, text} — only into an empty index, so a
-// restart against a persistent database doesn't duplicate anything.
-export function seedFromJsonl(db: Database, path: string): number {
-  if (countDocuments(db) > 0) return 0;
-  let count = 0;
-  db.transaction(() => {
-    for (const line of readFileSync(path, "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      const c = JSON.parse(line) as Chunk;
-      upsertDocument(db, { docId: c.id, kind: "seed", source: c.source, title: c.title, text: c.text });
-      count++;
+// ── the seed file (KNOWLEDGE_SEED, #166) ────────────────────────────────────────
+//
+// A JSONL file of {id, source, title, text}, one document per line (blank lines skipped),
+// read on every start. The `kind = 'seed'` documents follow it: an entry new to the index
+// is added, one whose title, source or text changed is re-indexed, one unchanged isn't
+// written (its updatedAt stays put), and a seed whose id is no longer in the file is
+// deleted. Documents of any other kind (Slack threads) are never read, changed or removed.
+//
+// The whole file is checked before anything is written, and what is written is one
+// transaction: a file with a wrong line, or one that can't be read, throws a SeedError
+// naming each line, and the index is left exactly as it was.
+
+// What one read of the seed file did. `entries` is how many the file holds.
+export type SeedSync = { entries: number; added: number; updated: number; removed: number };
+
+// The seed file can't be used as it is. The message says which file, which lines, what is
+// wrong with each and what to do: it is what an operator sees when the start fails.
+export class SeedError extends Error {
+  override name = "SeedError";
+}
+
+const SEED_FIELDS = ["id", "source", "title", "text"] as const;
+const SEED_LINE = '{"id": "…", "source": "…", "title": "…", "text": "…"}';
+const SEED_PROBLEMS_SHOWN = 10;
+const SLACK_ID_PREFIX = "slack:";
+
+function seedError(path: string, problems: string[]): SeedError {
+  const shown = problems.slice(0, SEED_PROBLEMS_SHOWN).map((p) => `\n  ${p}`).join("");
+  const more = problems.length > SEED_PROBLEMS_SHOWN ? `\n  … and ${problems.length - SEED_PROBLEMS_SHOWN} more` : "";
+  return new SeedError(
+    `lorehouse: KNOWLEDGE_SEED ${path} was not read, and the index is as it was: ${problems.length} ${problems.length === 1 ? "line is" : "lines are"} wrong.${shown}${more}\n` +
+      `Each line is one JSON object, ${SEED_LINE}, all four strings, with an id no other line has. ` +
+      "Fix the file and start again, or unset KNOWLEDGE_SEED to start without reading it (the seed documents already indexed stay).",
+  );
+}
+
+const jsonType = (v: unknown): string => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
+
+// The file's entries with the line each is on, or a SeedError naming every wrong line.
+function readSeed(path: string): { line: number; doc: Chunk }[] {
+  let file: string;
+  try {
+    file = readFileSync(path, "utf8");
+  } catch (err) {
+    throw new SeedError(
+      `lorehouse: KNOWLEDGE_SEED ${path} can't be read, and the index is as it was: ${(err as Error).message}. ` +
+        "Point KNOWLEDGE_SEED at a JSONL file this process can read, or unset it to start without one (the seed documents already indexed stay).",
+    );
+  }
+  const entries: { line: number; doc: Chunk }[] = [];
+  const problems: string[] = [];
+  const firstLine = new Map<string, number>();
+  // A byte order mark (an editor's, on Windows) is not part of the first line's JSON.
+  (file.charCodeAt(0) === 0xfeff ? file.slice(1) : file).split("\n").forEach((text, i) => {
+    const line = i + 1;
+    if (!text.trim()) return;
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch (err) {
+      problems.push(`line ${line}: not JSON (${(err as Error).message})`);
+      return;
     }
+    if (jsonType(value) !== "object") {
+      problems.push(`line ${line}: a JSON ${jsonType(value)}, not an object`);
+      return;
+    }
+    const entry = value as Record<string, unknown>;
+    const wrong = SEED_FIELDS.flatMap((f) => (entry[f] === undefined ? [`"${f}" is missing`] : typeof entry[f] !== "string" ? [`"${f}" is a ${jsonType(entry[f])}, not a string`] : []));
+    if (!wrong.length && !(entry.id as string).trim()) wrong.push('"id" is empty');
+    // Half of a character (as a cut made through an emoji leaves, written "\ud83d") is not
+    // stored as written, so the entry would never compare equal to what the index holds:
+    // re-indexed on every start, or with it in the id, removed on every other one.
+    if (!wrong.length) wrong.push(...SEED_FIELDS.filter((f) => !(entry[f] as string).isWellFormed()).map((f) => `"${f}" holds half of a character (a lone surrogate, as text cut through an emoji leaves): write the whole character or drop the half`));
+    // "slack:" ids are Slack threads' (slack:<channel>:<root ts>): ingest writes and removes
+    // documents under them whatever their kind, so a seed there would not stay a seed.
+    if (!wrong.length && (entry.id as string).startsWith(SLACK_ID_PREFIX)) wrong.push(`id "${entry.id as string}" starts with "${SLACK_ID_PREFIX}", which is where Slack threads' ids are: give the entry another id`);
+    if (wrong.length) {
+      problems.push(`line ${line}: ${wrong.join("; ")}`);
+      return;
+    }
+    const doc = entry as Chunk;
+    const first = firstLine.get(doc.id);
+    if (first !== undefined) {
+      problems.push(`line ${line}: id "${doc.id}" is already used on line ${first}`);
+      return;
+    }
+    firstLine.set(doc.id, line);
+    entries.push({ line, doc: { id: doc.id, source: doc.source, title: doc.title, text: doc.text } });
+  });
+  if (problems.length) throw seedError(path, problems);
+  return entries;
+}
+
+// Make the index's seed documents what the file at `path` holds (see above).
+export function syncSeed(db: Database, path: string): SeedSync {
+  const entries = readSeed(path);
+  const result: SeedSync = { entries: entries.length, added: 0, updated: 0, removed: 0 };
+  db.transaction(() => {
+    const stored = db.query("SELECT kind, source, title, text FROM knowledge_documents WHERE doc_id = ?");
+    const changed: Chunk[] = [];
+    const taken: string[] = [];
+    for (const { line, doc } of entries) {
+      const old = stored.get(doc.id) as { kind: string; source: string; title: string; text: string } | null;
+      if (!old) result.added++;
+      // Never written over: a Slack thread's document is Slack's (and ingest would take it
+      // back, so the entry would flip between the two on every start).
+      else if (old.kind !== "seed") taken.push(`line ${line}: id "${doc.id}" is already the id of a ${old.kind} document, which a seed never replaces: give the entry another id`);
+      else if (old.source !== doc.source || old.title !== doc.title || old.text !== doc.text) result.updated++;
+      else continue;
+      changed.push(doc);
+    }
+    if (taken.length) throw seedError(path, taken);
+    const inFile = new Set(entries.map((e) => e.doc.id));
+    const gone = (db.query("SELECT doc_id FROM knowledge_documents WHERE kind = 'seed'").all() as { doc_id: string }[]).filter((r) => !inFile.has(r.doc_id));
+    for (const doc of changed) upsertDocument(db, { docId: doc.id, kind: "seed", source: doc.source, title: doc.title, text: doc.text });
+    for (const { doc_id } of gone) deleteDocument(db, doc_id);
+    result.removed = gone.length;
   })();
-  return count;
+  // Old text was removed (an entry gone, or one replaced): it leaves the WAL too.
+  if (result.updated || result.removed) checkpointSoon(db);
+  return result;
+}
+
+// One line for the log: what this start's read of the seed file did.
+export function describeSeed(path: string, s: SeedSync): string {
+  return `lorehouse: seed: ${path}: ${s.entries} ${s.entries === 1 ? "entry" : "entries"}, ${s.added} added, ${s.updated} updated, ${s.removed} removed`;
 }
 
 // The most recently active documents, newest first — for "what's been discussed
