@@ -11,6 +11,17 @@
 // dropped (#163). before() holds such a reply until the mention is decided (threads.ts,
 // mentionHolds); the thread is joined only if the mention is accepted, in decide(), so a
 // reply held for a refused asker's mention finds no joined thread and gets nothing.
+//
+// What the hold costs, and what it doesn't cover:
+//   • Ingest of a held reply waits too, up to MENTION_HOLD_MS (12 s): June's onEvent, which
+//     feeds the knowledge index, awaits the same promise as the decision. The message is
+//     indexed late, not lost (and the start-up refresh would catch it after a restart).
+//   • A reply Slack delivers BEFORE its thread's app_mention is still dropped: the hold
+//     opens only when the mention arrives, so the reply finds neither a hold nor a joined
+//     thread. Slack doesn't promise the order of two events; this one is rare (the reply
+//     must be typed after the mention) and costs an answer, never exposes anything.
+//   • A hold lives in memory: a reply held when the process stops is lost, as any event
+//     in flight is.
 
 import { decideTurn, mayStartTurn, type Members, type Membership } from "./members";
 import { isFollowUp, mentionHolds } from "./threads";
