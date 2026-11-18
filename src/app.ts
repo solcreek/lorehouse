@@ -446,6 +446,9 @@ async function startApp(config: Config, keys: Uint8Array[]) {
           dataDir: tenant.dataDir,
           // Whether the tenant's databases are encrypted under its data key (tenant-key.ts).
           encrypted: !!tenantKey,
+          // What this start's read of KNOWLEDGE_SEED did to the index's seed documents
+          // (knowledge.ts); absent when no seed file is set.
+          ...(seed ? { seed } : {}),
           knowledge: ingester?.status() ?? { state: "idle", documents: countDocuments(knowledge), channels: {} },
           // Whether usage records who asks: a setting, not anyone's data.
           recordsWhoAsks: recordPeople,
