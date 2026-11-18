@@ -193,9 +193,10 @@ def cpupar(n):
     report(f"cpupar {n}", res, errs)
 
 
-def call(method, url, body=None, headers=None, timeout=900):
-    """Like req, for any URL and with extra headers; a refusal is an answer: (status, body)."""
-    data = json.dumps(body).encode() if body is not None else None
+def call(method, url, body=None, headers=None, timeout=900, raw=None):
+    """Like req, for any URL and with extra headers; a refusal is an answer: (status, body).
+    `raw`: the body's bytes as they are, for one json.dumps wouldn't write."""
+    data = raw if raw is not None else json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method,
                                headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json", **(headers or {})})
     try:
@@ -215,8 +216,12 @@ def limits():
     command timeout. Needs maxima above the defaults, and a disk quota (LAB_FS=btrfs):
       LAB_SANDBOXD="SANDBOXD_MAX_VCPUS=4 SANDBOXD_MAX_MEM_MIB=4096 SANDBOXD_MAX_DISK_GIB=4
                     SANDBOXD_MAX_PIDS=128 SANDBOXD_MAX_COMMAND_TIMEOUT_SECS=900"
-    Also: a request over a maximum, a malformed one, and another request for B are refused,
-    each with its code, and B's own request again is not."""
+    Also: a request over a maximum, a malformed one, and another request for B while it
+    runs are refused, each with its code, and B's own request again is not; an exec body
+    that tries to choose its own timeout is refused or cut to the sandbox's; and a stopped
+    sandbox takes its next request's resources (less disk than it holds is refused).
+    With SANDBOXD_IDLE_SECS at 30 or less (LAB_SANDBOXD), also: refused requests don't keep
+    a VM from its idle stop, after which the sandbox takes the request."""
     root = BASE.rsplit("/sandboxes", 1)[0]
     status, caps = call("GET", f"{root}/capabilities")
     if status != 200 or "resources" not in (caps.get("features") or []):
@@ -231,11 +236,15 @@ def limits():
     env = dict(l.strip().split("=", 1) for l in open("/etc/lorehouse/sandboxd.env") if "=" in l)
     state = env["SANDBOXD_STATE"]
     ask = {"vcpus": m["vcpus"], "memMib": m["memMib"], "diskGib": m["diskGib"], "pids": m["pids"], "commandTimeoutSecs": 20}
-    hdr = {"X-Lorehouse-Sandbox-Resources": json.dumps(ask)}
+    H = "X-Lorehouse-Sandbox-Resources"
     a, b = f"limits-a-{RUN}", f"limits-b-{RUN}"
     # What each sandbox should have: A the defaults, B what it asked for.
     want = {a: d, b: {**d, **ask}}
+    # The request each sandbox's calls carry: none for A, B's own.
+    hdrs = {b: {H: json.dumps(ask)}}
     checks = []
+
+    code_of = lambda out: out.get("code") if isinstance(out, dict) else None
 
     def check(name, got, expected, passed):
         checks.append({"check": name, "got": got, "want": expected, "ok": bool(passed)})
@@ -243,7 +252,7 @@ def limits():
 
     def run(sid, cmd, timeout_ms=600_000):
         t = time.time()
-        status, out = call("POST", f"{BASE}/{sid}/exec", {"command": cmd, "cwd": "/workspace", "timeoutMs": timeout_ms}, hdr if sid == b else None)
+        status, out = call("POST", f"{BASE}/{sid}/exec", {"command": cmd, "cwd": "/workspace", "timeoutMs": timeout_ms}, hdrs.get(sid))
         return status, out, time.time() - t
 
     def cgroup(sid, name):
@@ -255,12 +264,12 @@ def limits():
         # Refused before anything is made: over a maximum, and malformed.
         over = f"limits-over-{RUN}"
         status, out = call("POST", f"{BASE}/{over}/exec", {"command": "true", "cwd": "/", "timeoutMs": 60_000},
-                           {"X-Lorehouse-Sandbox-Resources": json.dumps({"memMib": m["memMib"] * 2})})
+                           {H: json.dumps({"memMib": m["memMib"] * 2})})
         check("a request over a maximum is refused", [status, out.get("code") if isinstance(out, dict) else out], [422, "resource_over_maximum"],
               status == 422 and isinstance(out, dict) and out.get("code") == "resource_over_maximum")
         check("and makes no sandbox", os.path.exists(f"{state}/{over}"), False, not os.path.exists(f"{state}/{over}"))
         status, out = call("POST", f"{BASE}/limits-bad-{RUN}/exec", {"command": "true", "cwd": "/", "timeoutMs": 60_000},
-                           {"X-Lorehouse-Sandbox-Resources": json.dumps({"vcpus": 0})})
+                           {H: json.dumps({"vcpus": 0})})
         check("a malformed request is refused", [status, out.get("code") if isinstance(out, dict) else out], [400, "invalid_resources"],
               status == 400 and isinstance(out, dict) and out.get("code") == "invalid_resources")
 
@@ -284,7 +293,7 @@ def limits():
 
         # Another request for B is refused; its own again is fine.
         status, out = call("POST", f"{BASE}/{b}/exec", {"command": "true", "cwd": "/", "timeoutMs": 60_000},
-                           {"X-Lorehouse-Sandbox-Resources": json.dumps({"vcpus": d["vcpus"]})})
+                           {H: json.dumps({"vcpus": d["vcpus"]})})
         check("another request for B is refused", [status, out.get("code") if isinstance(out, dict) else out], [409, "resources_mismatch"],
               status == 409 and isinstance(out, dict) and out.get("code") == "resources_mismatch")
         status, out, _ = run(b, "true")
@@ -301,6 +310,63 @@ def limits():
         _, out, dt = slept[b]
         check("B's command is stopped at its 20 s", [out.get("exitCode") if isinstance(out, dict) else out, round(dt)], [124, "20..25"],
               isinstance(out, dict) and out.get("exitCode") == 124 and 19 <= dt <= 25)
+
+        # An exec body can't choose its own timeout (B's is 20 s). A second spelling of the
+        # key, and a body one JSON reader refuses and another accepts, are refused outright;
+        # a query on the path changes nothing.
+        t0 = time.time()
+        status, out = call("POST", f"{BASE}/{b}/exec", {"command": "sleep 45", "cwd": "/workspace", "timeoutMs": 600_000, "timeoutms": 86_400_000}, hdrs[b])
+        check("a second spelling of timeoutMs is refused, at once", [status, code_of(out), round(time.time() - t0)], [400, "invalid_exec_body", "0..2"],
+              status == 400 and code_of(out) == "invalid_exec_body" and time.time() - t0 < 3)
+        status, out = call("POST", f"{BASE}/{b}/exec", None, hdrs[b], raw=b'{"command":"sleep 45 #\\ud800","timeoutMs":86400000}')
+        check("a body with half a character is refused", [status, code_of(out)], [400, "invalid_exec_body"], status == 400 and code_of(out) == "invalid_exec_body")
+        t0 = time.time()
+        status, out = call("POST", f"{BASE}/{b}/exec?x=1", {"command": "sleep 45", "cwd": "/workspace", "timeoutMs": 86_400_000}, hdrs[b])
+        dt = time.time() - t0
+        check("a query on the path doesn't lift B's 20 s", [status, out.get("exitCode") if isinstance(out, dict) else out, round(dt)], "400, or [200, 124, 20..25]",
+              status == 400 or (status == 200 and isinstance(out, dict) and out.get("exitCode") == 124 and 19 <= dt <= 25))
+
+        BOOT_ID = "cat /proc/sys/kernel/random/boot_id"
+
+        def reboot(sid):
+            # sandboxd has no call that stops a VM and keeps its disk: the guest reboots
+            # itself, which ends the VM (the kernel runs with reboot=k). The listing goes on
+            # saying it runs until the next request or the idle reaper finds out, so what is
+            # observed is the next request's boot: another boot id than this one.
+            status, out, _ = run(sid, BOOT_ID)
+            if not (isinstance(out, dict) and (out.get("stdout") or "").strip()):
+                print(f"  note: {sid} gave no boot id before its reboot: {status} {str(out)[:400]}")
+            run(sid, "sync; (sleep 0.5; reboot -f) >/dev/null 2>&1 &")
+            time.sleep(3)
+            return (out.get("stdout") or "").strip() if isinstance(out, dict) else None
+
+        def qgroup_limit(sid):
+            for line in os.popen(f"btrfs qgroup show -re --raw {state}").read().splitlines():
+                f = line.split()
+                if len(f) >= 6 and f[0].startswith("0/") and os.path.basename(f[5]) == sid:
+                    return f[4]
+
+        # A stopped sandbox takes its next request: B comes back with the defaults, the
+        # most disk, and a 30 s command timeout.
+        was = reboot(b)
+        ask2 = {"vcpus": d["vcpus"], "memMib": d["memMib"], "diskGib": m["diskGib"], "pids": d["pids"], "commandTimeoutSecs": 30}
+        hdrs[b], want[b] = {H: json.dumps(ask2)}, ask2
+        status, out, _ = run(b, f"nproc; grep MemTotal /proc/meminfo; {BOOT_ID}")
+        if status != 200 or not ok(out):
+            check("B boots with its new request", [status, str(out)[:300]], "exit 0", False)
+            raise RuntimeError("B did not boot with its new request")
+        cpus, mem_kb = int(out["stdout"].split()[0]), int(out["stdout"].split()[2])
+        check("B's guest rebooted, and this is a new boot", [was, out["stdout"].split()[-1]], "two boot ids", bool(was) and out["stdout"].split()[-1] != was)
+        check("B after its new request: vCPUs, MemTotal (MiB), cpu.max, pids.max", [cpus, mem_kb // 1024, cgroup(b, "cpu.max"), cgroup(b, "pids.max")],
+              [ask2["vcpus"], f"..{ask2['memMib']}", f"{(ask2['vcpus'] + 1) * 100000} 100000", str(ask2["pids"])],
+              cpus == ask2["vcpus"] and ask2["memMib"] * 0.9 <= mem_kb / 1024 <= ask2["memMib"] and cgroup(b, "cpu.max") == f"{(ask2['vcpus'] + 1) * 100000} 100000" and cgroup(b, "pids.max") == str(ask2["pids"]))
+        stored = json.load(open(f"{state}/{b}/resources.json"))
+        check("B's record on the host is the new request", stored, ask2, all(stored.get(k) == v for k, v in ask2.items()))
+        logged = os.popen(f"journalctl -u sandboxd --since '-15 min' -o cat | grep -c '{b}: resources changed from'").read().strip()
+        check("sandboxd logged the change", logged, "1 or more", logged.isdigit() and int(logged) >= 1)
+        _, out, dt = run(b, "sleep 45")
+        check("B's command is now stopped at 30 s", [out.get("exitCode") if isinstance(out, dict) else out, round(dt)], [124, "30..35"],
+              isinstance(out, dict) and out.get("exitCode") == 124 and 29 <= dt <= 35)
 
         # The disk, last: a guest that fills its disk may be left with a read-only root.
         # Direct IO, since a buffered write reports success and fails later, at writeback.
@@ -325,13 +391,54 @@ def limits():
             # Its own earlier writes count too, so it stops a little short of the cap.
             check(f"{sid} writes of 256 MiB stop at its {cap} GiB (MiB written, the last dd's exit)", [wrote, code], [f"{cap * 1024 - 400}..{cap * 1024}", "1"],
                   cap * 1024 - 400 <= wrote <= cap * 1024 and code == "1")
+        # B holds nearly all of its disk now: stopped, a request for 1 GiB is refused, and
+        # its limit stays. A, made with no request, is stopped and asks for more disk: the
+        # sandbox of a thread that began before its profile asked for anything.
+        # (Were B still running, the answer would be 409 resources_mismatch.)
+        reboot(b)
+        before = qgroup_limit(b)
+        status, out = call("POST", f"{BASE}/{b}/exec", {"command": "true", "cwd": "/", "timeoutMs": 60_000}, {H: json.dumps({**ask2, "diskGib": 1})})
+        used = out.get("usedBytes") if isinstance(out, dict) else None
+        check("less disk than B holds is refused", [status, code_of(out), used], [422, "disk_in_use", "over 1 GiB"],
+              status == 422 and code_of(out) == "disk_in_use" and isinstance(used, int) and used > 1 << 30)
+        check("and B's limit on the host is as it was", qgroup_limit(b), before, qgroup_limit(b) == before)
+        was = reboot(a)
+        hdrs[a] = {H: json.dumps({"diskGib": m["diskGib"]})}
+        status, out, _ = run(a, BOOT_ID)
+        now = (out.get("stdout") or "").strip() if isinstance(out, dict) else None
+        check("A, made with no request, takes one once stopped (a new boot)", [status, out.get("exitCode") if isinstance(out, dict) else str(out)[:200], now != was], [200, 0, True],
+              status == 200 and ok(out) and bool(was) and now != was)
+        check("A's limit on the host grew (bytes)", qgroup_limit(a), str(m["diskGib"] << 30), qgroup_limit(a) == str(m["diskGib"] << 30))
+
+        # Refused requests are not activity: a running sandbox asked for other resources
+        # every 5 s still stops when idle, and then takes the request.
+        idle = int(env.get("SANDBOXD_IDLE_SECS", "900"))
+        if idle <= 30:
+            c = f"limits-c-{RUN}"
+            call("POST", f"{BASE}/{c}/exec", {"command": "true", "cwd": "/", "timeoutMs": 60_000})
+            other = {H: json.dumps({"vcpus": m["vcpus"]})}
+            t0, codes, took = time.time(), set(), None
+            while time.time() - t0 < idle + 75:
+                status, out = call("POST", f"{BASE}/{c}/exec", {"command": "nproc", "cwd": "/", "timeoutMs": 60_000}, other)
+                if status == 200:
+                    took = round(time.time() - t0)
+                    break
+                codes.add((status, code_of(out)))
+                time.sleep(5)
+            seen = (out.get("stdout") or "").strip() if isinstance(out, dict) else out
+            check(f"a running sandbox refuses another request until its idle stop ({idle} s), then takes it",
+                  [sorted(codes), took, seen], [[(409, "resources_mismatch")], f"{idle}..{idle + 75}", str(m["vcpus"])],
+                  codes == {(409, "resources_mismatch")} and took is not None and took >= idle and seen == str(m["vcpus"]))
+            call("DELETE", f"{BASE}/{c}")
+        else:
+            print(f"  skip the idle-stop check: SANDBOXD_IDLE_SECS is {idle} (set it to 30 or less with LAB_SANDBOXD)")
     except Exception as e:
         check("the run itself", str(e)[:300], "no error", False)
     finally:
         for sid in (a, b):
             call("DELETE", f"{BASE}/{sid}")
     failed = [c["check"] for c in checks if not c["ok"]]
-    print(json.dumps({"bench": "limits", "ok": not failed, "defaults": d, "asked": ask, "checks": len(checks), "failed": failed}))
+    print(json.dumps({"bench": "limits", "ok": not failed, "defaults": d, "asked": ask, "idle_secs": int(env.get("SANDBOXD_IDLE_SECS", "900")), "checks": len(checks), "failed": failed}))
     sys.exit(1 if failed else 0)
 
 
