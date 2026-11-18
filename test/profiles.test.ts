@@ -6,7 +6,8 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentIdentity } from "../src/identity";
-import { activeTriggers, loadProfiles, LOREHOUSE, PROFILES, profileStatus, ProfileError, selectByName, slackTrigger, type Profile } from "../src/profiles";
+import { activeTriggers, loadProfiles, LOREHOUSE, PROFILES, profileStatus, ProfileError, selectByName, slackStarts, slackTrigger, startsTurn, type Profile, type SlackTriggerEvent } from "../src/profiles";
+import { isFollowUp } from "../src/threads";
 import { profilePrompt, PROMPT_CATALOG } from "../src/prompts";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -197,6 +198,68 @@ describe("a profile is checked on start", () => {
       message = (err as Error).message;
     }
     expect(message).toStartWith('lorehouse: invalid profile: profile "lorehouse": mode: must be one of');
+  });
+});
+
+describe("which Slack messages start a turn", () => {
+  // The events as the Slack channel gives them: a mention, a reply in a thread the agent
+  // was asked into, a reply in a thread it wasn't, a top-level message, and a DM.
+  const EVENTS = {
+    mention: { kind: "app_mention", channelType: "channel", channelId: "C1", ts: "10.1", text: "<@UBOT> hi" },
+    followUp: { kind: "message", channelType: "channel", channelId: "C1", ts: "10.2", threadId: "10.1", text: "and then?" },
+    otherThread: { kind: "message", channelType: "channel", channelId: "C1", ts: "20.2", threadId: "20.1", text: "unrelated" },
+    topLevel: { kind: "message", channelType: "channel", channelId: "C1", ts: "30.1", text: "hello all" },
+    dm: { kind: "message", channelType: "im", channelId: "D1", ts: "40.1", text: "psst" },
+  };
+  type Name = keyof typeof EVENTS;
+  // The names of the events that start a turn for a profile with these trigger events.
+  const started = (events: SlackTriggerEvent[], dm: "redirect" | "ignore" | "answer"): Name[] => {
+    const [profile] = loadProfiles([{ ...valid, triggers: [{ kind: "slack", events }] }], CATALOG) as [Profile];
+    const starts = slackStarts(profile, { dm });
+    const joined = (_channel: string, thread: string) => thread === "10.1"; // the mention's thread
+    return (Object.keys(EVENTS) as Name[]).filter((name) => startsTurn(starts, EVENTS[name], () => isFollowUp(EVENTS[name], joined)));
+  };
+
+  test("a follow-up needs a mention: without it the profile is refused, since only a mention opens the thread", () => {
+    const refusal = 'profile "lorehouse": triggers[0].events: "follow_up" needs "mention": a follow-up is a reply in a thread a mention opened';
+    expect(problems({ ...valid, triggers: [{ kind: "slack", events: ["follow_up"] }] })).toEqual([refusal]);
+    expect(problems({ ...valid, triggers: [{ kind: "slack", events: ["follow_up", "direct_message"] }] })).toEqual([refusal]);
+  });
+
+  // Every set of events loadProfiles accepts, under each DM_MODE.
+  test("mention only: a mention starts a turn; a reply in its thread, and a DM, do not", () => {
+    for (const dm of ["redirect", "ignore", "answer"] as const) expect(started(["mention"], dm), dm).toEqual(["mention"]);
+  });
+
+  test("mention and follow_up: a reply starts one only in a thread the agent was asked into; a DM does not, even with DM_MODE=answer", () => {
+    for (const dm of ["redirect", "ignore", "answer"] as const) expect(started(["mention", "follow_up"], dm), dm).toEqual(["mention", "followUp"]);
+  });
+
+  test("mention and direct_message: a DM starts one only with DM_MODE=answer; a reply in the thread does not", () => {
+    expect(started(["mention", "direct_message"], "answer")).toEqual(["mention", "dm"]);
+    expect(started(["mention", "direct_message"], "redirect")).toEqual(["mention"]);
+    expect(started(["mention", "direct_message"], "ignore")).toEqual(["mention"]);
+  });
+
+  test("all three, as the lorehouse profile has them: today's rule", () => {
+    expect(slackTrigger(LOREHOUSE)!.events).toEqual(["mention", "follow_up", "direct_message"]);
+    expect(started(["mention", "follow_up", "direct_message"], "answer")).toEqual(["mention", "followUp", "dm"]);
+    expect(started(["mention", "follow_up", "direct_message"], "redirect")).toEqual(["mention", "followUp"]);
+    expect(started(["mention", "follow_up", "direct_message"], "ignore")).toEqual(["mention", "followUp"]);
+  });
+
+  test("direct_message only: nothing in a channel starts a turn, and a mention doesn't ask the agent into its thread", () => {
+    expect(started(["direct_message"], "answer")).toEqual(["dm"]);
+    expect(started(["direct_message"], "redirect")).toEqual([]);
+    const [profile] = loadProfiles([{ ...valid, triggers: [{ kind: "slack", events: ["direct_message"] }] }], CATALOG) as [Profile];
+    // What the caller joins a mention's thread on.
+    expect(slackStarts(profile, { dm: "answer" }).mention).toBe(false);
+    expect(slackStarts(LOREHOUSE, { dm: "redirect" })).toEqual({ mention: true, followUp: true, directMessage: false });
+  });
+
+  test("a profile Slack does not start: no Slack message starts a turn of its", () => {
+    const [job] = loadProfiles([valid, { ...valid, id: "digest", mode: "job", triggers: [] }], CATALOG).slice(1) as [Profile];
+    expect(slackStarts(job, { dm: "answer" })).toEqual({ mention: false, followUp: false, directMessage: false });
   });
 });
 

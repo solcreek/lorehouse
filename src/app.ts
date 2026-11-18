@@ -18,7 +18,7 @@ import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
 import { PDF_SKILLS, SKILLS, profilePrompt } from "./prompts";
-import { loadProfiles, PROFILES, profileStatus, selectByName, slackTrigger, type Profile } from "./profiles";
+import { loadProfiles, PROFILES, profileStatus, selectByName, slackStarts, slackTrigger, startsTurn, type Profile } from "./profiles";
 import { renderPdfTool, typstRenderer } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
@@ -88,7 +88,6 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
   // At most one profile is started by Slack messages (ADR 0002 §2); this build needs one
   // (loadProfiles), because the Slack channel is its, and ingest and every post go through it.
   const interactive = profiles.find(slackTrigger)!;
-  const startsOn = new Set(slackTrigger(interactive)!.events);
 
   // Every listed channel must be public, as Slack says (channel-check.ts): before the
   // database is opened or purged, and before anything listens. A ConfigError names each.
@@ -253,12 +252,10 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
   const listed = { has: (channel: string) => config.agent.channels.has(channel) && !ingester?.isClosed(channel) };
 
   const dm = config.agent.dm;
-  // What starts a turn is the Slack trigger of the profile Slack starts; a DM also needs the
-  // install to answer them (DM_MODE=answer), which no profile can turn on.
-  const shouldRespond = (e: SlackNormalizedEvent) =>
-    (startsOn.has("mention") && e.kind === "app_mention") ||
-    (startsOn.has("direct_message") && dm === "answer" && e.channelType === "im") ||
-    (startsOn.has("follow_up") && isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread)));
+  // What starts a turn is the Slack trigger of the profile Slack starts (profiles.ts); a DM
+  // also needs the install to answer them (DM_MODE=answer), which no profile can turn on.
+  const starts = slackStarts(interactive, { dm });
+  const shouldRespond = (e: SlackNormalizedEvent) => startsTurn(starts, e, () => isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread)));
   // Only full members of the workspace are answered (members.ts, #145): a guest, or someone
   // from another workspace, can't open every channel an answer may quote. The sender of an
   // event that may start a turn is looked up (users.info, cached) in resolveIdentity, which
@@ -328,10 +325,12 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
       if (user) void ingester?.names([user]).catch(() => undefined);
       return true;
     },
-    // A mention asks the agent into its thread. Reactions are observed only: they are not
-    // in respondTo, so none starts a turn.
+    // A mention asks the agent into its thread, where mentions are a trigger. Reactions are
+    // observed only: they are not in respondTo, so none starts a turn.
     on: {
-      app_mention: (e) => joinThread(knowledge, e.channelId, e.threadId ?? e.ts),
+      app_mention: (e) => {
+        if (starts.mention) joinThread(knowledge, e.channelId, e.threadId ?? e.ts);
+      },
       reaction_added: onReaction,
       reaction_removed: onReaction,
     },
