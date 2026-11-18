@@ -32,7 +32,7 @@ import { neutralizeMentions } from "./mentions";
 import { withoutMentions } from "./slack-guard";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
-import { adminRoutes } from "./admin";
+import { adminRoutes, CHECK_TIMEOUT_MS } from "./admin";
 import { inThread, isFollowUp, joinThread } from "./threads";
 import { decideTurn, mayStartTurn, members, refusalText, type Membership } from "./members";
 import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, reconcileAsks, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
@@ -423,7 +423,9 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
     // repo the GitHub credential can read now. With code tools off there is no credential
     // to check with, and setting one is refused.
     channels: config.agent.channels,
-    checkRepo: github && ((repo, branch) => checkRepo(github, repo, { branch, apiUrl: config.githubApiUrl })),
+    // The admin API bounds the whole check (CHECK_TIMEOUT_MS); the same deadline on each
+    // request lets a stalled one go instead of leaving it open behind the answer.
+    checkRepo: github && ((repo, branch) => checkRepo(github, repo, { branch, apiUrl: config.githubApiUrl, fetch: ((url: string, init?: RequestInit) => fetch(url, { ...init, signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) })) as typeof fetch })),
     log: (line) => console.log(line),
     // With askers recorded, each is named as knowledge names people, from the names already
     // cached: reading usage only reads (no Slack call, no write). Uncached: name null.

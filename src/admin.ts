@@ -48,6 +48,8 @@ export type AdminOptions = {
   // Whether the GitHub credential can read a repo, and the branch exists (github-auth.ts,
   // checkRepo). Unset: code tools are off, so no default repo can be set.
   checkRepo?: (repo: RepoRef, branch?: string) => Promise<RepoCheck>;
+  // How long a PUT waits for checkRepo before answering github_unavailable (CHECK_TIMEOUT_MS).
+  checkTimeoutMs?: number;
   // One line per default repo set or cleared: counts and names, never a token.
   log?: (line: string) => void;
 };
@@ -65,8 +67,10 @@ class Refusal extends Error {
   }
 }
 
-// PUT's body is one small JSON object.
+// PUT's body is one small JSON object: at most this many bytes.
 const MAX_BODY = 4096;
+// How long PUT waits for GitHub's answers about a repo, all of them together.
+export const CHECK_TIMEOUT_MS = 10_000;
 const REPO_METHODS = ["GET", "PUT", "DELETE"];
 
 // A default repo as the API shows it; null when the channel has none.
@@ -196,8 +200,23 @@ export function adminRoutes(opts: AdminOptions) {
   // know is refused, never ignored, so a misspelt "branch" can't silently set none.
   async function wanted(req: Request): Promise<{ repo: RepoRef; branch?: string }> {
     const example = 'send JSON like { "repo": "owner/name" } or { "repo": "owner/name", "branch": "main" }';
-    const raw = await req.text();
-    if (raw.length > MAX_BODY) throw new Refusal(400, "invalid_body", `the body is too long: ${example}`);
+    // Refused by its declared length before any of it is read, and read no further than
+    // the limit when it declares none (or lies).
+    const tooLong = () => new Refusal(400, "invalid_body", `the body is over ${MAX_BODY} bytes: ${example}`);
+    const declared = req.headers.get("content-length");
+    if (declared !== null && !(/^\d+$/.test(declared) && Number(declared) <= MAX_BODY)) throw tooLong();
+    const parts: Uint8Array[] = [];
+    let size = 0;
+    const reader = req.body?.getReader();
+    for (let part = await reader?.read(); part && !part.done; part = await reader!.read()) {
+      size += part.value.byteLength;
+      if (size > MAX_BODY) {
+        await reader!.cancel().catch(() => undefined);
+        throw tooLong();
+      }
+      parts.push(part.value);
+    }
+    const raw = new TextDecoder().decode(Buffer.concat(parts));
     let body: unknown;
     try {
       body = JSON.parse(raw);
@@ -234,7 +253,13 @@ export function adminRoutes(opts: AdminOptions) {
     const want = await wanted(req);
     const full = `${want.repo.owner}/${want.repo.name}`;
     if (!opts.checkRepo) throw new Refusal(409, "code_tools_off", "code tools are off on this install (no sandbox and no GitHub credential), so a default repo would never be used and can't be checked. Turn them on (SANDBOX_RUNNER_TOKEN or SANDBOX_URL, with a GitHub App: docs/github-app.md), restart, then set it");
-    const check = await opts.checkRepo(want.repo, want.branch);
+    // Bounded: a GitHub that stalls (or a check that throws) is an answer, not a hung request.
+    const deadline = opts.checkTimeoutMs ?? CHECK_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<RepoCheck>((resolve) => { timer = setTimeout(() => resolve({ ok: false, reason: "unavailable", detail: `GitHub didn't answer in ${deadline / 1000} s` }), deadline); });
+    const checkRepo = opts.checkRepo;
+    const asked = Promise.resolve().then(() => checkRepo(want.repo, want.branch)).catch((e): RepoCheck => ({ ok: false, reason: "unavailable", detail: e instanceof Error ? e.message : String(e) }));
+    const check = await Promise.race([asked, late]).finally(() => clearTimeout(timer));
     if (!check.ok) {
       // Nothing is stored: a default the credential can't read would fail every request.
       if (check.reason === "not_installed") throw new Refusal(422, "app_not_installed", `the GitHub App isn't installed on ${full}: install it there (the App's settings, Install App, Only select repositories), then set it again`);

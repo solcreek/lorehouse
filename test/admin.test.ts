@@ -18,7 +18,7 @@ function setup(o: Partial<AdminOptions> = {}) {
   const handle = adminRoutes({ db, tenant: "t-test", token: TOKEN, ingest: () => undefined, sandbox: "off", ...o });
   const get = async (path: string, init: RequestInit & { token?: string | null } = {}) => {
     const { token = TOKEN, ...rest } = init;
-    const res = await handle(new Request(`http://x${path}`, { ...rest, headers: token === null ? {} : { authorization: `Bearer ${token}` } }));
+    const res = await handle(new Request(`http://x${path}`, { ...rest, headers: { ...(rest.headers as Record<string, string> | undefined), ...(token === null ? {} : { authorization: `Bearer ${token}` }) } }));
     return res!;
   };
   const body = async (path: string) => (await (await get(path)).json()) as Record<string, any>;
@@ -548,6 +548,36 @@ describe("a channel's default repo", () => {
     const unsaid = repoSetup({ checkRepo: github(() => ({ ok: false, reason: "rate_limited", detail: "GitHub is applying a rate limit to the credential" })).checkRepo });
     await refused(unsaid, { repo: "acme/widgets" }, 503, "github_rate_limited");
     expect((await unsaid.get("/api/v1/channels/C1/repo", { method: "PUT", body: '{"repo":"acme/widgets"}' })).headers.get("retry-after")).toBeNull();
+  });
+
+  test("a GitHub that stalls doesn't hang the request: after the deadline it is github_unavailable (502), nothing stored", async () => {
+    const r = repoSetup({ checkRepo: () => new Promise<RepoCheck>(() => {}), checkTimeoutMs: 20 });
+    const t0 = Date.now();
+    expect(await refused(r, { repo: "acme/widgets" }, 502, "github_unavailable")).toContain("didn't answer in");
+    expect(Date.now() - t0).toBeLessThan(2000);
+    // A check that throws is the same refusal, not a 500.
+    const broken = repoSetup({ checkRepo: async () => { throw new Error("boom"); } });
+    await refused(broken, { repo: "acme/widgets" }, 502, "github_unavailable");
+  });
+
+  // The body is one small JSON object: a long one is refused before it is read.
+  test("a body that declares more than 4096 bytes is refused unread; one that doesn't say is read no further than the limit", async () => {
+    const r = repoSetup();
+    const endless = () => {
+      let pulled = 0;
+      const stream = new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(1024).fill(0x20)); } }, { highWaterMark: 0 });
+      return { stream, pulled: () => pulled };
+    };
+    const declared = endless();
+    const a = await r.get("/api/v1/channels/C1/repo", { method: "PUT", body: declared.stream, headers: { "content-length": "5000" }, duplex: "half" } as RequestInit);
+    expect([a.status, ((await a.json()) as { code: string }).code]).toEqual([400, "invalid_body"]);
+    expect(declared.pulled()).toBe(0);
+    const silent = endless();
+    const b = await r.get("/api/v1/channels/C1/repo", { method: "PUT", body: silent.stream, duplex: "half" } as RequestInit);
+    expect([b.status, ((await b.json()) as { code: string }).code]).toEqual([400, "invalid_body"]);
+    expect(silent.pulled()).toBeLessThanOrEqual(6); // 4096 bytes and the chunk that crossed it, not the stream
+    expect(r.asked).toEqual([]);
+    expect(listChannelRepos(r.db)).toEqual([]);
   });
 
   test("a refused set leaves the default that was there", async () => {
