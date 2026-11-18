@@ -70,7 +70,7 @@ const TASK_LABELS: Record<string, string> = {
 // The start. The tenant's data key, if any, is needed only while it opens the databases:
 // it is wiped when the start ends, whether the app came up or not. `profiles`: the profiles
 // to run (profiles.ts), this build's unless a test passes its own.
-export async function createApp(config: Config, profiles: readonly unknown[] = PROFILES) {
+export async function createApp(config: Config, profiles: unknown = PROFILES) {
   const keys: Uint8Array[] = [];
   try {
     return await startApp(config, keys, loadProfiles(profiles));
@@ -79,7 +79,7 @@ export async function createApp(config: Config, profiles: readonly unknown[] = P
   }
 }
 
-async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[]) {
+async function startApp(config: Config, keys: Uint8Array[], profiles: readonly Profile[]) {
   const identity = agentIdentity(config.agent.name, config.agent.coAuthor);
 
   // The profiles (profiles.ts, ADR 0002), checked before anything was opened: each becomes

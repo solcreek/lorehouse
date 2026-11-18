@@ -31,23 +31,24 @@ export type SlackTriggerEvent = (typeof SLACK_TRIGGER_EVENTS)[number];
 
 // What starts a turn, tagged by `kind`. Only Slack exists yet; a webhook and a schedule
 // (ADR 0002 §1) are further members of this union, each with its own fields.
-export type ProfileTrigger = { kind: "slack"; events: SlackTriggerEvent[] };
+export type ProfileTrigger = { readonly kind: "slack"; readonly events: readonly SlackTriggerEvent[] };
 export const TRIGGER_KINDS = ["slack"] as const;
 
+// Read-only: a loaded profile is frozen (loadProfiles), so nothing changes one after the check.
 export type Profile = {
   // The durable agent id: names its sessions and, later, its sandboxes. Never the display
   // name, and never changed once sessions exist under it.
-  id: string;
-  mode: ProfileMode;
+  readonly id: string;
+  readonly mode: ProfileMode;
   // Its system prompt: the name of a file in prompts/profiles/, as registered in src/prompts.ts.
-  prompt: string;
+  readonly prompt: string;
   // Lorehouse's tools it may call, by name, in the order the model sees them. One whose
   // feature the install has off (no sandbox, PDF_REPLIES unset) is left out, not an error.
-  tools: string[];
+  readonly tools: readonly string[];
   // The skills in its index, by name, in order; likewise left out while their feature is off.
-  skills: string[];
-  triggers: ProfileTrigger[];
-  sandbox: ProfileSandbox;
+  readonly skills: readonly string[];
+  readonly triggers: readonly ProfileTrigger[];
+  readonly sandbox: ProfileSandbox;
   // ADR 0002 §1 also gives a profile `delivery`, `credentials`, `knowledge` and `model`.
   // Nothing reads them yet, so they are not fields yet (PENDING_FIELDS): a profile that
   // sets one is refused, not silently ignored. Each arrives with the code that honors it.
@@ -86,7 +87,7 @@ export const LOREHOUSE: Profile = {
 };
 
 // Every profile this build runs. The first profiles are code (ADR 0002, Deferred).
-export const PROFILES: Profile[] = [LOREHOUSE];
+export const PROFILES: readonly Profile[] = [LOREHOUSE];
 
 // What a profile's names are checked against: the prompts, tools and skills that exist.
 export type ProfileCatalog = { prompts: readonly string[]; tools: readonly string[]; skills: readonly string[] };
@@ -98,8 +99,11 @@ export class ProfileError extends Error {
   }
 }
 
-// The profiles this build runs, checked. Throws a ProfileError listing every problem.
-export function loadProfiles(profiles: readonly unknown[] = PROFILES, catalog: ProfileCatalog = PROMPT_CATALOG): Profile[] {
+// The profiles to run (this build's, unless given), checked: frozen copies, so what was
+// checked is what runs, whatever the caller does with its own objects after. Throws a
+// ProfileError listing every problem.
+export function loadProfiles(profiles: unknown = PROFILES, catalog: ProfileCatalog = PROMPT_CATALOG): readonly Profile[] {
+  if (!Array.isArray(profiles)) throw new ProfileError([`profiles: must be a list of profiles, got ${show(profiles)}`]);
   const problems: string[] = [];
   const checked = profiles.map((p, i) => checkProfile(p, i, catalog, problems));
   const ok = checked.filter((p): p is Profile => p !== undefined);
@@ -117,7 +121,7 @@ export function loadProfiles(profiles: readonly unknown[] = PROFILES, catalog: P
     problems.push(`triggers: exactly one profile may have a trigger of kind "slack" (ADR 0002 §2), found ${bySlack.length ? bySlack.join(", ") : "none"}`);
   }
   if (problems.length) throw new ProfileError(problems);
-  return ok;
+  return Object.freeze(ok);
 }
 
 function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, problems: string[]): Profile | undefined {
@@ -177,11 +181,19 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
     const workspace = tools.filter((t) => t.startsWith("workspace_"));
     if (input.sandbox === "none" && workspace.length) bad("sandbox", `must be read or write for the tool${workspace.length === 1 ? "" : "s"} ${workspace.join(", ")}, got "none"`);
   }
-  return problems.length === before ? (input as Profile) : undefined;
+  return problems.length === before ? deepFreeze(structuredClone(input) as Profile) : undefined;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const v of Object.values(value)) deepFreeze(v);
+  }
+  return value;
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-const show = (v: unknown) => (v === undefined ? "nothing" : JSON.stringify(v));
+const show = (v: unknown) => (v === undefined ? "nothing" : (JSON.stringify(v) ?? String(v)));
 
 // The profile's Slack trigger, if Slack messages start it.
 export function slackTrigger(profile: Profile): Extract<ProfileTrigger, { kind: "slack" }> | undefined {

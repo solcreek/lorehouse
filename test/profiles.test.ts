@@ -83,8 +83,32 @@ describe("June stays in src/app.ts (ADR 0001, ADR 0002 §1)", () => {
 });
 
 describe("a profile is checked on start", () => {
-  test("a valid one is returned as it is", () => {
+  test("a valid one is returned as it was given", () => {
     expect(loadProfiles([valid], CATALOG)).toEqual([valid]);
+  });
+
+  test("what comes back is a frozen copy: neither the caller's object nor a loaded profile can change what was checked", () => {
+    const given = structuredClone(valid) as unknown as { tools: string[]; triggers: { events: string[] }[] };
+    const [loaded] = loadProfiles([given], CATALOG) as [Profile];
+    given.tools.push("open_pull_request");
+    given.triggers[0]!.events.push("direct_message");
+    expect(loaded).toEqual(valid);
+    const writable = loaded as unknown as { id: string; tools: string[]; triggers: { events: string[] }[] };
+    expect(() => { writable.id = "other"; }).toThrow(TypeError);
+    expect(() => writable.tools.push("open_pull_request")).toThrow(TypeError);
+    expect(() => writable.triggers[0]!.events.push("direct_message")).toThrow(TypeError);
+    expect(() => (loadProfiles([valid], CATALOG) as unknown[]).push(valid)).toThrow(TypeError);
+    // The build's own list is not frozen by being loaded: its profiles come back as copies.
+    expect(loadProfiles()[0]).not.toBe(LOREHOUSE);
+    expect(Object.isFrozen(LOREHOUSE)).toBe(false);
+  });
+
+  test("something that isn't a list of profiles is a ProfileError too, not a crash", () => {
+    for (const given of [valid, "lorehouse", null, 7]) {
+      expect(() => loadProfiles(given, CATALOG), JSON.stringify(given)).toThrow(ProfileError);
+    }
+    expect(() => loadProfiles({ lorehouse: valid }, CATALOG)).toThrow(/^lorehouse: invalid profile: profiles: must be a list of profiles, got \{"lorehouse":/);
+    expect(() => loadProfiles(null, CATALOG)).toThrow("profiles: must be a list of profiles, got null");
   });
 
   test("the id is a lowercase handle of at most 32 characters, and names one profile", () => {
