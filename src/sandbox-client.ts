@@ -29,8 +29,11 @@ export type RemoteSandboxOptions = {
   url: string; // daemon base URL, e.g. https://sandbox.example.com
   token: string; // bearer credential the daemon checks
   fetch?: typeof fetch; // injectable for tests
-  // What to ask for the sandbox; left out, it gets the daemon's defaults.
+  // What to ask for the sandbox. Left out, nothing is asked: a new sandbox gets the
+  // daemon's defaults, and one that already has a grant keeps it (to return such a
+  // sandbox to the defaults, ask for them by name).
   resources?: SandboxResources;
+  now?: () => number; // injectable for tests: how long a command took
 };
 
 // Daemons known to understand a request for resources, per fetch and URL: asked once a
@@ -111,12 +114,14 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
     async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
       // Never more than the sandbox's command timeout: the daemon stops it there anyway.
       const timeoutMs = execTimeoutMs(opts.resources, o.timeoutMs, EXEC_TIMEOUT_MS);
+      const now = opts.now ?? Date.now;
+      const sent = now();
       const res = await call("/exec", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs }),
       });
-      return explainTimeout((await res.json()) as ExecResult, timeoutMs, opts.resources);
+      return explainTimeout((await res.json()) as ExecResult, timeoutMs, now() - sent, opts.resources);
     },
     async readFile(path: string): Promise<string> {
       const res = await call(`/file?path=${encodeURIComponent(path)}`, { method: "GET" });

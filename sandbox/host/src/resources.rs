@@ -202,16 +202,42 @@ impl Granted {
     /// choose the timeout. So a body that isn't a JSON object, or has any other key, is
     /// refused, and what goes out has each key once, spelled exactly.
     pub fn exec_body(&self, body: &[u8]) -> Result<Bytes, Refusal> {
+        Ok(self.write_exec(ExecBody::parse(body)?))
+    }
+
+    /// A parsed exec body as guestd gets it: its fields, and `timeoutMs` at what was asked
+    /// or this sandbox's command timeout, whichever is less.
+    pub fn write_exec(&self, parsed: ExecBody) -> Bytes {
+        let limit = self.command_timeout_secs.saturating_mul(1000);
+        let mut out = parsed.fields;
+        out.insert("timeoutMs".into(), json!(parsed.asked_ms.unwrap_or(limit).min(limit)));
+        // A map of JSON values with string keys always serializes.
+        Bytes::from(serde_json::to_vec(&out).unwrap_or_default())
+    }
+}
+
+/// A `POST /exec` body, read and found to be one guestd may be sent. Parsing needs no
+/// sandbox, so a body that is refused is refused before any sandbox is reached: nothing is
+/// booted, recorded or counted as a use for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecBody {
+    /// `command`, `cwd` and `env`, as parsed.
+    fields: Map<String, Value>,
+    /// The `timeoutMs` asked, when it is a whole number over zero.
+    asked_ms: Option<u64>,
+}
+
+impl ExecBody {
+    pub fn parse(body: &[u8]) -> Result<ExecBody, Refusal> {
         let bad = |why: String| Refusal::new(400, INVALID_EXEC, format!("{why}. A command's body is a JSON object with command, and optionally cwd, env and timeoutMs, spelled exactly so; nothing was run"), json!({}));
         let o = match serde_json::from_slice::<Value>(body) {
             Ok(Value::Object(o)) => o,
             Ok(other) => return Err(bad(format!("the exec body must be a JSON object, got {}", shown(&other)))),
             Err(e) => return Err(bad(format!("the exec body is not JSON sandboxd can read ({e})"))),
         };
-        let limit = self.command_timeout_secs.saturating_mul(1000);
         // The one `timeoutMs` the parsed object has (a key given twice: the last).
-        let asked = o.get("timeoutMs").and_then(Value::as_u64).filter(|ms| *ms > 0).unwrap_or(limit);
-        let mut out = Map::new();
+        let asked_ms = o.get("timeoutMs").and_then(Value::as_u64).filter(|ms| *ms > 0);
+        let mut fields = Map::new();
         for (key, value) in o {
             if !EXEC_KEYS.contains(&key.as_str()) {
                 let mut r = bad(format!("the exec body has a key {} that is not one guestd is sent", shown(&json!(key))));
@@ -219,11 +245,10 @@ impl Granted {
                 return Err(r);
             }
             if key != "timeoutMs" {
-                out.insert(key, value);
+                fields.insert(key, value);
             }
         }
-        out.insert("timeoutMs".into(), json!(asked.min(limit)));
-        serde_json::to_vec(&out).map(Bytes::from).map_err(|e| bad(format!("the exec body can't be written again ({e})")))
+        Ok(ExecBody { fields, asked_ms })
     }
 }
 
@@ -398,7 +423,7 @@ impl Policy {
             409,
             MISMATCH,
             format!(
-                "sandbox {id} is running with its earlier resources ({}), and this request comes to {}. A sandbox's resources are fixed while its VM runs and change at its next boot: the VM stops after {idle_secs} s without a request (SANDBOXD_IDLE_SECS; a running background job can hold it up longer, SANDBOXD_JOB_HOLD_SECS), and the first request after that starts it with what that request asks for. Wait that long and try again, or ask for what it has. This call was not run and does not count as a request",
+                "sandbox {id} is running with its earlier resources ({}), and this request comes to {}. A sandbox's resources are fixed while its VM runs and change at its next boot: the VM stops after {idle_secs} s without a request (SANDBOXD_IDLE_SECS; a running background job can hold it up longer, SANDBOXD_JOB_HOLD_SECS), and the first request after that starts it with what that request asks for. Wait that long and try again, or ask for what it has. A job already running there can still be watched and cancelled, and files read: only calls that start work or write are refused. This call was not run and does not count as a request",
                 has.describe(),
                 differs.iter().map(show).collect::<Vec<_>>().join(", ")
             ),
@@ -410,13 +435,18 @@ impl Policy {
     /// rules a request is (each field within its bounds, pids enough for the vCPUs) and to
     /// the maxima in force now. One that fails is not started, and not adjusted either.
     pub fn validate(&self, id: &str, stored: &Granted) -> Result<(), Refusal> {
-        let fix = format!("Send a request this host can grant for sandbox {id} (it replaces the record while the VM is stopped), or destroy the sandbox");
+        // The way out, spelled so it can be done without the source. Asking for nothing is
+        // not it: a sandbox with a record keeps the record when its caller asks for nothing.
+        let defaults = FIELDS.into_iter().filter_map(|f| self.defaults.get(f).map(|v| format!("\"{}\": {v}", f.name()))).collect::<Vec<_>>().join(", ");
+        let fix = format!(
+            "A sandbox keeps its record while it is asked for nothing, so removing the request (a profile's sandboxResources) does not return sandbox {id} to the defaults. Ask for values this host grants, explicitly: to return it to the defaults, name them ({{ {defaults} }}). An explicit request replaces the record at the sandbox's next boot. Or destroy the sandbox"
+        );
         for f in FIELDS {
             // An uncapped disk is no grant; a capped one on a host whose quota is now off
             // would go unenforced.
             let Some(has) = stored.get(f) else { continue };
             if f == Field::DiskGib && self.defaults.disk_gib.is_none() {
-                return Err(no_disk_quota(has, &format!("sandbox {id} was created with that cap, and the host's disk quota has been turned off since; turn it back on, send a request without diskGib, or destroy the sandbox")));
+                return Err(no_disk_quota(has, &format!("sandbox {id}'s record has that cap, and the host's disk quota has been turned off since; turn it back on, send an explicit request without diskGib (it replaces the record at the next boot), or destroy the sandbox")));
             }
             let (min, _) = f.bounds();
             if has < min {
@@ -429,7 +459,7 @@ impl Policy {
             }
             let max = self.maxima.get(f);
             if has > max {
-                return Err(over_maximum(f, has, max, &format!("Sandbox {id} was created with it under a higher maximum; it is not started, and not shrunk. Raise the maximum again, or: {fix}")));
+                return Err(over_maximum(f, has, max, &format!("Sandbox {id}'s record has it, from under a higher maximum; it is not started, and not shrunk. Raise the maximum again, or: {fix}")));
             }
         }
         if stored.pids < stored.vcpus + PIDS_OVER_VCPUS {
@@ -494,6 +524,8 @@ pub fn read_stored(dir: &Path) -> Result<Option<Granted>, String> {
 /// Written whole or not at all, and on the disk before it counts: the file is synced
 /// before the rename and the directory after it, so a power cut leaves the old record or
 /// the new one, never an empty or missing one (the rack this runs on loses power uncleanly).
+/// A write that fails anywhere (a full disk, a rename that can't be made) leaves the old
+/// record as it was and no temporary file beside it.
 pub fn store(dir: &Path, granted: &Granted) -> Result<(), String> {
     use std::io::Write;
     let (path, tmp) = (dir.join(FILE), dir.join(format!("{FILE}.tmp")));
@@ -505,7 +537,10 @@ pub fn store(dir: &Path, granted: &Granted) -> Result<(), String> {
         std::fs::rename(&tmp, &path)?;
         std::fs::File::open(dir)?.sync_all()
     };
-    write().map_err(|e| format!("{}: {e}", path.display()))
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
 }
 
 #[cfg(test)]
@@ -699,7 +734,16 @@ pub mod tests {
         // The maximum lowered since: not started, not shrunk.
         let r = stock().validate("t.s1", &has).unwrap_err();
         assert_eq!((r.status, r.code, r.detail["field"].as_str()), (422, OVER_MAXIMUM, Some("memMib")));
-        assert!(r.message.contains("Sandbox t.s1 was created with it") && r.message.contains("SANDBOXD_MAX_MEM_MIB") && r.message.contains("Send a request"), "{}", r.message);
+        // It says the next step exactly: asking for nothing keeps the record; name the defaults.
+        for part in [
+            "Sandbox t.s1's record has it, from under a higher maximum",
+            "SANDBOXD_MAX_MEM_MIB",
+            "removing the request (a profile's sandboxResources) does not return sandbox t.s1 to the defaults",
+            r#"name them ({ "vcpus": 2, "memMib": 2048, "diskGib": 8, "pids": 64, "commandTimeoutSecs": 600 })"#,
+            "An explicit request replaces the record at the sandbox's next boot",
+        ] {
+            assert!(r.message.contains(part), "{part:?} not in {}", r.message);
+        }
         // A capped disk on a host whose quota is off now: not started uncapped.
         let mut off = roomy();
         off.defaults.disk_gib = None;
@@ -796,6 +840,15 @@ pub mod tests {
         let body = &body[..body.find("\n}\n").unwrap()];
         let (sync, rename, dirsync) = (body.find("file.sync_all()").unwrap(), body.find("std::fs::rename(").unwrap(), body.find("File::open(dir)?.sync_all()").unwrap());
         assert!(sync < rename && rename < dirsync, "store() must sync the file, rename, then sync the directory");
+        // A write that fails after the temporary file was made (here the rename: the
+        // record's name is taken by a directory that isn't empty) leaves no temporary file.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(blocked.join(FILE).join("in-the-way")).unwrap();
+        let g = Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 600 };
+        assert!(store(&blocked, &g).unwrap_err().contains("resources.json"));
+        assert!(!blocked.join("resources.json.tmp").exists(), "a failed write left its temporary file");
+        assert!(blocked.join(FILE).join("in-the-way").exists(), "what was there was touched");
+        std::fs::remove_dir_all(&blocked).unwrap();
         // A directory that isn't there: an error that names the file, nothing written.
         assert!(store(&dir.join("gone"), &Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 600 }).unwrap_err().contains("resources.json"));
         for damaged in ["", "{}", r#"{"vcpus":4,"memMib":4096,"diskGib":null,"pids":128,"commandTimeoutSecs":1800,"gpus":1}"#] {

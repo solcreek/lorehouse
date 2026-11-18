@@ -67,7 +67,9 @@ export type Profile = {
   // commands the other tools run; background jobs keep their own limits), each optional. A
   // request, not a setting: the sandbox host grants it within its own maxima or refuses
   // the call with a reason, and never clamps it (ADR 0003; src/sandbox-resources.ts). Left
-  // out, the sandbox gets the host's defaults. Adding or changing it reaches a thread's
+  // out, nothing is asked: a new sandbox gets the host's defaults, but a thread's sandbox
+  // that already has a grant (from when its profile asked) keeps it. Removing the field
+  // does not return those to the defaults; naming the defaults here does. Adding or changing it reaches a thread's
   // existing sandbox at its VM's next boot, after its idle stop; until then calls there
   // are refused, saying so. A field
   // beside `sandbox`, not inside it: `sandbox` stays the one word that says what the

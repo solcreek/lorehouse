@@ -213,51 +213,74 @@ describe("commandTimeoutSecs bounds every command the tools run, not only worksp
   const reply = (job: Job, result: unknown): JobResult => ({ id: job.id, status: 200, bodyBase64: b64(JSON.stringify(result)) });
 
   test("through a runner: a tool's own longer timeout is cut to it, so the app never waits past what the host allows, and a stop there says which limit it was", async () => {
-    const hub = hubWith();
+    let clock = 1_800_000_000_000;
+    const hub = new RunnerHub(openKnowledge(":memory:"), { now: () => clock });
     const { sent, link } = wsRunner(hub, "r1", ["resources"]);
     const sb = hub.sandbox("s1", { resources: { commandTimeoutSecs: 120 } });
     // workspace_clone's clone asks for 10 minutes: sent, and waited for, as 120 s.
     const clone = sb.exec("git clone https://github.com/acme/big /workspace/repo", { cwd: "/", timeoutMs: 10 * 60_000 });
     expect([sent[0]!.timeoutMs, bodyOf(sent[0]!).timeoutMs]).toEqual([120_000, 120_000]);
+    clock += 120_400; // guestd stopped it at its 120 s
     link.result(reply(sent[0]!, TIMED_OUT));
     expect(await clone).toEqual({ ...TIMED_OUT, stderr: TIMED_OUT.stderr + NOTE });
     // A shorter one of its own stays, and a stop at it is the command's own, unremarked.
     const quick = sb.exec("git config user.name x", { timeoutMs: 30_000 });
     expect([sent[1]!.timeoutMs, bodyOf(sent[1]!).timeoutMs]).toEqual([30_000, 30_000]);
+    clock += 30_100;
     link.result(reply(sent[1]!, TIMED_OUT));
     expect(await quick).toEqual(TIMED_OUT);
     // Any other exit at the limit is not a timeout.
     const failed = sb.exec("make");
+    clock += 120_100;
     link.result(reply(sent[2]!, { exitCode: 2, stdout: "", stderr: "make: *** [all] Error 2" }));
     expect((await failed).stderr).toBe("make: *** [all] Error 2");
+    // A command that exits 124 by itself, printing guestd's words, after two seconds: the
+    // sandbox's timeout stopped nothing, so nothing says it did.
+    const faked = sb.exec("echo '[guestd] command timed out' >&2; exit 124");
+    clock += 2_000;
+    link.result(reply(sent[3]!, TIMED_OUT));
+    expect(await faked).toEqual(TIMED_OUT);
+    // Just under the timeout (a clock that differs a little) still counts.
+    const near = sb.exec("make test");
+    clock += 109_000;
+    link.result(reply(sent[4]!, TIMED_OUT));
+    expect((await near).stderr).toEndWith(NOTE);
 
     // Asking for more than a tool's own limit doesn't lengthen the tool's: a clone keeps
     // its 10 minutes under a 30-minute command timeout; a command with none gets the 30.
     const long = hub.sandbox("s2", { resources: { commandTimeoutSecs: 1800 } });
     void long.exec("git clone …", { timeoutMs: 10 * 60_000 });
     void long.exec("make test");
-    expect([sent[3]!.timeoutMs, sent[4]!.timeoutMs]).toEqual([600_000, 1_800_000]);
+    expect([sent[5]!.timeoutMs, sent[6]!.timeoutMs]).toEqual([600_000, 1_800_000]);
     // With no request, every timeout is what it was.
     void hub.sandbox("s3").exec("git fetch", { timeoutMs: 5 * 60_000 });
     void hub.sandbox("s3").exec("make");
-    expect([sent[5]!.timeoutMs, sent[6]!.timeoutMs]).toEqual([300_000, EXEC_TIMEOUT_MS]);
+    expect([sent[7]!.timeoutMs, sent[8]!.timeoutMs]).toEqual([300_000, EXEC_TIMEOUT_MS]);
   });
 
   test("called directly: the same cut, and the same sentence", async () => {
     const bodies: { timeoutMs: number }[] = [];
+    // The daemon answers each command after `took` ms on the injected clock.
+    let [clock, took] = [1_800_000_000_000, 0];
     const f = (async (url: string, init: RequestInit) => {
       if (url.endsWith("/v1/capabilities")) return Response.json({ features: ["resources"] });
       bodies.push(JSON.parse(init.body as string));
+      clock += took;
       return Response.json(TIMED_OUT);
     }) as typeof fetch;
-    const sb = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f, resources: { commandTimeoutSecs: 120 } });
+    const sb = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f, now: () => clock, resources: { commandTimeoutSecs: 120 } });
+    took = 120_300;
     expect(await sb.exec("git clone …", { timeoutMs: 10 * 60_000 })).toEqual({ ...TIMED_OUT, stderr: TIMED_OUT.stderr + NOTE });
     expect(await sb.exec("git config …", { timeoutMs: 30_000 })).toEqual(TIMED_OUT);
     expect(await sb.exec("make")).toEqual({ ...TIMED_OUT, stderr: TIMED_OUT.stderr + NOTE });
-    expect(bodies.map((b) => b.timeoutMs)).toEqual([120_000, 30_000, 120_000]);
-    const plain = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f });
+    // The same answer two seconds in: the command's own exit 124, not the sandbox's stop.
+    took = 2_000;
+    expect(await sb.exec("echo '[guestd] command timed out' >&2; exit 124")).toEqual(TIMED_OUT);
+    expect(bodies.map((b) => b.timeoutMs)).toEqual([120_000, 30_000, 120_000, 120_000]);
+    took = 600_500;
+    const plain = remoteSandbox("s1", { url: "https://fb.example", token: "tok", fetch: f, now: () => clock });
     expect(await plain.exec("git clone …", { timeoutMs: 10 * 60_000 })).toEqual(TIMED_OUT);
-    expect(bodies[3]!.timeoutMs).toBe(600_000);
+    expect(bodies[4]!.timeoutMs).toBe(600_000);
   });
 });
 

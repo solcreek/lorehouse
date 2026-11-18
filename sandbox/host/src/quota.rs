@@ -206,13 +206,23 @@ pub fn capped(quota: &Quota, dir: &Path) -> bool {
 }
 
 /// What a sandbox has written to its own subvolume, in bytes: its qgroup's exclusive
-/// usage, the number its limit is checked against. Asked before a limit is lowered.
+/// usage, the number its limit is checked against. Asked before a limit is lowered, and
+/// after a sync of the filesystem: the qgroup's numbers are those of the last committed
+/// transaction, and right after a VM stops its last writes may not be in one yet, so
+/// without it a limit could be lowered under what is really there. Any failure is an
+/// error, never a number.
 pub async fn used_bytes(dir: &Path) -> Result<u64, String> {
-    let out = command("btrfs").args(["qgroup", "show", "--raw", "-f"]).arg(dir).output().await.map_err(|e| format!("btrfs: {e}"))?;
+    let out = command("btrfs").args(usage_args(dir)).output().await.map_err(|e| format!("btrfs: {e}"))?;
     if !out.status.success() {
         return Err(format!("btrfs qgroup show {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
     }
     exclusive_bytes(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| format!("btrfs qgroup show {}: no usage in its output", dir.display()))
+}
+
+/// `btrfs qgroup show` for one subvolume's own qgroup (`-f`), in bytes (`--raw`), after a
+/// sync (`--sync`; btrfs-progs 7.1 on starship has it, 2026-11-18).
+pub fn usage_args(dir: &Path) -> Vec<String> {
+    vec!["qgroup".into(), "show".into(), "--sync".into(), "--raw".into(), "-f".into(), dir.display().to_string()]
 }
 
 /// The exclusive bytes in `btrfs qgroup show --raw -f <subvolume>`: the third column of
@@ -266,6 +276,8 @@ mod tests {
         assert_eq!(limit_bytes(&on, Some(16 << 30)), Some(16 << 30));
         assert_eq!(limit_args(limit_bytes(&on, Some(2 << 30)).unwrap(), Path::new("/s/y")).join(" "), "qgroup limit -e 2147483648 /s/y");
         assert_eq!(limit_bytes(&Quota::Off, Some(16 << 30)), None);
+        // Usage is read after a sync, or a limit could be lowered under the last writes.
+        assert_eq!(usage_args(Path::new("/s/x")).join(" "), "qgroup show --sync --raw -f /s/x");
         // What a sandbox uses, read from either form of `btrfs qgroup show --raw -f`.
         let new = "Qgroupid    Referenced    Exclusive   Path \n--------    ----------    ---------   ---- \n0/257       3221241856   3221225473   t.s1\n";
         let old = "qgroupid         rfer         excl \n--------         ----         ---- \n0/257           16384        16384 \n";

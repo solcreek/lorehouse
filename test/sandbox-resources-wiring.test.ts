@@ -55,6 +55,7 @@ const server = Bun.serve({
 const HERE = `http://127.0.0.1:${server.port}`;
 const dir = mkdtempSync(join(tmpdir(), "sandbox-resources-wiring-"));
 const RUNNER_TOKEN = "r".repeat(32);
+const STATUS = "s".repeat(32);
 const apps: Awaited<ReturnType<typeof createApp>>[] = [];
 
 // The app with `sandbox` as its sandbox settings, and its workspace_read_file tool.
@@ -69,6 +70,7 @@ async function start(name: string, sandbox: Record<string, string>, profiles?: u
     LOREHOUSE_DB: join(dir, `${name}.db`),
     SESSIONS_DB: ":memory:",
     GITHUB_TOKEN: "g",
+    STATUS_TOKEN: STATUS,
     INGEST_BACKFILL_DAYS: "0",
     ...sandbox,
   }), profiles);
@@ -107,7 +109,17 @@ describe("the sandbox the app builds for a profile that asks for resources", () 
     const { app, run } = await start(name, { SANDBOX_RUNNER_TOKEN: RUNNER_TOKEN }, profiles);
     const post = (path: string, body: unknown) => app.fetch(new Request(`http://x${path}`, { method: "POST", headers: { authorization: `Bearer ${RUNNER_TOKEN}`, "x-lorehouse-runner": "box-1", "content-type": "application/json" }, body: JSON.stringify(body) }));
     const polled = post("/runners/poll", { capacity: 2, running: 0, version: "0.1.0", features: ["resources"] });
-    await Bun.sleep(50); // the poll registers the runner before the tool asks for one
+    // The tool needs a runner to place its sandbox on: wait until the app itself lists
+    // this one as connected (its poll has arrived and is held), not for a guessed delay.
+    const listed = async () => {
+      const status = (await (await app.fetch(new Request("http://x/status", { headers: { authorization: `Bearer ${STATUS}` } }))).json()) as { runners?: { runner: string; online: boolean }[] };
+      return !!status.runners?.some((r) => r.runner === "box-1" && r.online);
+    };
+    const deadline = Date.now() + 5000;
+    while (!(await listed())) {
+      if (Date.now() > deadline) throw new Error("the runner's poll never registered: /status lists no box-1");
+      await Bun.sleep(5);
+    }
     const answer = run(session);
     const { jobs } = (await (await polled).json()) as { jobs: Record<string, unknown>[] };
     await post("/runners/results", { results: [{ id: jobs[0]!.id, status: 200, bodyBase64: Buffer.from("content").toString("base64") }] });
