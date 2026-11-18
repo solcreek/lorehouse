@@ -47,9 +47,16 @@ type Link =
   | { gen: number; kind: "ws"; send: (job: Job) => void }
   | { gen: number; kind: "poll"; queue: Job[]; waiter?: (jobs: Job[]) => void; unacked: Map<string, Job> };
 
-type Runner = { name: string; status: RunnerStatus; link: Link; lastSeen: number; session?: string; started?: number };
+// `heard`: this connection has sent a status of its own. Until it has, what the runner
+// honors is not known: the status kept from the connection before is another process's.
+type Runner = { name: string; status: RunnerStatus; link: Link; lastSeen: number; heard: boolean; session?: string; started?: number };
 // `gen` is the connection the job went out on; `session`, the runner process it went to.
 type Pending = { runner: string; gen: number; session?: string; deadline: number; resolve: (r: JobResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
+
+// A connection that hasn't sent its first status: not a verdict on its sandboxd, so not a
+// ResourcesUnsupported. A WebSocket runner sends one as it opens.
+const justConnected = (names: string[]) =>
+  `sandbox runner ${names.join(", ")} just connected and hasn't said yet whether it honors sandbox resources, so nothing was run there; try again in a few seconds`;
 
 // A boot can precede the work: a job's deadline is its own timeout plus this.
 const BOOT_SLACK_MS = 60_000;
@@ -195,7 +202,10 @@ export class RunnerHub {
   private replace(name: string, link: Link): Runner {
     const old = this.runners.get(name);
     if (old?.link.kind === "poll") old.link.waiter?.([]);
-    const r: Runner = { name, link, lastSeen: this.now(), status: old?.status ?? { runner: name, capacity: 0, running: 0 } };
+    // The old connection's status stands in until this one sends its own (its room, for
+    // placing), except what it said it understands: an older sandboxd may have taken the
+    // name, and must not be sent a request for resources on its predecessor's word.
+    const r: Runner = { name, link, lastSeen: this.now(), heard: false, status: old ? { ...old.status, features: undefined } : { runner: name, capacity: 0, running: 0 } };
     this.runners.set(name, r);
     if (!old) this.opts.log?.(`runners: ${name} connected (${link.kind})`);
     return r;
@@ -206,6 +216,7 @@ export class RunnerHub {
     if (!r) return;
     r.status = { runner: name, capacity: status.capacity, running: status.running, version: status.version, mirrors: status.mirrors, features: status.features };
     r.lastSeen = this.now();
+    r.heard = true;
     if (status.session) {
       r.session = status.session;
       r.started = status.started;
@@ -275,6 +286,8 @@ export class RunnerHub {
     if (!online.length) throw new Error("no sandbox runner is connected");
     const able = asks ? online.filter((r) => r.status.features?.includes(RESOURCES_FEATURE)) : online;
     if (!able.length) {
+      const unheard = online.filter((r) => !r.heard).map((r) => r.name);
+      if (unheard.length) throw new Error(justConnected(unheard));
       const names = online.map((r) => `${r.name} (version ${r.status.version ?? "unknown"})`).join(", ");
       throw new ResourcesUnsupported(`every connected sandbox runner: ${names}`, `none lists "${RESOURCES_FEATURE}" among its features, and each would run the sandbox with its defaults`);
     }
@@ -293,7 +306,7 @@ export class RunnerHub {
   private understands(runner: Runner, body: JobBody): void {
     if (body.op !== "guest" || !body.resources || runner.status.features?.includes(RESOURCES_FEATURE)) return;
     const host = `sandbox runner ${runner.name}`;
-    if (runner.status.version === undefined && runner.status.capacity === 0) throw new Error(`${host} just connected and hasn't said yet whether it honors sandbox resources, so nothing was run there; try again in a few seconds`);
+    if (!runner.heard) throw new Error(justConnected([runner.name]));
     throw new ResourcesUnsupported(host, `its sandboxd (version ${runner.status.version ?? "unknown"}) doesn't list "${RESOURCES_FEATURE}" among its features and would run the sandbox with its defaults`);
   }
 

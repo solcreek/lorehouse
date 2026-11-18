@@ -190,6 +190,33 @@ describe("the request over the runner protocol", () => {
     expect(((await exec!.run({ command: "make" }, { sessionId: "s2" } as never)) as { error: string }).error).toContain("Nothing was run there");
   });
 
+  test("a runner that connects again is sent no request until it says for itself that it honors it", async () => {
+    const hub = hubWith();
+    const first = wsRunner(hub, "box", ["resources"]);
+    void hub.sandbox("s1", { resources: ASK }).exec("make"); // placed on box
+    expect(first.sent).toHaveLength(1);
+    // The name connects again, and an older sandboxd may have taken its place: what the
+    // earlier connection said of its features is not this one's to inherit.
+    const again: Job[] = [];
+    const link = hub.attachWs("box", (j) => again.push(j));
+    const early = await hub.sandbox("s1", { resources: ASK }).exec("make").catch((e) => e);
+    expect(early.message).toContain("sandbox runner box just connected and hasn't said yet whether it honors sandbox resources");
+    expect(early).not.toBeInstanceOf(ResourcesUnsupported); // not a verdict on it yet
+    // A new sandbox isn't placed on it for a request either, on what the old connection said.
+    const fresh = await hub.sandbox("s2", { resources: ASK }).exec("make").catch((e) => e);
+    expect(fresh.message).toContain("just connected and hasn't said yet");
+    expect(again).toEqual([]);
+    // It is an older sandboxd: refused for what it is, and still sent nothing.
+    link.status({ runner: "box", capacity: 4, running: 0, version: "0.0.9" });
+    expect(await hub.sandbox("s1", { resources: ASK }).exec("make").catch((e) => e)).toBeInstanceOf(ResourcesUnsupported);
+    expect(again).toEqual([]);
+    // Once it lists the feature, the request goes.
+    link.status({ runner: "box", capacity: 4, running: 0, version: "0.1.0", features: ["resources"] });
+    void hub.sandbox("s1", { resources: ASK }).exec("make");
+    expect(again).toHaveLength(1);
+    expect(again[0]).toMatchObject({ sandbox: "s1", resources: ASK });
+  });
+
   test("a runner's features and a result's code survive the routes' parsing; a malformed list reads as none", async () => {
     const hubQuick = new RunnerHub(openKnowledge(":memory:"), { pollWaitMs: 5 });
     const quick = runnerRoutes(hubQuick, "tok");
