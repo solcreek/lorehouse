@@ -59,6 +59,21 @@ LAB_FS=btrfs LAB_DISK_QUOTA_GIB=2 sandbox/lab/lab.sh deploy
   `host.sh` puts upstream's static build (v7.1, the version starship runs, checked against
   its published sha256) in `/usr/local/bin`.
 
+`bench limits` proves each of a sandbox's limits (#109) there: two sandboxes with
+different requests, the refusals, a command's timeout, a stopped sandbox taking its next
+request, and (with a short idle stop) that refused requests don't keep a VM up. It needs
+maxima above the defaults, and exits 1 when a check fails:
+
+```bash
+LAB_FS=btrfs LAB_DISK_QUOTA_GIB=3 LAB_SANDBOXD="SANDBOXD_MAX_VCPUS=4 SANDBOXD_MAX_MEM_MIB=4096 \
+  SANDBOXD_MAX_DISK_GIB=4 SANDBOXD_MAX_PIDS=128 SANDBOXD_MAX_COMMAND_TIMEOUT_SECS=900 \
+  SANDBOXD_IDLE_SECS=20" sandbox/lab/lab.sh deploy
+sandbox/lab/lab.sh bench limits        # about 7 minutes; 41 checks, then one JSON line
+```
+
+What it saw on 2026-11-18 is in [`sandbox/host/README.md`](../host/README.md). The lab's
+disk sustains about 36 MB/s after its burst, so the disk check writes 256 MiB at a time.
+
 Proved 2026-11-18 on `n4-standard-16`, us-east4-a, with `main` at 2ec55bd and a 2 GiB
 quota: after a guest wrote 3000 MiB, the host's qgroup for the sandbox read 2.00 GiB of
 2.00 GiB. The guest's buffered `dd` still reported all 3000 MiB written: the writes fail
