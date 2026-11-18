@@ -159,6 +159,23 @@ async function mentionAndWait(question: string, { inHistory = false } = {}): Pro
   return ts;
 }
 
+// `user` mentions the agent in a new thread and is answered, so their membership is cached
+// from here on (until a restart). Null when answered, else why not.
+async function answeredOnce(user: string): Promise<string | null> {
+  const ts = `${1995000000 + ++seq}.000100`;
+  await sendEvent({ type: "app_mention", user, team: "T1", text: `<@UBOT> [q${seq}] where is the wombat review`, ts, event_ts: ts, channel: ALLOWED });
+  return (await fetch(`${MOCK}/wait?thread_ts=${ts}&timeout_ms=15000`)).ok ? null : `${user}'s own mention was never answered`;
+}
+
+// Whether the admin API lists this thread of the allowed channel as one the agent joined.
+const isJoined = async (thread: string) =>
+  (await admin<{ threads: { channel: string; threadTs: string }[] }>("/api/v1/threads?limit=50")).threads.some((t) => t.channel === ALLOWED && t.threadTs === thread);
+
+// Hold (or let go) the mock's answer to users.info about `user`, as a slow lookup: how
+// many such lookups are waiting.
+const holdLookup = async (user: string, on: boolean) =>
+  ((await (await fetch(`${MOCK}/fixtures/hold`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ method: "users.info", user, hold: on }) })).json()) as { waiting: number }).waiting;
+
 // A button click, as Slack's interactivity delivers one: form-encoded `payload=<json>`,
 // signed like an event, to the same URL.
 async function sendInteraction(payload: Record<string, unknown>) {
@@ -406,16 +423,34 @@ const scenarios: Scenario[] = [
   {
     // ADR 0002: today's agent is the first profile, id `lorehouse`, started by Slack. Each
     // profile is { id, mode, triggers }, a trigger tagged by `kind`; the events are the ones
-    // in force, so a DM is one only while the install answers DMs.
+    // in force, so a DM is one only while the install answers DMs. The values are the
+    // contract, read field by field: not the order of an object's keys, and a trigger's
+    // events are a set (each once, in any order). The keys are the contract too: a profile
+    // has exactly id, mode and triggers, a trigger exactly kind and events.
     name: "GET /status lists the profiles: lorehouse, interactive, started by Slack mentions and follow-ups, and by DMs only with DM_MODE=answer",
     run: async () => {
-      const profiles = async () => JSON.stringify(((await status()) as Status & { profiles?: unknown }).profiles);
-      const want = (events: string[]) => JSON.stringify([{ id: "lorehouse", mode: "interactive", triggers: [{ kind: "slack", events }] }]);
-      const byDefault = await profiles();
-      if (byDefault !== want(["mention", "follow_up"])) return `/status profiles ${byDefault}, want ${want(["mention", "follow_up"])}`;
+      const wrong = async (events: string[]): Promise<string | null> => {
+        const { profiles } = (await status()) as Status & { profiles?: unknown };
+        const got = `/status profiles ${JSON.stringify(profiles)}`;
+        if (!Array.isArray(profiles) || profiles.length !== 1) return `${got}, want a list of one profile`;
+        // Exactly these keys, in any order: nothing of a profile's prompt, tools or skills.
+        const keys = (o: unknown) => (o && typeof o === "object" ? Object.keys(o).sort().join(", ") : "none");
+        const p = profiles[0] as { id?: unknown; mode?: unknown; triggers?: unknown } | null;
+        if (keys(p) !== "id, mode, triggers") return `${got}, want a profile with exactly id, mode and triggers, got the keys ${keys(p)}`;
+        if (p?.id !== "lorehouse") return `${got}, want id "lorehouse" (a string)`;
+        if (p.mode !== "interactive") return `${got}, want mode "interactive"`;
+        if (!Array.isArray(p.triggers) || p.triggers.length !== 1) return `${got}, want one trigger`;
+        const t = p.triggers[0] as { kind?: unknown; events?: unknown } | null;
+        if (keys(t) !== "events, kind") return `${got}, want a trigger with exactly kind and events, got the keys ${keys(t)}`;
+        if (t?.kind !== "slack") return `${got}, want a trigger of kind "slack"`;
+        const sameSet = Array.isArray(t.events) && t.events.length === events.length && events.every((e) => (t.events as unknown[]).includes(e));
+        return sameSet ? null : `${got}, want the events ${events.join(", ")}, each once, in any order`;
+      };
+      const byDefault = await wrong(["mention", "follow_up"]);
+      if (byDefault) return byDefault;
       return inMode({ DM_MODE: "answer" }, async () => {
-        const answering = await profiles();
-        return answering === want(["mention", "follow_up", "direct_message"]) ? null : `DM_MODE=answer: /status profiles ${answering}, want ${want(["mention", "follow_up", "direct_message"])}`;
+        const answering = await wrong(["mention", "follow_up", "direct_message"]);
+        return answering && `DM_MODE=answer: ${answering}`;
       });
     },
   },
@@ -1346,7 +1381,7 @@ const scenarios: Scenario[] = [
   // which: in the fixtures UG1 is a multi-channel guest, UG2 a single-channel one, UX1 from
   // workspace T9, and U404 no one Slack knows (user_not_found: fails closed).
   {
-    name: "answers only full members: a guest's mention or follow-up, someone from another workspace, or a sender Slack doesn't know gets one line in the thread, with no search or model call",
+    name: "answers only full members: a guest's mention or follow-up, someone from another workspace, or a sender Slack doesn't know gets one line in the thread, with no search or model call, and a refused mention's thread isn't joined",
     run: async () => {
       const thread = await mentionAndWait("where is the wombat review"); // a member's: the thread is joined
       await reset();
@@ -1376,6 +1411,10 @@ const scenarios: Scenario[] = [
       if (s.modelCalls || s.byMethod["chat.startStream"]) return `answered anyway: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}`;
       if (s.posts.length !== want.length) return `posted ${s.posts.length}×, want ${want.length}`;
       if ((await usage()).asks !== asks) return "a refused question was counted as an ask";
+      // A refused mention asks the agent into nothing: its thread isn't one it joined.
+      const { threads } = await admin<{ threads: { channel: string; threadTs: string }[] }>("/api/v1/threads?limit=50");
+      const joined = [guest, outsider, unknown].filter((m) => threads.some((t) => t.channel === ALLOWED && t.threadTs === m.ts));
+      if (joined.length) return `a refused asker's thread is listed as joined: ${joined.map((m) => m.ts).join(", ")}`;
       // A member is still answered.
       const a = await ask("when is the quarterly wombat review");
       return a.cite === WOMBAT_THREAD ? null : `a member got ${JSON.stringify(a.text.slice(0, 120))}, want a cite of ${WOMBAT_THREAD}`;
@@ -1391,6 +1430,86 @@ const scenarios: Scenario[] = [
       await Bun.sleep(500);
       const s = await stats();
       return s.modelCalls || s.byMethod["chat.startStream"] ? `answered anyway: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}` : null;
+    }),
+  },
+  // A mention is decided only once its asker is looked up, and that waits on Slack; a plain
+  // reply in its thread by someone already looked up must wait for it too, not be dropped
+  // because the thread isn't joined yet (#163). Each of the two scenarios restarts the app,
+  // so nobody's membership is cached, has U2 answered once (now cached), then holds the
+  // asker's users.info at the mock.
+  {
+    name: "a follow-up that arrives while the mention that opened its thread is still being looked up is answered once the mention is accepted",
+    run: () => inMode({}, async () => {
+      const cached = await answeredOnce("U2");
+      if (cached) return cached;
+      const asks = (await usage()).asks;
+      await reset();
+      await holdLookup("U1", true);
+      try {
+        const thread = `${1997000000 + ++seq}.000100`;
+        await sendEvent({ type: "app_mention", user: "U1", team: "T1", text: `<@UBOT> [q${seq}] when is the quarterly wombat review`, ts: thread, event_ts: thread, channel: ALLOWED });
+        if (!(await until(async () => (await holdLookup("U1", true)) || undefined, 5000))) return "U1's mention never had Slack asked who U1 is";
+        await threadReply(thread, "and which floor is that on?", { user: "U2" }); // delivered (ACKed) while U1's lookup is out
+        // The reply's event is ACKed, so the app has it, and U1's lookup is still out. The
+        // thread must not be joined yet: an app that joined on arrival (and undid it on a
+        // refusal) would list it here, every time. That is what this proves. It does not
+        // prove nothing was said yet: a turn started this early could still be on its way
+        // to the model, and only a sleep would show it (the guest scenario below covers a
+        // reply answered when it should not be, by its final counts).
+        if (await isJoined(thread)) return "the thread was joined before its asker was looked up";
+        await holdLookup("U1", false);
+        const answers = async () => (await stats()).byMethod["chat.stopStream"] ?? 0;
+        // The check that fails without the hold: the reply is dropped, and one answer comes.
+        if (!(await until(async () => (await answers()) >= 2 || undefined))) return `answered ${await answers()}× in the thread, want twice: the mention, then the follow-up`;
+        if (!(await isJoined(thread))) return "the thread isn't listed as joined after its mention was answered";
+        const s = await stats();
+        if (s.posts.length) return `posted ${JSON.stringify(s.posts)}, want only the two answers`;
+        const counted = (await usage()).asks - asks;
+        return counted === 2 ? null : `counted ${counted} ask(s), want 2`;
+      } finally {
+        await holdLookup("U1", false);
+      }
+    }),
+  },
+  // What this one proves, and what it doesn't. It fails for an app that joins the thread
+  // when the mention arrives (listed as joined while the lookup is out), that answers the
+  // held reply after the refusal (the model and answer counts), or that leaves the thread
+  // joined. It does NOT tell an app that holds the reply from one that drops it at once
+  // (what #163 fixed): both say nothing, which is the contract here. Only the scenario
+  // above tells them apart.
+  {
+    name: "a follow-up that arrives while a guest's mention is still being looked up gets nothing, and the guest's thread is never joined",
+    run: () => inMode({}, async () => {
+      const cached = await answeredOnce("U2");
+      if (cached) return cached;
+      const joined = isJoined;
+      await reset();
+      await holdLookup("UG1", true);
+      try {
+        const thread = `${1997000000 + ++seq}.000100`;
+        await sendEvent({ type: "app_mention", user: "UG1", team: "T1", text: `<@UBOT> [q${seq}] when is the quarterly wombat review`, ts: thread, event_ts: thread, channel: ALLOWED });
+        if (!(await until(async () => (await holdLookup("UG1", true)) || undefined, 5000))) return "the guest's mention never had Slack asked who they are";
+        await threadReply(thread, "and which floor is that on?", { user: "U2" }); // delivered (ACKed) while the guest's lookup is out
+        if (await joined(thread)) return "the thread was joined before its asker was looked up";
+        await holdLookup("UG1", false);
+        const refusal = await until(async () => (await stats()).posts.find((p) => p.thread_ts === thread), 5000);
+        if (!refusal?.text.startsWith("I only answer full members of this workspace")) return `the guest got ${JSON.stringify(refusal)}, want the one-line refusal`;
+        // A question asked after the refusal is answered after the held reply was decided:
+        // once it is, a turn for that reply would have reached the model and Slack.
+        const later = await ask("when is the quarterly wombat review");
+        if (later.cite !== WOMBAT_THREAD) return `a member's later question got ${JSON.stringify(later.text.slice(0, 120))}, want a cite of ${WOMBAT_THREAD}`;
+        let s = await stats();
+        if (s.modelCalls !== 2 || s.byMethod["chat.startStream"] !== 1) return `the held follow-up was answered: ${s.modelCalls} model call(s) and ${s.byMethod["chat.startStream"]} answer(s), want 2 and 1 (the later question's)`;
+        if (s.posts.length !== 1) return `posts ${JSON.stringify(s.posts)}, want only the refusal`;
+        if (await joined(thread)) return "the guest's thread is listed as joined";
+        // Nor is a later reply there a follow-up.
+        await threadReply(thread, "anyone?", { user: "U2" });
+        await ask("when is the quarterly wombat review");
+        s = await stats();
+        return s.modelCalls === 4 && s.byMethod["chat.startStream"] === 2 ? null : `a later reply in the guest's thread was answered: ${s.modelCalls} model call(s) and ${s.byMethod["chat.startStream"]} answer(s), want 4 and 2`;
+      } finally {
+        await holdLookup("UG1", false);
+      }
     }),
   },
   {

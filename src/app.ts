@@ -18,7 +18,7 @@ import { publicChannelsOnly } from "./policy";
 import { assertPublicChannels, lookUpChannel } from "./channel-check";
 import { describePurge, purgeUnlistedChannels } from "./purge";
 import { PDF_SKILLS, SKILLS, profilePrompt } from "./prompts";
-import { loadProfiles, PROFILES, profileStatus, selectByName, slackTrigger, type Profile } from "./profiles";
+import { loadProfiles, PROFILES, profileStatus, selectByName, slackTrigger, unansweredDmNotice, type Profile } from "./profiles";
 import { renderPdfTool, typstRenderer } from "./tools/render-pdf";
 import { remoteSandbox } from "./sandbox-client";
 import { RunnerHub } from "./runners/hub";
@@ -33,8 +33,9 @@ import { withoutMentions } from "./slack-guard";
 import { directMessage, redirectText } from "./dm";
 import { statusRefusal } from "./status-auth";
 import { adminRoutes, CHECK_TIMEOUT_MS } from "./admin";
-import { inThread, isFollowUp, joinThread } from "./threads";
-import { decideTurn, mayStartTurn, members, refusalText, type Membership } from "./members";
+import { inThread, joinThread } from "./threads";
+import { members, refusalText, type Membership } from "./members";
+import { turnGate } from "./turns";
 import { channelsToNotify, eraseAskers, feedbackOf, forgetAsk, markNotified, notifiedChannels, pruneUsage, raterKey, reconcileAsks, recordAsk, recordFeedback, recordSearch, usageSummary, USAGE_RETENTION_DAYS } from "./usage";
 import { cachedNames } from "./ingest/slack-users";
 import { pullRequestTool } from "./tools/pull-request";
@@ -71,7 +72,7 @@ const TASK_LABELS: Record<string, string> = {
 // The start. The tenant's data key, if any, is needed only while it opens the databases:
 // it is wiped when the start ends, whether the app came up or not. `profiles`: the profiles
 // to run (profiles.ts), this build's unless a test passes its own.
-export async function createApp(config: Config, profiles: readonly unknown[] = PROFILES) {
+export async function createApp(config: Config, profiles: unknown = PROFILES) {
   const keys: Uint8Array[] = [];
   try {
     return await startApp(config, keys, loadProfiles(profiles));
@@ -80,15 +81,18 @@ export async function createApp(config: Config, profiles: readonly unknown[] = P
   }
 }
 
-async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[]) {
+async function startApp(config: Config, keys: Uint8Array[], profiles: readonly Profile[]) {
   const identity = agentIdentity(config.agent.name, config.agent.coAuthor);
 
   // The profiles (profiles.ts, ADR 0002), checked before anything was opened: each becomes
   // one June agent below, under the profile's id. That id is durable and the display name
   // is config: renaming the agent in a workspace must not orphan its threads' sessions.
-  // One profile is started by Slack messages (ADR 0002 §2), and the Slack channel is its.
+  // At most one profile is started by Slack messages (ADR 0002 §2); this build needs one
+  // (loadProfiles), because the Slack channel is its, and ingest and every post go through it.
   const interactive = profiles.find(slackTrigger)!;
-  const startsOn = new Set(slackTrigger(interactive)!.events);
+  // DM_MODE=answer with a profile that isn't started by DMs: said once, on start.
+  const dmNotice = unansweredDmNotice(interactive, { dm: config.agent.dm });
+  if (dmNotice) console.warn(dmNotice);
 
   // Every listed channel must be public, as Slack says (channel-check.ts): before the
   // database is opened or purged, and before anything listens. A ConfigError names each.
@@ -207,7 +211,10 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
     workspace ??= ingester?.ownTeamId ?? (await slackReads.call<{ team_id?: string }>("auth.test").catch(() => undefined))?.team_id;
     return workspace;
   };
-  // One gate per profile: a card is parked in a session of the agent that posted it.
+  // The gate looks the card's session up under the profile's id. Only the profile Slack
+  // starts can post a card: a click reaches June through the Slack channel, and June resumes
+  // the agent mounted with it, so no other profile may open a pull request (loadProfiles
+  // refuses one that lists the tool). Every agent still carries a gate, so none is ungated.
   const authorizeAnswerFor = (profile: Profile) => approverGate(config.prApprover, approvals, (session) => runtime?.session(profile.id, session), async (user) => {
     const m = await memberCheck.check(user, await workspaceTeam());
     if (!m.member) console.error(`approvals: a click by ${user} was refused: not a full member of the workspace (${m.reason}${m.reason === "lookup_failed" ? `: ${m.error}` : ""})`);
@@ -255,19 +262,25 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
   const listed = { has: (channel: string) => config.agent.channels.has(channel) && !ingester?.isClosed(channel) };
 
   const dm = config.agent.dm;
-  // What starts a turn is the Slack trigger of the profile Slack starts; a DM also needs the
-  // install to answer them (DM_MODE=answer), which no profile can turn on.
-  const shouldRespond = (e: SlackNormalizedEvent) =>
-    (startsOn.has("mention") && e.kind === "app_mention") ||
-    (startsOn.has("direct_message") && dm === "answer" && e.channelType === "im") ||
-    (startsOn.has("follow_up") && isFollowUp(e, (channel, thread) => inThread(knowledge, channel, thread)));
   // Only full members of the workspace are answered (members.ts, #145): a guest, or someone
   // from another workspace, can't open every channel an answer may quote. The sender of an
   // event that may start a turn is looked up (users.info, cached) in resolveIdentity, which
-  // June awaits before respondWhen; respondWhen then reads the verdict. Mentions, follow-ups
-  // and DMs all pass through it; reactions never start a turn. No principal is pinned: the
-  // hook is used only to look the sender up before the turn is decided.
+  // June awaits before respondWhen; respondWhen then reads the verdict (turns.ts). Mentions,
+  // follow-ups and DMs all pass through it; reactions never start a turn. No principal is
+  // pinned: the hook is used only to look the sender up before the turn is decided.
   const memberCheck = members(slackReads);
+  const gate = turnGate({
+    members: memberCheck,
+    listed,
+    dms: dm === "answer",
+    // Which kinds of message start a turn: the Slack trigger of the profile Slack starts.
+    startsOn: slackTrigger(interactive)!.events,
+    joined: (channel, thread) => inThread(knowledge, channel, thread),
+    join: (channel, thread) => joinThread(knowledge, channel, thread),
+    // Like usage (tally): a failed read or write of the joined threads is logged, and
+    // costs neither the sender's lookup nor an accepted mention its answer.
+    onError: (what, err) => console.error(`threads: ${what}:`, err),
+  });
   const refuse = (e: SlackNormalizedEvent, verdict: Membership | undefined) => {
     const v: Membership = verdict ?? { user: e.user?.id ?? "", member: false, reason: "lookup_failed", error: "not looked up" };
     if (v.member) return;
@@ -308,19 +321,15 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
     respondTo: ["app_mention", "message"],
     // Looks up who sent an event that may start a turn, before respondWhen (see members.ts).
     resolveIdentity: async (id) => {
-      if (id.userId && mayStartTurn(id, dm === "answer")) await memberCheck.check(id.userId, id.teamId);
+      await gate.before(id);
       return undefined;
     },
     respondWhen: (e) => {
-      if (!shouldRespond(e)) return false;
       // Fails closed: a sender not looked up, or not a full member, gets one line instead.
-      // The channel is checked again first: the lookup awaited Slack, and an hourly recheck
-      // may have closed the channel meanwhile (decideTurn).
-      const verdict = e.user?.id ? memberCheck.peek(e.user.id) : undefined;
-      const decision = decideTurn(e, listed, verdict);
-      if (decision === "skip") return false;
-      if (decision === "refuse") {
-        refuse(e, verdict);
+      const decision = gate.decide(e);
+      if (decision.turn === "none") return false;
+      if (decision.turn === "refuse") {
+        refuse(e, decision.verdict);
         return false;
       }
       // An ask records where; who, only if the install opted in and the channel was told
@@ -330,10 +339,10 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
       if (user) void ingester?.names([user]).catch(() => undefined);
       return true;
     },
-    // A mention asks the agent into its thread. Reactions are observed only: they are not
-    // in respondTo, so none starts a turn.
+    // Reactions are observed only: they are not in respondTo, so none starts a turn. (A
+    // mention asks the agent into its thread when it is accepted, in respondWhen: an
+    // observer here would join a refused asker's thread too.)
     on: {
-      app_mention: (e) => joinThread(knowledge, e.channelId, e.threadId ?? e.ts),
       reaction_added: onReaction,
       reaction_removed: onReaction,
     },

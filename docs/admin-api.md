@@ -347,8 +347,9 @@ this install runs under its one name ([ADR 0002](adr/0002-profiles.md)):
   event does) or `job` (a schedule or a command).
 - **`triggers`** is what starts its turns on this install, each an object tagged by
   `kind`. The one kind yet is `slack`, with `events` out of `mention`, `follow_up` and
-  `direct_message`; `direct_message` is listed only with `DM_MODE=answer`. Read `kind`
-  first: other kinds (a webhook, a schedule) will carry other fields.
+  `direct_message`; `direct_message` is listed only with `DM_MODE=answer`. `events` is a
+  set: each event once, in no promised order. Read `kind` first: other kinds (a webhook, a
+  schedule) will carry other fields.
 - A profile's prompt, tools and skills are not here.
 
 ## Pages

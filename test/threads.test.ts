@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { openKnowledge } from "../src/knowledge";
-import { inThread, isFollowUp, joinThread } from "../src/threads";
+import { inThread, isFollowUp, joinThread, mentionHolds } from "../src/threads";
 
 const joined = (channel: string, thread: string) => channel === "C1" && thread === "1.1";
 const reply = (e: Partial<Parameters<typeof isFollowUp>[0]> = {}) =>
@@ -42,6 +42,58 @@ describe("isFollowUp", () => {
     expect(isFollowUp(reply({ channelType: "unknown" }), joined)).toBe(false);
     expect(isFollowUp(reply({ kind: "app_mention" }), joined)).toBe(false);
     expect(isFollowUp(reply({ kind: "reaction_added" }), joined)).toBe(false);
+  });
+});
+
+describe("mentionHolds", () => {
+  // Whether a promise has resolved by now (after the microtasks already queued).
+  const done = async (p: Promise<void>) => Promise.race([p.then(() => true), Bun.sleep(1).then(() => false)]);
+
+  test("a thread with no hold is settled at once; one with a hold, when its mention is decided", async () => {
+    const holds = mentionHolds();
+    expect(await done(holds.settled("C1", "1.1"))).toBe(true);
+    holds.open("C1", "1.1", "1.1");
+    const waiting = holds.settled("C1", "1.1");
+    expect(await done(waiting)).toBe(false);
+    expect(await done(holds.settled("C1", "2.2"))).toBe(true); // another thread
+    expect(await done(holds.settled("C2", "1.1"))).toBe(true); // another channel
+    holds.close("C1", "1.1", "1.1");
+    expect(await done(waiting)).toBe(true);
+    expect(holds.size).toBe(0);
+  });
+
+  test("two mentions pending in a thread: settled when both are decided; one that arrives later isn't waited for", async () => {
+    const holds = mentionHolds();
+    holds.open("C1", "1.1", "1.1");
+    holds.open("C1", "1.1", "1.2");
+    const waiting = holds.settled("C1", "1.1");
+    holds.close("C1", "1.1", "1.1");
+    expect(await done(waiting)).toBe(false);
+    holds.open("C1", "1.1", "1.3"); // after the wait began
+    holds.close("C1", "1.1", "1.2");
+    expect(await done(waiting)).toBe(true);
+    expect(holds.size).toBe(1);
+    holds.close("C1", "1.1", "1.3");
+  });
+
+  test("a hold never closed ends by itself, and leaves nothing behind", async () => {
+    const holds = mentionHolds(10);
+    for (let i = 0; i < 100; i++) holds.open("C1", `${i}.1`, `${i}.1`);
+    expect(holds.size).toBe(100);
+    await holds.settled("C1", "7.1");
+    await Bun.sleep(5);
+    expect(holds.size).toBe(0);
+  });
+
+  test("opening a mention's hold twice, or closing one that isn't open, is harmless", async () => {
+    const holds = mentionHolds();
+    holds.open("C1", "1.1", "1.1");
+    holds.open("C1", "1.1", "1.1");
+    expect(holds.size).toBe(1);
+    holds.close("C1", "1.1", "1.1");
+    holds.close("C1", "1.1", "1.1");
+    holds.close("C9", "9.9", "9.9");
+    expect(holds.size).toBe(0);
   });
 });
 
