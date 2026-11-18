@@ -1,6 +1,7 @@
 //! Configuration, all from the environment, with every problem reported at once.
 
 use crate::publish::{Policy, GIB};
+use crate::resources::{self, Field, Maxima};
 use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,8 +36,12 @@ pub struct Config {
     /// How long after its last request a VM with a running background job is kept from
     /// its idle stop (guestd says how many run; vm.rs `reap`). 0: a job doesn't hold it.
     pub job_hold: Duration,
+    /// What a sandbox created with no request gets (resources.rs).
     pub vcpus: u32,
     pub mem_mib: u32,
+    /// The most a request may be granted of each resource: SANDBOXD_MAX_*, each the
+    /// default unless set, so an install that sets none grants nothing beyond today's.
+    pub maxima: Maxima,
     /// Where repos are published to and mirrored from: https://github.com. Another base (a
     /// file:// directory) is for testing the publish path without GitHub.
     pub github_url: String,
@@ -264,6 +269,16 @@ impl Config {
             ("SANDBOXD_DISK_IOPS", num("SANDBOXD_DISK_IOPS", dl.disk_iops)),
         ];
         let quota_gib = var("SANDBOXD_DISK_QUOTA_GIB").map(|_| num("SANDBOXD_DISK_QUOTA_GIB", DEFAULT_DISK_QUOTA_GIB));
+        // The maxima, read here (the last settings that are numbers) and checked below.
+        let quota_default = quota_gib.unwrap_or(DEFAULT_DISK_QUOTA_GIB);
+        let bounded = [
+            (Field::Vcpus, vcpus, "SANDBOXD_VCPUS, the default"),
+            (Field::MemMib, mem, "SANDBOXD_MEM_MIB, the default"),
+            (Field::DiskGib, quota_default, "SANDBOXD_DISK_QUOTA_GIB, the default"),
+            (Field::Pids, resources::DEFAULT_PIDS, "the default"),
+            (Field::CommandTimeoutSecs, resources::DEFAULT_COMMAND_TIMEOUT_SECS, "the default"),
+        ]
+        .map(|(field, default, what)| (field, default, what, num(field.max_setting(), default)));
         // Checked before the casts below, so an out-of-range value fails here instead of
         // wrapping (4294967297 as u32 is 1).
         if !(1..=32).contains(&vcpus) {
@@ -326,6 +341,26 @@ impl Config {
         if quota_gib.is_some_and(|g| g > 65_536) {
             problems.push("SANDBOXD_DISK_QUOTA_GIB must be 0 (off)..=65536".into());
         }
+        // The maxima a request is held to (resources.rs). Each defaults to the default it
+        // bounds and can only be at or above it: a default over its own maximum would
+        // refuse every sandbox. With the disk quota off no disk size can be granted at all.
+        for (field, default, what, value) in bounded {
+            let (key, top) = (field.max_setting(), field.bounds().1);
+            if field == Field::DiskGib && quota_default == 0 {
+                if var(key).is_some() {
+                    problems.push(format!("{key} is set, but SANDBOXD_DISK_QUOTA_GIB=0 turns the disk quota off, so no disk size could be enforced: unset one of them"));
+                }
+            } else if !(default..=top).contains(&value) {
+                problems.push(format!("{key} must be {default} ({what})..={top}, got {value}"));
+            }
+        }
+        let maxima = Maxima {
+            vcpus: bounded[0].3,
+            mem_mib: bounded[1].3,
+            disk_gib: if quota_default == 0 { 0 } else { bounded[2].3 },
+            pids: bounded[3].3,
+            command_timeout_secs: bounded[4].3,
+        };
         let limits = Limits {
             net_rx_mibps: rates[0].1,
             net_tx_mibps: rates[1].1,
@@ -359,6 +394,7 @@ impl Config {
             job_hold: Duration::from_secs(job_hold),
             vcpus: vcpus as u32,
             mem_mib: mem as u32,
+            maxima,
             github_url: var("SANDBOXD_GITHUB_URL").unwrap_or_else(|| "https://github.com".into()),
             mirrors,
             jail,
@@ -444,6 +480,51 @@ mod tests {
         std::env::set_var("SANDBOXD_ALLOW_INSECURE_HTTP", "yes"); // only "1" opts in
         assert!(Config::from_env().is_err());
         for k in ["SANDBOXD_APP_URL", "SANDBOXD_ALLOW_INSECURE_HTTP", "SANDBOXD_RUNNER_TOKEN", "SANDBOXD_RUNNER_NAME"] {
+            std::env::remove_var(k);
+        }
+
+        // A request's maxima: the defaults unless set, never under them, never past what
+        // any install may grant.
+        assert_eq!(ok.maxima, super::Maxima { vcpus: 2, mem_mib: 2048, disk_gib: 8, pids: 64, command_timeout_secs: 600 });
+        let raised = [("SANDBOXD_MAX_VCPUS", "8"), ("SANDBOXD_MAX_MEM_MIB", "8192"), ("SANDBOXD_MAX_DISK_GIB", "32"), ("SANDBOXD_MAX_PIDS", "256"), ("SANDBOXD_MAX_COMMAND_TIMEOUT_SECS", "3600")];
+        for (k, v) in raised {
+            std::env::set_var(k, v);
+        }
+        let set = Config::from_env().unwrap();
+        assert_eq!(set.maxima, super::Maxima { vcpus: 8, mem_mib: 8192, disk_gib: 32, pids: 256, command_timeout_secs: 3600 });
+        assert_eq!((set.vcpus, set.mem_mib), (2, 2048), "raising a maximum moves no default");
+        for (k, v) in [
+            ("SANDBOXD_MAX_VCPUS", "1"),
+            ("SANDBOXD_MAX_VCPUS", "33"),
+            ("SANDBOXD_MAX_MEM_MIB", "1024"),
+            ("SANDBOXD_MAX_DISK_GIB", "4"),
+            ("SANDBOXD_MAX_PIDS", "32"),
+            ("SANDBOXD_MAX_PIDS", "5000"),
+            ("SANDBOXD_MAX_COMMAND_TIMEOUT_SECS", "60"),
+            ("SANDBOXD_MAX_COMMAND_TIMEOUT_SECS", "21601"),
+            ("SANDBOXD_MAX_MEM_MIB", "lots"),
+        ] {
+            let before = std::env::var(k).unwrap();
+            std::env::set_var(k, v);
+            assert!(Config::from_env().unwrap_err().contains(k), "{k}={v}");
+            std::env::set_var(k, before);
+        }
+        // A raised default raises its maximum with it; a maximum under it is refused.
+        std::env::remove_var("SANDBOXD_MAX_MEM_MIB");
+        std::env::set_var("SANDBOXD_MEM_MIB", "4096");
+        assert_eq!(Config::from_env().unwrap().maxima.mem_mib, 4096);
+        std::env::set_var("SANDBOXD_MAX_MEM_MIB", "2048");
+        assert!(Config::from_env().unwrap_err().contains("SANDBOXD_MAX_MEM_MIB must be 4096"));
+        std::env::remove_var("SANDBOXD_MEM_MIB");
+        // The quota off: no disk size can be granted, and a maximum for one is a mistake.
+        std::env::set_var("SANDBOXD_DISK_QUOTA_GIB", "0");
+        assert!(Config::from_env().unwrap_err().contains("SANDBOXD_MAX_DISK_GIB is set"));
+        std::env::remove_var("SANDBOXD_MAX_DISK_GIB");
+        assert_eq!(Config::from_env().unwrap().maxima.disk_gib, 0);
+        std::env::set_var("SANDBOXD_DISK_QUOTA_GIB", "16");
+        assert_eq!(Config::from_env().unwrap().maxima.disk_gib, 16);
+        std::env::remove_var("SANDBOXD_DISK_QUOTA_GIB");
+        for (k, _) in raised {
             std::env::remove_var(k);
         }
 

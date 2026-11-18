@@ -1905,6 +1905,29 @@ const scenarios: Scenario[] = [
     }),
   },
   {
+    // #109, compatibility: the shipped profile asks for nothing, so its sandboxes are the
+    // host's defaults and its jobs are what they were before a profile could ask.
+    name: "sandbox runners: the shipped profile asks for no resources, so a command's job carries none and the 10-minute timeout it always had",
+    run: () => inMode(RUNNER_ENV, async () => {
+      const runner = await wsRunner(APP, RUNNER_TOKEN, "r-compat");
+      try {
+        const a = await ask("[exec] echo hi");
+        if (!a.text.includes("[exec:0:ran:echo hi]")) return `answer ${a.text.slice(0, 160)}, want the runner's output`;
+        const job = runner.jobs.find((j) => j.op === "guest" && j.method === "POST" && j.path === "/exec");
+        if (!job) return `no exec job reached the runner: ${JSON.stringify(runner.jobs.map((j) => `${j.op} ${j.method} ${j.path}`))}`;
+        if ("resources" in job) return `the job carries resources ${JSON.stringify(job.resources)}, want no such key: the profile asks for none`;
+        if (job.timeoutMs !== 600_000) return `the job's timeoutMs ${job.timeoutMs}, want 600000`;
+        const body = JSON.parse(Buffer.from(job.bodyBase64 ?? "", "base64").toString()) as Record<string, unknown>;
+        if (body.timeoutMs !== 600_000) return `the body's timeoutMs ${body.timeoutMs}, want 600000`;
+        // guestd reads an exec body by these keys exactly and refuses any other.
+        const extra = Object.keys(body).filter((k) => !["command", "cwd", "env", "timeoutMs"].includes(k));
+        return extra.length ? `the exec body has keys guestd refuses: ${extra.join(", ")}` : null;
+      } finally {
+        await runner.stop();
+      }
+    }),
+  },
+  {
     name: "sandbox runners over long poll: the same command, the same output",
     run: () => inMode(RUNNER_ENV, async () => {
       const runner = pollRunner(APP, RUNNER_TOKEN, "r-poll");

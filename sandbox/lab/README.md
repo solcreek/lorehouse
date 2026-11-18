@@ -33,10 +33,52 @@ What it sets up (`host.sh`):
   - the API token comes as a systemd credential generated on the VM, and never leaves it;
   - the state directory is on the data disk.
 
-  Disk quotas are off (`SANDBOXD_DISK_QUOTA_GIB=0`: XFS quotas are not set up), and `SANDBOXD_MAX_VMS=64`.
+  Disk quotas are off (`SANDBOXD_DISK_QUOTA_GIB=0`: sandboxd sets none on XFS), and `SANDBOXD_MAX_VMS=64`.
 
 Env: `LAB_ZONE` (`us-east4-a`), `LAB_NAME` (`sbx-lab`), `LAB_TYPE` (`n4-standard-16`: 16
 vCPU, 64 GB, ≈$0.73/h on demand), `LAB_DISK_GB` (`200`).
+
+## A lab whose sandboxes have a disk quota
+
+sandboxd caps a sandbox's disk only on btrfs with simple quotas on
+(`sandbox/host/src/quota.rs`), so proving a disk limit needs a lab on btrfs. `deploy` takes:
+
+```bash
+export LAB_NAME=sbx-lab-btrfs          # a VM of its own: a data disk is never reformatted
+sandbox/lab/lab.sh up
+LAB_FS=btrfs LAB_DISK_QUOTA_GIB=2 sandbox/lab/lab.sh deploy
+```
+
+- `LAB_FS` (`xfs`): `btrfs` formats a new VM's data disk as btrfs, turns simple quotas on,
+  and starts sandboxd with `SANDBOXD_DISK_QUOTA_GIB` set (`LAB_DISK_QUOTA_GIB`, `8`), so
+  sandboxd refuses to start if the quota can't be enforced. A data disk that is already the
+  other filesystem stops the deploy with an error.
+- `LAB_SANDBOXD`: more sandboxd settings for this deploy, as `"SANDBOXD_X=1 SANDBOXD_Y=2"`.
+  `sandboxd.env` is rewritten on every deploy, so they last until the next one.
+- Ubuntu 24.04's btrfs-progs (6.6.3) has no `btrfs quota status`, which sandboxd asks, so
+  `host.sh` puts upstream's static build (v7.1, the version starship runs, checked against
+  its published sha256) in `/usr/local/bin`.
+
+`bench limits` proves each of a sandbox's limits (#109) there: two sandboxes with
+different requests, the refusals, a command's timeout, a stopped sandbox taking its next
+request, and (with a short idle stop) that refused requests don't keep a VM up. It needs
+maxima above the defaults, and exits 1 when a check fails:
+
+```bash
+LAB_FS=btrfs LAB_DISK_QUOTA_GIB=3 LAB_SANDBOXD="SANDBOXD_MAX_VCPUS=4 SANDBOXD_MAX_MEM_MIB=4096 \
+  SANDBOXD_MAX_DISK_GIB=4 SANDBOXD_MAX_PIDS=128 SANDBOXD_MAX_COMMAND_TIMEOUT_SECS=900 \
+  SANDBOXD_IDLE_SECS=20" sandbox/lab/lab.sh deploy
+sandbox/lab/lab.sh bench limits        # about 7 minutes; 41 checks, then one JSON line
+```
+
+What it saw on 2026-11-18 is in [`sandbox/host/README.md`](../host/README.md). The lab's
+disk sustains about 36 MB/s after its burst, so the disk check writes 256 MiB at a time.
+
+Proved 2026-11-18 on `n4-standard-16`, us-east4-a, with `main` at 2ec55bd and a 2 GiB
+quota: after a guest wrote 3000 MiB, the host's qgroup for the sandbox read 2.00 GiB of
+2.00 GiB. The guest's buffered `dd` still reported all 3000 MiB written: the writes fail
+at writeback, so a check from inside the guest has to write with `oflag=direct`. Boot
+times on btrfs were not measured: the table below is XFS.
 
 Measured on `n4-standard-16`, us-east4-a, 2026-10-16. For comparison, the same golden,
 kernel and sandboxd on bare metal (a 32-thread Zen 5 desktop):

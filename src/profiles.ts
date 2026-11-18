@@ -9,6 +9,7 @@
 
 import type { DmMode } from "./config";
 import { PROMPT_CATALOG } from "./prompts";
+import { resourceProblems, type SandboxResources } from "./sandbox-resources";
 
 // How a profile's turns start, and what its sessions are (ADR 0002 §3):
 //   interactive  a person: a mention, then follow-ups in the thread; one session per thread
@@ -61,12 +62,28 @@ export type Profile = {
   readonly skills: readonly string[];
   readonly triggers: readonly ProfileTrigger[];
   readonly sandbox: ProfileSandbox;
+  // What it asks for its sandbox (#109): vCPUs, memory, disk, pids and how long any one
+  // command may run there (commandTimeoutSecs: workspace_exec, and the clone, fetch and git
+  // commands the other tools run; background jobs keep their own limits), each optional. A
+  // request, not a setting: the sandbox host grants it within its own maxima or refuses
+  // the call with a reason, and never clamps it (ADR 0003; src/sandbox-resources.ts). Left
+  // out, nothing is asked: a new sandbox gets the host's defaults, but a thread's sandbox
+  // that already has a grant (from when its profile asked) keeps it. Removing the field
+  // does not return those to the defaults; naming the defaults here does. Adding or changing it reaches a thread's
+  // existing sandbox at its VM's next boot, after its idle stop; until then calls there
+  // are refused, saying so. A field
+  // beside `sandbox`, not inside it: `sandbox` stays the one word that says what the
+  // profile may do there (ADR 0002 §1), and this says how big "there" is. Only for a
+  // profile with a sandbox, and only the Slack-started one for now (loadProfiles).
+  readonly sandboxResources?: SandboxResources;
   // ADR 0002 §1 also gives a profile `delivery`, `credentials`, `knowledge` and `model`.
   // Nothing reads them yet, so they are not fields yet (PENDING_FIELDS): a profile that
   // sets one is refused, not silently ignored. Each arrives with the code that honors it.
 };
 
-const FIELDS = ["id", "mode", "prompt", "tools", "skills", "triggers", "sandbox"] as const;
+const FIELDS = ["id", "mode", "prompt", "tools", "skills", "triggers", "sandbox", "sandboxResources"] as const;
+// What every profile must have; the rest of FIELDS may be left out.
+const REQUIRED_FIELDS = FIELDS.filter((f) => f !== "sandboxResources");
 const PENDING_FIELDS = ["delivery", "credentials", "knowledge", "model"];
 
 // Like the agent name, so it is valid in a sandbox id as is (ADR 0002 §1).
@@ -171,7 +188,7 @@ function nameOf(profile: unknown, index: number): string {
 // Checks one profile, already copied, and freezes it. `input` is the copy that is returned.
 function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, problems: string[]): Profile | undefined {
   if (!isRecord(input)) {
-    problems.push(`profile #${index}: must be an object with ${FIELDS.join(", ")}`);
+    problems.push(`profile #${index}: must be an object with ${REQUIRED_FIELDS.join(", ")}`);
     return undefined;
   }
   const who = nameOf(input, index);
@@ -239,6 +256,21 @@ function checkProfile(input: unknown, index: number, catalog: ProfileCatalog, pr
   if (input.sandbox === "none" && Array.isArray(input.tools)) {
     const code = input.tools.filter((t: unknown): t is string => typeof t === "string" && isCodeTool(t));
     if (code.length) bad("sandbox", `must be write for the tool${code.length === 1 ? "" : "s"} ${code.join(", ")}, got "none"`);
+  }
+  // A request for resources: whole numbers within what any host could grant, only fields a
+  // host honors, and only where something sends it. `none` has no sandbox to size. The
+  // sandbox is built for the profile Slack starts (src/app.ts), so another profile's
+  // request would reach no host: refused until its sandbox is its own (ADR 0002 §7).
+  if ("sandboxResources" in input) {
+    const at = "sandboxResources";
+    if (input.sandboxResources === undefined) bad(at, "is set to nothing; leave the field out to get the sandbox host's defaults");
+    else {
+      for (const problem of resourceProblems(input.sandboxResources, at)) problems.push(`${who}: ${problem}`);
+      if (input.sandbox === "none") bad(at, 'needs a sandbox: this profile\'s sandbox is "none", so nothing would be booted with them');
+      else if (Array.isArray(input.triggers) && !input.triggers.some((t: unknown) => isRecord(t) && t.kind === "slack")) {
+        bad(at, 'needs a trigger of kind "slack", for now: only the sandbox of the profile Slack starts is asked for with a request, so nothing would honor this one');
+      }
+    }
   }
   return problems.length === before ? deepFreeze(input as Profile) : undefined;
 }

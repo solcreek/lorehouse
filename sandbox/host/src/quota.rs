@@ -169,24 +169,67 @@ pub fn limit_args(bytes: u64, dir: &Path) -> Vec<String> {
 /// limit (re)applied, so a raised or lowered SANDBOXD_DISK_QUOTA_GIB reaches existing
 /// sandboxes (0 doesn't lift a limit already set: `btrfs qgroup limit none <dir>`). A
 /// directory made before quotas were on stays as it is, uncapped, and says so, even with
-/// the quota set explicitly.
-pub async fn prepare_dir(quota: &Quota, dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
+/// the quota set explicitly. `granted`: this sandbox's own size (resources.rs), where it
+/// was created with one; else the host's.
+pub async fn prepare_dir(quota: &Quota, dir: &Path, granted: Option<u64>) -> Result<(), String> {
     match quota {
         Quota::Off => tokio::fs::create_dir_all(dir).await.map_err(|e| format!("state dir: {e}")),
-        Quota::Btrfs { bytes } => {
+        Quota::Btrfs { .. } => {
             if !dir.exists() {
                 btrfs(&["subvolume", "create", &dir.to_string_lossy()]).await?;
             }
-            let is_subvolume = tokio::fs::metadata(dir).await.is_ok_and(|m| m.ino() == SUBVOLUME_INO);
-            if !is_subvolume {
+            if !capped(quota, dir) {
                 eprintln!("sandboxd: {} predates the disk quota (not a subvolume); its disk is not capped", dir.display());
                 return Ok(());
             }
-            let args = limit_args(*bytes, dir);
+            let Some(bytes) = limit_bytes(quota, granted) else { return Ok(()) };
+            let args = limit_args(bytes, dir);
             btrfs(&args.iter().map(String::as_str).collect::<Vec<_>>()).await
         }
     }
+}
+
+/// The limit a sandbox's subvolume gets: its own grant, else the host's default; none
+/// where the quota is off.
+pub fn limit_bytes(quota: &Quota, granted: Option<u64>) -> Option<u64> {
+    match quota {
+        Quota::Off => None,
+        Quota::Btrfs { bytes } => Some(granted.unwrap_or(*bytes)),
+    }
+}
+
+/// Whether a limit set on this sandbox's directory would hold: the quota is on, and the
+/// directory is a subvolume (one made before quotas were on is not, and stays uncapped).
+pub fn capped(quota: &Quota, dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!(quota, Quota::Btrfs { .. }) && std::fs::metadata(dir).is_ok_and(|m| m.ino() == SUBVOLUME_INO)
+}
+
+/// What a sandbox has written to its own subvolume, in bytes: its qgroup's exclusive
+/// usage, the number its limit is checked against. Asked before a limit is lowered, and
+/// after a sync of the filesystem: the qgroup's numbers are those of the last committed
+/// transaction, and right after a VM stops its last writes may not be in one yet, so
+/// without it a limit could be lowered under what is really there. Any failure is an
+/// error, never a number.
+pub async fn used_bytes(dir: &Path) -> Result<u64, String> {
+    let out = command("btrfs").args(usage_args(dir)).output().await.map_err(|e| format!("btrfs: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("btrfs qgroup show {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    exclusive_bytes(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| format!("btrfs qgroup show {}: no usage in its output", dir.display()))
+}
+
+/// `btrfs qgroup show` for one subvolume's own qgroup (`-f`), in bytes (`--raw`), after a
+/// sync (`--sync`; btrfs-progs 7.1 on starship has it, 2026-11-18).
+pub fn usage_args(dir: &Path) -> Vec<String> {
+    vec!["qgroup".into(), "show".into(), "--sync".into(), "--raw".into(), "-f".into(), dir.display().to_string()]
+}
+
+/// The exclusive bytes in `btrfs qgroup show --raw -f <subvolume>`: the third column of
+/// the subvolume's own row (`0/<id>`), under either header btrfs-progs prints
+/// ("Qgroupid Referenced Exclusive Path", or the older "qgroupid rfer excl").
+pub fn exclusive_bytes(show: &str) -> Option<u64> {
+    show.lines().map(|l| l.split_whitespace().collect::<Vec<_>>()).find(|cols| cols.first().is_some_and(|c| c.starts_with("0/")))?.get(2)?.parse().ok()
 }
 
 /// After a sandbox's subvolume is deleted: its qgroup, once empty, removed (kernels before
@@ -226,6 +269,25 @@ mod tests {
         // -e: exclusive bytes. Referenced bytes would count the golden's shared extents,
         // which under full qgroups is the whole image the moment it's reflinked.
         assert_eq!(limit_args(8 << 30, Path::new("/s/x")).join(" "), "qgroup limit -e 8589934592 /s/x");
+        // A sandbox granted its own size gets that, more or less than the host's; one
+        // without, the host's; and with the quota off there is no limit to set.
+        let on = Quota::Btrfs { bytes: 8 << 30 };
+        assert_eq!(limit_bytes(&on, None), Some(8 << 30));
+        assert_eq!(limit_bytes(&on, Some(16 << 30)), Some(16 << 30));
+        assert_eq!(limit_args(limit_bytes(&on, Some(2 << 30)).unwrap(), Path::new("/s/y")).join(" "), "qgroup limit -e 2147483648 /s/y");
+        assert_eq!(limit_bytes(&Quota::Off, Some(16 << 30)), None);
+        // Usage is read after a sync, or a limit could be lowered under the last writes.
+        assert_eq!(usage_args(Path::new("/s/x")).join(" "), "qgroup show --sync --raw -f /s/x");
+        // What a sandbox uses, read from either form of `btrfs qgroup show --raw -f`.
+        let new = "Qgroupid    Referenced    Exclusive   Path \n--------    ----------    ---------   ---- \n0/257       3221241856   3221225473   t.s1\n";
+        let old = "qgroupid         rfer         excl \n--------         ----         ---- \n0/257           16384        16384 \n";
+        assert_eq!(exclusive_bytes(new), Some(3_221_225_473));
+        assert_eq!(exclusive_bytes(old), Some(16_384));
+        assert_eq!(exclusive_bytes("ERROR: can't list qgroups: quotas not enabled\n"), None);
+        assert_eq!(exclusive_bytes("0/257 16.00KiB 16.00KiB x\n"), None, "not --raw: refused, not guessed");
+        // A directory that isn't a subvolume (here: any temp directory) isn't capped.
+        assert!(!capped(&on, &std::env::temp_dir()));
+        assert!(!capped(&Quota::Off, &std::env::temp_dir()));
         assert_eq!(fs_kind(BTRFS_SUPER_MAGIC), Some(true));
         assert_eq!(fs_kind(XFS_SUPER_MAGIC), Some(false));
         assert_eq!(fs_kind(0xEF53), None); // ext4

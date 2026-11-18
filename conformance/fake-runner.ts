@@ -11,7 +11,7 @@
 // new stage id, and push succeeds only for a stage it handed out, once, with the same
 // commit and branch (sandbox/host/src/publish.rs). Background jobs answer as guestd's do.
 
-type Job = { id: string; sandbox: string; op: string; method?: string; path?: string; bodyBase64?: string };
+type Job = { id: string; sandbox: string; op: string; method?: string; path?: string; bodyBase64?: string; timeoutMs?: number; resources?: unknown };
 
 export type FakeRunner = { jobs: Job[]; stop: () => Promise<void> };
 
@@ -133,7 +133,9 @@ const headers = (token: string, name: string) => ({ authorization: `Bearer ${tok
 // With a mirrors block as sandboxd reports it (sandbox/host/src/publish/upkeep.rs), which
 // /status passes through.
 export const MIRRORS = { count: 1, bytes: 1_048_576, maxBytes: 24 * 2 ** 30, perMirrorMaxBytes: 4 * 2 ** 30, fsFreeBytes: 100 * 2 ** 30, garbageBytes: 0, stageRefs: 0, records: 0, largest: { repo: "acme/widgets", bytes: 1_048_576 }, oldestIdleSecs: 60, lastGc: null, evicted: 0, refusedForSpace: 0, refreshTimeouts: 0 };
-const status = { type: "status", capacity: 2, running: 0, version: "fake", mirrors: MIRRORS };
+// `features`: as sandboxd lists them. No scenario sends a request for resources (the
+// shipped profile asks for none), so a job never carries one here.
+const status = { type: "status", capacity: 2, running: 0, version: "fake", features: ["resources"], mirrors: MIRRORS };
 
 export async function wsRunner(base: string, token: string, name: string): Promise<FakeRunner> {
   const jobs: Job[] = [];

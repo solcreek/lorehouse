@@ -12,25 +12,80 @@
 //   PUT  /v1/sandboxes/{id}/file?path=…                            → 204
 //   POST /v1/sandboxes/{id}/jobs, GET …/jobs/{job}, POST …/jobs/{job}/cancel → a background job
 //
+// With `resources` (what the profile asks for its sandbox, src/sandbox-resources.ts), every
+// exec, file and jobs call carries them in X-Lorehouse-Sandbox-Resources: the daemon
+// boots the sandbox with them, or refuses the call with a code and its reason
+// (400, 409, 422 `{ error, code }`), which is thrown whole as a SandboxRefusal. A daemon
+// that predates the header would ignore it, so it is asked first, once:
+//
+//   GET  /v1/capabilities          → { version, features: ["resources"], resources: {defaults, maxima} }
+//
 // Feasibility numbers (boot, exec, persistence): sandbox/spike/.
 
-import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type SandboxJob, type Staged } from "./tools/workspace";
+import { RESOURCES_FEATURE, RESOURCES_HEADER, ResourcesUnsupported, execTimeoutMs, explainTimeout, refusalFrom, wireResources, type SandboxResources } from "./sandbox-resources";
+import { EXEC_TIMEOUT_MS, FileTooLarge, JOB_CALL_MS, JOB_CANCEL_MS, JobCallError, PUSH_TIMEOUT_MS, STAGE_TIMEOUT_MS, jobQuery, jobReply, type ExecOptions, type ExecResult, type Sandbox, type SandboxJob, type Staged } from "./tools/workspace";
 
 export type RemoteSandboxOptions = {
   url: string; // daemon base URL, e.g. https://sandbox.example.com
   token: string; // bearer credential the daemon checks
   fetch?: typeof fetch; // injectable for tests
+  // What to ask for the sandbox. Left out, nothing is asked: a new sandbox gets the
+  // daemon's defaults, and one that already has a grant keeps it (to return such a
+  // sandbox to the defaults, ask for them by name).
+  resources?: SandboxResources;
+  now?: () => number; // injectable for tests: how long a command took
 };
+
+// Daemons known to understand a request for resources, per fetch and URL: asked once a
+// process, and again after an answer that wasn't a yes (it may have been updated since).
+const understands = new WeakMap<typeof fetch, Map<string, Promise<void>>>();
+
+async function askCapabilities(f: typeof fetch, url: string, auth: Record<string, string>): Promise<void> {
+  const host = `the sandbox host at ${url}`;
+  let res: Response;
+  try {
+    res = await f(`${url}/v1/capabilities`, { method: "GET", headers: auth, signal: AbortSignal.timeout(10_000) });
+  } catch (err) {
+    throw new Error(`${host} didn't say whether it honors sandbox resources (GET /v1/capabilities: ${err instanceof Error ? err.message : String(err)}), so nothing was run there; try again`);
+  }
+  if (res.status === 404) throw new ResourcesUnsupported(host, "its sandboxd predates resource requests (no GET /v1/capabilities) and would run the sandbox with its defaults");
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${host} didn't say whether it honors sandbox resources (GET /v1/capabilities: ${res.status} ${text.slice(0, 200)}), so nothing was run there`);
+  let features: unknown;
+  try {
+    features = (JSON.parse(text) as { features?: unknown }).features;
+  } catch {}
+  if (!Array.isArray(features) || !features.includes(RESOURCES_FEATURE)) throw new ResourcesUnsupported(host, `its sandboxd doesn't list "${RESOURCES_FEATURE}" among its features and would run the sandbox with its defaults`);
+}
 
 export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
   const f = opts.fetch ?? fetch;
-  const base = `${opts.url.replace(/\/$/, "")}/v1/sandboxes/${encodeURIComponent(id)}`;
+  const url = opts.url.replace(/\/$/, "");
+  const base = `${url}/v1/sandboxes/${encodeURIComponent(id)}`;
   const auth = { authorization: `Bearer ${opts.token}` };
+  const asked = opts.resources ? { [RESOURCES_HEADER]: JSON.stringify(wireResources(opts.resources)) } : undefined;
+
+  // The headers of a call that may create the sandbox: the token, and what is asked for
+  // it, once the daemon is known to honor that.
+  async function creating(): Promise<Record<string, string>> {
+    if (!asked) return auth;
+    let known = understands.get(f);
+    if (!known) understands.set(f, (known = new Map()));
+    let answer = known.get(url);
+    if (!answer) {
+      answer = askCapabilities(f, url, auth);
+      known.set(url, answer);
+      answer.catch(() => known.delete(url));
+    }
+    await answer;
+    return { ...auth, ...asked };
+  }
 
   async function call(path: string, init: RequestInit): Promise<Response> {
-    const res = await f(`${base}${path}`, { ...init, headers: { ...auth, ...(init.headers as Record<string, string>) } });
+    const res = await f(`${base}${path}`, { ...init, headers: { ...(await creating()), ...(init.headers as Record<string, string>) } });
     if (!res.ok && res.status !== 404) {
-      throw new Error(`sandbox ${init.method ?? "GET"} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+      const text = await res.text();
+      throw refusalFrom(res.status, text) ?? new Error(`sandbox ${init.method ?? "GET"} ${path}: ${res.status} ${text.slice(0, 200)}`);
     }
     return res;
   }
@@ -39,11 +94,15 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
   async function job(op: string, method: "POST" | "GET", path: string, body: object | undefined, timeoutMs: number): Promise<SandboxJob> {
     const res = await f(`${base}${path}`, {
       method,
-      headers: { ...auth, ...(body ? { "content-type": "application/json" } : {}) },
+      headers: { ...(await creating()), ...(body ? { "content-type": "application/json" } : {}) },
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
-    return jobReply(op, res.status, await res.text());
+    const text = await res.text();
+    // Refused before anything ran (a 4xx), in the daemon's own words.
+    const refusal = refusalFrom(res.status, text);
+    if (refusal) throw new JobCallError(`job ${op}: ${refusal.message}`, res.status);
+    return jobReply(op, res.status, text);
   }
 
   return {
@@ -53,12 +112,16 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
       cancel: (j) => job("cancel", "POST", `/jobs/${encodeURIComponent(j)}/cancel`, undefined, JOB_CANCEL_MS),
     },
     async exec(command: string, o: ExecOptions = {}): Promise<ExecResult> {
+      // Never more than the sandbox's command timeout: the daemon stops it there anyway.
+      const timeoutMs = execTimeoutMs(opts.resources, o.timeoutMs, EXEC_TIMEOUT_MS);
+      const now = opts.now ?? Date.now;
+      const sent = now();
       const res = await call("/exec", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs: o.timeoutMs ?? EXEC_TIMEOUT_MS }),
+        body: JSON.stringify({ command, cwd: o.cwd, env: o.env, timeoutMs }),
       });
-      return (await res.json()) as ExecResult;
+      return explainTimeout((await res.json()) as ExecResult, timeoutMs, now() - sent, opts.resources);
     },
     async readFile(path: string): Promise<string> {
       const res = await call(`/file?path=${encodeURIComponent(path)}`, { method: "GET" });
@@ -66,10 +129,13 @@ export function remoteSandbox(id: string, opts: RemoteSandboxOptions): Sandbox {
       return res.text();
     },
     async readBytes(path: string): Promise<Uint8Array> {
-      const res = await f(`${base}/file?path=${encodeURIComponent(path)}`, { method: "GET", headers: auth });
+      const res = await f(`${base}/file?path=${encodeURIComponent(path)}`, { method: "GET", headers: await creating() });
       if (res.status === 404) throw new Error(`no such file: ${path}`);
       if (res.status === 413) throw new FileTooLarge(path, (await res.text()).trim().slice(0, 200));
-      if (!res.ok) throw new Error(`sandbox GET /file: ${res.status} ${(await res.text()).slice(0, 200)}`);
+      if (!res.ok) {
+        const text = await res.text();
+        throw refusalFrom(res.status, text) ?? new Error(`sandbox GET /file: ${res.status} ${text.slice(0, 200)}`);
+      }
       return new Uint8Array(await res.arrayBuffer());
     },
     async writeFile(path: string, content: string): Promise<void> {

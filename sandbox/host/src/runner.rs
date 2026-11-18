@@ -12,6 +12,7 @@
 
 use crate::config::Transport;
 use crate::publish::{self, Publisher};
+use crate::resources;
 use crate::vm::{self, Manager};
 use crate::vsock;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -51,6 +52,10 @@ struct Job {
     /// How long Lorehouse will still wait for this job, as of handing it out.
     #[serde(rename = "deadlineMs")]
     deadline_ms: Option<u64>,
+    /// The resources asked for the job's sandbox (resources.rs), on a `guest` job: what its
+    /// VM is next booted with, and what a running one must already have. Kept as it arrived, so
+    /// a malformed one is refused with its reason instead of failing the whole frame.
+    resources: Option<serde_json::Value>,
 }
 
 /// The guest call stops this much before Lorehouse's deadline, so its answer (a timeout)
@@ -79,10 +84,11 @@ fn keep_for(app_deadline: Duration) -> Duration {
 }
 
 /// How long the guest call may take, `elapsed` after the job arrived (a boot may have come
-/// first): until just before Lorehouse stops waiting, and never past the host's backstop.
+/// first): until just before Lorehouse stops waiting, and never past the host's backstop
+/// (for a command, its sandbox's command timeout and some: `crate::bounded`).
 /// Zero: don't start it.
-fn guest_budget(app_deadline: Duration, elapsed: Duration) -> Duration {
-    app_deadline.saturating_sub(DEADLINE_MARGIN).saturating_sub(elapsed).min(crate::REQUEST_DEADLINE)
+fn guest_budget(app_deadline: Duration, elapsed: Duration, backstop: Duration) -> Duration {
+    app_deadline.saturating_sub(DEADLINE_MARGIN).saturating_sub(elapsed).min(backstop)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -95,11 +101,19 @@ struct JobResult {
     body_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// With `error`, for a refused request for resources: its code (resources.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 impl JobResult {
     fn error(id: &str, status: u16, msg: impl Into<String>) -> JobResult {
-        JobResult { id: id.to_string(), status, content_type: None, body_base64: None, error: Some(msg.into()) }
+        JobResult { id: id.to_string(), status, content_type: None, body_base64: None, error: Some(msg.into()), code: None }
+    }
+
+    /// A sandbox that couldn't be reached: the status and the reason, and a refusal's code.
+    fn unreachable(id: &str, e: &vm::AcquireError) -> JobResult {
+        JobResult { code: e.code().map(String::from), ..JobResult::error(id, e.status(), e.message()) }
     }
 }
 
@@ -108,7 +122,8 @@ impl JobResult {
 fn allowed(method: &str, path: &str) -> Option<Method> {
     let (route, _) = path.split_once('?').unwrap_or((path, ""));
     match (method, route) {
-        ("POST", "/exec") => Some(Method::POST),
+        // A command's path is that and nothing more: with a query it is refused, not run.
+        ("POST", "/exec") if path == "/exec" => Some(Method::POST),
         ("GET", "/file") if path.starts_with("/file?") => Some(Method::GET),
         ("PUT", "/file") if path.starts_with("/file?") => Some(Method::PUT),
         // Background jobs: start, status, cancel (vm::job_call says which paths).
@@ -123,7 +138,7 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
     }
     match job.op.as_str() {
         "destroy" => match vms.destroy(&job.sandbox).await {
-            Ok(()) => JobResult { id: job.id, status: 204, content_type: None, body_base64: None, error: None },
+            Ok(()) => JobResult { id: job.id, status: 204, content_type: None, body_base64: None, error: None, code: None },
             Err(e) => JobResult::error(&job.id, 409, e),
         },
         "guest" => {
@@ -134,15 +149,39 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
                 Some(Ok(b)) => Bytes::from(b),
                 Some(Err(_)) => return JobResult::error(&job.id, 400, "bodyBase64 is not base64"),
             };
-            let (_use, uds) = match vms.acquire(&job.sandbox).await {
-                Ok(v) => v,
-                Err((status, msg)) => return JobResult::error(&job.id, status, msg),
+            // Before the sandbox is reached: a command's body that can't be sent to guestd is
+            // refused with nothing booted, recorded or counted as a use.
+            let call = match crate::checked(&method, p, body) {
+                Ok(c) => c,
+                Err(r) => {
+                    eprintln!("sandboxd: {}: refused ({}): {}", job.sandbox, r.code, r.message);
+                    return JobResult::unreachable(&job.id, &r.into());
+                }
             };
+            // What the job asks for its sandbox: refused here, with its code, before anything
+            // is made or run. sandboxd logs it; the result carries it to the caller.
+            let request = match job.resources.as_ref().map(resources::parse) {
+                None => None,
+                Some(Ok(r)) => Some(r),
+                Some(Err(r)) => {
+                    eprintln!("sandboxd: {}: refused ({}): {}", job.sandbox, r.code, r.message);
+                    return JobResult::unreachable(&job.id, &r.into());
+                }
+            };
+            // A job's status or cancel, or a file read, is served by a VM running with other
+            // resources than the job asks for: it starts no work there (crate::watches).
+            let (_use, uds, granted) = match vms.acquire_for(&job.sandbox, request.as_ref(), crate::watches(&method, p)).await {
+                Ok(v) => v,
+                Err(e) => return JobResult::unreachable(&job.id, &e),
+            };
+            // A command gets its sandbox's timeout, never more: guestd is sent a body written
+            // here from what was parsed above.
+            let (body, backstop) = crate::bounded(&granted, call);
             // Bounded by the job's deadline at Lorehouse: once it has told the caller the job
             // timed out, the job must not go on changing the checkout. Dropping the request
             // closes the vsock connection, and guestd stops: an exec's process group is killed
             // with its request's context, and a write whose body didn't all arrive isn't made.
-            let budget = guest_budget(job.app_deadline(), arrived.elapsed());
+            let budget = guest_budget(job.app_deadline(), arrived.elapsed(), backstop);
             if budget.is_zero() {
                 return JobResult::error(&job.id, 504, "Lorehouse's deadline for this job passed before it could start");
             }
@@ -153,6 +192,7 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
                     content_type: r.content_type,
                     body_base64: Some(B64.encode(&r.body)),
                     error: None,
+                    code: None,
                 },
                 Ok(Err(e)) => JobResult::error(&job.id, 502, e),
                 Err(_) => JobResult::error(&job.id, 504, format!("stopped: the guest didn't answer within {} s (the job's deadline)", budget.as_secs())),
@@ -164,7 +204,7 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
             let Some(body) = job.body_base64.as_deref().and_then(|b| B64.decode(b).ok()) else {
                 return JobResult::error(&job.id, 400, "bodyBase64: the request as base64 JSON");
             };
-            let budget = guest_budget(job.app_deadline(), arrived.elapsed());
+            let budget = guest_budget(job.app_deadline(), arrived.elapsed(), crate::REQUEST_DEADLINE);
             let work = async {
                 let answer = if job.op == "stage" {
                     match serde_json::from_slice::<publish::StageRequest>(&body) {
@@ -178,7 +218,7 @@ async fn execute(vms: &Manager, publisher: &Publisher, job: Job, arrived: Instan
                     }
                 };
                 match answer {
-                    Ok(Ok(json)) => JobResult { id: job.id.clone(), status: 200, content_type: Some("application/json".into()), body_base64: Some(B64.encode(json)), error: None },
+                    Ok(Ok(json)) => JobResult { id: job.id.clone(), status: 200, content_type: Some("application/json".into()), body_base64: Some(B64.encode(json)), error: None, code: None },
                     Ok(Err(e)) => JobResult::error(&job.id, 500, e.to_string()),
                     Err((status, msg)) => JobResult::error(&job.id, status, msg),
                 }
@@ -439,7 +479,7 @@ impl Runner {
 
     async fn status_json(&self) -> serde_json::Value {
         let jobs = self.ledger().ids(Instant::now());
-        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "sandboxes": self.vms.running_ids().await, "version": VERSION, "jobs": jobs, "session": self.process, "started": self.started, "mirrors": self.publisher.status() })
+        serde_json::json!({ "type": "status", "runner": self.name, "capacity": self.vms.capacity(), "running": self.vms.running_count().await, "sandboxes": self.vms.running_ids().await, "version": VERSION, "features": [resources::FEATURE], "jobs": jobs, "session": self.process, "started": self.started, "mirrors": self.publisher.status() })
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -644,7 +684,7 @@ impl Runner {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::{allowed, guest_budget, keep_for, Job, JobResult, Ledger, KEEP_RESULTS, SEEN_IDS};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -652,6 +692,10 @@ mod tests {
     #[test]
     fn only_the_listed_guest_calls_are_allowed() {
         assert!(allowed("POST", "/exec").is_some());
+        // With a query it would be a command the timeout cap doesn't recognise: refused.
+        for path in ["/exec?x=1", "/exec?", "/exec?timeoutMs=86400000"] {
+            assert!(allowed("POST", path).is_none(), "{path}");
+        }
         assert!(allowed("GET", "/file?path=%2Fw%2Fa").is_some());
         assert!(allowed("PUT", "/file?path=%2Fw%2Fa").is_some());
         assert!(allowed("GET", "/exec").is_none());
@@ -667,7 +711,7 @@ mod tests {
     }
 
     fn done(id: &str) -> JobResult {
-        JobResult { id: id.into(), status: 200, content_type: None, body_base64: None, error: None }
+        JobResult { id: id.into(), status: 200, content_type: None, body_base64: None, error: None, code: None }
     }
 
     #[test]
@@ -782,26 +826,30 @@ mod tests {
     }
 
     fn job(deadline_ms: Option<u64>, timeout_ms: Option<u64>) -> Job {
-        Job { id: "j".into(), sandbox: "s".into(), op: "guest".into(), method: None, path: None, body_base64: None, timeout_ms, deadline_ms }
+        Job { id: "j".into(), sandbox: "s".into(), op: "guest".into(), method: None, path: None, body_base64: None, timeout_ms, deadline_ms, resources: None }
     }
 
     #[test]
     fn a_guest_call_stops_just_before_lorehouse_stops_waiting() {
         // A file write Lorehouse waits 90 s for (30 s + boot slack), just handed out.
         let deadline = job(Some(90_000), Some(30_000)).app_deadline();
-        assert_eq!(guest_budget(deadline, Duration::from_secs(0)), Duration::from_secs(88));
+        let backstop = crate::REQUEST_DEADLINE;
+        assert_eq!(guest_budget(deadline, Duration::from_secs(0), backstop), Duration::from_secs(88));
         // a 20 s boot came first: less is left for the call itself
-        assert_eq!(guest_budget(deadline, Duration::from_secs(20)), Duration::from_secs(68));
+        assert_eq!(guest_budget(deadline, Duration::from_secs(20), backstop), Duration::from_secs(68));
         // the deadline passed while it booted: the call isn't made
-        assert!(guest_budget(deadline, Duration::from_secs(89)).is_zero());
+        assert!(guest_budget(deadline, Duration::from_secs(89), backstop).is_zero());
         // never past the host's backstop
-        assert_eq!(guest_budget(Duration::from_secs(3600), Duration::ZERO), crate::REQUEST_DEADLINE);
+        assert_eq!(guest_budget(Duration::from_secs(3600), Duration::ZERO, backstop), crate::REQUEST_DEADLINE);
+        // a command in a sandbox granted 30 minutes a command: the backstop follows the grant
+        let granted = crate::resources::Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 1800 };
+        assert_eq!(guest_budget(Duration::from_secs(1860), Duration::ZERO, granted.exec_backstop()), Duration::from_secs(1858));
         // an app that sends no deadlineMs: timeout plus boot slack
         assert_eq!(job(None, Some(30_000)).app_deadline(), Duration::from_secs(90));
     }
 
     /// A manager that never starts a VM here, and a publisher over file:// remotes in `dir`.
-    fn no_vms(dir: &std::path::Path) -> (std::sync::Arc<crate::vm::Manager>, std::sync::Arc<crate::publish::Publisher>) {
+    pub fn no_vms(dir: &std::path::Path) -> (std::sync::Arc<crate::vm::Manager>, std::sync::Arc<crate::publish::Publisher>) {
         use crate::config::{Config, Mode};
         let cfg = Config {
             mode: Mode::Serve { listen: "127.0.0.1:0".into(), token: "t".into() },
@@ -814,6 +862,7 @@ mod tests {
             job_hold: Duration::from_secs(6 * 3600),
             vcpus: 1,
             mem_mib: 128,
+            maxima: crate::resources::Maxima::of_defaults(1, 128, 8),
             github_url: format!("file://{}", dir.display()),
             mirrors: crate::publish::Policy::default(),
             jail: crate::config::JailConfig { jailer: "jailer".into(), firecracker: "firecracker".into(), uid_base: 1_900_000_000, git_uid_base: 1_900_100_000, git_mem_mib: 2048, mem_headroom_mib: 512 },
@@ -870,7 +919,7 @@ mod tests {
         use base64::Engine;
         let dir = scratch_dir("publish-body");
         let (vms, publisher) = no_vms(&dir);
-        let push = |body: Option<String>| Job { id: "j".into(), sandbox: "s".into(), op: "push".into(), method: None, path: None, body_base64: body, timeout_ms: None, deadline_ms: Some(60_000) };
+        let push = |body: Option<String>| Job { id: "j".into(), sandbox: "s".into(), op: "push".into(), method: None, path: None, body_base64: body, timeout_ms: None, deadline_ms: Some(60_000), resources: None };
         let stage = format!("1700000000-{}", "0".repeat(32));
         let mut pads = std::collections::HashSet::new();
         for branch in ["scout/a", "scout/ab", "scout/abc"] {
@@ -893,6 +942,100 @@ mod tests {
         let r = execute(&vms, &publisher, push(Some(B64.encode("{\"stage\":1}"))), Instant::now()).await;
         assert_eq!(r.status, 400);
         assert!(r.error.as_deref().unwrap_or("").starts_with("push request:"), "{:?}", r.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_jobs_request_for_resources_is_refused_with_its_code_before_anything_runs() {
+        use super::{execute, B64};
+        use base64::Engine;
+        let dir = scratch_dir("job-resources");
+        // An install that sets no maximum: 1 vCPU, 128 MiB, no disk quota here.
+        let (vms, publisher) = no_vms(&dir);
+        // A job as Lorehouse sends it, read as the wire has it.
+        let wire = |resources: serde_json::Value| -> Job {
+            serde_json::from_value(serde_json::json!({ "id": "j_1", "sandbox": "acme.t1", "op": "guest", "method": "POST", "path": "/exec", "bodyBase64": "e30=", "timeoutMs": 600000, "deadlineMs": 659000, "resources": resources })).unwrap()
+        };
+        for (resources, status, code, names) in [
+            (serde_json::json!({ "memMib": 4096 }), 422, "resource_over_maximum", "resources.memMib 4096 is over this sandbox host's maximum of 128"),
+            (serde_json::json!({ "diskGib": 4 }), 422, "disk_quota_unavailable", "can't cap a sandbox's disk"),
+            (serde_json::json!({ "vcpus": 0 }), 400, "invalid_resources", "resources.vcpus must be at least 1"),
+            (serde_json::json!({ "gpus": 1 }), 400, "invalid_resources", "resources.gpus is not a resource this host knows"),
+            (serde_json::json!("big"), 400, "invalid_resources", "resources must be an object"),
+        ] {
+            let r = execute(&vms, &publisher, wire(resources.clone()), Instant::now()).await;
+            assert_eq!((r.status, r.code.as_deref()), (status, Some(code)), "{resources}: {:?}", r.error);
+            assert!(r.error.as_deref().unwrap_or("").contains(names), "{resources}: {:?}", r.error);
+            assert!(r.body_base64.is_none());
+        }
+        // Nothing was made, and the result goes out with its code.
+        assert!(!dir.join("state/acme.t1").exists());
+        assert_eq!(vms.running_count().await, 0);
+        let r = execute(&vms, &publisher, wire(serde_json::json!({ "pids": 65 })), Instant::now()).await;
+        let frame = serde_json::to_value(&r).unwrap();
+        assert_eq!((frame["id"].as_str(), frame["status"].as_u64(), frame["code"].as_str()), (Some("j_1"), Some(422), Some("resource_over_maximum")), "{frame}");
+        assert!(frame["error"].as_str().unwrap().contains("SANDBOXD_MAX_PIDS"), "{frame}");
+        // A result with no code keeps the shape it always had, and one recorded by an
+        // older sandboxd (no `code`) still reads.
+        assert_eq!(serde_json::to_string(&JobResult::error("j", 503, "busy")).unwrap(), r#"{"id":"j","status":503,"error":"busy"}"#);
+        assert_eq!(serde_json::from_str::<JobResult>(r#"{"id":"j","status":503,"error":"busy"}"#).unwrap(), JobResult::error("j", 503, "busy"));
+        // A command with a query on its path, which the timeout cap wouldn't have known for
+        // a command: refused before any sandbox is reached, whatever its body asks.
+        let mut sneaky = wire(serde_json::json!({}));
+        sneaky.path = Some("/exec?x=1".into());
+        sneaky.body_base64 = Some(B64.encode(r#"{"command":"sleep 86400","timeoutMs":86400000}"#));
+        let r = execute(&vms, &publisher, sneaky, Instant::now()).await;
+        assert_eq!((r.status, r.error.as_deref()), (400, Some("guest call not allowed: POST /exec?x=1")));
+        assert!(!dir.join("state/acme.t1").exists());
+        // A command whose body guestd can't be sent, with a request this host would grant
+        // (and record): refused with its code before the sandbox is reached. Nothing made.
+        for body in [r#"{"command":"sleep 86400","timeoutms":86400000}"#, "not json"] {
+            let mut bad = wire(serde_json::json!({ "vcpus": 1 }));
+            bad.body_base64 = Some(B64.encode(body));
+            let r = execute(&vms, &publisher, bad, Instant::now()).await;
+            assert_eq!((r.status, r.code.as_deref()), (400, Some("invalid_exec_body")), "{body}: {:?}", r.error);
+        }
+        assert!(!dir.join("state/acme.t1").exists());
+        assert_eq!((vms.running_count().await, vms.in_flight().await), (0, 0));
+        assert!(vms.list().await.is_empty());
+        // A destroy carries no request, and one sent with it is not read.
+        let destroy: Job = serde_json::from_value(serde_json::json!({ "id": "j_2", "sandbox": "acme.t1", "op": "destroy", "timeoutMs": 60000, "resources": { "gpus": 1 } })).unwrap();
+        assert_eq!(execute(&vms, &publisher, destroy, Instant::now()).await.status, 204);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_job_for_a_running_vm_with_other_resources_may_watch_or_stop_but_not_start() {
+        use super::execute;
+        let dir = scratch_dir("job-watch");
+        let (vms, _grant) = crate::vm::tests::one_running(&dir).await;
+        let (_, publisher) = no_vms(&dir.join("publisher"));
+        // The profile's request changed since the VM booted (4 vCPUs then, 2 asked now).
+        let job = |method: &str, path: &str, body: &str| -> Job {
+            serde_json::from_value(serde_json::json!({ "id": "j_1", "sandbox": "up", "op": "guest", "method": method, "path": path, "bodyBase64": super::B64.encode(body), "timeoutMs": 30000, "deadlineMs": 89000, "resources": { "vcpus": 2 } })).unwrap()
+        };
+        use base64::Engine;
+        // A job's status and cancel, and a file read: they reach the VM as it is (its guestd
+        // isn't there in this test: 502, with no code).
+        for (m, p) in [("GET", "/jobs/bench-1?waitMs=0&tailBytes=8192"), ("POST", "/jobs/bench-1/cancel"), ("GET", "/file?path=%2Fw%2Fout.txt")] {
+            let r = execute(&vms, &publisher, job(m, p, ""), Instant::now()).await;
+            assert_eq!((r.status, r.code.as_deref()), (502, None), "{m} {p}: {:?}", r.error);
+        }
+        // What would start work or write there: refused as a mismatch, and told what still works.
+        for (m, p, body) in [("POST", "/exec", r#"{"command":"make"}"#), ("POST", "/jobs", r#"{"id":"b2","command":"make"}"#), ("PUT", "/file?path=%2Fw%2Fa", "x")] {
+            let r = execute(&vms, &publisher, job(m, p, body), Instant::now()).await;
+            assert_eq!((r.status, r.code.as_deref()), (409, Some("resources_mismatch")), "{m} {p}: {:?}", r.error);
+            assert!(r.error.as_deref().unwrap_or("").contains("can still be watched and cancelled"), "{:?}", r.error);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_status_says_this_runner_understands_requests_for_resources() {
+        let dir = scratch_dir("status-features");
+        let (vms, publisher) = no_vms(&dir);
+        let runner = super::Runner::new(vms, publisher, "http://127.0.0.1:1".into(), "tok".into(), "box-1".into(), crate::config::Transport::Poll, dir.join("jobs"));
+        assert_eq!(runner.status_json().await["features"], serde_json::json!(["resources"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

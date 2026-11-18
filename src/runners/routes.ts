@@ -38,14 +38,19 @@ function parseStatus(runner: string, v: unknown): RunnerStatus | undefined {
   // dropped (never the whole status: nothing acts on it).
   const m = o.mirrors as unknown;
   const mirrors = m && typeof m === "object" && !Array.isArray(m) && JSON.stringify(m).length <= 2048 ? { mirrors: m as Record<string, unknown> } : {};
-  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received), sandboxes: ids(o.sandboxes), ...session, ...mirrors };
+  // What the runner's sandboxd understands beyond the first protocol ("resources": a job's
+  // request for its sandbox's resources). Absent or malformed: nothing, so no such job is
+  // sent to it (the hub refuses it, loudly) rather than sent and ignored.
+  const f = o.features as unknown;
+  const features = Array.isArray(f) && f.length <= 32 && f.every((x) => typeof x === "string" && x.length <= 40) ? { features: f as string[] } : {};
+  return { runner, capacity: o.capacity!, running: o.running!, version: typeof o.version === "string" ? o.version.slice(0, 40) : undefined, jobs: ids(o.jobs), received: ids(o.received), sandboxes: ids(o.sandboxes), ...session, ...mirrors, ...features };
 }
 
 function parseResult(v: unknown): JobResult | undefined {
   const o = v as Partial<JobResult> | undefined;
   if (!o || typeof o.id !== "string" || typeof o.status !== "number") return undefined;
   const str = (s: unknown) => (typeof s === "string" ? s : undefined);
-  return { id: o.id, status: o.status, contentType: str(o.contentType), bodyBase64: str(o.bodyBase64), error: str(o.error) };
+  return { id: o.id, status: o.status, contentType: str(o.contentType), bodyBase64: str(o.bodyBase64), error: str(o.error), code: str(o.code)?.slice(0, 64) };
 }
 
 const bad = (why: string) => new Response(why, { status: 400 });
