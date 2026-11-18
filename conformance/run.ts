@@ -1231,7 +1231,7 @@ const scenarios: Scenario[] = [
   // which: in the fixtures UG1 is a multi-channel guest, UG2 a single-channel one, UX1 from
   // workspace T9, and U404 no one Slack knows (user_not_found: fails closed).
   {
-    name: "answers only full members: a guest's mention or follow-up, someone from another workspace, or a sender Slack doesn't know gets one line in the thread, with no search or model call",
+    name: "answers only full members: a guest's mention or follow-up, someone from another workspace, or a sender Slack doesn't know gets one line in the thread, with no search or model call, and a refused mention's thread isn't joined",
     run: async () => {
       const thread = await mentionAndWait("where is the wombat review"); // a member's: the thread is joined
       await reset();
@@ -1261,6 +1261,10 @@ const scenarios: Scenario[] = [
       if (s.modelCalls || s.byMethod["chat.startStream"]) return `answered anyway: ${s.modelCalls} model call(s), Slack ${JSON.stringify(s.byMethod)}`;
       if (s.posts.length !== want.length) return `posted ${s.posts.length}×, want ${want.length}`;
       if ((await usage()).asks !== asks) return "a refused question was counted as an ask";
+      // A refused mention asks the agent into nothing: its thread isn't one it joined.
+      const { threads } = await admin<{ threads: { channel: string; threadTs: string }[] }>("/api/v1/threads?limit=50");
+      const joined = [guest, outsider, unknown].filter((m) => threads.some((t) => t.channel === ALLOWED && t.threadTs === m.ts));
+      if (joined.length) return `a refused asker's thread is listed as joined: ${joined.map((m) => m.ts).join(", ")}`;
       // A member is still answered.
       const a = await ask("when is the quarterly wombat review");
       return a.cite === WOMBAT_THREAD ? null : `a member got ${JSON.stringify(a.text.slice(0, 120))}, want a cite of ${WOMBAT_THREAD}`;

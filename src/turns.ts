@@ -31,6 +31,8 @@ export function turnGate(o: {
   dms: boolean;
   // Whether the agent was asked into this thread.
   joined: (channel: string, threadTs: string) => boolean;
+  // Record that it was: called for a mention that is answered, and for no other.
+  join: (channel: string, threadTs: string) => void;
 }): TurnGate {
   // Mentions start a turn, and so do follow-ups in a thread the agent was mentioned in
   // (threads.ts); with DMs answered, DMs too.
@@ -48,6 +50,10 @@ export function turnGate(o: {
       const decision = decideTurn(e, o.listed, verdict);
       if (decision === "skip") return { turn: "none" };
       if (decision === "refuse") return { turn: "refuse", verdict };
+      // A mention asks the agent into its thread, once it is accepted: a thread a guest
+      // opened, or one in a channel closed meanwhile, is never one the agent joined, so a
+      // member's reply there is not a follow-up.
+      if (e.kind === "app_mention") o.join(e.channelId, e.threadId ?? e.ts);
       return { turn: "answer" };
     },
   };

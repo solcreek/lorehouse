@@ -256,6 +256,7 @@ async function startApp(config: Config, keys: Uint8Array[]) {
     listed,
     dms: dm === "answer",
     joined: (channel, thread) => inThread(knowledge, channel, thread),
+    join: (channel, thread) => joinThread(knowledge, channel, thread),
   });
   const refuse = (e: SlackNormalizedEvent, verdict: Membership | undefined) => {
     const v: Membership = verdict ?? { user: e.user?.id ?? "", member: false, reason: "lookup_failed", error: "not looked up" };
@@ -315,10 +316,10 @@ async function startApp(config: Config, keys: Uint8Array[]) {
       if (user) void ingester?.names([user]).catch(() => undefined);
       return true;
     },
-    // A mention asks the agent into its thread. Reactions are observed only: they are not
-    // in respondTo, so none starts a turn.
+    // Reactions are observed only: they are not in respondTo, so none starts a turn. (A
+    // mention asks the agent into its thread when it is accepted, in respondWhen: an
+    // observer here would join a refused asker's thread too.)
     on: {
-      app_mention: (e) => joinThread(knowledge, e.channelId, e.threadId ?? e.ts),
       reaction_added: onReaction,
       reaction_removed: onReaction,
     },

@@ -36,6 +36,7 @@ function setup(opts: { dms?: boolean; listed?: string[]; holdMs?: number } = {})
     listed,
     dms: opts.dms ?? false,
     joined: (channel, thread) => inThread(db, channel, thread),
+    join: (channel, thread) => joinThread(db, channel, thread),
   });
   const deliver = async (e: TurnEvent): Promise<TurnDecision> => {
     await gate.before({ userId: e.user?.id, teamId: "T1", channelId: e.channelId, threadId: e.threadId, kind: e.kind, ts: e.ts });
@@ -104,6 +105,30 @@ describe("turnGate", () => {
     const on = setup({ dms: true });
     expect(await on.deliver(dm("U1"))).toEqual(ANSWER);
     expect(await on.deliver(dm("UG1"))).toMatchObject({ turn: "refuse" });
+  });
+
+  test("a mention asks the agent into its thread only once it is accepted", async () => {
+    const t = setup();
+    const asked = mention("U1");
+    expect(t.joined(asked.ts)).toBe(false);
+    expect(await t.deliver(asked)).toEqual(ANSWER);
+    expect(t.joined(asked.ts)).toBe(true);
+    // In a thread someone else started: the thread's root is what is joined.
+    expect(await t.deliver(mention("U2", "1.1"))).toEqual(ANSWER);
+    expect(t.joined("1.1")).toBe(true);
+  });
+
+  test("a refused asker's mention joins nothing: a guest's, an unknown sender's, or one in a channel closed meanwhile", async () => {
+    const t = setup();
+    const guest = mention("UG1"), unknown = mention("U404"), closed = mention("U1");
+    expect(await t.deliver(guest)).toMatchObject({ turn: "refuse" });
+    expect(await t.deliver(unknown)).toMatchObject({ turn: "refuse" });
+    t.listed.delete("C1");
+    expect(await t.deliver(closed)).toEqual(NONE);
+    for (const m of [guest, unknown, closed]) expect(t.joined(m.ts)).toBe(false);
+    // So a member's reply there is not a follow-up.
+    t.listed.add("C1");
+    expect(await t.deliver(reply("U2", guest.ts))).toEqual(NONE);
   });
 
   test("a channel closed while the sender was looked up gets nothing, not even a refusal", async () => {
