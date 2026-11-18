@@ -4,8 +4,10 @@
 //   /slack/api/<method>        Slack Web API (JSON, form or query params). Records every call.
 //                              Serves conversations.history/replies/info from its fixtures.
 //   /anthropic/v1/messages     Anthropic Messages API, streaming (SSE) or not.
-//   /github/…                  GitHub's REST API, as much as open_pull_request uses: the
-//                              token's user, and listing and opening pull requests.
+//   /github/…                  GitHub's REST API, as much as open_pull_request and a
+//                              channel's default repo use: the token's user, listing and
+//                              opening pull requests, and the repos the token can read
+//                              (acme/widgets, acme/gadgets) with their branches.
 //   POST /slack/response/…     an interaction's response_url: recorded (the ephemeral replies)
 //   POST /slack/upload/<id>    a file's bytes, to the upload_url files.getUploadURLExternal
 //                              handed out: recorded (the uploads)
@@ -377,13 +379,25 @@ async function anthropic(req: Request): Promise<Response> {
 
 // ── GitHub ───────────────────────────────────────────────────────────────────
 
-// The token's user (who the commits must be by), and pull requests: none open yet, and
-// a new one is always number 7. Records every request.
+// The repos the token can read, each with its branches; any other repo is a 404, as
+// GitHub answers for one that doesn't exist or that the token has no access to.
+const REPOS: Record<string, string[]> = { "acme/widgets": ["main", "release/1.x"], "acme/gadgets": ["main"] };
+
+// The token's user (who the commits must be by), the repos it can read and their branches,
+// and pull requests: none open yet, and a new one is always number 7. Records every request.
 async function github(req: Request, url: URL): Promise<Response> {
   const path = url.pathname.slice("/github".length) + url.search;
   const raw = await req.text();
   githubCalls.push({ method: req.method, path, body: raw ? safeJson(raw) : undefined });
   if (url.pathname === "/github/user") return Response.json({ id: 1, login: "octo" });
+  const repo = /^\/github\/repos\/([^/]+)\/([^/]+)(?:\/branches\/(.+))?$/.exec(url.pathname);
+  if (repo && req.method === "GET") {
+    const full = `${repo[1]}/${repo[2]}`;
+    const branches = REPOS[full.toLowerCase()];
+    if (!branches) return Response.json({ message: "Not Found" }, { status: 404 });
+    if (repo[3] === undefined) return Response.json({ full_name: full.toLowerCase(), default_branch: "main" });
+    return branches.includes(repo[3]) ? Response.json({ name: repo[3] }) : Response.json({ message: "Branch not found" }, { status: 404 });
+  }
   const pulls = /^\/github\/repos\/([^/]+)\/([^/]+)\/pulls$/.exec(url.pathname);
   if (pulls && req.method === "GET") return Response.json([]);
   if (pulls && req.method === "POST") return Response.json({ html_url: `https://github.com/${pulls[1]}/${pulls[2]}/pull/7`, number: 7 }, { status: 201 });

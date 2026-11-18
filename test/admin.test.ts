@@ -1,9 +1,11 @@
-// The admin API: a read-only view of the index, the agent's threads and the sandboxes,
-// behind its own token.
+// The admin API: the index, the agent's threads and the sandboxes, read behind its own
+// token; and the one setting it writes, a channel's default repo.
 
 import { describe, expect, test } from "bun:test";
 import { adminRoutes, type AdminOptions } from "../src/admin";
+import { getChannelRepo, listChannelRepos, setChannelRepo } from "../src/channel-repos";
 import { ConfigError, loadConfig } from "../src/config";
+import type { RepoCheck } from "../src/github-auth";
 import type { IngestStatus } from "../src/ingest/slack";
 import { openKnowledge, searcher, upsertDocument } from "../src/knowledge";
 import { joinThread } from "../src/threads";
@@ -54,14 +56,14 @@ describe("who may use it", () => {
   test("every answer to the token names the tenant; a refusal doesn't", async () => {
     const { db, get } = setup();
     fill(db);
-    for (const path of ["/api/v1/documents", "/api/v1/documents/seed-1", "/api/v1/search?q=wombat", "/api/v1/channels", "/api/v1/threads", "/api/v1/runners", "/api/v1/sandboxes", "/api/v1/usage", "/api/v1/documents?limit=0", "/api/v1/nope"]) {
+    for (const path of ["/api/v1/documents", "/api/v1/documents/seed-1", "/api/v1/search?q=wombat", "/api/v1/channels", "/api/v1/channels/C1/repo", "/api/v1/threads", "/api/v1/runners", "/api/v1/sandboxes", "/api/v1/usage", "/api/v1/documents?limit=0", "/api/v1/nope"]) {
       const r = await get(path);
       expect([path, ((await r.json()) as { tenant?: string }).tenant]).toEqual([path, "t-test"]);
     }
     expect(await (await get("/api/v1/documents", { token: "wrong" })).text()).not.toContain("t-test");
   });
 
-  test("it only reads: anything but GET is 405", async () => {
+  test("a read endpoint only reads: anything but GET is 405", async () => {
     const { get } = setup();
     const r = await get("/api/v1/documents", { method: "POST" });
     expect(r.status).toBe(405);
@@ -83,7 +85,11 @@ describe("who may use it", () => {
       await get("/api/v1/nope"), // 404
       await get("/api/v1/documents", { token: "wrong" }), // 401
       await get("/api/v1/documents", { method: "POST" }), // 405
+      await get("/api/v1/channels/C1/repo"), // 404, with a code
+      await get("/api/v1/channels/C1/repo", { method: "DELETE" }), // 200
+      await get("/api/v1/channels/C1/repo", { method: "PUT", body: "{" }), // 404, with a code
       await closed("/api/v1/documents"), // 404, closed
+      await closed("/api/v1/channels/C1/repo", { method: "PUT", body: '{"repo":"acme/widgets"}' }), // 404, closed
     ]) {
       expect(`${r.status} ${r.headers.get("cache-control")}`).toBe(`${r.status} no-store`);
     }
@@ -245,10 +251,20 @@ describe("channels, threads and sandboxes", () => {
     expect(await body("/api/v1/channels")).toEqual({ tenant: "t-test",
       state: "ready",
       channels: [
-        { id: "C1", threads: 3, lastMessageAt: new Date(1790000005.0001 * 1000).toISOString() },
-        { id: "C2", threads: 0, lastMessageAt: null },
+        { id: "C1", threads: 3, lastMessageAt: new Date(1790000005.0001 * 1000).toISOString(), defaultRepo: null },
+        { id: "C2", threads: 0, lastMessageAt: null, defaultRepo: null },
       ],
     });
+  });
+
+  test("each channel is listed with its default repo, or null", async () => {
+    const status: IngestStatus = { state: "ready", documents: 0, channels: { C1: { threads: 0 }, C2: { threads: 0 } }, reconciled: { refreshed: 0, removed: 0 } };
+    const { db, body } = setup({ ingest: () => status });
+    setChannelRepo(db, { channel: "C2", repo: { owner: "acme", name: "widgets" }, branch: "main" }, new Date("2026-11-01T00:00:00Z"));
+    expect((await body("/api/v1/channels")).channels.map((c: { id: string; defaultRepo: unknown }) => [c.id, c.defaultRepo])).toEqual([
+      ["C1", null],
+      ["C2", { repo: "acme/widgets", branch: "main", setAt: "2026-11-01T00:00:00.000Z" }],
+    ]);
   });
 
   test("an ingest error is passed on; no channels at all is idle", async () => {
@@ -349,5 +365,196 @@ describe("usage", () => {
     recordSearch(db, { channel: "C1", threadTs: "1.1", query: "wombat", hits: 3 });
     recordSearch(db, { channel: "C2", threadTs: "1.1", query: "same ts, another channel", hits: 0 });
     expect((await body("/api/v1/threads")).threads[0]).toMatchObject({ channel: "C1", threadTs: "1.1", asks: 2, searches: 2, emptySearches: 1 });
+  });
+});
+
+// #126: the one thing the admin API writes. Declarative: PUT the state wanted, DELETE for
+// none, both safe to repeat; a refusal carries a stable code and stores nothing.
+describe("a channel's default repo", () => {
+  // A GitHub where every repo and branch is readable, unless `over` says otherwise.
+  function github(over?: (repo: string, branch?: string) => RepoCheck | undefined) {
+    const asked: string[] = [];
+    const checkRepo: NonNullable<AdminOptions["checkRepo"]> = async (repo, branch) => {
+      const full = `${repo.owner}/${repo.name}`;
+      asked.push(branch === undefined ? full : `${full}@${branch}`);
+      return over?.(full, branch) ?? { ok: true, repo };
+    };
+    return { checkRepo, asked };
+  }
+  function repoSetup(o: Partial<AdminOptions> = {}) {
+    const gh = github();
+    const log: string[] = [];
+    const s = setup({ channels: new Set(["C1", "C2"]), checkRepo: gh.checkRepo, log: (l) => log.push(l), ...o });
+    const call = async (method: string, channel: string, body?: unknown) => {
+      const res = await s.get(`/api/v1/channels/${channel}/repo`, { method, ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }) });
+      return { status: res.status, allow: res.headers.get("allow"), body: (await res.json()) as Record<string, any> };
+    };
+    return { ...s, call, asked: gh.asked, log };
+  }
+  const put = (r: ReturnType<typeof repoSetup>, body: unknown, channel = "C1") => r.call("PUT", channel, body);
+
+  test("none until set: GET says null", async () => {
+    const r = repoSetup();
+    expect(await r.call("GET", "C1")).toEqual({ status: 200, allow: null, body: { tenant: "t-test", channel: "C1", defaultRepo: null } });
+  });
+
+  test("PUT sets it, checked with GitHub first, and GET reads it back", async () => {
+    const r = repoSetup();
+    const set = await put(r, { repo: "acme/widgets", branch: "main" });
+    expect(set).toEqual({ status: 200, allow: null, body: { tenant: "t-test", channel: "C1", defaultRepo: { repo: "acme/widgets", branch: "main", setAt: expect.any(String) } } });
+    expect(r.asked).toEqual(["acme/widgets@main"]);
+    expect((await r.call("GET", "C1")).body).toEqual(set.body);
+    expect((await r.call("GET", "C2")).body.defaultRepo).toBeNull(); // per channel
+    expect(r.log).toEqual(["admin: C1's default repo is now acme/widgets (branch main)"]);
+  });
+
+  test("the branch is optional: left out or null, it is the repo's default branch, and no branch is checked", async () => {
+    const r = repoSetup();
+    expect((await put(r, { repo: "acme/widgets" })).body.defaultRepo).toMatchObject({ repo: "acme/widgets", branch: null });
+    expect((await put(r, { repo: "acme/widgets", branch: null }, "C2")).body.defaultRepo).toMatchObject({ branch: null });
+    expect(r.asked).toEqual(["acme/widgets", "acme/widgets"]);
+  });
+
+  test("PUT again with the same state is the same answer, setAt included; with another, it replaces", async () => {
+    const r = repoSetup();
+    const first = await put(r, { repo: "acme/widgets", branch: "main" });
+    await Bun.sleep(2);
+    expect(await put(r, { repo: "acme/widgets", branch: "main" })).toEqual(first);
+    expect(r.log).toHaveLength(1);
+    const other = await put(r, { repo: "acme/gadgets" });
+    expect(other.body.defaultRepo).toMatchObject({ repo: "acme/gadgets", branch: null });
+    expect(listChannelRepos(r.db)).toHaveLength(1);
+    expect(r.log.at(-1)).toBe("admin: C1's default repo is now acme/gadgets");
+  });
+
+  test("it is stored as GitHub spells the repo", async () => {
+    const r = repoSetup({ checkRepo: github(() => ({ ok: true, repo: { owner: "Acme", name: "Widgets" } })).checkRepo });
+    expect((await put(r, { repo: "acme/widgets" })).body.defaultRepo.repo).toBe("Acme/Widgets");
+  });
+
+  test("DELETE clears it, and again is the same answer", async () => {
+    const r = repoSetup();
+    await put(r, { repo: "acme/widgets" });
+    const cleared = await r.call("DELETE", "C1");
+    expect(cleared).toEqual({ status: 200, allow: null, body: { tenant: "t-test", channel: "C1", defaultRepo: null } });
+    expect(getChannelRepo(r.db, "C1")).toBeUndefined();
+    expect(await r.call("DELETE", "C1")).toEqual(cleared);
+    expect(r.log.filter((l) => l.includes("cleared"))).toEqual(["admin: C1 has no default repo now (cleared)"]);
+    // A channel off the list has none to clear: the same answer, not an error.
+    expect((await r.call("DELETE", "C9")).status).toBe(200);
+  });
+
+  // Every refusal: its status, its code, and that nothing was stored or changed.
+  const refused = async (r: ReturnType<typeof repoSetup>, body: unknown, status: number, code: string, channel = "C1") => {
+    const before = listChannelRepos(r.db);
+    const res = await put(r, body, channel);
+    expect([res.status, res.body.code]).toEqual([status, code]);
+    expect(res.body.error.length).toBeGreaterThan(20);
+    expect(res.body.tenant).toBe("t-test");
+    expect(listChannelRepos(r.db)).toEqual(before);
+    return res.body.error as string;
+  };
+
+  test("invalid_channel (400): not a Slack channel id", async () => {
+    const r = repoSetup();
+    for (const channel of ["general", "c1", "C1%3Bdrop", "%E0%A4%A"]) {
+      await refused(r, { repo: "acme/widgets" }, 400, "invalid_channel", channel);
+      expect((await r.call("GET", channel)).body.code).toBe("invalid_channel");
+      expect((await r.call("DELETE", channel)).body.code).toBe("invalid_channel");
+    }
+    expect(r.asked).toEqual([]);
+  });
+
+  test("channel_not_listed (404): only a channel on AGENT_CHANNELS can have one, so never a DM", async () => {
+    const r = repoSetup();
+    for (const channel of ["C9", "D1", "G1"]) {
+      const error = await refused(r, { repo: "acme/widgets" }, 404, "channel_not_listed", channel);
+      expect(error).toContain("AGENT_CHANNELS");
+      expect((await r.call("GET", channel)).body.code).toBe("channel_not_listed");
+    }
+    // With no channels at all, none is listed.
+    await refused(repoSetup({ channels: undefined }), { repo: "acme/widgets" }, 404, "channel_not_listed");
+    expect(r.asked).toEqual([]);
+  });
+
+  test("invalid_body (400): not JSON, not an object, too long, or a field it doesn't know", async () => {
+    const r = repoSetup();
+    for (const body of ["", "{", "[]", '"acme/widgets"', "null", JSON.stringify({ repo: "acme/widgets", branch: "x".repeat(5000) })]) await refused(r, body, 400, "invalid_body");
+    expect(await refused(r, { repo: "acme/widgets", default_branch: "main" }, 400, "invalid_body")).toContain('"default_branch"');
+    expect(r.asked).toEqual([]);
+  });
+
+  test("invalid_repo (400): anything but owner/name", async () => {
+    const r = repoSetup();
+    for (const repo of [undefined, 7, "", "widgets", "acme/", "acme/widgets/x", "https://github.com/acme/widgets", "acme/widgets.git", "acme/widgets; rm -rf /", "../x", "acme/.."]) await refused(r, { repo }, 400, "invalid_repo");
+    expect(r.asked).toEqual([]);
+  });
+
+  test("invalid_branch (400): not a branch name", async () => {
+    const r = repoSetup();
+    for (const branch of [7, "", "-rf", "a b", "a..b", "$(id)", ["main"]]) await refused(r, { repo: "acme/widgets", branch }, 400, "invalid_branch");
+    expect(r.asked).toEqual([]);
+  });
+
+  test("code_tools_off (409): with no GitHub credential there is nothing to check with, and nothing to use it", async () => {
+    const r = repoSetup({ checkRepo: undefined });
+    expect(await refused(r, { repo: "acme/widgets" }, 409, "code_tools_off")).toContain("SANDBOX_RUNNER_TOKEN");
+    // Reading and clearing still work.
+    expect((await r.call("GET", "C1")).status).toBe(200);
+    expect((await r.call("DELETE", "C1")).status).toBe(200);
+  });
+
+  test("app_not_installed (422): says to install the App on that repo", async () => {
+    const r = repoSetup({ checkRepo: github(() => ({ ok: false, reason: "not_installed", detail: "the GitHub App isn't installed on acme/secret" })).checkRepo });
+    const error = await refused(r, { repo: "acme/secret" }, 422, "app_not_installed");
+    expect(error).toContain("isn't installed on acme/secret");
+    expect(error).toContain("install it there");
+  });
+
+  test("repo_not_readable (422): the credential gets no read of it", async () => {
+    const r = repoSetup({ checkRepo: github(() => ({ ok: false, reason: "not_readable", detail: "the GitHub credential can't read acme/secret (GitHub answered 404): no such repo, or no access to it" })).checkRepo });
+    expect(await refused(r, { repo: "acme/secret" }, 422, "repo_not_readable")).toContain("can't read acme/secret");
+  });
+
+  test("branch_not_found (422): the repo is readable, the branch isn't there", async () => {
+    const r = repoSetup({ checkRepo: github((_, branch) => (branch === "nope" ? { ok: false, reason: "branch_not_found", detail: "acme/widgets has no branch nope" } : undefined)).checkRepo });
+    expect(await refused(r, { repo: "acme/widgets", branch: "nope" }, 422, "branch_not_found")).toContain("has no branch nope");
+    expect((await put(r, { repo: "acme/widgets", branch: "main" })).status).toBe(200);
+  });
+
+  test("github_unavailable (502): GitHub couldn't be asked, so nothing changes", async () => {
+    const r = repoSetup({ checkRepo: github(() => ({ ok: false, reason: "unavailable", detail: "GitHub answered 503 for acme/widgets" })).checkRepo });
+    expect(await refused(r, { repo: "acme/widgets" }, 502, "github_unavailable")).toContain("try again");
+  });
+
+  test("a refused set leaves the default that was there", async () => {
+    let gone = false;
+    const r = repoSetup({ checkRepo: github(() => (gone ? { ok: false, reason: "not_installed", detail: "x" } : undefined)).checkRepo });
+    await put(r, { repo: "acme/widgets", branch: "main" });
+    gone = true;
+    await refused(r, { repo: "acme/gadgets" }, 422, "app_not_installed");
+    await refused(r, { repo: "acme/widgets", branch: "main" }, 422, "app_not_installed"); // even the same state: it is checked every time
+    expect(getChannelRepo(r.db, "C1")).toMatchObject({ repo: "acme/widgets", branch: "main" });
+  });
+
+  test("method_not_allowed (405): GET, PUT and DELETE only", async () => {
+    const r = repoSetup();
+    for (const method of ["POST", "PATCH"]) {
+      const res = await r.call(method, "C1", { repo: "acme/widgets" });
+      expect([res.status, res.body.code, res.allow]).toEqual([405, "method_not_allowed", "GET, PUT, DELETE"]);
+    }
+    expect(listChannelRepos(r.db)).toEqual([]);
+  });
+
+  test("it needs the admin token like everything else, and is closed without one", async () => {
+    const r = repoSetup();
+    const init = { method: "PUT", body: JSON.stringify({ repo: "acme/widgets" }) };
+    expect((await r.get("/api/v1/channels/C1/repo", { ...init, token: "wrong" })).status).toBe(401);
+    expect((await r.get("/api/v1/channels/C1/repo", { ...init, token: null })).status).toBe(401);
+    const closed = repoSetup({ token: undefined });
+    expect((await closed.get("/api/v1/channels/C1/repo", init)).status).toBe(404);
+    expect(listChannelRepos(r.db)).toEqual([]);
+    expect(listChannelRepos(closed.db)).toEqual([]);
+    expect(r.asked).toEqual([]);
   });
 });

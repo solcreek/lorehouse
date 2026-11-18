@@ -40,7 +40,7 @@ import { cachedNames } from "./ingest/slack-users";
 import { pullRequestTool } from "./tools/pull-request";
 import { approvalStore, approverGate } from "./approvals";
 import { cloneTool } from "./tools/clone";
-import { githubApp, staticToken } from "./github-auth";
+import { checkRepo, githubApp, staticToken, type GithubAccess } from "./github-auth";
 import { workspaceTools } from "./tools/workspace";
 import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
 import { prepareTenant, sandboxIdFor, tenantsIn, upgradeLayout } from "./tenant";
@@ -215,6 +215,8 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
   // Sandbox runners connect in (docs/sandbox-runners.md); or one host is called directly.
   const hub = config.sandbox?.mode === "runners" ? new RunnerHub(knowledge, { log: (m) => console.log(m) }) : undefined;
   const runners = hub && config.sandbox?.mode === "runners" ? runnerRoutes(hub, config.sandbox.runnerToken) : undefined;
+  // The GitHub credential, which only code tools have (config.ts).
+  let githubAccess: GithubAccess | undefined;
   if (config.sandbox) {
     const sb = config.sandbox;
     // One sandbox per thread, keyed off the tenant and the session (never model input):
@@ -226,6 +228,7 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
     // Per-repo GitHub credentials: from the App (short-lived, least permission) or a token.
     const apiUrl = config.githubApiUrl;
     const github = sb.github.kind === "app" ? githubApp({ appId: sb.github.appId, privateKey: sb.github.privateKey, apiUrl }) : staticToken(sb.github.token, { apiUrl });
+    githubAccess = github;
     const approverName = async (userId: string) => (await ingester?.names([userId]))?.get(userId)?.full;
     // Who started each background job, for who may cancel it (tools/jobs.ts): pruned on
     // start, then daily.
@@ -404,7 +407,8 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
     }
   };
 
-  // The read-only admin API (/api/v1), behind ADMIN_TOKEN.
+  // The admin API (/api/v1), behind ADMIN_TOKEN: it reads, and sets a channel's default repo.
+  const github = githubAccess;
   const admin = adminRoutes({
     db: knowledge,
     tenant: tenant.id,
@@ -412,8 +416,14 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: Profile[])
     ingest: () => ingester?.status(),
     sandbox: config.sandbox?.mode ?? "off",
     runners: hub ? () => hub.status() : undefined,
+    // A channel's default repo (#126): only for a channel on AGENT_CHANNELS, and only a
+    // repo the GitHub credential can read now. With code tools off there is no credential
+    // to check with, and setting one is refused.
+    channels: config.agent.channels,
+    checkRepo: github && ((repo, branch) => checkRepo(github, repo, { branch, apiUrl: config.githubApiUrl })),
+    log: (line) => console.log(line),
     // With askers recorded, each is named as knowledge names people, from the names already
-    // cached: the admin API only reads (no Slack call, no write). Uncached: name null.
+    // cached: reading usage only reads (no Slack call, no write). Uncached: name null.
     usage: (since) => {
       const summary = usageSummary(knowledge, { since, people: recordPeople });
       if (!summary.askers?.length) return summary;
