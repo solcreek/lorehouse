@@ -202,16 +202,42 @@ impl Granted {
     /// choose the timeout. So a body that isn't a JSON object, or has any other key, is
     /// refused, and what goes out has each key once, spelled exactly.
     pub fn exec_body(&self, body: &[u8]) -> Result<Bytes, Refusal> {
+        Ok(self.write_exec(ExecBody::parse(body)?))
+    }
+
+    /// A parsed exec body as guestd gets it: its fields, and `timeoutMs` at what was asked
+    /// or this sandbox's command timeout, whichever is less.
+    pub fn write_exec(&self, parsed: ExecBody) -> Bytes {
+        let limit = self.command_timeout_secs.saturating_mul(1000);
+        let mut out = parsed.fields;
+        out.insert("timeoutMs".into(), json!(parsed.asked_ms.unwrap_or(limit).min(limit)));
+        // A map of JSON values with string keys always serializes.
+        Bytes::from(serde_json::to_vec(&out).unwrap_or_default())
+    }
+}
+
+/// A `POST /exec` body, read and found to be one guestd may be sent. Parsing needs no
+/// sandbox, so a body that is refused is refused before any sandbox is reached: nothing is
+/// booted, recorded or counted as a use for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecBody {
+    /// `command`, `cwd` and `env`, as parsed.
+    fields: Map<String, Value>,
+    /// The `timeoutMs` asked, when it is a whole number over zero.
+    asked_ms: Option<u64>,
+}
+
+impl ExecBody {
+    pub fn parse(body: &[u8]) -> Result<ExecBody, Refusal> {
         let bad = |why: String| Refusal::new(400, INVALID_EXEC, format!("{why}. A command's body is a JSON object with command, and optionally cwd, env and timeoutMs, spelled exactly so; nothing was run"), json!({}));
         let o = match serde_json::from_slice::<Value>(body) {
             Ok(Value::Object(o)) => o,
             Ok(other) => return Err(bad(format!("the exec body must be a JSON object, got {}", shown(&other)))),
             Err(e) => return Err(bad(format!("the exec body is not JSON sandboxd can read ({e})"))),
         };
-        let limit = self.command_timeout_secs.saturating_mul(1000);
         // The one `timeoutMs` the parsed object has (a key given twice: the last).
-        let asked = o.get("timeoutMs").and_then(Value::as_u64).filter(|ms| *ms > 0).unwrap_or(limit);
-        let mut out = Map::new();
+        let asked_ms = o.get("timeoutMs").and_then(Value::as_u64).filter(|ms| *ms > 0);
+        let mut fields = Map::new();
         for (key, value) in o {
             if !EXEC_KEYS.contains(&key.as_str()) {
                 let mut r = bad(format!("the exec body has a key {} that is not one guestd is sent", shown(&json!(key))));
@@ -219,11 +245,10 @@ impl Granted {
                 return Err(r);
             }
             if key != "timeoutMs" {
-                out.insert(key, value);
+                fields.insert(key, value);
             }
         }
-        out.insert("timeoutMs".into(), json!(asked.min(limit)));
-        serde_json::to_vec(&out).map(Bytes::from).map_err(|e| bad(format!("the exec body can't be written again ({e})")))
+        Ok(ExecBody { fields, asked_ms })
     }
 }
 

@@ -110,17 +110,34 @@ fn refused(e: &vm::AcquireError) -> Response {
     (StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(e.body())).into_response()
 }
 
-/// A guest call as it goes to guestd, and how long the host waits for it. A command
-/// (`POST /exec`, told by the path before any `?`) is sent a body sandboxd wrote itself,
-/// with the sandbox's own timeout at most (resources.rs `exec_body`), and the host's wait
-/// follows that timeout; one whose body can't be rewritten is refused, never forwarded.
-/// Anything else has the fixed deadline.
-pub fn bounded(granted: &resources::Granted, method: &Method, guest_path: &str, body: Bytes) -> Result<(Bytes, Duration), resources::Refusal> {
+/// A guest call, read before any sandbox is reached: a command (`POST /exec`, told by the
+/// path before any `?`) with its body parsed, or anything else as it came.
+#[derive(Debug, PartialEq)]
+pub enum Call {
+    Exec(resources::ExecBody),
+    Other(Bytes),
+}
+
+/// The call a request makes, or why it is refused. A command whose body isn't the JSON
+/// object guestd is sent (resources.rs `ExecBody`) is refused here, where nothing has been
+/// acquired: no VM is booted for it, no record is replaced by the request it came with,
+/// and it is not a use of the sandbox.
+pub fn checked(method: &Method, guest_path: &str, body: Bytes) -> Result<Call, resources::Refusal> {
     let route = guest_path.split_once('?').map_or(guest_path, |(route, _)| route);
     if method == Method::POST && route == "/exec" {
-        Ok((granted.exec_body(&body)?, granted.exec_backstop()))
+        Ok(Call::Exec(resources::ExecBody::parse(&body)?))
     } else {
-        Ok((body, REQUEST_DEADLINE))
+        Ok(Call::Other(body))
+    }
+}
+
+/// A checked call as it goes to guestd, and how long the host waits for it. A command is
+/// sent a body sandboxd wrote itself, with the sandbox's own timeout at most, and the
+/// host's wait follows that timeout. Anything else has the fixed deadline.
+pub fn bounded(granted: &resources::Granted, call: Call) -> (Bytes, Duration) {
+    match call {
+        Call::Exec(parsed) => (granted.write_exec(parsed), granted.exec_backstop()),
+        Call::Other(body) => (body, REQUEST_DEADLINE),
     }
 }
 
@@ -136,19 +153,21 @@ async fn forward(app: &App, id: &str, method: Method, guest_path: String, body: 
             return refused(&r.into());
         }
     };
+    // Before the sandbox is reached: a command's body that can't be sent touches nothing.
+    let call = match checked(&method, &guest_path, body) {
+        Ok(c) => c,
+        Err(r) => {
+            eprintln!("sandboxd: {id}: refused ({}): {}", r.code, r.message);
+            return refused(&r.into());
+        }
+    };
     let (_use, uds, granted) = match app.vms.acquire_with(id, request.as_ref()).await {
         Ok(v) => v,
         Err(e) => return refused(&e),
     };
     // A host-side deadline, whatever the guest does: guestd kills a command at the timeout
     // it is sent (the sandbox's own, see `bounded`), so this is the backstop.
-    let (body, deadline) = match bounded(&granted, &method, &guest_path, body) {
-        Ok(v) => v,
-        Err(r) => {
-            eprintln!("sandboxd: {id}: refused ({}): {}", r.code, r.message);
-            return refused(&r.into());
-        }
-    };
+    let (body, deadline) = bounded(&granted, call);
     match tokio::time::timeout(deadline, vsock::request(&uds, method, &guest_path, body)).await {
         Ok(Ok(reply)) => {
             let mut headers = HeaderMap::new();
@@ -513,26 +532,54 @@ mod tests {
         use bytes::Bytes;
         let granted = crate::resources::Granted { vcpus: 2, mem_mib: 2048, disk_gib: None, pids: 64, command_timeout_secs: 60 };
         let timeout = |sent: &Bytes| serde_json::from_slice::<serde_json::Value>(sent).unwrap()["timeoutMs"].clone();
+        let sent = |m: &Method, path: &str, body: &[u8]| super::checked(m, path, Bytes::copy_from_slice(body)).map(|call| super::bounded(&granted, call));
         // An exec that asks for more than the sandbox has, or for nothing: the sandbox's.
         // With a query on its path too: it is still a command (the runner refuses the
         // query outright; this is what holds if anything ever passes one).
         for path in ["/exec", "/exec?x=1", "/exec?"] {
             for body in [r#"{"command":"make","timeoutMs":86400000}"#, r#"{"command":"make"}"#] {
-                let (sent, wait) = super::bounded(&granted, &Method::POST, path, Bytes::from(body)).unwrap();
-                assert_eq!(timeout(&sent), 60_000, "{path} {body}");
+                let (body_sent, wait) = sent(&Method::POST, path, body.as_bytes()).unwrap();
+                assert_eq!(timeout(&body_sent), 60_000, "{path} {body}");
                 assert_eq!(wait, std::time::Duration::from_secs(60 + 330), "{path}");
             }
-            // A body guestd could read another timeout from: refused, with its code.
+            // A body guestd could read another timeout from: refused, with its code, and
+            // by `checked`, which has no sandbox to touch.
             for body in [&br#"{"command":"make","timeoutms":86400000}"#[..], &br#"{"command":"sleep 3600 #\ud800","timeoutMs":86400000}"#[..], &b"not json"[..]] {
-                let r = super::bounded(&granted, &Method::POST, path, Bytes::copy_from_slice(body)).unwrap_err();
+                let r = sent(&Method::POST, path, body).unwrap_err();
                 assert_eq!((r.status, r.code), (400, "invalid_exec_body"), "{path} {}", String::from_utf8_lossy(body));
             }
         }
         // A file write or a job start is not a command: untouched, the fixed deadline.
         for (m, p) in [(Method::PUT, "/file?path=%2Fexec"), (Method::POST, "/jobs"), (Method::GET, "/exec"), (Method::POST, "/execute")] {
             let body = Bytes::from_static(br#"{"command":"make","timeoutMs":7200000}"#);
-            assert_eq!(super::bounded(&granted, &m, p, body.clone()), Ok((body, super::REQUEST_DEADLINE)), "{m} {p}");
+            assert_eq!(sent(&m, p, &body), Ok((body, super::REQUEST_DEADLINE)), "{m} {p}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_command_whose_body_is_refused_reaches_no_sandbox() {
+        use axum::http::{HeaderMap, HeaderValue};
+        use bytes::Bytes;
+        let dir = std::env::temp_dir().join(format!("sandboxd-serve-exec-body-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (vms, publisher) = crate::runner::tests::no_vms(&dir);
+        let app = super::App { vms: vms.clone(), publisher, token_digest: super::digest("t") };
+        // With a request for resources this host would grant (and record), too.
+        let mut asking = HeaderMap::new();
+        asking.insert("x-lorehouse-sandbox-resources", HeaderValue::from_static(r#"{"commandTimeoutSecs":60}"#));
+        for headers in [HeaderMap::new(), asking] {
+            for body in [&br#"{"command":"sleep 86400","timeoutms":86400000}"#[..], &b"not json"[..], &br#"["sleep 86400"]"#[..]] {
+                let res = super::forward(&app, "acme.t1", Method::POST, "/exec".into(), Bytes::copy_from_slice(body), &headers).await;
+                assert_eq!(res.status(), 400, "{}", String::from_utf8_lossy(body));
+                let text = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&text).unwrap()["code"], "invalid_exec_body");
+            }
+        }
+        // No directory, no record, no slot, no entry (so nothing a reaper would count as use).
+        assert!(!dir.join("state/acme.t1").exists());
+        assert_eq!((vms.running_count().await, vms.in_flight().await), (0, 0));
+        assert!(vms.list().await.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
