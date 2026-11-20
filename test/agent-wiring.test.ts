@@ -51,8 +51,8 @@ const CODE_TOOLS = [
   "open_pull_request",
 ];
 // The system prompt differs only by the skill index: with pdf-report in it, or not.
-const PROMPT = "6afc224f8bcf19d97b066574029bfe3429193af535bd2e3887309762ce35a2e3";
-const PROMPT_WITH_PDF = "f1ab5fe7233dabc5370ddba952e7af8c24e9262a66b823c2296549153084ce92";
+const PROMPT = "8e3f6dbb95930657b29cbaff9916b0b15767b543e38fd873cfd9e12d8ce7f6f2";
+const PROMPT_WITH_PDF = "7135b7be2fc5bf1bac133f48e42de5f1ce28c37fdfb859cb386d78a95657e04e";
 
 type Given = { id: string; prompt: string; tools: string[]; specs: string; skills: string[]; channels: string[] };
 const PINNED: Record<"base" | "everything" | "sandbox" | "pdf", Given> = {
