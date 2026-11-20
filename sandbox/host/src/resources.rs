@@ -242,25 +242,57 @@ impl ExecBody {
             ));
         }
         let bad = |why: String| Refusal::new(400, INVALID_EXEC, format!("{why}. A command's body is a JSON object with command, and optionally cwd, env and timeoutMs, spelled exactly so; nothing was run"), json!({}));
-        let o = match serde_json::from_slice::<Value>(body) {
-            Ok(Value::Object(o)) => o,
-            Ok(other) => return Err(bad(format!("the exec body must be a JSON object, got {}", shown(&other)))),
-            Err(e) => return Err(bad(format!("the exec body is not JSON sandboxd can read ({e})"))),
+        // Read key by key, each checked as it is read: the first key guestd isn't sent
+        // ends the read there, with nothing after it parsed or kept. Then nothing may
+        // follow the object.
+        let mut other_key = None;
+        let mut de = serde_json::Deserializer::from_slice(body);
+        let read = match serde::Deserializer::deserialize_any(&mut de, ExecReader { other_key: &mut other_key }) {
+            Ok(read) => de.end().map(|()| read),
+            Err(e) => Err(e),
         };
-        // The one `timeoutMs` the parsed object has (a key given twice: the last).
-        let asked_ms = o.get("timeoutMs").and_then(Value::as_u64).filter(|ms| *ms > 0);
-        let mut fields = Map::new();
-        for (key, value) in o {
-            if !EXEC_KEYS.contains(&key.as_str()) {
+        match (read, other_key) {
+            (Ok(body), _) => Ok(body),
+            (Err(_), Some(key)) => {
                 let mut r = bad(format!("the exec body has a key {} that is not one guestd is sent", shown(&json!(key))));
                 r.detail.insert("field".into(), json!(key));
-                return Err(r);
+                Err(r)
             }
-            if key != "timeoutMs" {
-                fields.insert(key, value);
+            (Err(e), None) if e.is_data() => Err(bad(format!("the exec body must be a JSON object ({e})"))),
+            (Err(e), None) => Err(bad(format!("the exec body is not JSON sandboxd can read ({e})"))),
+        }
+    }
+}
+
+/// Reads a `POST /exec` body as an `ExecBody`: a JSON object of `EXEC_KEYS` only. A key
+/// given twice counts once, the last (guestd refuses a repeat; it is never sent one).
+struct ExecReader<'a> {
+    /// The first key that isn't one of `EXEC_KEYS`, when that is why the read failed.
+    other_key: &'a mut Option<String>,
+}
+
+impl<'de> serde::de::Visitor<'de> for ExecReader<'_> {
+    type Value = ExecBody;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<ExecBody, A::Error> {
+        let mut body = ExecBody { fields: Map::new(), asked_ms: None };
+        while let Some(key) = map.next_key::<String>()? {
+            if !EXEC_KEYS.contains(&key.as_str()) {
+                *self.other_key = Some(key);
+                return Err(serde::de::Error::custom("a key that is not one guestd is sent"));
+            }
+            let value = map.next_value::<Value>()?;
+            if key == "timeoutMs" {
+                body.asked_ms = value.as_u64().filter(|ms| *ms > 0);
+            } else {
+                body.fields.insert(key, value);
             }
         }
-        Ok(ExecBody { fields, asked_ms })
+        Ok(body)
     }
 }
 
@@ -828,6 +860,25 @@ pub mod tests {
             assert_eq!((r.status, r.code), (400, INVALID_EXEC), "{}", String::from_utf8_lossy(&body));
             assert!(r.body()["error"].as_str().unwrap().contains("nothing was run"));
         }
+        // The first key guestd isn't sent ends the read: it is what the refusal names,
+        // whatever follows it (here, something that isn't JSON at all).
+        let r = g.exec_body(br#"{"command":"make","extra":1,"cwd":oops"#).unwrap_err();
+        assert_eq!((r.status, r.code), (400, INVALID_EXEC));
+        assert_eq!(r.body()["field"], "extra");
+        assert!(r.message.contains(r#"has a key "extra" that is not one guestd is sent"#), "{}", r.message);
+        // Not an object: said so, with what it is. Not JSON: said so. Neither names a key.
+        for (body, says) in [(&br#"["sleep 3600"]"#[..], "must be a JSON object (invalid type: sequence"), (b"null", "must be a JSON object (invalid type: null"), (br#""make""#, "must be a JSON object (invalid type: string"), (b"not json", "is not JSON sandboxd can read"), (br#"{"command":"#, "is not JSON sandboxd can read"), (br#"{"command":"make"} x"#, "is not JSON sandboxd can read")] {
+            let r = g.exec_body(body).unwrap_err();
+            assert!(r.message.contains(says), "{}: {}", String::from_utf8_lossy(body), r.message);
+            assert_eq!(r.body().get("field"), None, "{}", String::from_utf8_lossy(body));
+        }
+        // A key given twice counts once, the last: for timeoutMs even when the last is
+        // not a number (the grant then), and for the others.
+        assert_eq!(sent(r#"{"command":"make","timeoutMs":1000,"timeoutMs":"x"}"#), json!({ "command": "make", "timeoutMs": 60_000 }));
+        assert_eq!(sent(r#"{"command":"a","cwd":"/x","command":"b"}"#), json!({ "command": "b", "cwd": "/x", "timeoutMs": 60_000 }));
+        // Nesting deeper than serde_json reads (128) is refused, not followed.
+        let deep = format!(r#"{{"command":"make","env":{}{}}}"#, "[".repeat(200), "]".repeat(200));
+        assert_eq!(g.exec_body(deep.as_bytes()).unwrap_err().status, 400);
         // A body over the limit: refused by its size, before it is parsed (it need not be
         // JSON to be refused so), with the size and the limit. At the limit: read.
         let command = |len: usize| format!(r#"{{"command":"{}"}}"#, "x".repeat(len - r#"{"command":""}"#.len())).into_bytes();
