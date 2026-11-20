@@ -566,6 +566,9 @@ mod tests {
                 let r = sent(&Method::POST, path, body).unwrap_err();
                 assert_eq!((r.status, r.code), (400, "invalid_exec_body"), "{path} {}", String::from_utf8_lossy(body));
             }
+            // A body over a command's size: refused there too, before it is parsed.
+            let r = sent(&Method::POST, path, &vec![b' '; crate::resources::MAX_EXEC_BODY + 1]).unwrap_err();
+            assert_eq!((r.status, r.code), (413, "invalid_exec_body"), "{path}");
         }
         // A file write or a job start is not a command: untouched, the fixed deadline.
         for (m, p) in [(Method::PUT, "/file?path=%2Fexec"), (Method::POST, "/jobs"), (Method::GET, "/exec"), (Method::POST, "/execute")] {

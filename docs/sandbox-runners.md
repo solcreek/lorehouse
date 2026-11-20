@@ -240,6 +240,7 @@ profile's sandbox carries it:
   | `disk_in_use` | 422 | less disk than the sandbox has already written (`usedBytes`); a cap under that would fail every write |
   | `invalid_stored_resources` | 500 | with no request: the sandbox's record of its resources is not one a request could have been granted (a damaged file) |
   | `invalid_exec_body` | 400 | a `POST /exec` body that is not a JSON object the runner can read, or has a key other than `command`, `cwd`, `env`, `timeoutMs`. Decided before the sandbox is reached: nothing is booted, recorded or counted as a use |
+  | `invalid_exec_body` | 413 | a `POST /exec` body over 1 MiB (`bytes`, `maxBytes`), refused before it is parsed. Something large goes in a file (`PUT /file`) for the command to read |
 
 - **Fixed while the VM runs, and only then.** Nothing is resized under a running VM. A
   job that would start work or write there (`POST /exec`, `POST /jobs`, `PUT /file`) with

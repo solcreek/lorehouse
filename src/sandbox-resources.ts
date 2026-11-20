@@ -127,7 +127,7 @@ export function explainTimeout<T extends { exitCode: number; stderr: string }>(r
 // resources_mismatch (its VM is running with other resources; they change after its idle
 // stop), disk_in_use and invalid_stored_resources; for a command's body
 // invalid_exec_body. The message is sandboxd's own, whole: it names the field, what was
-// asked, the limit and what to do. `status` is its HTTP-like status (400, 409, 422, 500).
+// asked, the limit and what to do. `status` is its HTTP-like status (400, 409, 413, 422, 500).
 export class SandboxRefusal extends Error {
   constructor(readonly code: string, readonly status: number, readonly reason: string) {
     super(`the sandbox host refused this call (${code}): ${reason}`);
