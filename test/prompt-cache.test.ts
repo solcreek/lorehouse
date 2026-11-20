@@ -93,6 +93,16 @@ describe("withPromptCaching", () => {
     expect(restAfter).toEqual(restBefore);
   });
 
+  test("a caller's request options reach the client as given", () => {
+    const got: unknown[] = [];
+    const inner = { messages: { stream: (_body: Params, options?: unknown) => (got.push(options), {}) } } as unknown as MessagesClient;
+    const options = { timeout: 1234 };
+    withPromptCaching(inner).messages.stream(request(), options);
+    withPromptCaching(inner).messages.stream(request());
+    expect(got[0]).toBe(options);
+    expect(got[1]).toBeUndefined();
+  });
+
   test("the SDK's own client is one it can wrap, and June takes the wrapped one", () => {
     // Types are the test: no cast on either line. Nothing is sent.
     const wrapped = withPromptCaching(new Anthropic({ apiKey: "test", baseURL: "http://127.0.0.1:9" }));

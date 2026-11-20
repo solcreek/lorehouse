@@ -8,12 +8,17 @@
 //     makes for one profile, so every thread reads them, whatever it goes on to say;
 //   - on the request itself: the API puts the mark on the last block it can cache, so each
 //     step of a turn reads the conversation up to the step before it and writes its own end.
-// A cached prefix lives five minutes from its last read (the API's default). A write costs
-// a quarter more than plain input and a read a tenth of it, so a prefix read once has paid
-// for itself. A prefix shorter than the model's minimum is simply not cached: no error.
+// A cached prefix lives five minutes from the last request that wrote or read it (the
+// API's default). A write costs a quarter more than plain input and a read a tenth of it
+// or less, by model, so a prefix read once has paid for itself. A prefix shorter than the
+// model's minimum is simply not cached: no error.
+// The mark on the request is the Anthropic API's own. A gateway that speaks another
+// dialect (Bedrock refuses it) would need this left out; ANTHROPIC_BASE_URL has only ever
+// meant the API or a mock of it.
 import type Anthropic from "@anthropic-ai/sdk";
 
 type StreamParams = Anthropic.MessageStreamParams;
+type StreamOptions = Parameters<Anthropic["messages"]["stream"]>[1];
 type MessageStream = ReturnType<Anthropic["messages"]["stream"]>;
 
 const EPHEMERAL = { type: "ephemeral" } as const;
@@ -32,13 +37,13 @@ export function withCacheMarks(body: StreamParams): StreamParams {
 // The part of the SDK's client June calls, marking each request on its way out. `stream`
 // is a method on purpose: June checks an injected client against the request it sends, and
 // the real SDK's narrower parameter passes that check only as a method's.
-export type MessagesClient = { messages: { stream(body: StreamParams): MessageStream } };
+export type MessagesClient = { messages: { stream(body: StreamParams, options?: StreamOptions): MessageStream } };
 
 export function withPromptCaching(client: MessagesClient): MessagesClient {
   return {
     messages: {
-      stream(body: StreamParams): MessageStream {
-        return client.messages.stream(withCacheMarks(body));
+      stream(body: StreamParams, options?: StreamOptions): MessageStream {
+        return client.messages.stream(withCacheMarks(body), options);
       },
     },
   };
