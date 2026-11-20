@@ -21,8 +21,9 @@
 //   - what is recorded, and a non-streamed body handed back, is scrubbed of the
 //     credential, should an upstream ever echo it.
 //
-// The budget: once the run's tokens reach `maxTokens`, further model calls are refused
-// (HTTP 400, `x-should-retry: false`, so the SDK doesn't retry) and `exceeded()` is true.
+// The budget: once the run's tokens reach `maxTokens` (at or over it), `exceeded()` is
+// true and further model calls are refused (HTTP 400, `x-should-retry: false`, so the SDK
+// doesn't retry). Calls in flight at that moment finish and are counted.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { scrub, type Credential } from "./credential";
@@ -140,7 +141,12 @@ export function startProxy(opts: ProxyOptions): Proxy {
   const key = `sk-eval-${randomBytes(24).toString("base64url")}`;
   const trials = new Map<string, { upstream: string; turns: ModelTurn[]; inFlight: number; retryUntil: number }>();
   let spent = noTokens();
-  let exceeded = false;
+  // The one rule of the budget: it is reached when the tokens counted so far are at or
+  // over it. From then on no model call is made and no trial starts. Tokens are counted
+  // when a response ends, so calls already in flight when it is reached still finish:
+  // the total can end up over the budget by what those calls cost (at most one per
+  // trial running and one for the grader).
+  const reached = () => totalTokens(spent) >= opts.maxTokens;
   // Nothing recorded or handed back holds the credential, whatever upstream said.
   const clean = (text: string) => scrub(text, opts.credential.secrets());
 
@@ -168,8 +174,7 @@ export function startProxy(opts: ProxyOptions): Proxy {
       },
     };
     trial.turns.push(turn);
-    if (exceeded || totalTokens(spent) >= opts.maxTokens) {
-      exceeded = true;
+    if (reached()) {
       turn.status = 0;
       turn.error = `budget: the run's ${totalTokens(spent)} tokens reached --max-tokens ${opts.maxTokens}; this model call was not made`;
       return refusal(400, "invalid_request_error", `eval budget exceeded: ${turn.error}`);
@@ -318,7 +323,7 @@ export function startProxy(opts: ProxyOptions): Proxy {
     },
     tokens: (trial) =>
       trial === undefined ? spent : (trials.get(trial)?.turns ?? []).reduce((sum, t) => (t.response ? addTokens(sum, t.response.tokens) : sum), noTokens()),
-    exceeded: () => exceeded || totalTokens(spent) > opts.maxTokens,
+    exceeded: () => reached(),
     stop: async () => {
       await server.stop(true);
     },

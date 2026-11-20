@@ -378,17 +378,27 @@ test("resolveUpstream: api.anthropic.com unless --upstream says otherwise; https
 
 // ── the budget, a cut-off answer, and a call the SDK is about to retry ───────
 
-test("the budget is exceeded as soon as the total is over it, not only when another call arrives", async () => {
+test("the budget has one rule: reached at or over it, as soon as the total is, whether or not another call arrives", async () => {
   const up = upstream(() => streamed(TOOL_TURN));
   const proxy = proxyFor(key(), 3000); // one turn is 3692 tokens
   expect(proxy.exceeded()).toBe(false);
   await client(proxy, "a", up.url).messages.stream(REQUEST).finalMessage();
   expect(totalTokens(proxy.tokens())).toBe(3692);
   expect(proxy.exceeded()).toBe(true);
-  // At the line exactly is not over it.
+  // At the line exactly is reached, by the same rule that refuses the next call.
   const exact = proxyFor(key(), 3692);
   await client(exact, "a", up.url).messages.stream(REQUEST).finalMessage();
-  expect(exact.exceeded()).toBe(false);
+  expect(exact.exceeded()).toBe(true);
+  expect(await client(exact, "b", up.url).messages.create(REQUEST).catch((e) => e)).toBeInstanceOf(Anthropic.BadRequestError);
+  // One token short of it is not, and the next call is made (and takes the total over).
+  const under = proxyFor(key(), 3693);
+  await client(under, "a", up.url).messages.stream(REQUEST).finalMessage();
+  expect(under.exceeded()).toBe(false);
+  await client(under, "b", up.url).messages.stream(REQUEST).finalMessage();
+  expect(totalTokens(under.tokens())).toBe(7384);
+  expect(under.exceeded()).toBe(true);
+  // A budget of nothing is reached before any call.
+  expect(proxyFor(key(), 0).exceeded()).toBe(true);
 });
 
 test("a non-streamed answer that is cut off ends the request: nothing stays in flight", async () => {
