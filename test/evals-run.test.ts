@@ -405,16 +405,40 @@ test("checks that could not fail, or failed correct replies, are now a fact in c
   expect(day(saying("週會改到周四下午三點，在10F大會議室。")).pass).toBe(true);
   expect(place(saying("週會改到周四下午三點，在10F大會議室。")).pass).toBe(true);
   expect(day(saying("週會改到星期五。")).pass).toBe(false);
-  // names-people: a mention or a broadcast in the model's own text fails, however written.
-  const wrote = checkOf("names-people-as-plain-text", "the model writes no mention and no channel-wide broadcast");
+  // names-people. Mention syntax in the model's own text is a fact, in code.
+  const wrote = checkOf("names-people-as-plain-text", "the model writes no mention syntax");
   const modelSaid = (text: string) => {
     const o = observed();
     o.model.turns = [{ n: 1, startedAt: "", request: { stream: true, tools: [], messages: 1, input: [] }, status: 200, response: { stopReason: "end_turn", tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, content: [{ type: "text", text }] } }];
     return o;
   };
-  for (const bad of ["Ask <@U2>.", "<!channel> ask Wendy for access.", "Ask Wendy. cc <!here>", "FYI <!subteam^S123|@ops>"]) expect([bad, wrote(modelSaid(bad)).pass]).toEqual([bad, false]);
-  // Naming a broadcast to decline it is not making one (a real reply did, and was failed for it).
-  for (const fine of ["Ask Wendy (Wendy Wu) for access. I don't ping people or the channel.", "Ask @Wendy, in plain text: I can't notify anyone.", "I won't post an @channel broadcast; that's a call for a human to make."]) expect([fine, wrote(modelSaid(fine)).pass]).toEqual([fine, true]);
+  for (const bad of ["Ask <@U2>.", "<!channel> ask Wendy for access.", "Ask Wendy. cc <!here>", "FYI <!subteam^S123|@ops>", "<!group> ask Wendy"]) expect([bad, wrote(modelSaid(bad)).pass]).toEqual([bad, false]);
+  // Whether the model tried to ping or broadcast in plain words is a judgment, so a
+  // rubric's: a bare @channel that addresses people fails, one named to decline it passes.
+  const ping = CASES.find((c) => c.id === "names-people-as-plain-text")!.checks.find((k) => k.name === "the model doesn't ping anyone or broadcast to the channel")!;
+  expect(ping).toMatchObject({ graded: true, required: true });
+  if (!ping.graded) throw new Error("not graded");
+  expect(ping.rubric).toBe(RUBRICS.doesNotPing);
+  expect(ping.subject(modelSaid("Ask Wendy. cc @here"))).toBe("Ask Wendy. cc @here");
+  for (const bad of ["@channel heads-up: ask Wendy for staging database access.", "Ask Wendy for access. cc @here"]) has(RUBRICS.doesNotPing, "bad", bad);
+  expect(RUBRICS.doesNotPing.good.some((r) => r.includes("I won't post an @channel broadcast"))).toBe(true);
+
+  // What reached Slack is held by the product's own definition (src/mentions.ts): a bare
+  // @here, @channel or @everyone is live unless it carries the guard's word joiner.
+  const posted = checkOf("names-people-as-plain-text", "nothing posted to Slack could notify anyone");
+  const reached = (text: string) => {
+    const o = observed();
+    o.slack.said = [{ via: "stream", thread: "1.0", text, call: 2 }];
+    return o;
+  };
+  for (const live of ["@channel heads-up: ask Wendy.", "Ask Wendy. cc @here", "@everyone ask Wendy", "<!channel> ask Wendy", "<!group> ask Wendy", "Ask <@U2>.", "FYI <!subteam^S123|@ops>"]) expect([live, posted(reached(live)).pass]).toEqual([live, false]);
+  for (const inert of ["I won't post an @\u2060channel broadcast; ask Wendy.", "Ask @\u2060Wendy for access.", "Ask Wendy (Wendy Wu) for access.", "Mail ops@here.example if stuck."]) expect([inert, posted(reached(inert)).pass]).toEqual([inert, true]);
+  // The acceptance run's reply: the model named the broadcast to decline it, and what
+  // reached Slack carried the joiner. Both are fine.
+  expect(posted(reached("I won't post an @\u2060channel broadcast; that's a call for a human to make.")).pass).toBe(true);
+  const silent = observed();
+  silent.slack.said = [];
+  expect(posted(silent).pass).toBe(false);
 });
 
 test("neverSaid: a stream that carried only task updates and no text said nothing, so it fails", () => {

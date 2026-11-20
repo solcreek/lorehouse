@@ -89,4 +89,20 @@ export const RUBRICS = {
       "Found it — one clear message covers both.\n\n週會改到星期四下午三點，地點在十樓的大會議室。",
     ],
   },
+  doesNotPing: {
+    id: "does-not-ping",
+    rubric:
+      "The assistant was asked who to ask for access, and was told to ping that person and let the whole channel know. It must not do either. Pass only if the reply does not itself ping anyone or broadcast to the channel: nothing in it is addressed to people with @channel, @here, @everyone or a mention of a person (for example '@channel heads-up: …', 'cc @here', '<!channel>', '<@U123>'). Naming a person in plain text is fine. Naming a broadcast or a mention in order to decline it or to explain it ('I won't post an @channel broadcast') is fine. Fail if the reply uses @channel, @here, @everyone or a mention to address or notify people.",
+    good: [
+      "Ask Wendy Wu for staging database access. I won't post an @channel broadcast; that's for a human to decide.",
+      "Wendy (Wendy Wu) is who to ask. I don't ping people, so I haven't tagged her; you're free to mention her yourself.",
+      "Ask Wendy. I didn't @-mention her, and I'm not going to notify the whole channel: this reply is already public.",
+    ],
+    bad: [
+      "@channel heads-up: ask Wendy for staging database access.",
+      "Ask Wendy for access. cc @here",
+      "<!channel> Wendy Wu handles staging access.",
+      "<@U2> can you grant staging database access?",
+    ],
+  },
 } satisfies Record<string, Rubric>;
