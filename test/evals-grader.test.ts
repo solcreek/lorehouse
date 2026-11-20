@@ -24,6 +24,19 @@ test("parseVerdict: strict JSON, written for this call, with a quote from the re
   expect(parseVerdict(answer({ pass: false, quote: "What next?", reason: "asks nothing about the repo" }), "What next?", WORD)).toMatchObject({ judged: true, pass: false });
 });
 
+test("parseVerdict: a short quote decides something when it is a whole sentence or line of the reply", () => {
+  // A real reply (2026-11-20): its first line is the whole answer, and is 11 characters.
+  const reply = "Tests pass.\n\n**`bun test` on `main` (acme/widgets) — 3 pass, 0 fail, ~21ms**\n\nExit code 0. Note the suite is small.";
+  expect(parseVerdict(answer({ pass: true, quote: "Tests pass.", reason: "reports the outcome" }), reply, WORD)).toEqual({ judged: true, pass: true, evidence: 'grader: reports the outcome — quoting "Tests pass."' });
+  expect(parseVerdict(answer({ pass: true, quote: "Exit code 0.", reason: "x" }), reply, WORD)).toMatchObject({ judged: true });
+  expect(parseVerdict(answer({ pass: true, quote: "測試通過。", reason: "x" }), "測試通過。\n3 pass, 0 fail", WORD)).toMatchObject({ judged: true, pass: true });
+  // Short and not a sentence of its own: a fragment, a single word, a word that is a line.
+  for (const fragment of ["Tests pass", "pass.", "Tests", "0 fail", "small.", "Exit code"]) {
+    expect([fragment, parseVerdict(answer({ pass: true, quote: fragment, reason: "x" }), reply, WORD).judged]).toEqual([fragment, false]);
+  }
+  expect(parseVerdict(answer({ pass: true, quote: "Done.", reason: "x" }), "Done.\nSee above.", WORD).judged).toBe(false);
+});
+
 test("parseVerdict: anything else is not judged, never a pass", () => {
   const unusable: [string, string][] = [
     [`\`\`\`json\n${answer({ pass: true, quote: "couldn't find a door code", reason: "x" })}\n\`\`\``, "isn't JSON"],

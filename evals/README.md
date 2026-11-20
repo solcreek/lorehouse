@@ -205,7 +205,8 @@ verdict is not promised to repeat; the self-test below is what holds the grader.
 
 A graded check has a verdict only when the grader's answer can be used. An answer that
 isn't the JSON asked for or doesn't carry the call's word, a quote that isn't in the
-reply or is shorter than 12 characters (unless it is all of a shorter reply), a pass that
+reply or is shorter than 12 characters (unless it is a whole sentence or line of the
+reply, or all of a shorter reply), a pass that
 quotes nothing, or a call that fails (one that failed in passing is tried once more) is
 **not judged, never a pass**. A trial with no failure but a required
 graded check left unjudged is *not fully judged*; so is its case (`NOT JUDGED` in the

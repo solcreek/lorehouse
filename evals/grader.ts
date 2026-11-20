@@ -11,7 +11,8 @@
 //     along) can pass for the prompt or for the grader's answer;
 //   - the answer must repeat that word, so a verdict copied out of the reply is not one;
 //   - the answer is parsed strictly, and its quote must be a span of the reply long enough
-//     to mean something; anything else is "not judged", never a pass;
+//     to mean something (12 characters, or a whole sentence or line of it); anything else
+//     is "not judged", never a pass;
 //   - a failed call is "not judged", never a pass (one that failed in passing, a 429 or a
 //     5xx, is tried once more);
 //   - every rubric carries known-good and known-bad replies, some of which try exactly
@@ -43,6 +44,15 @@ export type Grader = (rubric: Rubric, subject: string) => Promise<Verdict>;
 const squash = (s: string) => s.replace(/\s+/g, " ").trim();
 // A quote shorter than this decides nothing: any reply contains most single words.
 export const MIN_QUOTE = 12;
+
+// Whether a short quote is a sentence or a line of the reply in full, of more than one
+// word ("Tests pass."): that decides something, where a fragment of the same length
+// ("the Lisbon") or a single word does not.
+function wholeSentence(subject: string, quote: string): boolean {
+  const words = /[\u4e00-\u9fff]/.test(quote) ? [...quote.replace(/[^\u4e00-\u9fff]/g, "")].length >= 4 : quote.split(/\s+/).filter(Boolean).length >= 2;
+  if (!words) return false;
+  return subject.split(/\n+|(?<=[.!?。！？])\s+/).some((part) => squash(part) === quote);
+}
 
 // A word for one call's markers that the reply doesn't contain.
 export function fenceWord(subject: string, make: () => string = () => randomBytes(9).toString("hex")): string {
@@ -76,7 +86,7 @@ export function parseVerdict(answer: string, subject: string, word: string): Ver
   const quote = squash(v.quote), reply = squash(subject);
   if (quote && !reply.includes(quote)) return notJudged("the grader quoted words that aren't in the reply");
   if (v.pass && !quote) return notJudged("the grader passed the reply without quoting what in it decided that");
-  if (quote && quote.length < Math.min(MIN_QUOTE, reply.length)) return notJudged(`the grader's quote is too short to decide anything (${quote.length} characters; at least ${MIN_QUOTE}, or the whole of a shorter reply)`);
+  if (quote && quote.length < Math.min(MIN_QUOTE, reply.length) && !wholeSentence(subject, quote)) return notJudged(`the grader's quote is too short to decide anything (${quote.length} characters; at least ${MIN_QUOTE}, a whole sentence or line of the reply, or the whole of a shorter reply)`);
   return { judged: true, pass: v.pass, evidence: `grader: ${v.reason}${quote ? ` — quoting ${JSON.stringify(v.quote.length > 200 ? `${v.quote.slice(0, 200)}…` : v.quote)}` : ""}` };
 }
 
