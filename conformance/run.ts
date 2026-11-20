@@ -354,6 +354,18 @@ const scenarios: Scenario[] = [
     },
   },
   {
+    // Not something a teammate sees, but what every turn costs (#193), and only the wiring
+    // in src/app.ts makes it so: a model request without the marks is billed in full.
+    name: "every model request asks for prompt caching: a mark on the system prompt and one on the request",
+    run: async () => {
+      const answer = await ask("when is the wombat review");
+      if (!answer.text) return "no answer";
+      const s = await stats();
+      if (s.modelCalls < 2) return `${s.modelCalls} model call(s), want the search and the answer at least`;
+      return s.cacheMarkedModelCalls === s.modelCalls ? null : `${s.cacheMarkedModelCalls} of ${s.modelCalls} model requests carried both cache marks`;
+    },
+  },
+  {
     name: "reports ingest state and document count at GET /status",
     run: async () => {
       const s = await status();
