@@ -25,8 +25,6 @@ const SECRET = "eval-signing-secret";
 const STATUS_TOKEN = "eval-status-token";
 const ADMIN_TOKEN = "eval-admin-token-00000000000000000000";
 const RUNNER_TOKEN = "eval-runner-token-0000000000000000000";
-// What the app is given in place of the model credential: the proxy holds the real one.
-export const PLACEHOLDER_KEY = "eval-placeholder-key";
 // How long nothing may happen, with a turn begun and no model call in flight, before a
 // step still waiting is given up on.
 const IDLE_MS = 10_000;
@@ -81,7 +79,9 @@ export async function listeningPort(
 // holds, nor anything else that would configure Lorehouse.
 export function trialAppEnv(
   shell: Record<string, string | undefined>,
-  o: { mock: string; db: string; sessions: string; modelBase: string; model?: string; code: boolean; extra?: Record<string, string> },
+  // `modelKey`: what the app is given in place of a model credential: the proxy's own key
+  // for this run (proxy.ts), which is worth nothing anywhere else.
+  o: { mock: string; db: string; sessions: string; modelBase: string; modelKey: string; model?: string; code: boolean; extra?: Record<string, string> },
 ): Record<string, string | undefined> {
   const inherited = Object.fromEntries(["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER"].flatMap((k) => (shell[k] ? [[k, shell[k]!]] : [])));
   return appEnv(
@@ -89,7 +89,7 @@ export function trialAppEnv(
     // Port 0: the app binds a port of its own and says which (see listeningPort).
     { port: 0, secret: SECRET, mock: o.mock, channels: CHANNEL, seed: join(FIXTURES, "corpus.jsonl"), db: o.db, statusToken: STATUS_TOKEN, adminToken: ADMIN_TOKEN },
     {
-      ANTHROPIC_API_KEY: PLACEHOLDER_KEY,
+      ANTHROPIC_API_KEY: o.modelKey,
       ANTHROPIC_AUTH_TOKEN: "",
       ANTHROPIC_BASE_URL: o.modelBase,
       ANTHROPIC_MODEL: o.model ?? "",
@@ -237,7 +237,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
     const proc = Bun.spawn(["bun", join(ROOT, "src/server.ts")], {
       // Its own directory: the checkout's .env is never loaded.
       cwd: dir,
-      env: trialAppEnv(process.env, { mock: mockUrl, db: join(dir, "lorehouse.db"), sessions: join(dir, "sessions.db"), modelBase, model: opts.model, code, extra: c.setup?.env }),
+      env: trialAppEnv(process.env, { mock: mockUrl, db: join(dir, "lorehouse.db"), sessions: join(dir, "sessions.db"), modelBase, modelKey: opts.proxy.key, model: opts.model, code, extra: c.setup?.env }),
       stdout: "pipe", stderr: "pipe",
     });
     app = proc;
@@ -343,7 +343,9 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
       let seen = -1;
       let changedAt = Date.now();
       // A model call just answered is followed by what the app does with the answer (the
-      // reply's last append, the card's update): quiet is counted from then, too.
+      // reply's last append, the card's update): quiet is counted from then, too. Busy is
+      // a call in flight, or one the SDK is about to retry (a 429 with its retry-after):
+      // between those attempts nothing is in flight, and the turn is not over.
       let busyAt = 0;
       let fatalAt: number | undefined;
       let failure: string | undefined;
@@ -353,8 +355,8 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
         const count = all.length + jobs.length + turns().length;
         if (count !== seen) { seen = count; changedAt = now; }
         const ok = met(all);
-        if (opts.proxy.inFlight(id) > 0) busyAt = now;
-        if (ok && opts.proxy.inFlight(id) === 0 && now - Math.max(changedAt, busyAt) >= quietMs) break;
+        if (opts.proxy.busy(id)) busyAt = now;
+        if (ok && !opts.proxy.busy(id) && now - Math.max(changedAt, busyAt) >= quietMs) break;
         // A model call that failed for good (not one the SDK retries): the turn can't go on.
         const fatal = turns().slice(mark.turns).find((t) => t.error && (t.status === 0 || (t.status! >= 400 && t.status! < 500 && ![408, 409, 429].includes(t.status!))));
         if (fatal && !ok) fatalAt ??= now;
@@ -362,7 +364,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
         if (fatal && !ok && now - fatalAt! > 2000) { failure = `a model call failed (turn ${fatal.n}, HTTP ${fatal.status}): ${fatal.error}. Was waiting for ${waitingFor[until]}. ${since()}`; break; }
         // The turn is over and what the step waits for never came: the model answered
         // some other way (a reply and no card). No need to sit out the deadline.
-        if (!ok && turns().length > mark.turns && opts.proxy.inFlight(id) === 0 && now - Math.max(changedAt, busyAt) >= IDLE_MS) { failure = `no ${waitingFor[until]}: the turn ended without it (nothing new for ${IDLE_MS} ms and no model call in flight). ${since()}`; break; }
+        if (!ok && turns().length > mark.turns && !opts.proxy.busy(id) && now - Math.max(changedAt, busyAt) >= IDLE_MS) { failure = `no ${waitingFor[until]}: the turn ended without it (nothing new for ${IDLE_MS} ms and no model call in flight). ${since()}`; break; }
         if (mock && mock.exitCode !== null) { failure = `the mock exited (${mock.exitCode}) while waiting for ${waitingFor[until]}: ${mockErr.text().slice(-400)}`; break; }
         if (app.exitCode !== null) { failure = `the app exited (${app.exitCode}) while waiting for ${waitingFor[until]}: ${appErr.text().slice(-400)}`; break; }
         if (now > deadline) { failure = `${ok ? "it never went quiet" : `no ${waitingFor[until]}`} within ${step.deadlineMs ?? opts.deadlineMs} ms. ${since()}`; break; }

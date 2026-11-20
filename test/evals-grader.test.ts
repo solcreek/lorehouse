@@ -8,7 +8,6 @@ import { noCredential } from "../evals/credential";
 import { grader, GRADER_SYSTEM, graderPrompt, parseVerdict, selftest, type Grader } from "../evals/grader";
 import { startProxy } from "../evals/proxy";
 import { RUBRICS, type Rubric } from "../evals/rubrics";
-import { PLACEHOLDER_KEY } from "../evals/trial";
 
 const REPLY = "I couldn't find a door code for the Lisbon office.";
 
@@ -63,7 +62,7 @@ test("the grader asks through the proxy with the fixed prompt; its tokens are co
   const up = upstream((n) => (n === 1 ? message('{"pass": true, "quote": "couldn\'t find a door code", "reason": "it says so plainly"}') : message("I think it passes.")));
   const proxy = startProxy({ credential: noCredential, maxTokens: 1_000_000 });
   stops.push(() => proxy.stop());
-  const grade = grader(proxy.open("grader", up.url), PLACEHOLDER_KEY, "claude-haiku-5-5");
+  const grade = grader(proxy.open("grader", up.url), proxy.key, "claude-haiku-5-5");
   expect(await grade(RUBRICS.saysNotFound, REPLY)).toEqual({ judged: true, pass: true, evidence: 'grader: it says so plainly — quoting "couldn\'t find a door code"' });
   // An answer that isn't the JSON asked for: not judged.
   expect(await grade(RUBRICS.saysNotFound, REPLY)).toMatchObject({ judged: false });
@@ -81,17 +80,17 @@ test("a grader call that fails is not judged, never a pass: an API error, a refu
   const up = upstream(() => Response.json({ type: "error", error: { type: "invalid_request_error", message: "model: claude-nope not found" } }, { status: 400 }));
   const proxy = startProxy({ credential: noCredential, maxTokens: 1_000_000 });
   stops.push(() => proxy.stop());
-  const failed = await grader(proxy.open("grader", up.url), PLACEHOLDER_KEY, "claude-nope")(RUBRICS.saysNotFound, REPLY);
+  const failed = await grader(proxy.open("grader", up.url), proxy.key, "claude-nope")(RUBRICS.saysNotFound, REPLY);
   expect(failed.judged).toBe(false);
   expect(failed.evidence).toContain("not judged: the grader call failed: 400");
   expect(failed.evidence).toContain("claude-nope not found");
 
   const broke = startProxy({ credential: noCredential, maxTokens: 0 });
   stops.push(() => broke.stop());
-  const refused = await grader(broke.open("grader", up.url), PLACEHOLDER_KEY, "claude-haiku-5-5")(RUBRICS.saysNotFound, REPLY);
+  const refused = await grader(broke.open("grader", up.url), broke.key, "claude-haiku-5-5")(RUBRICS.saysNotFound, REPLY);
   expect(refused).toMatchObject({ judged: false, evidence: expect.stringContaining("eval budget exceeded") });
 
-  const nowhere = await grader(proxy.open("gone", "http://127.0.0.1:1"), PLACEHOLDER_KEY, "claude-haiku-5-5")(RUBRICS.saysNotFound, REPLY);
+  const nowhere = await grader(proxy.open("gone", "http://127.0.0.1:1"), proxy.key, "claude-haiku-5-5")(RUBRICS.saysNotFound, REPLY);
   expect(nowhere.judged).toBe(false);
 }, 30_000);
 

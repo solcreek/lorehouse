@@ -11,12 +11,12 @@ import { join, relative, resolve } from "node:path";
 import { listing, parseArgs, selectCases, UsageError, type Args } from "./args";
 import type { Case } from "./case";
 import { CASES } from "./cases";
-import { noCredential, resolveCredential, scrub, type Credential } from "./credential";
+import { DEFAULT_UPSTREAM, noCredential, resolveCredential, resolveUpstream, scrub, type Credential } from "./credential";
 import { DEFAULT_GRADER_MODEL, grader, selftest } from "./grader";
 import { RUBRICS } from "./rubrics";
 import { startProxy } from "./proxy";
 import { caseResult, judge, summarize, table, trialVerdict, type TrialResult } from "./report";
-import { children, PLACEHOLDER_KEY, runTrial } from "./trial";
+import { children, runTrial } from "./trial";
 
 const ROOT = join(import.meta.dir, "..");
 const exit2 = (message: string): never => {
@@ -45,7 +45,14 @@ if (!args.dry) {
   if ("problem" in resolved) exit2(resolved.problem);
   else credential = resolved;
 }
-const upstream = (process.env.EVAL_ANTHROPIC_UPSTREAM ?? "https://api.anthropic.com").replace(/\/+$/, "");
+// Where the credential goes is decided here, once, and said before anything is sent.
+let upstream = DEFAULT_UPSTREAM;
+if (!args.dry) {
+  const resolved = resolveUpstream(args.upstream, process.env);
+  if ("problem" in resolved) exit2(resolved.problem);
+  else upstream = resolved.url;
+  console.error(`eval: the model credential (${credential.kind}) will be sent to ${upstream}, and nowhere else`);
+}
 const usdIn = Number(process.env.EVAL_USD_PER_MTOK_IN), usdOut = Number(process.env.EVAL_USD_PER_MTOK_OUT);
 const usd = Number.isFinite(usdIn) && Number.isFinite(usdOut) && process.env.EVAL_USD_PER_MTOK_IN && process.env.EVAL_USD_PER_MTOK_OUT ? { in: usdIn, out: usdOut } : undefined;
 
@@ -62,11 +69,19 @@ const shown = (path: string) => {
 // Nothing written or printed holds the credential: the last line of defense (credential.ts).
 const clean = (text: string) => scrub(text, credential.secrets());
 const log = (line: string) => console.error(clean(line));
+// An error nobody caught is printed through the same scrub, never raw.
+for (const event of ["uncaughtException", "unhandledRejection"] as const) {
+  process.on(event, (err: unknown) => {
+    console.error(clean(`eval: crashed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`));
+    for (const child of children) child.kill("SIGKILL");
+    process.exit(1);
+  });
+}
 
 const proxy = startProxy({ credential, maxTokens: args.maxTokens });
 const graderModel = args.dry || args.noGrader ? null : (args.graderModel ?? process.env.EVAL_GRADER_MODEL ?? DEFAULT_GRADER_MODEL);
 const hasGraded = args.graderSelftest || cases.some((c) => c.checks.some((k) => k.graded));
-const grade = graderModel && hasGraded ? grader(proxy.open("grader", upstream), PLACEHOLDER_KEY, graderModel) : undefined;
+const grade = graderModel && hasGraded ? grader(proxy.open("grader", upstream), proxy.key, graderModel) : undefined;
 
 // ── --grader-selftest: is the grader itself right? ──────────────────────────
 // Every rubric's known-good and known-bad replies (rubrics.ts), graded by the real grader

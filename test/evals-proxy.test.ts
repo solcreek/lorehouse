@@ -5,10 +5,10 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { afterEach, expect, test } from "bun:test";
-import { antToken, noCredential, resolveCredential, scrub, type Credential } from "../evals/credential";
-import { startProxy, type Proxy } from "../evals/proxy";
+import { antToken, noCredential, resolveCredential, resolveUpstream, scrub, type Credential } from "../evals/credential";
+import { retryWaitMs, startProxy, type Proxy } from "../evals/proxy";
 import { SseReader, StreamedMessage, totalTokens } from "../evals/sse";
-import { PLACEHOLDER_KEY, trialAppEnv } from "../evals/trial";
+import { trialAppEnv } from "../evals/trial";
 
 const sse = (events: [string, unknown][]) => events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
 
@@ -68,7 +68,7 @@ function proxyFor(credential: Credential, maxTokens = 1_000_000): Proxy {
   return proxy;
 }
 // The app's side: the SDK, holding a placeholder key, pointed at the proxy.
-const client = (baseURL: string) => new Anthropic({ apiKey: PLACEHOLDER_KEY, baseURL, maxRetries: 2 });
+const client = (proxy: Proxy, trial: string, upstreamUrl: string) => new Anthropic({ apiKey: proxy.key, baseURL: proxy.open(trial, upstreamUrl), maxRetries: 2 });
 const REQUEST = { model: "claude-opus-5", max_tokens: 4096, system: "You are scout.", tools: [{ name: "workspace_clone", description: "clone", input_schema: { type: "object" as const, properties: {} } }], messages: [{ role: "user" as const, content: "run the tests in acme/gadgets" }] };
 
 test("SseReader: events survive any chunking, CRLF, comments and multi-line data", () => {
@@ -120,7 +120,7 @@ test("StreamedMessage: a stream cut off mid tool call keeps what arrived; an err
 test("the proxy passes a streamed response through intact and records the turn", async () => {
   const up = upstream(() => streamed(TOOL_TURN));
   const proxy = proxyFor(key());
-  const final = await client(proxy.open("t1", up.url)).messages.stream(REQUEST).finalMessage();
+  const final = await client(proxy, "t1", up.url).messages.stream(REQUEST).finalMessage();
   // The app got exactly what upstream sent.
   expect(final.stop_reason).toBe("tool_use");
   expect(final.content.map((b) => (b.type === "tool_use" ? { name: b.name, input: b.input } : b.type === "text" ? b.text : b.type))).toEqual(["I'll get the repo — 先看一下 🙂.", { name: "workspace_clone", input: { repo: "acme/gadgets" } }, { name: "recent_knowledge", input: {} }]);
@@ -141,7 +141,7 @@ test("the proxy records the tool results a later turn hands the model, and a non
   const body = { id: "msg_02", type: "message", role: "assistant", model: "claude-haiku-5-5", content: [{ type: "text", text: "Done." }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 50, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
   const up = upstream(() => Response.json(body));
   const proxy = proxyFor(key());
-  const reply = await client(proxy.open("t", up.url)).messages.create({
+  const reply = await client(proxy, "t", up.url).messages.create({
     model: "claude-haiku-5-5", max_tokens: 100,
     messages: [
       { role: "user", content: "go" },
@@ -173,14 +173,14 @@ for (const [kind, env, header] of [
     // An upstream that echoes the credential back in an error body, the worst case.
     const up = upstream((_s, n) => (n === 1 ? streamed(TOOL_TURN) : Response.json({ type: "error", error: { type: "invalid_request_error", message: "bad request" } }, { status: 400 })));
     const proxy = proxyFor(credential);
-    const c = client(proxy.open("t", up.url));
+    const c = client(proxy, "t", up.url);
     await c.messages.stream(REQUEST).finalMessage();
     expect(await c.messages.create(REQUEST).catch((e) => e)).toBeInstanceOf(Anthropic.BadRequestError);
 
     for (const seen of up.seen) {
       expect(seen.headers).toMatchObject(header);
       expect(Object.keys(seen.headers).filter((h) => h === "x-api-key" || h === "authorization").join()).toBe(Object.keys(header).join());
-      expect(JSON.stringify(seen.headers)).not.toContain(PLACEHOLDER_KEY);
+      expect(JSON.stringify(seen.headers)).not.toContain(proxy.key);
       expect(seen.headers["anthropic-version"]).toBe("2023-06-01");
     }
     expect(proxy.turns("t")).toHaveLength(2);
@@ -188,9 +188,9 @@ for (const [kind, env, header] of [
     expect(JSON.stringify(proxy.turns("t"))).not.toContain(REAL);
     expect(credential.secrets()).toEqual([REAL]);
     // And the app's environment never has it, whatever this shell holds.
-    const appEnv = trialAppEnv({ ...env, PATH: "/usr/bin", ANTHROPIC_API_KEY: REAL, ANTHROPIC_AUTH_TOKEN: REAL }, { mock: "http://localhost:2", db: "/tmp/x/lorehouse.db", sessions: "/tmp/x/sessions.db", modelBase: "http://127.0.0.1:3/t/t", code: true });
+    const appEnv = trialAppEnv({ ...env, PATH: "/usr/bin", ANTHROPIC_API_KEY: REAL, ANTHROPIC_AUTH_TOKEN: REAL }, { mock: "http://localhost:2", db: "/tmp/x/lorehouse.db", sessions: "/tmp/x/sessions.db", modelBase: "http://127.0.0.1:3/t/t", modelKey: proxy.key, code: true });
     expect(JSON.stringify(appEnv)).not.toContain(REAL);
-    expect(appEnv.ANTHROPIC_API_KEY).toBe(PLACEHOLDER_KEY);
+    expect(appEnv.ANTHROPIC_API_KEY).toBe(proxy.key);
     expect(appEnv.ANTHROPIC_AUTH_TOKEN).toBe("");
   });
 }
@@ -213,7 +213,7 @@ test("credential ant: a 401 fetches the token once more and retries that request
   if ("problem" in credential) throw new Error(credential.problem);
   const up = upstream((s) => (s.headers.authorization === `Bearer ${tokens[1]}` ? streamed(TOOL_TURN) : Response.json({ type: "error", error: { type: "authentication_error", message: "expired" } }, { status: 401 })));
   const proxy = proxyFor(credential);
-  const final = await client(proxy.open("t", up.url)).messages.stream(REQUEST).finalMessage();
+  const final = await client(proxy, "t", up.url).messages.stream(REQUEST).finalMessage();
   expect(final.stop_reason).toBe("tool_use");
   expect(up.seen.map((s) => s.headers.authorization)).toEqual([`Bearer ${tokens[0]}`, `Bearer ${tokens[1]}`]);
   expect(asked).toBe(2);
@@ -230,7 +230,7 @@ test("credential ant: a 401 with nothing newer to send is passed on, after askin
   if ("problem" in credential) throw new Error(credential.problem);
   const up = upstream(() => Response.json({ type: "error", error: { type: "authentication_error", message: "revoked" } }, { status: 401 }));
   const proxy = proxyFor(credential);
-  expect(await client(proxy.open("t", up.url)).messages.create(REQUEST).catch((e) => e)).toBeInstanceOf(Anthropic.AuthenticationError);
+  expect(await client(proxy, "t", up.url).messages.create(REQUEST).catch((e) => e)).toBeInstanceOf(Anthropic.AuthenticationError);
   expect(up.seen).toHaveLength(1);
   expect(asked).toBe(2);
 });
@@ -238,11 +238,11 @@ test("credential ant: a 401 with nothing newer to send is passed on, after askin
 test("the budget: once the run's tokens reach --max-tokens, model calls are refused without reaching upstream", async () => {
   const up = upstream(() => streamed(TOOL_TURN));
   const proxy = proxyFor(key(), 3000); // one turn is 3692 tokens
-  const c = client(proxy.open("a", up.url));
+  const c = client(proxy, "a", up.url);
   await c.messages.stream(REQUEST).finalMessage();
-  expect(proxy.exceeded()).toBe(false);
+  expect(proxy.exceeded()).toBe(true); // over the line already: that call cost 3692
   // Another trial's call counts against the same budget, and isn't retried by the SDK.
-  const other = client(proxy.open("b", up.url));
+  const other = client(proxy, "b", up.url);
   const refused = await other.messages.create(REQUEST).catch((e) => e);
   expect(refused).toBeInstanceOf(Anthropic.BadRequestError);
   expect(String(refused.message)).toContain("eval budget exceeded");
@@ -256,7 +256,7 @@ test("the budget: once the run's tokens reach --max-tokens, model calls are refu
 
 test("an upstream that can't be reached is the turn's error, and the app is told", async () => {
   const proxy = proxyFor(key());
-  const failed = await new Anthropic({ apiKey: PLACEHOLDER_KEY, baseURL: proxy.open("t", "http://127.0.0.1:1"), maxRetries: 0 }).messages.create(REQUEST).catch((e) => e);
+  const failed = await new Anthropic({ apiKey: proxy.key, baseURL: proxy.open("t", "http://127.0.0.1:1"), maxRetries: 0 }).messages.create(REQUEST).catch((e) => e);
   expect(failed).toBeInstanceOf(Anthropic.APIError);
   expect(proxy.turns("t")[0]!.status).toBe(0);
   expect(proxy.turns("t")[0]!.error).toContain("upstream unreachable");
@@ -266,4 +266,173 @@ test("an upstream that can't be reached is the turn's error, and the app is told
 test("scrub replaces a credential wherever it turns up", () => {
   expect(scrub(`{"error":"key ${REAL} is invalid","again":"${REAL}"}`, [REAL])).toBe('{"error":"key [redacted credential] is invalid","again":"[redacted credential]"}');
   expect(scrub("nothing here", noCredential.secrets())).toBe("nothing here");
+});
+
+// ── only this run spends the credential, and only on model calls ─────────────
+
+test("a request without the run's key is refused and nothing goes upstream; the key is random per run", async () => {
+  const up = upstream(() => streamed(TOOL_TURN));
+  const proxy = proxyFor(key());
+  const base = proxy.open("t", up.url);
+  for (const headers of [{}, { "x-api-key": "eval-placeholder-key" }, { "x-api-key": REAL }, { authorization: `Bearer ${proxy.key}` }] as Record<string, string>[]) {
+    const r = await fetch(`${base}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(REQUEST) });
+    expect(r.status).toBe(401);
+    expect(await r.text()).toContain("doesn't carry the run's key");
+  }
+  expect(up.seen).toHaveLength(0);
+  expect(proxy.turns("t")).toHaveLength(0);
+  expect(proxy.tokens()).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  const other = proxyFor(key());
+  expect(proxy.key).toMatch(/^sk-eval-[A-Za-z0-9_-]{32}$/);
+  expect(other.key).not.toBe(proxy.key);
+});
+
+test("only POST /v1/messages of an open trial is forwarded: any other path, method or trial is a 404 and nothing is sent", async () => {
+  const up = upstream(() => Response.json({ data: [] }));
+  const proxy = proxyFor(key());
+  const base = proxy.open("t", up.url);
+  const auth = { "x-api-key": proxy.key, "content-type": "application/json" };
+  const tries: [string, string][] = [
+    ["GET", `${base}/v1/models`], ["POST", `${base}/v1/messages/count_tokens`], ["POST", `${base}/v1/messages/batches`], ["GET", `${base}/v1/messages`],
+    ["POST", `${base}/v1/files`], ["POST", `http://127.0.0.1:${proxy.port}/t/unopened/v1/messages`], ["POST", `http://127.0.0.1:${proxy.port}/v1/messages`], ["POST", `${base}/v1/messages/../models`],
+  ];
+  for (const [method, url] of tries) {
+    const r = await fetch(url, { method, headers: auth, body: method === "POST" ? "{}" : undefined });
+    expect([method, url, r.status]).toEqual([method, url, 404]);
+  }
+  expect(up.seen).toHaveLength(0);
+  expect(proxy.turns("t")).toHaveLength(0);
+});
+
+test("a redirect from upstream is not followed: the credential would go with it", async () => {
+  const elsewhere = upstream(() => streamed(TOOL_TURN));
+  const up = upstream(() => new Response(null, { status: 307, headers: { location: `${elsewhere.url}/v1/messages` } }));
+  const proxy = proxyFor(key());
+  const failed = await new Anthropic({ apiKey: proxy.key, baseURL: proxy.open("t", up.url), maxRetries: 2 }).messages.create(REQUEST).catch((e) => e);
+  expect(failed).toBeInstanceOf(Anthropic.APIError);
+  expect(up.seen).toHaveLength(1); // not retried either
+  expect(elsewhere.seen).toHaveLength(0);
+  expect(proxy.turns("t")[0]).toMatchObject({ status: 307 });
+  expect(proxy.turns("t")[0]!.error).toContain(`a redirect to ${elsewhere.url}: not followed`);
+  expect(proxy.inFlight("t")).toBe(0);
+});
+
+test("an upstream that echoes the credential back: it is in no record and not in what the app is handed", async () => {
+  const echo = `Invalid API key ${REAL} (header x-api-key: ${REAL})`;
+  const up = upstream((_s, n) =>
+    n === 1 ? Response.json({ type: "error", error: { type: "authentication_error", message: echo } }, { status: 403 })
+    : n === 2 ? new Response(`<html>bad gateway for ${REAL}</html>`, { status: 400, headers: { "content-type": "text/html" } })
+    : new Response(sse([["message_start", TOOL_TURN[0]![1]], ["error", { type: "error", error: { type: "overloaded_error", message: `overloaded for ${REAL}` } }]]), { headers: { "content-type": "text/event-stream" } }));
+  const proxy = proxyFor(key());
+  const c = new Anthropic({ apiKey: proxy.key, baseURL: proxy.open("t", up.url), maxRetries: 0 });
+  const first = await c.messages.create(REQUEST).catch((e) => e);
+  const second = await c.messages.create(REQUEST).catch((e) => e);
+  await c.messages.stream(REQUEST).finalMessage().catch((e) => e);
+  expect(first).toBeInstanceOf(Anthropic.PermissionDeniedError);
+  // What the app was handed (and may log) for the two bodies the proxy read whole.
+  for (const err of [first, second]) expect(`${err.message} ${JSON.stringify(err.error ?? "")}`).not.toContain(REAL);
+  expect(String(first.message)).toContain("Invalid API key [redacted credential]");
+  // What was recorded, of all three.
+  const records = JSON.stringify(proxy.turns("t"));
+  expect(proxy.turns("t").map((t) => t.status)).toEqual([403, 400, 200]);
+  expect(records).not.toContain(REAL);
+  expect(proxy.turns("t")[0]!.error).toBe("authentication_error: Invalid API key [redacted credential] (header x-api-key: [redacted credential])");
+  expect(proxy.turns("t")[1]!.error).toContain("<html>bad gateway for [redacted credential]</html>");
+  expect(proxy.turns("t")[2]!.error).toBe("overloaded_error: overloaded for [redacted credential]");
+});
+
+test("resolveUpstream: api.anthropic.com unless --upstream says otherwise; https, or http to this machine only", () => {
+  const ok = (flag: string | undefined, env: Record<string, string>, url: string) => expect(resolveUpstream(flag, env)).toEqual({ url });
+  ok(undefined, {}, "https://api.anthropic.com");
+  ok(undefined, { EVAL_ANTHROPIC_UPSTREAM: "https://api.anthropic.com/" }, "https://api.anthropic.com");
+  ok("https://gateway.example.com/anthropic/", {}, "https://gateway.example.com/anthropic");
+  ok("http://localhost:8080", {}, "http://localhost:8080");
+  ok("http://127.0.0.1:9000/x", {}, "http://127.0.0.1:9000/x");
+  ok("http://[::1]:9000", {}, "http://[::1]:9000");
+  // The command line wins over the environment, and is the only thing that can name another host.
+  ok("https://gateway.example.com", { EVAL_ANTHROPIC_UPSTREAM: "https://other.example.com" }, "https://gateway.example.com");
+  const refused: [string | undefined, Record<string, string>, string][] = [
+    [undefined, { EVAL_ANTHROPIC_UPSTREAM: "https://gateway.example.com" }, "pass --upstream https://gateway.example.com on the command line"],
+    [undefined, { EVAL_ANTHROPIC_UPSTREAM: "http://localhost:8080" }, "pass --upstream http://localhost:8080 on the command line"],
+    [undefined, { EVAL_ANTHROPIC_UPSTREAM: "http://evil.example.com" }, "only sent over https"],
+    ["http://gateway.example.com", {}, "only sent over https"],
+    ["http://127.0.0.1.evil.example.com", {}, "only sent over https"],
+    ["http://192.168.1.10:8080", {}, "only sent over https"],
+    ["ftp://api.anthropic.com", {}, "only sent over https"],
+    ["https://user:pw@gateway.example.com", {}, "no credentials, query or fragment"],
+    ["https://gateway.example.com/?key=1", {}, "no credentials, query or fragment"],
+    ["not a url", {}, "isn't a URL"],
+  ];
+  for (const [flag, env, why] of refused) {
+    const r = resolveUpstream(flag, env);
+    if (!("problem" in r)) throw new Error(`resolved ${JSON.stringify([flag, env])} to ${r.url}`);
+    expect(r.problem).toContain(why);
+  }
+});
+
+// ── the budget, a cut-off answer, and a call the SDK is about to retry ───────
+
+test("the budget is exceeded as soon as the total is over it, not only when another call arrives", async () => {
+  const up = upstream(() => streamed(TOOL_TURN));
+  const proxy = proxyFor(key(), 3000); // one turn is 3692 tokens
+  expect(proxy.exceeded()).toBe(false);
+  await client(proxy, "a", up.url).messages.stream(REQUEST).finalMessage();
+  expect(totalTokens(proxy.tokens())).toBe(3692);
+  expect(proxy.exceeded()).toBe(true);
+  // At the line exactly is not over it.
+  const exact = proxyFor(key(), 3692);
+  await client(exact, "a", up.url).messages.stream(REQUEST).finalMessage();
+  expect(exact.exceeded()).toBe(false);
+});
+
+test("a non-streamed answer that is cut off ends the request: nothing stays in flight", async () => {
+  // A server that promises more body than it sends, then hangs up.
+  const cut = Bun.listen({
+    hostname: "127.0.0.1", port: 0,
+    socket: { data(socket) { socket.write('HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{"id":"msg_cut","type":"message","content":[{"type":"te'); socket.end(); } },
+  });
+  stops.push(() => cut.stop(true));
+  const proxy = proxyFor(key());
+  const failed = await new Anthropic({ apiKey: proxy.key, baseURL: proxy.open("t", `http://127.0.0.1:${cut.port}`), maxRetries: 0 }).messages.create(REQUEST).catch((e) => e);
+  expect(failed).toBeInstanceOf(Anthropic.APIError);
+  expect(proxy.inFlight("t")).toBe(0);
+  expect(proxy.busy("t")).toBe(false);
+  expect(proxy.turns("t")[0]!.error).toMatch(/was cut off|upstream unreachable/);
+});
+
+test("retryWaitMs: how long the SDK may wait before it retries a status it retries", () => {
+  const h = (o: Record<string, string> = {}) => new Headers(o);
+  expect(retryWaitMs(200, h())).toBe(0);
+  expect(retryWaitMs(400, h({ "retry-after": "30" }))).toBe(0);
+  expect(retryWaitMs(401, h())).toBe(0);
+  expect(retryWaitMs(429, h({ "retry-after": "20" }))).toBe(22_000);
+  expect(retryWaitMs(529, h({ "retry-after-ms": "1500" }))).toBe(3500);
+  expect(retryWaitMs(429, h())).toBe(10_000); // the SDK's own backoff tops out at 8 s
+  expect(retryWaitMs(500, h())).toBe(10_000);
+  expect(retryWaitMs(429, h({ "retry-after": "3600" }))).toBe(65_000); // bounded
+  expect(retryWaitMs(429, h({ "retry-after": "20", "x-should-retry": "false" }))).toBe(0);
+});
+
+test("a call answered 429 with a retry-after keeps the turn busy until the SDK has retried, though nothing is in flight", async () => {
+  let clock = 1_000_000;
+  const up = upstream((_s, n) => (n === 1 ? Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, { status: 429, headers: { "retry-after": "20" } }) : streamed(TOOL_TURN)));
+  const proxy = startProxy({ credential: key(), maxTokens: 1_000_000, now: () => clock });
+  stops.push(() => proxy.stop());
+  const base = proxy.open("t", up.url);
+  const call = () => fetch(`${base}/v1/messages`, { method: "POST", headers: { "x-api-key": proxy.key, "content-type": "application/json" }, body: JSON.stringify(REQUEST) });
+  expect(proxy.busy("t")).toBe(false);
+  expect((await call()).status).toBe(429);
+  // Answered: nothing in flight. But the SDK will be back within its retry-after.
+  expect(proxy.inFlight("t")).toBe(0);
+  expect(proxy.busy("t")).toBe(true);
+  clock += 15_000; // longer than the trial's idle rule (10 s): still busy
+  expect(proxy.busy("t")).toBe(true);
+  // The retry arrives and is answered: busy only until the retry-after has run out.
+  const retried = await call();
+  await retried.text();
+  expect(retried.status).toBe(200);
+  clock += 8_000;
+  expect(proxy.busy("t")).toBe(false);
+  // Had it never retried, the turn is held busy no longer than that either.
+  expect(proxy.turns("t").map((t) => t.status)).toEqual([429, 200]);
 });

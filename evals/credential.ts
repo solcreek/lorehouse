@@ -80,6 +80,31 @@ export async function resolveCredential(
 // A placeholder for runs that reach no real model (--dry, tests).
 export const noCredential: Credential = { kind: "api_key", header: () => ["x-api-key", "dry"], refresh: async () => false, secrets: () => [] };
 
+export const DEFAULT_UPSTREAM = "https://api.anthropic.com";
+
+// Where the credential is sent. It goes to this host with every model call, so the host is
+// the person's choice, made where they can see it:
+//   - api.anthropic.com unless `--upstream <url>` is on the command line. An upstream set
+//     only in the environment (EVAL_ANTHROPIC_UPSTREAM, which Bun would also read from a
+//     checkout's .env) is refused: an environment variable is not a decision;
+//   - https, or plain http only to this machine (localhost, 127.0.0.0/8, [::1]);
+//   - a URL with no credentials, query or fragment of its own.
+export function resolveUpstream(flag: string | undefined, env: Record<string, string | undefined>): { url: string } | { problem: string } {
+  const fromEnv = env.EVAL_ANTHROPIC_UPSTREAM || undefined;
+  const raw = flag ?? fromEnv ?? DEFAULT_UPSTREAM;
+  const named = flag !== undefined ? `--upstream ${raw}` : `EVAL_ANTHROPIC_UPSTREAM=${raw}`;
+  if (!URL.canParse(raw)) return { problem: `${named} isn't a URL (want e.g. ${DEFAULT_UPSTREAM})` };
+  const u = new URL(raw);
+  if (u.username || u.password || u.search || u.hash) return { problem: `${named}: an upstream is an origin and an optional path, with no credentials, query or fragment` };
+  const loopback = u.hostname === "localhost" || u.hostname === "[::1]" || /^127(\.\d{1,3}){3}$/.test(u.hostname);
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) return { problem: `${named}: the model credential is only sent over https (or plain http to this machine: localhost, 127.0.0.1, [::1])` };
+  const url = `${u.origin}${u.pathname}`.replace(/\/+$/, "");
+  if (flag === undefined && u.origin !== new URL(DEFAULT_UPSTREAM).origin) {
+    return { problem: `EVAL_ANTHROPIC_UPSTREAM names ${u.origin}, and the model credential would be sent there. The environment alone doesn't decide that: pass --upstream ${url} on the command line if that is where it should go, or unset EVAL_ANTHROPIC_UPSTREAM` };
+  }
+  return { url };
+}
+
 // `text` with every secret replaced: the last line of defense before anything is written
 // or printed. Nothing is meant to hold one (the proxy records no header), so a replacement
 // here is a bug elsewhere, but not a leak.

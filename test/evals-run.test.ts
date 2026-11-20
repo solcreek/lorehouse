@@ -490,11 +490,70 @@ test("--list prints the cases and exits 0; a bad argument or an --only that matc
 
 test("with no credential and no --dry, it exits 2 naming the three ways to provide one", async () => {
   // Only bun on the PATH: no `ant` to be logged in with.
-  const r = await evalCommand(["--only", "cites-a-source"], { PATH: dirname(process.execPath), HOME: mkdtempSync(join(tmpdir(), "lorehouse-eval-home-")) });
+  const home = mkdtempSync(join(tmpdir(), "lorehouse-eval-home-"));
+  const r = await evalCommand(["--only", "cites-a-source"], { PATH: dirname(process.execPath), HOME: home }).finally(() => rmSync(home, { recursive: true, force: true }));
   expect(r.code).toBe(2);
   for (const way of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ant auth login", "--dry"]) expect(r.stderr).toContain(way);
   expect(r.stdout).toBe("");
 });
+
+const KEY = "sk-ant-real-credential-for-the-e2e-test-0123456789";
+// This shell's PATH (for bun and, in the app, nothing else), and one explicit credential.
+const withKey = (extra: Record<string, string> = {}) => ({ PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR, ANTHROPIC_API_KEY: KEY, ...extra });
+
+test("where the credential goes is the command line's to say: an upstream from the environment alone, or over plain http, exits 2", async () => {
+  const fromEnv = await evalCommand(["--only", "cites-a-source"], withKey({ EVAL_ANTHROPIC_UPSTREAM: "https://gateway.example.com" }));
+  expect(fromEnv.code).toBe(2);
+  expect(fromEnv.stderr).toContain("pass --upstream https://gateway.example.com on the command line");
+  expect(fromEnv.stderr).not.toContain("will be sent to");
+  const http = await evalCommand(["--only", "cites-a-source", "--upstream", "http://gateway.example.com"], withKey());
+  expect(http.code).toBe(2);
+  expect(http.stderr).toContain("only sent over https");
+  for (const r of [fromEnv, http]) {
+    expect(r.stdout).toBe("");
+    expect(r.stderr).not.toContain(KEY);
+  }
+});
+
+test("end to end against an upstream that echoes the credential back: it reaches upstream, and no output or evidence file holds it", async () => {
+  const seen: (string | null)[] = [];
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      seen.push(req.headers.get("x-api-key"));
+      await req.text();
+      return Response.json({ type: "error", error: { type: "authentication_error", message: `invalid x-api-key ${req.headers.get("x-api-key")}` } }, { status: 401 });
+    },
+  });
+  const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));
+  try {
+    const upstream = `http://127.0.0.1:${server.port}`;
+    const r = await evalCommand(["--only", "cites-a-source", "--trials", "1", "--upstream", upstream, "--out", out], withKey());
+    // Said before anything was sent, with the kind and never the value.
+    expect(r.stderr).toContain(`eval: the model credential (api_key) will be sent to ${upstream}, and nowhere else`);
+    expect(r.code).toBe(1);
+    // The real credential did go upstream (in place of the app's key)…
+    expect(seen.length).toBeGreaterThan(0);
+    expect(new Set(seen)).toEqual(new Set([KEY]));
+    // …and is in nothing the run printed or wrote, though upstream sent it back.
+    expect(r.stdout + r.stderr).not.toContain(KEY);
+    const files: string[] = [];
+    const walk = (dir: string) => { for (const e of readdirSync(dir, { withFileTypes: true })) e.isDirectory() ? walk(join(dir, e.name)) : files.push(join(dir, e.name)); };
+    walk(out);
+    expect(files.length).toBeGreaterThanOrEqual(2); // the trial's evidence and the summary
+    for (const f of files) expect([f, readFileSync(f, "utf8").includes(KEY)]).toEqual([f, false]);
+    const summary = JSON.parse(r.stdout.trimEnd().split("\n").at(-1)!) as Summary;
+    expect(summary).toMatchObject({ ok: false, credential: "api_key", dry: false });
+    const failure = summary.failures.find((f) => f.check === COMPLETED)!;
+    expect(failure.evidence).toContain("model turn 1 failed (HTTP 401): authentication_error: invalid x-api-key [redacted credential]");
+    // The app under test never had it: its environment holds the run's own key.
+    const evidence = readFileSync(files.find((f) => f.endsWith("1.json"))!, "utf8");
+    expect(evidence).toContain("[redacted credential]");
+  } finally {
+    server.stop(true);
+    rmSync(out, { recursive: true, force: true });
+  }
+}, 90_000);
 
 test("--dry runs a case of each suite end to end: a table, one JSON line last, and an evidence file per trial", async () => {
   const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));

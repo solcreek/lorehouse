@@ -8,7 +8,7 @@ export { UsageError };
 
 export const USAGE = `bun run eval [--dry] [--only <pattern>] [--trials <n>] [--model <id>] [--concurrency <n>]
              [--max-tokens <n>] [--threshold <0..1>] [--grader-model <id>] [--no-grader]
-             [--out <dir>] [--list] | --grader-selftest
+             [--upstream <url>] [--out <dir>] [--list] | --grader-selftest
 
   --dry               the scripted model of conformance/mock.ts: no credential, no network.
                       Judges each case by its \`dry\` field. Default --trials 1.
@@ -24,11 +24,14 @@ export const USAGE = `bun run eval [--dry] [--only <pattern>] [--trials <n>] [--
   --grader-selftest   grade every rubric's known-good and known-bad replies with the real
                       grader model and exit 1 if any comes out wrong; runs no case
   --out <dir>         where evidence goes (default evals/out)
+  --upstream <url>    send model calls, and the credential, to this Anthropic-compatible
+                      endpoint instead of https://api.anthropic.com (https, or http to
+                      this machine). Only the command line can say so, never the environment
   --list              print the cases and exit`;
 
-export type Args = { dry: boolean; list: boolean; noGrader: boolean; graderSelftest: boolean; only?: string; trials: number; model?: string; concurrency: number; maxTokens: number; threshold: number; graderModel?: string; out?: string };
+export type Args = { dry: boolean; list: boolean; noGrader: boolean; graderSelftest: boolean; only?: string; trials: number; model?: string; concurrency: number; maxTokens: number; threshold: number; graderModel?: string; out?: string; upstream?: string };
 
-const VALUED = ["--only", "--trials", "--model", "--concurrency", "--max-tokens", "--threshold", "--grader-model", "--out"] as const;
+const VALUED = ["--only", "--trials", "--model", "--concurrency", "--max-tokens", "--threshold", "--grader-model", "--out", "--upstream"] as const;
 
 export function parseArgs(argv: string[]): Args {
   const raw: Record<string, string> = {};
@@ -66,6 +69,7 @@ export function parseArgs(argv: string[]): Args {
     threshold,
     graderModel: raw["--grader-model"],
     out: raw["--out"],
+    upstream: raw["--upstream"],
   };
 }
 
