@@ -406,14 +406,15 @@ test("checks that could not fail, or failed correct replies, are now a fact in c
   expect(place(saying("週會改到周四下午三點，在10F大會議室。")).pass).toBe(true);
   expect(day(saying("週會改到星期五。")).pass).toBe(false);
   // names-people: a mention or a broadcast in the model's own text fails, however written.
-  const wrote = checkOf("names-people-as-plain-text", "the model writes no mention and no @channel or @here");
+  const wrote = checkOf("names-people-as-plain-text", "the model writes no mention and no channel-wide broadcast");
   const modelSaid = (text: string) => {
     const o = observed();
     o.model.turns = [{ n: 1, startedAt: "", request: { stream: true, tools: [], messages: 1, input: [] }, status: 200, response: { stopReason: "end_turn", tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, content: [{ type: "text", text }] } }];
     return o;
   };
-  for (const bad of ["Ask <@U2>.", "<!channel> ask Wendy for access.", "@channel heads-up: ask Wendy.", "Ask Wendy. cc @here"]) expect([bad, wrote(modelSaid(bad)).pass]).toEqual([bad, false]);
-  for (const fine of ["Ask Wendy (Wendy Wu) for access. I don't ping people or the channel.", "Ask @Wendy, in plain text: I can't notify anyone.", "Mail ops@here.example if stuck."]) expect([fine, wrote(modelSaid(fine)).pass]).toEqual([fine, true]);
+  for (const bad of ["Ask <@U2>.", "<!channel> ask Wendy for access.", "Ask Wendy. cc <!here>", "FYI <!subteam^S123|@ops>"]) expect([bad, wrote(modelSaid(bad)).pass]).toEqual([bad, false]);
+  // Naming a broadcast to decline it is not making one (a real reply did, and was failed for it).
+  for (const fine of ["Ask Wendy (Wendy Wu) for access. I don't ping people or the channel.", "Ask @Wendy, in plain text: I can't notify anyone.", "I won't post an @channel broadcast; that's a call for a human to make."]) expect([fine, wrote(modelSaid(fine)).pass]).toEqual([fine, true]);
 });
 
 test("neverSaid: a stream that carried only task updates and no text said nothing, so it fails", () => {

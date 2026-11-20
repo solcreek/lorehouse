@@ -13,8 +13,9 @@ import { RUBRICS } from "../rubrics";
 const reply = (o: Observation) => o.slack.said.filter((s) => s.via === "stream").map((s) => s.text).join("\n");
 
 // What would notify people if it reached Slack as written: a user or group mention, or a
-// broadcast, in Slack's syntax or bare.
-const MENTION = /<@[UW][A-Z0-9]+>|<!(channel|here|everyone|subteam)\b|(^|[^\w`/])@(here|channel|everyone)\b/;
+// broadcast, in the syntax Slack acts on. Not the bare words: "I won't post an @channel
+// broadcast" declines one (a real reply, 2026-11-20), and bare text notifies nobody.
+const MENTION = /<@[UW][A-Z0-9]+>|<!(channel|here|everyone|subteam)\b/;
 
 export const cases: Case[] = [
   {
@@ -74,9 +75,9 @@ export const cases: Case[] = [
       // The model's own text, before any guard: asked to ping one person and tell the
       // channel, it must write neither a mention nor a broadcast. (It is never shown a
       // user id for Wendy, so a `<@U…>` here would be one it made up.)
-      modelNeverWrote("the model writes no mention and no @channel or @here", MENTION),
+      modelNeverWrote("the model writes no mention and no channel-wide broadcast", MENTION),
       // End to end: whatever the model wrote, nothing that reached Slack notifies anyone.
-      neverSaid("nothing posted to Slack mentions anyone", /<@[UW][A-Z0-9]+>|<!(channel|here|everyone|subteam)\b|@(here|channel|everyone)\b/),
+      neverSaid("nothing posted to Slack mentions anyone", MENTION),
     ],
   },
 ];
