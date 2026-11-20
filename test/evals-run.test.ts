@@ -983,6 +983,52 @@ test("end to end against an upstream that echoes the credential back: it reaches
   }
 }, 90_000);
 
+// An upstream that grades every self-test row as it is known to deserve, at 100 tokens a call.
+function knowingGrader() {
+  // By rubric and reply: the same reply ("What next?") is a row of two rubrics.
+  const known = new Map(Object.values(RUBRICS).flatMap((r) => [...r.good.map((x): [string, boolean] => [`${r.rubric}\n${x}`, true]), ...r.bad.map((x): [string, boolean] => [`${r.rubric}\n${x}`, false])]));
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const prompt = ((await req.json()) as { messages: { content: string }[] }).messages[0]!.content;
+      const m = /^Criterion:\n([\s\S]*?)\n\nBEGIN REPLY ([0-9a-f]+)\n([\s\S]*)\nEND REPLY \2$/.exec(prompt)!;
+      const pass = known.get(`${m[1]}\n${m[3]}`)!;
+      const text = JSON.stringify({ word: m[2], pass, quote: pass ? m[3]!.slice(0, 40) : "", reason: pass ? "meets it" : "doesn't" });
+      return Response.json({ id: "msg", type: "message", role: "assistant", model: "claude-haiku-5-5", content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 90, output_tokens: 10 } });
+    },
+  });
+  return { url: `http://127.0.0.1:${server.port}`, rows: known.size, stop: () => server.stop(true) };
+}
+
+test("--grader-selftest follows the budget's rule: reached, it is not ok, though every verdict was right; its JSON line has the budget's fields", async () => {
+  const up = knowingGrader();
+  try {
+    // Room to spare: every row right, exit 0, and the tokens with their budget.
+    const roomy = await evalCommand(["--grader-selftest", "--upstream", up.url, "--max-tokens", String(up.rows * 100 + 1)], withKey());
+    const fine = JSON.parse(roomy.stdout.trimEnd().split("\n").at(-1)!);
+    expect({ code: roomy.code, said: roomy.code === 0 ? "" : roomy.stderr + roomy.stdout }).toEqual({ code: 0, said: "" });
+    expect(fine).toMatchObject({ ok: true, selftest: true, examples: up.rows, right: up.rows, wrong: 0, notJudged: 0, tokens: { input: up.rows * 90, output: up.rows * 10, total: up.rows * 100, max: up.rows * 100 + 1, exceeded: false } });
+    expect(fine.stopped).toBeUndefined();
+    // The last answers take the total to the budget exactly: every verdict is still right,
+    // and the budget was reached.
+    const tight = await evalCommand(["--grader-selftest", "--upstream", up.url, "--max-tokens", String(up.rows * 100)], withKey());
+    const reached = JSON.parse(tight.stdout.trimEnd().split("\n").at(-1)!);
+    expect(reached).toMatchObject({ selftest: true, right: up.rows, wrong: 0, notJudged: 0, tokens: { total: up.rows * 100, max: up.rows * 100, exceeded: true } });
+    expect(reached.ok).toBe(false);
+    expect(reached.stopped).toContain(`--max-tokens ${up.rows * 100} was reached`);
+    expect(tight.code).toBe(1);
+    // Reached part-way: the rows after it have no verdict, and are counted so.
+    const short = await evalCommand(["--grader-selftest", "--upstream", up.url, "--max-tokens", "1000"], withKey());
+    const cut = JSON.parse(short.stdout.trimEnd().split("\n").at(-1)!);
+    expect(short.code).toBe(1);
+    expect(cut).toMatchObject({ ok: false, wrong: 0, tokens: { max: 1000, exceeded: true } });
+    expect(cut.notJudged).toBeGreaterThan(0);
+    expect(cut.right + cut.notJudged).toBe(up.rows);
+  } finally {
+    up.stop();
+  }
+}, 60_000);
+
 test("--dry runs a case of each suite end to end: a table, one JSON line last, and an evidence file per trial", async () => {
   const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));
   try {

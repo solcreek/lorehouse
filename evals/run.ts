@@ -99,7 +99,18 @@ if (args.graderSelftest) {
   for (const r of rows) console.log(clean(`${r.right ? "ok   " : "WRONG"} ${r.rubric}: known to ${r.expect}, graded ${r.got}: ${JSON.stringify(r.reply.length > 90 ? `${r.reply.slice(0, 90)}…` : r.reply)}${r.right ? "" : `\n      ${r.evidence}`}`));
   const wrong = rows.filter((r) => !r.right);
   const t = proxy.tokens("grader");
-  const result = { ok: wrong.length === 0, selftest: true, grader: graderModel, credential: credential.kind, examples: rows.length, right: rows.length - wrong.length, wrong: wrong.filter((r) => r.got !== "not judged").length, notJudged: wrong.filter((r) => r.got === "not judged").length, tokens: { ...t, total: t.input + t.output + t.cacheRead + t.cacheWrite }, failures: wrong.map((r) => ({ rubric: r.rubric, expect: r.expect, got: r.got, reply: r.reply, evidence: r.evidence })), ms: Date.now() - started };
+  // The budget's one rule holds here as in a run: reached (at or over), it is not ok,
+  // whether or not every verdict came out right.
+  const exceeded = proxy.exceeded();
+  const result = {
+    ok: wrong.length === 0 && !exceeded, selftest: true, grader: graderModel, credential: credential.kind,
+    examples: rows.length, right: rows.length - wrong.length, wrong: wrong.filter((r) => r.got !== "not judged").length, notJudged: wrong.filter((r) => r.got === "not judged").length,
+    tokens: { ...t, total: t.input + t.output + t.cacheRead + t.cacheWrite, max: args.maxTokens, exceeded },
+    failures: wrong.map((r) => ({ rubric: r.rubric, expect: r.expect, got: r.got, reply: r.reply, evidence: r.evidence })),
+    ...(exceeded ? { stopped: `budget: --max-tokens ${args.maxTokens} was reached; rows graded after that have no verdict` } : {}),
+    ms: Date.now() - started,
+  };
+  if (exceeded) console.log(`STOPPED: ${result.stopped}`);
   console.log(clean(JSON.stringify(result)));
   process.exit(result.ok ? 0 : 1);
 }
