@@ -64,7 +64,7 @@ const tell = (line: string) => {
 // Start the reaper: from here on, what is started and made is cleaned up even if this
 // process is killed outright.
 export function startReaper(): void {
-  reaper = Bun.spawn([process.execPath, join(import.meta.dir, "reaper.ts")], { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+  reaper = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "reaper.ts")], { env: childEnv(process.env), stdin: "pipe", stdout: "ignore", stderr: "ignore" });
   reaper.unref();
 }
 function started(proc: ReturnType<typeof Bun.spawn>): void {
@@ -104,6 +104,14 @@ export async function listeningPort(
     if (Date.now() - t0 > ms) throw new Error(`${what} didn't say which port it listens on within ${ms} ms: ${err.text().slice(-600).trim() || out.text().slice(-300).trim() || "it wrote nothing"}`);
     await Bun.sleep(10);
   }
+}
+
+// What a child that isn't the app starts with (the mock, the reaper): where to find
+// programs and temp files, and nothing else of this process's environment. Never the
+// model credential. Every child is also started with --no-env-file, in a directory with
+// no .env of its own.
+export function childEnv(shell: Record<string, string | undefined>, extra: Record<string, string> = {}): Record<string, string> {
+  return { ...Object.fromEntries(["PATH", "HOME", "TMPDIR"].flatMap((k) => (shell[k] ? [[k, shell[k]!]] : []))), ...extra };
 }
 
 // The environment the app under test starts with. Only what a process needs from this
@@ -256,8 +264,9 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
   const turns = () => opts.proxy.turns(id);
 
   try {
-    mock = Bun.spawn(["bun", join(ROOT, "conformance/mock.ts")], {
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", TTFT_MS: "20", TOKEN_DELAY_MS: "1", TOKENS: "12", SLACK_FIXTURES: join(FIXTURES, "slack-history.json") },
+    mock = Bun.spawn([process.execPath, "--no-env-file", join(ROOT, "conformance/mock.ts")], {
+      cwd: dir,
+      env: childEnv(process.env, { PORT: "0", TTFT_MS: "20", TOKEN_DELAY_MS: "1", TOKENS: "12", SLACK_FIXTURES: join(FIXTURES, "slack-history.json") }),
       stdout: "pipe", stderr: "pipe",
     });
     started(mock);
@@ -268,8 +277,8 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
     for (const m of c.setup?.messages ?? []) await fixture("/fixtures/messages", m);
 
     const modelBase = opts.proxy.open(id, opts.dry ? `${mockUrl}/anthropic` : opts.upstream);
-    const proc = Bun.spawn(["bun", join(ROOT, "src/server.ts")], {
-      // Its own directory: the checkout's .env is never loaded.
+    const proc = Bun.spawn([process.execPath, "--no-env-file", join(ROOT, "src/server.ts")], {
+      // No .env at all, and its own directory.
       cwd: dir,
       env: trialAppEnv(process.env, { mock: mockUrl, db: join(dir, "lorehouse.db"), sessions: join(dir, "sessions.db"), modelBase, modelKey: opts.proxy.key, model: opts.model, code, extra: c.setup?.env }),
       stdout: "pipe", stderr: "pipe",

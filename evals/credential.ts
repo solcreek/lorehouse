@@ -80,6 +80,26 @@ export async function resolveCredential(
 // A placeholder for runs that reach no real model (--dry, tests).
 export const noCredential: Credential = { kind: "api_key", header: () => ["x-api-key", "dry"], refresh: async () => false, secrets: () => [] };
 
+// Every variable the harness reads from its environment: the credential, where it goes,
+// and what its children are started with. Bun loads `.env*` files of the working
+// directory into the environment before a script runs, so any of these could come from a
+// file in a checkout, not from the person.
+export const READ_FROM_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "EVAL_ANTHROPIC_UPSTREAM", "EVAL_GRADER_MODEL", "EVAL_USD_PER_MTOK_IN", "EVAL_USD_PER_MTOK_OUT", "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER"];
+
+// Why this process may not start: it was not started with `--no-env-file` (so Bun has
+// loaded the working directory's `.env*` files), and one of them defines a variable the
+// harness reads. `bun run eval` passes the flag; `bun evals/run.ts` does not.
+// `files`: each `.env*` file there with its text. Undefined when it may start.
+export function envFileProblem(execArgv: string[], files: [name: string, text: string][]): string | undefined {
+  if (execArgv.includes("--no-env-file")) return undefined;
+  const found = files.flatMap(([name, text]) => {
+    const names = [...text.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/gm)].map((m) => m[1]!).filter((n) => READ_FROM_ENV.includes(n));
+    return names.length ? [`${name} defines ${[...new Set(names)].join(", ")}`] : [];
+  });
+  if (!found.length) return undefined;
+  return `${found.join("; ")}, and this was started without --no-env-file, so Bun has loaded it: a credential or an upstream could be a file's, not yours. Start it with \`bun run eval\` (or \`bun --no-env-file evals/run.ts\`), which loads no .env file`;
+}
+
 export const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 
 // Where the credential is sent. It goes to this host with every model call, so the host is

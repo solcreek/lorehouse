@@ -3,7 +3,7 @@
 // subprocess plumbing (the app, the mock, the fake runner, the proxy).
 
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { listing, parseArgs, selectCases, UsageError } from "../evals/args";
@@ -13,7 +13,8 @@ import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, s
 import type { Grader } from "../evals/grader";
 import { caseResult, COMPLETED, judge, summarize, table, trialVerdict, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
 import { RUBRICS } from "../evals/rubrics";
-import { listeningPort, saidFrom, tail } from "../evals/trial";
+import { childEnv, listeningPort, saidFrom, tail } from "../evals/trial";
+import { envFileProblem } from "../evals/credential";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -537,7 +538,8 @@ test("the reaper: when the runner's end of the pipe closes, what is still listed
 test("a runner killed outright leaves no app, no mock and no temp directory behind", async () => {
   const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));
   const before = new Set(readdirSync(tmpdir()).filter((d) => d.startsWith("lorehouse-eval-")));
-  const runner = Bun.spawn([process.execPath, join(ROOT, "evals/run.ts"), "--dry", "--concurrency", "2", "--trials", "3", "--out", out], { cwd: ROOT, stdout: "ignore", stderr: "pipe" });
+  // The runner holds a credential in its environment; none of its children may.
+  const runner = Bun.spawn([process.execPath, "--no-env-file", join(ROOT, "evals/run.ts"), "--dry", "--concurrency", "2", "--trials", "3", "--out", out], { cwd: ROOT, env: { ...process.env, ANTHROPIC_API_KEY: KEY, ANTHROPIC_AUTH_TOKEN: KEY }, stdout: "ignore", stderr: "pipe" });
   try {
     // Wait until trials are under way: the runner has children that are the app and the mock.
     const kids = async () => (await Bun.$`pgrep -P ${runner.pid}`.quiet().nothrow().text()).trim().split("\n").filter(Boolean).map(Number);
@@ -549,6 +551,26 @@ test("a runner killed outright leaves no app, no mock and no temp directory behi
     let running: number[] = [];
     for (let i = 0; i < 200 && running.length < 2; i++) { await Bun.sleep(25); running = await servers(); }
     expect(running.length).toBeGreaterThanOrEqual(2);
+    // Every child (the app, the mock, the reaper): started with --no-env-file, and with
+    // no credential in its environment (where `ps e` shows a process's environment).
+    const all = await kids();
+    expect(all.length).toBeGreaterThanOrEqual(3);
+    // Whether this platform's ps shows another process's environment at all (Linux does;
+    // macOS doesn't): where it doesn't, only the command line is checked here, and
+    // childEnv's own test holds what the children are given.
+    const probe = Bun.spawn(["sleep", "5"], { env: { PATH: process.env.PATH, EVAL_PS_PROBE: "visible" } });
+    const showsEnv = (await Bun.$`ps eww -o command= -p ${probe.pid}`.quiet().nothrow().text()).includes("EVAL_PS_PROBE=visible");
+    probe.kill();
+    let reaper = 0;
+    for (const pid of all) {
+      const shown = await Bun.$`ps eww -o command= -p ${pid}`.quiet().nothrow().text();
+      if (!shown.trim()) continue; // gone already
+      if (shown.includes("evals/reaper.ts")) reaper++;
+      expect([pid, shown.includes("--no-env-file")]).toEqual([pid, true]);
+      expect([pid, shown.includes(KEY)]).toEqual([pid, false]);
+      if (showsEnv) expect([pid, shown.includes("PATH=")]).toEqual([pid, true]); // so the line above isn't vacuous
+    }
+    expect(reaper).toBe(1);
     const made = readdirSync(tmpdir()).filter((d) => d.startsWith("lorehouse-eval-") && !before.has(d) && !d.startsWith("lorehouse-eval-out-"));
     expect(made.length).toBeGreaterThan(0);
 
@@ -634,6 +656,67 @@ test("where the credential goes is the command line's to say: an upstream from t
     expect(r.stderr).not.toContain(KEY);
   }
 });
+
+test("envFileProblem: a .env that defines something the harness reads stops a start that loaded it", () => {
+  const key: [string, string][] = [[".env", "# local\nANTHROPIC_API_KEY=sk-from-a-file\nOTHER=1\n"]];
+  expect(envFileProblem([], key)).toContain(".env defines ANTHROPIC_API_KEY, and this was started without --no-env-file");
+  expect(envFileProblem([], key)).toContain("bun run eval");
+  // Started with the flag, Bun loaded nothing: fine.
+  expect(envFileProblem(["--no-env-file"], key)).toBeUndefined();
+  // A file that defines nothing this reads, or no file: fine.
+  expect(envFileProblem([], [[".env", "SLACK_BOT_TOKEN=x\nDATABASE_URL=y\n"]])).toBeUndefined();
+  expect(envFileProblem([], [])).toBeUndefined();
+  // Each variable it reads, in any of the files, in either spelling.
+  expect(envFileProblem([], [[".env.local", "export EVAL_ANTHROPIC_UPSTREAM=https://x.example\n"], [".env", "  EVAL_GRADER_MODEL = m\nPATH=/evil\n"]])).toContain(".env.local defines EVAL_ANTHROPIC_UPSTREAM; .env defines EVAL_GRADER_MODEL, PATH");
+  for (const name of ["ANTHROPIC_AUTH_TOKEN", "EVAL_USD_PER_MTOK_IN", "EVAL_USD_PER_MTOK_OUT", "HOME", "TMPDIR"]) expect(envFileProblem([], [[".env", `${name}=x`]])).toContain(name);
+  // A comment or a longer name isn't a definition of it.
+  expect(envFileProblem([], [[".env", "# ANTHROPIC_API_KEY=x\nMY_ANTHROPIC_API_KEY=y\n"]])).toBeUndefined();
+});
+
+test("a child that isn't the app gets where programs and temp files are, and nothing else", () => {
+  const env = childEnv({ PATH: "/usr/bin", HOME: "/home/x", TMPDIR: "/tmp", ANTHROPIC_API_KEY: KEY, ANTHROPIC_AUTH_TOKEN: KEY, EVAL_GRADER_MODEL: "m", SECRET: "s" }, { PORT: "0" });
+  expect(env).toEqual({ PATH: "/usr/bin", HOME: "/home/x", TMPDIR: "/tmp", PORT: "0" });
+});
+
+// Run in a directory of its own, as `bun <path>/evals/run.ts` and as the package script does.
+async function evalIn(cwd: string, bunArgs: string[], args: string[], env: Record<string, string | undefined>) {
+  const proc = Bun.spawn([process.execPath, ...bunArgs, join(ROOT, "evals/run.ts"), ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  return { stdout, stderr, code };
+}
+
+test("with a .env in the working directory: started plainly it refuses; with --no-env-file the file's key is not a credential", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lorehouse-eval-cwd-"));
+  const home = mkdtempSync(join(tmpdir(), "lorehouse-eval-home-"));
+  // Only bun on the PATH (no `ant`), and no credential in the environment: only the file has one.
+  const env = { PATH: dirname(process.execPath), HOME: home, TMPDIR: process.env.TMPDIR };
+  try {
+    writeFileSync(join(dir, ".env"), `ANTHROPIC_API_KEY=${KEY}\nEVAL_GRADER_MODEL=from-the-file\n`);
+    // Plainly: Bun has loaded the file, so the harness won't start, real or dry.
+    for (const args of [["--only", "cites-a-source"], ["--dry", "--only", "cites-a-source"], ["--list"]]) {
+      const plain = await evalIn(dir, [], args, env);
+      expect([args, plain.code]).toEqual([args, 2]);
+      expect(plain.stderr).toContain(".env defines ANTHROPIC_API_KEY, EVAL_GRADER_MODEL, and this was started without --no-env-file");
+      expect(plain.stdout + plain.stderr).not.toContain(KEY);
+    }
+    // As the package script starts it: the file is not loaded, so there is no credential at all.
+    const flagged = await evalIn(dir, ["--no-env-file"], ["--only", "cites-a-source"], env);
+    expect(flagged.code).toBe(2);
+    expect(flagged.stderr).toContain("no model credential");
+    expect(flagged.stderr).not.toContain("will be sent to");
+    // And a dry run goes through, untouched by the file.
+    const out = join(dir, "out");
+    const dry = await evalIn(dir, ["--no-env-file"], ["--dry", "--only", "cites-a-source", "--out", out], env);
+    expect({ code: dry.code, said: dry.code === 0 ? "" : dry.stderr + dry.stdout }).toEqual({ code: 0, said: "" });
+    expect(readFileSync(join(out, readdirSync(out)[0]!, "cites-a-source", "1.json"), "utf8")).not.toContain(KEY);
+    // A .env that defines nothing the harness reads doesn't stop a plain start.
+    writeFileSync(join(dir, ".env"), "SLACK_BOT_TOKEN=xoxb-something\n");
+    expect((await evalIn(dir, [], ["--list", "--only", "cites-a-source"], env)).code).toBe(0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 60_000);
 
 test("end to end against an upstream that echoes the credential back: it reaches upstream, and no output or evidence file holds it", async () => {
   const seen: (string | null)[] = [];

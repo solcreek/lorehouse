@@ -6,12 +6,12 @@
 // usage or setup error (a bad argument, an --only that matches nothing, no credential
 // without --dry), decided before anything starts.
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { listing, parseArgs, selectCases, UsageError, type Args } from "./args";
 import type { Case } from "./case";
 import { CASES } from "./cases";
-import { DEFAULT_UPSTREAM, noCredential, resolveCredential, resolveUpstream, scrub, type Credential } from "./credential";
+import { DEFAULT_UPSTREAM, envFileProblem, noCredential, resolveCredential, resolveUpstream, scrub, type Credential } from "./credential";
 import { DEFAULT_GRADER_MODEL, grader, selftest } from "./grader";
 import { RUBRICS } from "./rubrics";
 import { startProxy } from "./proxy";
@@ -25,6 +25,12 @@ const exit2 = (message: string): never => {
 };
 
 // ── decided before anything starts ──────────────────────────────────────────
+// Started without --no-env-file, with a .env here that defines something this reads: refuse.
+{
+  const files = readdirSync(process.cwd(), { withFileTypes: true }).filter((e) => e.isFile() && /^\.env(\..+)?$/.test(e.name)).map((e): [string, string] => [e.name, readFileSync(join(process.cwd(), e.name), "utf8")]);
+  const problem = envFileProblem(process.execArgv, files);
+  if (problem) exit2(problem);
+}
 let args: Args;
 let cases: Case[];
 try {
