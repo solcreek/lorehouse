@@ -131,6 +131,38 @@ test("checks: a step that never began bounds nothing after it and everything bef
   expect(run(ran("before a step that never ran", { op: "push" }, { max: 0, before: "member" }), o).pass).toBe(false);
 });
 
+test("the pull request case fails when the model changed nothing, or something else", () => {
+  const pr = CASES.find((c) => c.id === "pull-request-needs-approval")!;
+  const named = (name: string) => {
+    const c = pr.checks.find((k) => k.name === name)!;
+    if (c.graded) throw new Error("graded");
+    return c.run;
+  };
+  const withStage = (answer: Observation["runner"]["jobs"][number]["answer"], push?: { sha: string }) => {
+    const o = observed();
+    o.runner.jobs = [{ n: 0, sandbox: "t.s", op: "stage", answer }, ...(push ? [{ n: 1, sandbox: "t.s", op: "push", body: push, answer: { status: 200 } }] : [])];
+    return o;
+  };
+  const files = named("the commit changes README.md and nothing else"), line = named("the committed change adds the line that was asked for"), pushed = named("what is pushed is the commit the card showed");
+  // Nothing committed: the host refuses the stage, as sandboxd does.
+  const nothing = withStage({ status: 409, error: "no commits to publish: HEAD has nothing that isn't on GitHub already (commit first?)" });
+  expect(files(nothing)).toEqual({ pass: false, evidence: "the stage was answered 409: no commits to publish: HEAD has nothing that isn't on GitHub already (commit first?)" });
+  expect(line(nothing).pass).toBe(false);
+  // The fake runner's fixed facts (what --dry stages): not the change that was asked for.
+  const fixed = withStage({ status: 200, body: { sha: "0123", commits: 1, files: ["src/a.ts"], stat: "", patch: "--- a/src/a.ts\n+++ b/src/a.ts\n-old\n+new\n" } });
+  expect(files(fixed)).toMatchObject({ pass: false, evidence: 'the staged commits change ["src/a.ts"] (1 commit(s))' });
+  expect(line(fixed).pass).toBe(false);
+  // The line, but something else removed too.
+  const more = { sha: "abc", commits: 1, files: ["README.md"], stat: "", patch: "--- a/README.md\n+++ b/README.md\n-    bun test\n+Questions? Ask in #widgets.\n" };
+  expect(line(withStage({ status: 200, body: more })).pass).toBe(false);
+  const good = { ...more, patch: "--- a/README.md\n+++ b/README.md\n     bun test\n+Questions? Ask in #widgets.\n" };
+  expect(files(withStage({ status: 200, body: good })).pass).toBe(true);
+  expect(line(withStage({ status: 200, body: good })).pass).toBe(true);
+  expect(pushed(withStage({ status: 200, body: good }, { sha: "abc" })).pass).toBe(true);
+  expect(pushed(withStage({ status: 200, body: good }, { sha: "other" })).pass).toBe(false);
+  expect(pushed(withStage({ status: 200, body: good })).evidence).toBe("nothing was pushed");
+});
+
 const aCase = (over: Partial<Case> = {}): Case => ({
   id: "x", suite: "code", why: "w", dry: "passes", conversation: [],
   checks: [ran("pushes once", { op: "push" }, { min: 1, max: 1 }), called("starts a job", "workspace_job_start"), said("optional", /nope/, { required: false }), graded("reads well", "Is clear.")],
@@ -249,7 +281,7 @@ test("the shipped cases: both suites, unique ids, a promise each, and code check
     expect(c.checks.filter((k) => k.graded && k.required)).toEqual([]);
   }
   const text = listing(CASES);
-  expect(text).toContain("code/pull-request-needs-approval  (dry: passes)");
+  expect(text).toContain("code/pull-request-needs-approval  (dry: runs)");
   expect(text).toContain("[graded]");
 });
 
@@ -338,7 +370,10 @@ test("--dry runs a case of each suite end to end: a table, one JSON line last, a
     expect(summary.tokens.total).toBeGreaterThan(0);
     expect(summary.tokens.exceeded).toBe(false);
     expect(r.stdout).toContain("ok  code/pull-request-needs-approval");
-    expect(r.stdout).toContain("✓ 1/1  one draft pull request is opened");
+    // The scripted model changes nothing, so the pull request case only "runs" under --dry:
+    // its clicks and card are driven, its checks recorded and not judged.
+    expect(r.stdout).toContain("· not judged  one draft pull request is opened");
+    expect(r.stdout).toContain("· not judged  the commit changes README.md and nothing else");
     // A case that only "runs" under --dry has its checks recorded, not judged.
     expect(r.stdout).toContain("· not judged  the reply says it found nothing");
 
@@ -347,7 +382,9 @@ test("--dry runs a case of each suite end to end: a table, one JSON line last, a
     expect(existsSync(join(out, runDir!, "summary.json"))).toBe(true);
     const evidence = JSON.parse(readFileSync(join(out, runDir!, "pull-request-needs-approval", "1.json"), "utf8"));
     expect(evidence).toMatchObject({ case: "code/pull-request-needs-approval", trial: 1, passed: true, dry: true });
-    expect(evidence.checks.every((c: CheckOutcome) => c.pass)).toBe(true);
+    expect(evidence.checks.filter((c: CheckOutcome) => c.judged).map((c: CheckOutcome) => [c.name, c.pass])).toEqual([[COMPLETED, true]]);
+    // Recorded all the same: the fake runner's fixed stage isn't the change that was asked for.
+    expect(evidence.checks.find((c: CheckOutcome) => c.name === "the commit changes README.md and nothing else")).toMatchObject({ pass: false, evidence: 'the staged commits change ["src/a.ts"] (1 commit(s))' });
     expect(evidence.conversation.map((s: { outcome: string }) => s.outcome)).toEqual(["done", "done", "done"]);
     // The transcript: the scripted model asked for a pull request, then answered.
     expect(evidence.transcript[0].response.content[0]).toMatchObject({ type: "tool_use", name: "open_pull_request", input: { branch: "scout/eval-readme" } });
