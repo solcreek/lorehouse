@@ -17,6 +17,9 @@
 //                              GitHub requests, channels whose reactions were listed, and
 //                              uploads: each file's name, size, first bytes and where
 //                              files.completeUploadExternal shared it
+//   GET  /calls                every recorded Slack call as it arrived, in order: its method,
+//                              its body and when (epoch ms). What /stats summarizes, whole,
+//                              for a harness that reads streams and timelines itself (evals/)
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
@@ -554,6 +557,7 @@ Bun.serve({
       });
       return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, reactionChannels, posts, updates, responses, github: githubCalls, uploads: shared });
     }
+    if (url.pathname === "/calls") return Response.json({ calls });
     if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; uploads = []; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });
   },

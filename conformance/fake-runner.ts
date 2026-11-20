@@ -11,9 +11,16 @@
 // new stage id, and push succeeds only for a stage it handed out, once, with the same
 // commit and branch (sandbox/host/src/publish.rs). Background jobs answer as guestd's do.
 
-type Job = { id: string; sandbox: string; op: string; method?: string; path?: string; bodyBase64?: string; timeoutMs?: number; resources?: unknown };
+export type Job = { id: string; sandbox: string; op: string; method?: string; path?: string; bodyBase64?: string; timeoutMs?: number; resources?: unknown };
+// What a runner answers a job with (docs/sandbox-runners.md): `code` with `error` is a
+// refusal before anything ran.
+export type JobAnswer = { id: string; status: number; contentType?: string; bodyBase64?: string; error?: string; code?: string };
 
 export type FakeRunner = { jobs: Job[]; stop: () => Promise<void> };
+// `answer`: asked first for each job; what it returns is the runner's answer, and undefined
+// leaves the job to the answers below (a harness scripting a sandbox of its own: evals/).
+// `onAnswer`: told each job with what it was answered.
+export type RunnerOptions = { answer?: (job: Job) => JobAnswer | undefined; onAnswer?: (job: Job, answer: JobAnswer) => void };
 
 const b64 = (s: string) => Buffer.from(s).toString("base64");
 
@@ -117,7 +124,7 @@ function jobCall(job: Job) {
   return json(job, 200, jobView(j));
 }
 
-function answer(job: Job) {
+function answer(job: Job): JobAnswer {
   if (job.op === "stage" || job.op === "push") return publish(job);
   if (job.op === "guest" && (job.path === "/jobs" || job.path?.startsWith("/jobs/"))) return jobCall(job);
   if (job.op === "guest" && job.method === "POST" && job.path === "/exec") {
@@ -137,7 +144,13 @@ export const MIRRORS = { count: 1, bytes: 1_048_576, maxBytes: 24 * 2 ** 30, per
 // shipped profile asks for none), so a job never carries one here.
 const status = { type: "status", capacity: 2, running: 0, version: "fake", features: ["resources"], mirrors: MIRRORS };
 
-export async function wsRunner(base: string, token: string, name: string): Promise<FakeRunner> {
+function answerWith(job: Job, opts: RunnerOptions): JobAnswer {
+  const result = opts.answer?.(job) ?? answer(job);
+  opts.onAnswer?.(job, result);
+  return result;
+}
+
+export async function wsRunner(base: string, token: string, name: string, opts: RunnerOptions = {}): Promise<FakeRunner> {
   const jobs: Job[] = [];
   const ws = new WebSocket(`${base.replace(/^http/, "ws")}/runners/connect`, { headers: headers(token, name) } as unknown as string[]);
   await new Promise<void>((resolve, reject) => {
@@ -149,7 +162,7 @@ export async function wsRunner(base: string, token: string, name: string): Promi
     const msg = JSON.parse(String(e.data)) as { type: string; job: Job };
     if (msg.type !== "job") return;
     jobs.push(msg.job);
-    ws.send(JSON.stringify({ type: "result", result: answer(msg.job) }));
+    ws.send(JSON.stringify({ type: "result", result: answerWith(msg.job, opts) }));
   };
   return {
     jobs,
@@ -160,7 +173,7 @@ export async function wsRunner(base: string, token: string, name: string): Promi
   };
 }
 
-export function pollRunner(base: string, token: string, name: string): FakeRunner {
+export function pollRunner(base: string, token: string, name: string, opts: RunnerOptions = {}): FakeRunner {
   const jobs: Job[] = [];
   const abort = new AbortController();
   const loop = (async () => {
@@ -181,7 +194,7 @@ export function pollRunner(base: string, token: string, name: string): FakeRunne
         await fetch(`${base}/runners/results`, {
           method: "POST",
           headers: { ...headers(token, name), "content-type": "application/json" },
-          body: JSON.stringify({ results: [answer(job)] }),
+          body: JSON.stringify({ results: [answerWith(job, opts)] }),
         });
       }
     }
