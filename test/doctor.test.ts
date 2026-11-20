@@ -40,6 +40,11 @@ type World = {
   app?: { secret?: string; status?: object | number | string; adminToken?: string | null }; // status as a string: a non-JSON body, 200; adminToken null: /api closed
 };
 
+// The requests `world` saw go to one host. Each entry is "METHOD host/path": the host is
+// compared whole, never searched for in the line, so a path or another host that merely
+// contains the name is not a match.
+const sentTo = (seen: string[], host: string) => seen.filter((s) => s.split(" ")[1]?.split("/")[0] === host);
+
 // One fake internet: Slack, Anthropic, GitHub and the running app, by host.
 function world(w: World = {}) {
   const seen: string[] = [];
@@ -363,7 +368,7 @@ describe("code tools", () => {
     const checks = await doctor({ env: { ...ENV, ...app, GITHUB_APP_PRIVATE_KEY: bad }, fetch: f });
     expect(find(checks, "App")[0]?.level).toBe("fail");
     expect(find(checks, "App")[0]!.detail).toStartWith("GITHUB_APP_PRIVATE_KEY can't sign");
-    expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
+    expect(sentTo(seen, "api.github.com")).toEqual([]);
   });
 
   test("a SANDBOX_URL that isn't a URL, or is plain HTTP off this machine, fails the configuration instead of crashing", async () => {
@@ -390,7 +395,7 @@ describe("code tools", () => {
     const { f, seen } = world();
     await doctor({ env: { ...ENV, SANDBOX_RUNNER_TOKEN: "r".repeat(32), GITHUB_TOKEN: "ghp_1", GITHUB_API_URL: "http://github.test/api/" }, fetch: f });
     expect(seen).toContain("GET github.test/api/user");
-    expect(seen.some((s) => s.includes("api.github.com"))).toBe(false);
+    expect(sentTo(seen, "api.github.com")).toEqual([]);
   });
 
   // #126: a channel's default repo was readable when an admin set it, and can go stale.
@@ -502,7 +507,7 @@ describe("code tools", () => {
         expect(find(checks, "default repo").map((c) => c.level)).toEqual(["warn", "warn"]);
         expect(find(checks, "default repo")[0]!.detail).toStartWith("C1: acme/widgets, branch main is set, but code tools are off");
         // Each entry is "METHOD host/path": no request went to GitHub's host.
-        expect(seen.filter((s) => s.split(" ")[1]?.split("/")[0] === "api.github.com")).toEqual([]);
+        expect(sentTo(seen, "api.github.com")).toEqual([]);
       });
     });
 
