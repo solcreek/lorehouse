@@ -126,7 +126,7 @@ in 5 min 9 s**, of them 903,474 input and 27,774 output, with 20,337 the grader'
 (`claude-haiku-5-5`, 18 verdicts). A knowledge trial was 7,100 to 15,400 tokens; a code
 trial 16,500 to 50,400, since each tool call is another model turn that resends the
 conversation. Nothing is cached: June sends no cache breakpoints. `--grader-selftest`
-was 37,071 tokens (52 replies).
+was 37,985 tokens (53 replies).
 
 `--max-tokens` is the run's budget: input + output + cache read + cache write, the
 grader's included. It has one rule: the budget is **reached when the tokens counted are
@@ -220,7 +220,8 @@ themselves (closing what looks like the reply's tag and writing a criterion of t
 bringing a finished verdict), and `bun run eval --grader-selftest` grades them all with
 the real grader model: exit 0 only if every verdict is the one the example deserves. Run
 it when a rubric or the grader's prompt changes, or the grader model does. On 2026-11-20
-it was 52 of 52 right with `claude-haiku-5-5`.
+it was 53 of 53 right with `claude-haiku-5-5`. It follows the budget's rule like a run:
+with `--max-tokens` reached it is not ok, and its JSON line has the same `tokens` fields.
 
 ### The simulated shell's refusals
 
@@ -304,6 +305,12 @@ Cases are data in `evals/cases/`, one file per small group, listed in
   deadline; a step that isn't answered fails the trial saying what it waited for. Users
   and channels are the fixtures' (`conformance/fixtures/slack-history.json`): `U1`–`U7`
   are full members, `UG1` a guest, `C1` the listed channel.
+- **A command that was sent is not a command that ran.** Where a check stands for "this
+  happened" (the tests ran, the repo was cloned, the job ended), hold the outcome, not
+  the request: `ran(…, { succeeded: true, output: /…/ })` needs the job not refused,
+  answered 2xx, an exec exited 0 and its stdout matching; for a background job, read its
+  final status. `called` holds what the model asked for; put a check of what came of it
+  beside it.
 - **A fact is a code check** (`checks.ts`): `ran` (runner jobs), `called` (the model's
   tool calls and their input), `said` / `neverSaid` (a fact in what people saw: a digit, a
   link), `modelNeverWrote` (the model's own text, before Lorehouse's guards), `github`,
@@ -326,8 +333,11 @@ Cases are data in `evals/cases/`, one file per small group, listed in
   `programs` their scripts run (a test runner, a script) with what each prints or
   writes. Keep fixtures consistent with themselves: a model reads a script before running
   it, and notices when the output isn't what the source says. Prefer an output nobody
-  could guess (the catalog's 137 entries) over one a model might invent. `refuse` makes
-  the host refuse calls, as sandboxd does.
+  could guess (the catalog's 137 entries) over one a model might invent. A repo's
+  programs run only in a cloned checkout, from its root. `refuse` makes the host refuse
+  calls, as sandboxd does. `exec` rules answer before the shell in real and dry runs
+  alike; `dryExec` rules answer under `--dry` only (where there is no shell and no clone
+  step) and are never consulted in a real trial.
 - Run it: `bun run eval --dry --only <id>`, then for real with `--trials 1`, and read the
   evidence file even when it passes: a check that passes for the wrong reason is worse
   than none.
