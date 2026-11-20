@@ -5,6 +5,7 @@
 
 import { expect, test } from "bun:test";
 import { BENCH, widgets, WIDGETS } from "../evals/cases/widgets";
+import { CASES } from "../evals/cases";
 import { scriptedSandbox } from "../evals/sandbox";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -411,6 +412,31 @@ test("a pattern that could stall the runner is not run: a repeated group inside 
   expect(sh.refused[0]).toMatchObject({ part: "grep -E (a+)+$ long.txt", said: "grep: regular expression is too large", why: expect.stringContaining("could stall the runner") });
   // Groups and repeats that aren't nested are fine.
   expect(sh.exec("grep -cE 'bun (install|test)' README.md; grep -c 'a\\+b' long.txt; grep -cE '^ +bun' README.md", WORKDIR, ME).stdout).toBe("2\n1\n2\n");
+});
+
+test("run-and-show's script prints its count only where it exists: in a cloned checkout, run from its root", () => {
+  const sandbox = CASES.find((c) => c.id === "run-and-show")!.setup!.sandbox!;
+  const SCRIPT = "./scripts/count-widgets.sh";
+  // A real trial, before any clone: there is no checkout, so no script and no count.
+  const real = scriptedSandbox(sandbox);
+  const none = result(real(exec(SCRIPT)));
+  expect(none).toEqual({ exitCode: 2, stdout: "", stderr: "sh: 1: cd: can't cd to /workspace/repo\n" });
+  expect(result(real(exec(SCRIPT, "/tmp")))).toEqual({ exitCode: 127, stdout: "", stderr: "sh: 1: ./scripts/count-widgets.sh: not found\n" });
+  // Cloned: run from the checkout's root it prints the catalog's count…
+  expect(result(real(exec(gitWithToken(`clone ${URL_} ${WORKDIR}`), "/"))).exitCode).toBe(0);
+  expect(result(real(exec(SCRIPT)))).toEqual({ exitCode: 0, stdout: `widgets counted: ${WIDGETS}\n`, stderr: "" });
+  expect(result(real(exec(SCRIPT, `${WORKDIR}/`))).stdout).toBe(`widgets counted: ${WIDGETS}\n`);
+  // …and from anywhere else there is no such path.
+  expect(result(real(exec(SCRIPT, "/tmp")))).toMatchObject({ exitCode: 127, stdout: "" });
+  expect(result(real(exec(`cd /tmp && ${SCRIPT}`)))).toMatchObject({ exitCode: 127, stdout: "" });
+  expect(result(real(exec("cd src && bun test")))).toMatchObject({ stdout: "" });
+  // Under --dry there is no shell and no clone step: the scripted model's one command is
+  // answered by the case's dry-only rule.
+  const dry = scriptedSandbox(sandbox, { dry: true });
+  expect(result(dry(exec(SCRIPT)))).toEqual({ exitCode: 0, stdout: `widgets counted: ${WIDGETS}\n`, stderr: "" });
+  // A rule under `exec` still answers in both (the refusal test above uses one).
+  const both = scriptedSandbox({ ...widgets, exec: [{ match: /^make test$/, exitCode: 2, stderr: "boom" }] });
+  expect(result(both(exec("make test", "/")))).toEqual({ exitCode: 2, stdout: "", stderr: "boom" });
 });
 
 test("a refused git command changes nothing: stash is refused, not pretended", () => {

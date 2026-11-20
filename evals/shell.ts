@@ -434,6 +434,7 @@ export class Shell {
   // ── running ──
   // `env`: what the caller sets for this command (the job's env), e.g. who commits.
   exec(command: string, cwd = WORKDIR, env: Record<string, string> = {}): ExecResult {
+    cwd = this.abs(cwd, "/"); // as given, less a trailing slash or a `.`
     // A working directory that isn't there (the checkout, before a clone).
     if (!this.isDir(cwd)) return fail(2, `sh: 1: cd: can't cd to ${cwd}`);
     const here = heredocs(command);
@@ -603,7 +604,9 @@ export class Shell {
   private run(words: string[], stdin: string, st: State): ExecResult {
     const [name, ...args] = words as [string, ...string[]];
     const written = words.join(" ");
-    const program = (this.repo?.programs ?? []).find((p) => p.match.test(written));
+    // The repo's own programs run from the checkout's root, where their rules' paths are
+    // (`./scripts/…`, `bun test`): from anywhere else the same words name nothing.
+    const program = st.cwd === WORKDIR ? (this.repo?.programs ?? []).find((p) => p.match.test(written)) : undefined;
     if (program) {
       for (const [path, content] of Object.entries(program.writes ?? {})) this.write(this.abs(path, WORKDIR), content);
       return { exitCode: program.exitCode ?? 0, stdout: program.stdout ?? "", stderr: program.stderr ?? "" };

@@ -13,8 +13,8 @@
 // commits HEAD has that GitHub doesn't, with their files, diffstat, authors and patch, and
 // with nothing committed it answers what sandboxd does ("no commits to publish").
 //
-// Tried in order, for each job: a refusal; an `exec` rule on the whole command line; the
-// shell; then the fake runner.
+// Tried in order, for each job: a refusal; an `exec` rule on the whole command line (and,
+// under --dry only, a `dryExec` rule); the shell; then the fake runner.
 
 import type { Job, JobAnswer } from "../conformance/fake-runner";
 import { Shell, type ExecResult, type ShellScript } from "./shell";
@@ -41,7 +41,13 @@ export type Refusal = {
 
 export type SandboxScript = {
   shell?: ShellScript;
+  // Answered before the shell, in real trials and dry ones alike: for a case with no
+  // shell, or a failure it must see.
   exec?: ExecRule[];
+  // Answered under --dry only, where there is no shell and the scripted model takes one
+  // step: what the shell's own program would print in a real trial, once the repo is
+  // cloned. Never consulted in a real trial.
+  dryExec?: ExecRule[];
   refuse?: Refusal[];
 };
 
@@ -111,7 +117,7 @@ export function scriptedSandbox(script: SandboxScript = {}, opts: { dry?: boolea
     if (refusal) return { id: job.id, status: refusal.status, code: refusal.code, error: refusal.error };
 
     if (job.method === "POST" && job.path === "/exec" && command !== undefined) {
-      const rule = (script.exec ?? []).find((r) => r.match.test(command));
+      const rule = [...(opts.dry ? (script.dryExec ?? []) : []), ...(script.exec ?? [])].find((r) => r.match.test(command));
       if (rule) return json(job, { exitCode: rule.exitCode ?? 0, stdout: rule.stdout ?? "", stderr: rule.stderr ?? "" });
       if (!shell) return undefined;
       return json(job, run(command, body(job).cwd, body(job).env));

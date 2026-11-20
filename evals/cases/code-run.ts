@@ -28,13 +28,16 @@ export const cases: Case[] = [
     setup: {
       ...repo,
       // The script counts catalog.json's 137 entries: a number nobody would guess, in the
-      // reply only if the command's output is. (The exec rule is for --dry, which has no shell.)
-      sandbox: { ...widgets, exec: [{ match: /^(\.\/)?scripts\/count-widgets\.sh$/, stdout: `widgets counted: ${WIDGETS}\n` }] },
+      // reply only if the command's output is. In a real trial it is the shell's own
+      // program, which prints only in a cloned checkout, run from its root. Under --dry
+      // there is no shell and no clone, so the scripted model's one command has a rule of
+      // its own, used there only.
+      sandbox: { ...widgets, dryExec: [{ match: /^(\.\/)?scripts\/count-widgets\.sh$/, stdout: `widgets counted: ${WIDGETS}\n` }] },
     },
     conversation: [{ mention: "run `./scripts/count-widgets.sh` and tell me exactly what it printed", dry: "[exec] ./scripts/count-widgets.sh" }],
     checks: [
       called("the command is run with workspace_exec", "workspace_exec", { input: (i) => /count-widgets\.sh/.test(String(i.command)) }),
-      ran("the command reaches the sandbox", { method: "POST", path: /^\/exec$/, command: /count-widgets\.sh/ }),
+      ran("the script runs in the sandbox and prints its count", { method: "POST", path: /^\/exec$/, command: /count-widgets\.sh/, succeeded: true, output: new RegExp(`^widgets counted: ${WIDGETS}$`, "m") }),
       said("the reply carries the command's output", /\b137\b/),
       called("a quick command is not started as a background job", "workspace_job_start", { max: 0 }),
     ],
