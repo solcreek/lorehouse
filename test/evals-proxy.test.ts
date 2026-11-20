@@ -274,7 +274,10 @@ test("a request without the run's key is refused and nothing goes upstream; the 
   const up = upstream(() => streamed(TOOL_TURN));
   const proxy = proxyFor(key());
   const base = proxy.open("t", up.url);
-  for (const headers of [{}, { "x-api-key": "eval-placeholder-key" }, { "x-api-key": REAL }, { authorization: `Bearer ${proxy.key}` }] as Record<string, string>[]) {
+  // No key, a wrong one, the real credential, the key in the wrong header, and keys that
+  // differ from the run's only at the end, at the start, or by a character more.
+  const near = [`${proxy.key.slice(0, -1)}${proxy.key.endsWith("A") ? "B" : "A"}`, `x${proxy.key.slice(1)}`, `${proxy.key}A`, proxy.key.slice(0, -1), ""];
+  for (const headers of [{}, { "x-api-key": "eval-placeholder-key" }, { "x-api-key": REAL }, { authorization: `Bearer ${proxy.key}` }, ...near.map((k) => ({ "x-api-key": k }))] as Record<string, string>[]) {
     const r = await fetch(`${base}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(REQUEST) });
     expect(r.status).toBe(401);
     expect(await r.text()).toContain("doesn't carry the run's key");
@@ -282,6 +285,9 @@ test("a request without the run's key is refused and nothing goes upstream; the 
   expect(up.seen).toHaveLength(0);
   expect(proxy.turns("t")).toHaveLength(0);
   expect(proxy.tokens()).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  // And the run's own key is let through.
+  expect((await fetch(`${base}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": proxy.key }, body: JSON.stringify(REQUEST) })).status).toBe(200);
+  expect(up.seen).toHaveLength(1);
   const other = proxyFor(key());
   expect(proxy.key).toMatch(/^sk-eval-[A-Za-z0-9_-]{32}$/);
   expect(other.key).not.toBe(proxy.key);

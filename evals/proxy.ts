@@ -10,7 +10,8 @@
 // The real credential lives here and nowhere else, and only this run can spend it:
 //   - the proxy listens on loopback only;
 //   - every request must carry the run's own key (`key`: random per run, what the app and
-//     the grader are given in place of a credential); without it, 401 and nothing is sent;
+//     the grader are given in place of a credential), compared in constant time; without
+//     it, 401 and nothing is sent;
 //   - only `POST /v1/messages` of an open trial is forwarded; anything else is a 404 and
 //     nothing is sent;
 //   - whatever auth the request carried is dropped and the real header set; no header is
@@ -23,7 +24,7 @@
 // The budget: once the run's tokens reach `maxTokens`, further model calls are refused
 // (HTTP 400, `x-should-retry: false`, so the SDK doesn't retry) and `exceeded()` is true.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { scrub, type Credential } from "./credential";
 import { addTokens, noTokens, responseFromJson, SseReader, StreamedMessage, totalTokens, type ModelResponse, type Tokens } from "./sse";
 
@@ -124,6 +125,13 @@ export function retryWaitMs(status: number, headers: Headers): number {
   const secs = Number(headers.get("retry-after"));
   const said = headers.get("retry-after-ms") !== null && Number.isFinite(ms) ? ms : headers.get("retry-after") !== null && Number.isFinite(secs) ? secs * 1000 : undefined;
   return Math.min(RETRY_MAX_MS, said === undefined ? RETRY_DEFAULT_MS : Math.max(0, said) + 2000);
+}
+
+// Whether two keys are the same, in time that doesn't depend on where they first differ
+// (both are hashed, so the comparison is of equal lengths whatever was sent).
+function sameKey(given: string, key: string): boolean {
+  const digest = (s: string) => createHash("sha256").update(s).digest();
+  return timingSafeEqual(digest(given), digest(key));
 }
 
 export function startProxy(opts: ProxyOptions): Proxy {
@@ -287,7 +295,7 @@ export function startProxy(opts: ProxyOptions): Proxy {
     async fetch(req) {
       const url = new URL(req.url);
       // This run's key, on every request: no other local process spends the credential.
-      if (req.headers.get("x-api-key") !== key) return refusal(401, "authentication_error", "eval proxy: this request doesn't carry the run's key; nothing was sent upstream");
+      if (!sameKey(req.headers.get("x-api-key") ?? "", key)) return refusal(401, "authentication_error", "eval proxy: this request doesn't carry the run's key; nothing was sent upstream");
       const m = /^\/t\/([^/]+)\/v1\/messages$/.exec(url.pathname);
       const trialId = m ? decodeURIComponent(m[1]!) : undefined;
       if (req.method !== "POST" || !trialId || !trials.has(trialId)) return refusal(404, "not_found_error", "eval proxy: only POST /t/<open trial>/v1/messages is forwarded; nothing was sent upstream");
