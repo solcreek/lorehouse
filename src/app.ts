@@ -48,6 +48,7 @@ import { jobStore, jobTools, slackJobAuthority } from "./tools/jobs";
 import { prepareTenant, sandboxIdFor, tenantsIn, upgradeLayout } from "./tenant";
 import { KEY_FILE, loadTenantKey, strongroomKeys } from "./tenant-key";
 import { Database, encryptInPlace } from "./sqlite";
+import { withPromptCaching } from "./prompt-cache";
 import { basename, dirname, join } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
 
@@ -415,7 +416,8 @@ async function startApp(config: Config, keys: Uint8Array[], profiles: readonly P
     maxTokens: 4096,
     // Injected: bundlers can't see June's lazy SDK import, so a compiled binary needs it.
     // No cast: tsc checks the real SDK client against June's AnthropicClient here.
-    client: new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl }),
+    // Every request it sends is marked for prompt caching on the way out (#193).
+    client: withPromptCaching(new Anthropic({ apiKey: config.anthropic.apiKey, baseURL: config.anthropic.baseUrl })),
   });
   // Encrypted, the session store is opened here with the tenant's key (June's `open` hook);
   // otherwise June opens it with its own driver.
