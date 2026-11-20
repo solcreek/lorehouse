@@ -277,15 +277,18 @@ test("pass rates: per case over trials, per check over judged trials, code and g
   // An optional graded failure doesn't.
   expect(caseResult(aCase(), [trial(1, [outcome("a", true), g(false, { required: false })])], 1).status).toBe("ok");
   // No trials at all (the budget stopped the run first) is not a pass.
-  expect(caseResult(aCase(), [], 1)).toMatchObject({ trials: 0, status: "fail" });
+  expect(caseResult(aCase(), [], 1)).toMatchObject({ trials: 0, status: "notrun" });
 });
 
 test("summarize: the JSON line's counts by kind, failures with their kind and file, tokens, and the budget stop", () => {
   const trials = [trial(1, [outcome("a", true), g(true)]), trial(2, [outcome("a", false), outcome("opt", false, { required: false }), g(false)])];
   const results = [caseResult(aCase(), trials, 1), caseResult(aCase({ id: "y" }), [], 1)];
-  const base = { results, trials, planned: 4, model: "claude-opus-5", dry: false, credential: "ant" as const, threshold: 1, tokens: { input: 1000, output: 200, cacheRead: 50, cacheWrite: 10 }, graderTokens: { input: 30, output: 5, cacheRead: 0, cacheWrite: 0 }, graderModel: "claude-haiku-5-5", maxTokens: 5000, ms: 9, out: "evals/out/r" };
+  const base = { results, trials, planned: 4, plan: [["code/x", 1], ["code/x", 2], ["code/y", 1], ["code/y", 2]] as [string, number][], model: "claude-opus-5", dry: false, credential: "ant" as const, threshold: 1, tokens: { input: 1000, output: 200, cacheRead: 50, cacheWrite: 10 }, graderTokens: { input: 30, output: 5, cacheRead: 0, cacheWrite: 0 }, graderModel: "claude-haiku-5-5", maxTokens: 5000, ms: 9, out: "evals/out/r" };
   const s = summarize({ ...base, exceeded: false, usd: { in: 5, out: 25 } });
-  expect(s).toMatchObject({ ok: false, model: "claude-opus-5", dry: false, credential: "ant", cases: 2, passed: 0, failed: 2, unjudged: 0, trials: 2, planned: 4, threshold: 1, grader: "claude-haiku-5-5", out: "evals/out/r" });
+  expect(s).toMatchObject({ ok: false, model: "claude-opus-5", dry: false, credential: "ant", cases: 2, passed: 0, failed: 1, unjudged: 0, notRun: 1, trials: 2, planned: 4, threshold: 1, grader: "claude-haiku-5-5", out: "evals/out/r" });
+  // The case that never ran is listed trial by trial, with why; it is not a failure.
+  expect(s.trialsNotRun).toEqual([{ case: "code/y", trial: 1, reason: "the run ended before this trial started", file: null }, { case: "code/y", trial: 2, reason: "the run ended before this trial started", file: null }]);
+  expect(s.trialsNotJudged).toEqual([]);
   // Code and graded verdicts are never added together.
   expect(s.checks).toEqual({ code: { passed: 1, of: 3 }, graded: { passed: 1, of: 2, notJudged: 0 } });
   // Every required check that failed, of either kind, saying which.
@@ -307,6 +310,10 @@ test("summarize: the JSON line's counts by kind, failures with their kind and fi
   expect(stopped.ok).toBe(false);
   expect(stopped.stopped).toContain("--max-tokens 5000");
   expect(stopped.stopped).toContain("2 planned trial(s) never ran");
+  expect(stopped.trialsNotRun.map((t) => t.reason)).toEqual(Array(2).fill("the run's tokens reached --max-tokens 5000 before this trial started"));
+  const stoppedTable = table(results, trials, stopped);
+  expect(stoppedTable).toContain("NOT RUN  code/y");
+  expect(stoppedTable).toContain("2 planned trial(s) never ran:\n  code/y trial 1: the run's tokens reached --max-tokens 5000 before this trial started");
   expect(stopped.tokens.usdEstimate).toBeUndefined();
   // Everything passing, and nothing stopped it: ok.
   expect(summarize({ ...base, results: [caseResult(aCase(), [trials[0]!], 1)], trials: [trials[0]!], exceeded: false }).ok).toBe(true);
@@ -316,11 +323,16 @@ test("--no-grader: a case whose required checks include a graded one is not full
   const trials = [trial(1, [outcome("a", true), g(false, { judged: false, evidence: "not judged: --no-grader" })])];
   const results = [caseResult(aCase(), trials, 1)];
   const s = summarize({ results, trials, planned: 1, model: "m", dry: false, credential: "ant", threshold: 1, tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, graderTokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, graderModel: null, maxTokens: 10, exceeded: false, ms: 1, out: "o" });
-  expect(s).toMatchObject({ ok: false, passed: 0, failed: 0, unjudged: 1, grader: null, failures: [], checks: { code: { passed: 1, of: 1 }, graded: { passed: 0, of: 0, notJudged: 1 } } });
+  expect(s).toMatchObject({ ok: false, passed: 0, failed: 0, unjudged: 1, notRun: 0, grader: null, failures: [], trialsNotRun: [], checks: { code: { passed: 1, of: 1 }, graded: { passed: 0, of: 0, notJudged: 1 } } });
+  // The trial is named, with the check that has no verdict, why, and its evidence file.
+  expect(s.trialsNotJudged).toEqual([{ case: "code/x", trial: 1, check: "g", reason: "not judged: --no-grader", file: "out/x/1.json" }]);
   const shown = table(results, trials, s);
   expect(shown).toContain("NOT JUDGED  code/x");
   expect(shown).toContain("· not judged  g [graded]");
   expect(shown).toContain("0/1 cases at or above 100%; 1 not fully judged (a required graded check has no verdict)");
+  expect(shown).toContain("1 required graded check(s) have no verdict (not judged is not passed, and not failed):\n  code/x trial 1: g: not judged: --no-grader\n      out/x/1.json");
+  // Under --dry no graded check is judged, by design: none is listed as missing.
+  expect(summarize({ results, trials, planned: 1, model: "m", dry: true, credential: null, threshold: 1, tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, graderTokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, graderModel: null, maxTokens: 10, exceeded: false, ms: 1, out: "o" }).trialsNotJudged).toEqual([]);
 });
 
 test("the command line: defaults, --dry's one trial, and what is refused", () => {
@@ -816,7 +828,7 @@ test("--dry: a run stopped by the budget says so, fails the trial on the refused
     const r = await evalCommand(["--dry", "--only", "run-and-show", "--max-tokens", "1", "--out", out]);
     expect(r.code).toBe(1);
     const summary = JSON.parse(r.stdout.trimEnd().split("\n").at(-1)!) as Summary;
-    expect(summary).toMatchObject({ ok: false, passed: 0, failed: 1, tokens: { exceeded: true, max: 1 } });
+    expect(summary).toMatchObject({ ok: false, passed: 0, failed: 1, notRun: 0, trialsNotRun: [], tokens: { exceeded: true, max: 1 } });
     expect(summary.stopped).toContain("--max-tokens 1");
     const failure = summary.failures.find((f) => f.check === COMPLETED)!;
     expect(failure).toMatchObject({ case: "code/run-and-show", trial: 1 });

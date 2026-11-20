@@ -106,7 +106,9 @@ export type CaseResult = {
   // Passing trials over trials.
   rate: number;
   // ok: at or above the threshold. unjudged: it would be, if its unjudged trials passed.
-  status: "ok" | "fail" | "unjudged";
+  // notrun: none of its trials ran (the budget stopped the run first). Not a pass, and
+  // not a failure of the case either.
+  status: "ok" | "fail" | "unjudged" | "notrun";
   checks: CheckRate[];
   // Check verdicts across the case's trials, by kind: passed over judged.
   code: Count;
@@ -128,8 +130,7 @@ export function caseResult(c: Case, trials: TrialResult[], threshold: number): C
   const code = sum(false);
   return {
     case: `${c.suite}/${c.id}`, suite: c.suite, trials: trials.length, passed, failed: count("failed"), unjudged, rate,
-    // No trials (the budget stopped the run first) is not a pass.
-    status: trials.length > 0 && rate >= threshold ? "ok" : trials.length > 0 && (passed + unjudged) / trials.length >= threshold ? "unjudged" : "fail",
+    status: trials.length === 0 ? "notrun" : rate >= threshold ? "ok" : (passed + unjudged) / trials.length >= threshold ? "unjudged" : "fail",
     checks, code: { passed: code.passed, of: code.of }, graded: sum(true),
     tokens: trials.reduce((n, t) => addTokens(n, t.tokens), noTokens()),
   };
@@ -148,6 +149,8 @@ export type Summary = {
   failed: number;
   // Cases not fully judged: no failure, but a required graded check has no verdict.
   unjudged: number;
+  // Cases none of whose trials ran (the budget stopped the run first).
+  notRun: number;
   // Trials run, of those planned.
   trials: number;
   planned: number;
@@ -171,6 +174,11 @@ export type Summary = {
   // case beside one of these may be a gap in the shell, not the model's doing.
   // `said` is what the model saw (a real sandbox's words); `why` is the real reason.
   shellRefused: { case: string; trial: number; command: string; part: string; said: string; why: string }[];
+  // Every trial that has no verdict because a required graded check has none, with the
+  // check and why (--no-grader; the grader's answer couldn't be used; its call failed).
+  trialsNotJudged: { case: string; trial: number; check: string; reason: string; file: string }[];
+  // Every planned trial that never ran, and why. There is no evidence file for one.
+  trialsNotRun: { case: string; trial: number; reason: string; file: null }[];
   // Why the run stopped early, when it did.
   stopped?: string;
   ms: number;
@@ -178,7 +186,8 @@ export type Summary = {
 };
 
 export function summarize(o: {
-  results: CaseResult[]; trials: TrialResult[]; planned: number; model: string; dry: boolean; credential: CredentialKind | null; threshold: number;
+  // `plan`: every trial that was to run, as [case, trial].
+  results: CaseResult[]; trials: TrialResult[]; planned: number; plan?: [string, number][]; model: string; dry: boolean; credential: CredentialKind | null; threshold: number;
   tokens: Tokens; graderTokens: Tokens; graderModel: string | null; maxTokens: number; exceeded: boolean; ms: number; out: string; usd?: { in: number; out: number };
 }): Summary {
   const failures: Failure[] = o.trials.flatMap((t) =>
@@ -191,7 +200,7 @@ export function summarize(o: {
   return {
     ok: !o.exceeded && o.results.length > 0 && o.results.every((r) => r.status === "ok"),
     model: o.model, dry: o.dry, credential: o.credential,
-    cases: o.results.length, passed: status("ok"), failed: status("fail"), unjudged: status("unjudged"),
+    cases: o.results.length, passed: status("ok"), failed: status("fail"), unjudged: status("unjudged"), notRun: status("notrun"),
     trials: o.trials.length, planned: o.planned, threshold: o.threshold,
     checks: {
       code: o.results.reduce((n, r) => add(n, r.code), { passed: 0, of: 0 }),
@@ -205,6 +214,8 @@ export function summarize(o: {
     },
     failures,
     shellRefused: o.trials.flatMap((t) => t.refused.map((r) => ({ case: t.case, trial: t.trial, command: r.command, part: r.part, said: r.said, why: r.why }))),
+    trialsNotJudged: o.dry ? [] : o.trials.flatMap((t) => t.checks.filter((c) => c.graded && c.required && !c.judged).map((c) => ({ case: t.case, trial: t.trial, check: c.name, reason: c.evidence, file: t.file }))),
+    trialsNotRun: (o.plan ?? []).filter(([name, n]) => !o.trials.some((t) => t.case === name && t.trial === n)).map(([name, n]) => ({ case: name, trial: n, reason: o.exceeded ? `the run's tokens reached --max-tokens ${o.maxTokens} before this trial started` : "the run ended before this trial started", file: null })),
     ...(o.exceeded ? { stopped: `budget: --max-tokens ${o.maxTokens} was reached; ${o.planned - o.trials.length} planned trial(s) never ran and later model calls were refused` } : {}),
     ms: o.ms, out: o.out,
   };
@@ -218,7 +229,7 @@ const ratio = (c: Count) => (c.of ? `${c.passed}/${c.of}` : "-");
 // their own), then each case's checks with their rates and, for a failing one, the first
 // failure's evidence and file.
 export function table(results: CaseResult[], trials: TrialResult[], summary: Summary): string {
-  const label = { ok: "ok", fail: "FAIL", unjudged: "NOT JUDGED" };
+  const label = { ok: "ok", fail: "FAIL", unjudged: "NOT JUDGED", notrun: "NOT RUN" };
   const rows = results.map((r) => [label[r.status], r.case, `${r.passed}/${r.trials}`, ratio(r.code), `${ratio(r.graded)}${r.graded.notJudged ? ` (+${r.graded.notJudged} not judged)` : ""}`, num(totalTokens(r.tokens))]);
   const head = ["", "case", "trials", "code checks", "graded checks", "tokens"];
   const widths = head.map((h, i) => Math.max(h.length, ...rows.map((row) => row[i]!.length)));
@@ -239,12 +250,20 @@ export function table(results: CaseResult[], trials: TrialResult[], summary: Sum
     }
   }
   const t = summary.tokens, k = summary.checks;
-  out.push("", `${summary.passed}/${summary.cases} cases at or above ${pct(summary.threshold)}${summary.unjudged ? `; ${summary.unjudged} not fully judged (a required graded check has no verdict)` : ""}`);
+  out.push("", `${summary.passed}/${summary.cases} cases at or above ${pct(summary.threshold)}${summary.unjudged ? `; ${summary.unjudged} not fully judged (a required graded check has no verdict)` : ""}${summary.notRun ? `; ${summary.notRun} not run` : ""}`);
   out.push(`code checks ${ratio(k.code)}; graded checks ${ratio(k.graded)}${k.graded.notJudged ? `, ${k.graded.notJudged} not judged` : ""}${summary.grader ? ` (grader ${summary.grader})` : ""}`);
   out.push(`tokens: ${num(t.total)} of ${num(t.max)} (input ${num(t.input)}, output ${num(t.output)}, cache read ${num(t.cacheRead)}, cache write ${num(t.cacheWrite)}; grader ${num(t.grader.total)} of them)${t.usdEstimate !== undefined ? `; about $${t.usdEstimate} at EVAL_USD_PER_MTOK_IN/OUT` : ""}`);
   if (summary.shellRefused.length) {
     out.push("", `the simulated shell refused ${summary.shellRefused.length} command(s) (evals/shell.ts; a failure beside one may be the shell's gap, not the model's):`);
     for (const r of summary.shellRefused) out.push(`  ${r.case} trial ${r.trial}: ${JSON.stringify(r.part)}${r.part === r.command ? "" : ` in ${JSON.stringify(r.command.length > 160 ? `${r.command.slice(0, 160)}…` : r.command)}`}\n      the model saw: ${JSON.stringify(r.said.split("\n")[0])}; the reason: ${r.why}`);
+  }
+  if (summary.trialsNotJudged.length) {
+    out.push("", `${summary.trialsNotJudged.length} required graded check(s) have no verdict (not judged is not passed, and not failed):`);
+    for (const t of summary.trialsNotJudged) out.push(`  ${t.case} trial ${t.trial}: ${t.check}: ${t.reason}\n      ${t.file}`);
+  }
+  if (summary.trialsNotRun.length) {
+    out.push("", `${summary.trialsNotRun.length} planned trial(s) never ran:`);
+    for (const t of summary.trialsNotRun) out.push(`  ${t.case} trial ${t.trial}: ${t.reason}`);
   }
   if (summary.stopped) out.push(`STOPPED: ${summary.stopped}`);
   return out.join("\n");

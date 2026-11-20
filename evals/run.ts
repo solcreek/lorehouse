@@ -158,7 +158,7 @@ await Promise.all(
 results.sort((a, b) => planned.findIndex((p) => `${p.c.suite}/${p.c.id}` === a.case && p.trial === a.trial) - planned.findIndex((p) => `${p.c.suite}/${p.c.id}` === b.case && p.trial === b.trial));
 const perCase = cases.map((c) => caseResult(c, results.filter((r) => r.case === `${c.suite}/${c.id}`), args.threshold));
 const summary = summarize({
-  results: perCase, trials: results, planned: planned.length,
+  results: perCase, trials: results, planned: planned.length, plan: planned.map((x) => [`${x.c.suite}/${x.c.id}`, x.trial]),
   model: args.dry ? "scripted (conformance/mock.ts)" : (args.model ?? modelSeen ?? "the app's default"),
   dry: args.dry, credential: args.dry ? null : credential.kind, threshold: args.threshold,
   tokens: proxy.tokens(), graderTokens: proxy.tokens("grader"), graderModel: grade ? graderModel : null,
