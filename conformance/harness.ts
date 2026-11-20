@@ -59,7 +59,7 @@ export function postInteraction(target: string, secret: string, payload: Record<
 export type Block = { type: string; elements?: { type: string; text?: { text: string }; action_id?: string; value?: string }[] };
 // The mock's GET /stats.
 export type Stats = {
-  slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[]; reactionChannels: string[];
+  slackCalls: number; modelCalls: number; cacheMarkedModelCalls: number; byMethod: Record<string, number>; readChannels: string[]; reactionChannels: string[];
   posts: { channel: string; thread_ts?: string; text: string; blocks?: Block[]; ts: string }[];
   updates: { channel: string; ts: string; text: string }[];
   responses: { path: string; text?: string; response_type?: string; replace_original?: boolean }[];

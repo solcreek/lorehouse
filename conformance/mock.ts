@@ -92,6 +92,14 @@ type SlackCall = { t: number; method: string; body: Record<string, unknown> };
 const holds = new Map<string, { waiting: number; released: Promise<void>; release: () => void }>();
 let calls: SlackCall[] = [];
 let modelCalls = 0;
+// How many of them asked for prompt caching the way the app does (#193): the system prompt
+// as text blocks with a mark on the last, and a mark on the request itself.
+let cacheMarkedModelCalls = 0;
+const isMark = (v: unknown) => !!v && typeof v === "object" && (v as { type?: unknown }).type === "ephemeral";
+function cacheMarked(body: { system?: unknown; cache_control?: unknown }): boolean {
+  const last = Array.isArray(body.system) ? (body.system.at(-1) as { type?: unknown; cache_control?: unknown } | undefined) : undefined;
+  return isMark(body.cache_control) && last?.type === "text" && isMark(last.cache_control);
+}
 let githubCalls: { method: string; path: string; body?: unknown; auth: string }[] = [];
 // Files uploaded through files.getUploadURLExternal: the reserved name and length, then
 // the bytes POSTed to the upload_url.
@@ -333,7 +341,8 @@ async function toolUse(id: string, name: string, input: unknown, stream: boolean
 
 async function anthropic(req: Request): Promise<Response> {
   modelCalls++;
-  const body = (await req.json()) as { messages: Msg[]; stream?: boolean; tools?: { name: string }[] };
+  const body = (await req.json()) as { messages: Msg[]; stream?: boolean; tools?: { name: string }[]; system?: unknown; cache_control?: unknown };
+  if (cacheMarked(body)) cacheMarkedModelCalls++;
   const id = `msg_${modelCalls}`;
   const result = lastUserHasToolResult(body.messages);
 
@@ -558,10 +567,10 @@ const server = Bun.serve({
         const done = calls.find((c) => c.method === "files.completeUploadExternal" && (c.body.files as { id?: string; title?: string }[] | undefined)?.some?.((f) => f.id === u.fileId));
         return { ...u, channel: done?.body.channel_id, thread_ts: done?.body.thread_ts, title: (done?.body.files as { id?: string; title?: string }[] | undefined)?.find((f) => f.id === u.fileId)?.title };
       });
-      return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, reactionChannels, posts, updates, responses, github: githubCalls, uploads: shared });
+      return Response.json({ slackCalls: calls.length, modelCalls, cacheMarkedModelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, reactionChannels, posts, updates, responses, github: githubCalls, uploads: shared });
     }
     if (url.pathname === "/calls") return Response.json({ calls });
-    if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; uploads = []; return Response.json({ ok: true }); }
+    if (url.pathname === "/reset") { calls = []; modelCalls = 0; cacheMarkedModelCalls = 0; githubCalls = []; uploads = []; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });
   },
 });
