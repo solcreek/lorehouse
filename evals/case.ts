@@ -157,7 +157,9 @@ export type Observation = {
     uploads: Stats["uploads"];
     reactions: { name: string; channel?: string; ts?: string; call: number }[];
   };
-  runner: { connected: boolean; jobs: RunnerJob[] };
+  // `refused`: every command the case's simulated shell (shell.ts) wouldn't run. A failed
+  // check beside one of these may be a gap in the shell, not the model's doing.
+  runner: { connected: boolean; jobs: RunnerJob[]; refused: { command: string; part: string; why: string }[] };
   github: { calls: (Stats["github"][number] & { n: number })[] };
   model: { turns: ModelTurn[]; toolCalls: ToolCall[] };
   app: { exit: number | null; stderr: string; stdout: string };

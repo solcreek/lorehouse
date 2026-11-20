@@ -14,7 +14,7 @@ import { wsRunner, type FakeRunner, type Job, type JobAnswer } from "../conforma
 import { appEnv, buttonOn, postEvent, postInteraction, type Block, type Stats } from "../conformance/harness";
 import type { Case, Observation, RunnerJob, Said, SlackCall, Step, StepMark, ToolCall, Until } from "./case";
 import type { Proxy } from "./proxy";
-import { commandOf, scriptedSandbox } from "./sandbox";
+import { commandOf, scriptedSandbox, type ScriptedSandbox } from "./sandbox";
 
 const ROOT = join(import.meta.dir, "..");
 const FIXTURES = join(ROOT, "conformance/fixtures");
@@ -204,6 +204,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
   let mock: ReturnType<typeof Bun.spawn> | undefined;
   let app: ReturnType<typeof Bun.spawn> | undefined;
   let runner: FakeRunner | undefined;
+  let sandbox: ScriptedSandbox | undefined;
   let appOut = { text: () => "", done: Promise.resolve() };
   let appErr = { text: () => "", done: Promise.resolve() };
   let mockErr = { text: () => "", done: Promise.resolve() };
@@ -253,8 +254,8 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
     }
 
     if (code) {
-      const script = scriptedSandbox(c.setup?.sandbox, { dry: opts.dry });
-      runner = await wsRunner(appUrl, RUNNER_TOKEN, "eval-runner", { answer: script, onAnswer: (job, answer) => jobs.push(observeJob(jobs.length, job, answer)) });
+      sandbox = scriptedSandbox(c.setup?.sandbox, { dry: opts.dry });
+      runner = await wsRunner(appUrl, RUNNER_TOKEN, "eval-runner", { answer: sandbox, onAnswer: (job, answer) => jobs.push(observeJob(jobs.length, job, answer)) });
       const online = Date.now();
       while (!(await status()).runners?.some((r) => r.runner === "eval-runner" && r.online)) {
         if (Date.now() - online > 10_000) throw new Error("the fake runner connected but /status never listed it online");
@@ -408,7 +409,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
       uploads: final?.uploads ?? [],
       reactions: all.filter((x) => x.method === "reactions.add").map((x) => ({ name: String(x.body.name), channel: x.body.channel as string | undefined, ts: x.body.timestamp as string | undefined, call: x.n })),
     },
-    runner: { connected: !!runner, jobs },
+    runner: { connected: !!runner, jobs, refused: sandbox?.refused ?? [] },
     github: { calls: (final?.github ?? []).map((g, n) => ({ ...g, n })) },
     model: { turns: modelTurns, toolCalls },
     app: { exit, stderr: appErr.text(), stdout: appOut.text() },

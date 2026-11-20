@@ -96,7 +96,7 @@ await Promise.all(
       const file = join(outDir, c.id, `${trial}.json`);
       mkdirSync(join(outDir, c.id), { recursive: true });
       const tokens = proxy.tokens(id);
-      const result: TrialResult = { case: name, trial, passed, checks, tokens, ms: run.ms, file: shown(file) };
+      const result: TrialResult = { case: name, trial, passed, checks, tokens, ms: run.ms, file: shown(file), refused: run.observation.runner.refused };
       // What a reader needs first comes first: the verdict and the checks, then the
       // transcript (the model's turns in order), then everything observed.
       const evidence = {

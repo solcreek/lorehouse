@@ -10,7 +10,7 @@ import { listing, parseArgs, selectCases, UsageError } from "../evals/args";
 import type { Case, Observation } from "../evals/case";
 import { CASES } from "../evals/cases";
 import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, said, toldAlone, uploaded } from "../evals/checks";
-import { caseResult, COMPLETED, judge, summarize, trialPassed, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
+import { caseResult, COMPLETED, judge, summarize, table, trialPassed, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
 import { listeningPort, saidFrom, tail } from "../evals/trial";
 
 const ROOT = join(import.meta.dir, "..");
@@ -37,6 +37,7 @@ function observed(): Observation {
     slack: { calls, said: saidFrom(calls), uploads: [{ fileId: "F1", filename: "bench.png", length: 70, bytes: 70, contentType: "image/png", head: "\u0089PNG\r", channel: "C1", thread_ts: "1.0" }], reactions: [] },
     runner: {
       connected: true,
+      refused: [],
       jobs: [
         { n: 0, sandbox: "t.s", op: "guest", method: "POST", path: "/exec", command: "git -c x clone --branch main https://github.com/acme/widgets.git /workspace/repo", answer: { status: 200, exitCode: 0, stdout: "" } },
         { n: 1, sandbox: "t.s", op: "stage", answer: { status: 200 } },
@@ -165,7 +166,7 @@ test("judge: code checks, graded checks apart, and what --dry judges", async () 
 });
 
 const outcome = (name: string, pass: boolean, o: Partial<CheckOutcome> = {}): CheckOutcome => ({ name, required: true, graded: false, judged: true, pass, evidence: pass ? "ok" : `${name} failed`, ...o });
-const trial = (n: number, checks: CheckOutcome[], tokens = 100): TrialResult => ({ case: "code/x", trial: n, checks, passed: trialPassed(checks), tokens: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 }, ms: 1, file: `out/x/${n}.json` });
+const trial = (n: number, checks: CheckOutcome[], tokens = 100): TrialResult => ({ case: "code/x", trial: n, checks, passed: trialPassed(checks), tokens: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 }, ms: 1, file: `out/x/${n}.json`, refused: n === 2 ? [{ command: "ls && od -c x", part: "od -c x", why: "`od` isn't supported" }] : [] });
 
 test("pass rates: per case over trials, per check over judged trials, graded apart, against the threshold", () => {
   const trials = [
@@ -202,6 +203,9 @@ test("summarize: the JSON line's counts, failures with their files, tokens, and 
   // (1000 + 50 + 10) input-side tokens at $5/M, 200 output at $25/M.
   expect(s.tokens.usdEstimate).toBe(0.0103);
   expect(s.graded).toEqual({ model: "claude-haiku-5-5", passed: 0, of: 1 });
+  expect(s.shellRefused).toEqual([{ case: "code/x", trial: 2, command: "ls && od -c x", part: "od -c x" }]);
+  expect(table(results, trials, s)).toContain('the simulated shell refused 1 command(s)');
+  expect(table(results, trials, s)).toContain('code/x trial 2: "od -c x" in "ls && od -c x"');
   expect(s.stopped).toBeUndefined();
   const stopped = summarize({ ...base, exceeded: true });
   expect(stopped.ok).toBe(false);
@@ -359,7 +363,7 @@ test("--dry runs a case of each suite end to end: a table, one JSON line last, a
     expect(o.github.calls.some((c) => c.method === "POST" && c.path === "/repos/acme/widgets/pulls")).toBe(true);
     expect(o.app.exit).toBe(0);
     const knowledge = JSON.parse(readFileSync(join(out, runDir!, "cites-a-source", "1.json"), "utf8"));
-    expect(knowledge.observation.runner).toEqual({ connected: false, jobs: [] });
+    expect(knowledge.observation.runner).toEqual({ connected: false, jobs: [], refused: [] });
     expect(knowledge.observation.model.toolCalls[0]).toMatchObject({ turn: 1, name: "search_knowledge" });
   } finally {
     rmSync(out, { recursive: true, force: true });

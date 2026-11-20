@@ -1,20 +1,179 @@
 // The simulated shell a code case's sandbox runs (evals/shell.ts): it has to answer the
 // commands a model checks its tools with as bash and git would, or the model, rightly,
-// stops trusting the sandbox (which is what a real run against "ran:<command>" showed).
+// stops trusting the sandbox (which is what a real run against "ran:<command>" showed);
+// and what it can't run it must refuse out loud, and count.
 
 import { expect, test } from "bun:test";
-import { widgets } from "../evals/cases/widgets";
+import { BENCH, widgets, WIDGETS } from "../evals/cases/widgets";
 import { scriptedSandbox } from "../evals/sandbox";
-import { chartPng, Shell, WORKDIR } from "../evals/shell";
+import { chartPng, Shell, SUPPORTED, WORKDIR } from "../evals/shell";
 import { gitWithToken } from "../src/tools/git-credential";
 
 const URL_ = "https://github.com/acme/widgets.git";
+const ME = { GIT_AUTHOR_NAME: "octo", GIT_AUTHOR_EMAIL: "1+octo@users.noreply.github.com", GIT_COMMITTER_NAME: "octo", GIT_COMMITTER_EMAIL: "1+octo@users.noreply.github.com" };
 const fresh = () => new Shell(widgets.shell!);
-function cloned(): Shell {
+function cloned(repo = URL_): Shell {
   const sh = fresh();
-  expect(sh.exec(gitWithToken(`clone --branch main ${URL_} ${WORKDIR}`), "/").exitCode).toBe(0);
+  expect(sh.exec(gitWithToken(`clone --branch main ${repo} ${WORKDIR}`), "/").exitCode).toBe(0);
   return sh;
 }
+const README = "# widgets\n\nWidgets for Acme.\n\n## Develop\n\n    bun install\n    bun test\n";
+const TESTS_END = " 3 pass\n 0 fail\nRan 3 tests across 1 file. [21.00ms]\n";
+
+// One row: commands run in order in one checkout (as the model would, each its own exec),
+// and what the last one answers. A string is its exact stdout with exit 0; a RegExp is
+// tested against stdout; an object names what to hold (stdout, stderr or code).
+type Want = string | RegExp | { stdout?: string | RegExp; stderr?: string | RegExp; code?: number };
+const TABLE: [name: string, commands: string[], want: Want][] = [
+  // ── the shell ──
+  ["echo", ["echo hello"], "hello\n"],
+  ["a ; b and $?", ['false; echo "exit=$?"'], "exit=1\n"],
+  ["a && b runs b after success", ["true && echo yes"], "yes\n"],
+  ["a && b skips b after failure", ["false && echo yes"], { stdout: "", code: 1 }],
+  ["a || b runs b after failure", ["ls nope 2>/dev/null || echo missing"], "missing\n"],
+  ["the README's own line", ["bun install && bun test"], new RegExp(`^bun install v1\\.4\\.3[\\s\\S]*${TESTS_END.replace(/[.[\]()]/g, "\\$&")}$`)],
+  ["VAR=x cmd is that command's only", ["GREETING=hi env | grep GREETING; echo \"[$GREETING]\""], "GREETING=hi\n[]\n"],
+  ["VAR=x alone, then $VAR and ${VAR}", ['NAME=widgets; echo "$NAME ${NAME}" $NAME'], "widgets widgets widgets\n"],
+  ["export, then $VAR in a later command of the line", ["export CI=1 && echo ci=$CI"], "ci=1\n"],
+  ["an unset variable is nothing; single quotes keep the $", ["echo a${NOPE}b $NOPE 'c $NOPE'"], "ab c $NOPE\n"],
+  ["env prefix before a program", ["CI=1 NODE_ENV=test bun test | tail -3"], TESTS_END],
+  ["env VAR=x cmd", ["env FOO=bar echo ok"], "ok\n"],
+  ["2> sends stderr to a file", ["cat nope.txt 2> err.log; cat err.log"], "cat: nope.txt: No such file or directory\n"],
+  [">&2 sends stdout to stderr, and makes no file", ["echo oops >&2; ls"], { stdout: /^Makefile\nREADME\.md\nbench\ncatalog\.json\npackage\.json\nscripts\nsrc\ntest\n$/ }],
+  [">&2 is on stderr", ["echo oops >&2"], { stdout: "", stderr: "oops\n", code: 0 }],
+  ["2>&1 joins stderr to the pipe", ["cat nope.txt 2>&1 | wc -l"], "1\n"],
+  ["&> sends both to a file", ["cat README.md nope.txt &> all.log; wc -l all.log"], "9 all.log\n"],
+  ["> /dev/null", ["echo gone > /dev/null; ls /dev 2>/dev/null; echo done"], "done\n"],
+  ["a glob expands to the files it matches", ["ls scripts/*.ts"], "scripts/bench.ts\nscripts/count.ts\n"],
+  ["a glob that matches nothing stays as written", ["echo *.nope"], "*.nope\n"],
+  ["a quoted glob is not expanded", ["echo '*.md' \"*.md\" *.md"], "*.md *.md README.md\n"],
+  ["? in a glob", ["ls src/widget?.ts"], "src/widgets.ts\n"],
+  ["cp", ["cp README.md COPY.md && cat COPY.md"], README],
+  ["cp -r", ["cp -r scripts tools && ls tools"], "bench.ts\ncount-widgets.sh\ncount.ts\nplot_bench.py\n"],
+  ["mv", ["mv README.md docs.md && ls *.md"], "docs.md\n"],
+  ["mv into a directory", ["mv README.md src/ && ls src"], "README.md\nwidgets.ts\n"],
+  ["ls -l shows the exec bit a clone gives a script", ["ls -l scripts/count-widgets.sh"], /^-rwxr-xr-x 1 root root +\d+ Nov 19 10:00 scripts\/count-widgets\.sh\n$/],
+  ["chmod +x", ["chmod +x scripts/count.ts && ls -l scripts/count.ts"], /^-rwxr-xr-x /],
+  ["chmod 644 takes it away", ["chmod 644 scripts/count-widgets.sh && ls -l scripts/count-widgets.sh && test -x scripts/count-widgets.sh || echo no"], /^-rw-r--r-- .*\nno\n$/],
+  ["tee", ["echo line | tee out.txt && cat out.txt"], "line\nline\n"],
+  ["tee -a", ["echo one > log; echo two | tee -a log > /dev/null; cat log"], "one\ntwo\n"],
+  ["env", ["env | grep -c ="], /^\d+\n$/],
+  ["sleep", ["sleep 2 && echo awake"], "awake\n"],
+  ["time", ["time bun test | tail -1"], { stdout: "Ran 3 tests across 1 file. [21.00ms]\n", stderr: /real\t0m/ }],
+  ["set -e stops at the first failure", ["set -e\ncat nope.txt\necho after"], { stdout: "", code: 1 }],
+  ["a here-document", ["cat > notes.md <<'EOF'\n# Notes\nline two\nEOF\ncat notes.md"], "# Notes\nline two\n"],
+  ["cd, pwd, ls", ["cd scripts && pwd && ls"], "/workspace/repo/scripts\nbench.ts\ncount-widgets.sh\ncount.ts\nplot_bench.py\n"],
+  ["tail, wc", ['tail -2 README.md; echo "---"; wc -l README.md'], "    bun install\n    bun test\n---\n8 README.md\n"],
+  ["sed -n", ["sed -n '1,3p' README.md"], "# widgets\n\nWidgets for Acme.\n"],
+  ["cat -n | tail", ["cat -n README.md | tail -1"], "     8\t    bun test\n"],
+  ["grep -n with context", ["grep -n -A1 '^bench:' Makefile"], "1:bench:\n2-\tbun scripts/bench.ts\n"],
+  ["find -name", ["find . -name '*.ts'"], "./scripts/bench.ts\n./scripts/count.ts\n./src/widgets.ts\n./test/widgets.test.ts\n"],
+  ["a failure's exit code and stderr", ["head -1 README.md && cat nope.txt"], { stdout: "# widgets\n", stderr: "cat: nope.txt: No such file or directory\n", code: 1 }],
+  ["which, type, command -v", ["which make; type make echo; command -v python3"], "/usr/bin/make\nmake is /usr/bin/make\necho is a shell builtin\n/usr/bin/python3\n"],
+  ["what which names is a binary", ["file /usr/bin/make"], /^\/usr\/bin\/make: ELF 64-bit LSB pie executable/],
+  ["versions are each program's own", ["python3 -V; make --version | head -1; bun --version"], "Python 3.12.3\nGNU Make 4.3\n1.4.3\n"],
+  // ── the fixtures agree with themselves ──
+  ["the catalog holds what the script counts", ["cat catalog.json | grep -o w | wc -l; ./scripts/count-widgets.sh"], { stdout: new RegExp(`widgets counted: ${WIDGETS}\n$`) }],
+  ["the count, by any of its names", ["bun scripts/count.ts && bun run count && sh scripts/count-widgets.sh"], `widgets counted: ${WIDGETS}\n`.repeat(3)],
+  ["make bench prints the results file's numbers", ["make bench"], BENCH],
+  ["make -n says what it would run, and that runs", ["make -n bench && bun scripts/bench.ts | tail -1"], "bun scripts/bench.ts\nbench total 290 ms (5 benchmarks)\n"],
+  ["the plot script writes a real PNG", ['python3 scripts/plot_bench.py; echo "exit=$?"; file bench.png'], "wrote bench.png\nexit=0\nbench.png: PNG image data, 640 x 400, 8-bit/color RGB, non-interlaced\n"],
+  ["the tests name the test file's three tests", ["grep -c '^test(' test/widgets.test.ts; bun test | grep -c '(pass)'"], "3\n3\n"],
+  // ── git ──
+  ["status, clean", ["git status"], "On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n"],
+  ["status --short after an edit and a new file", ["echo x >> README.md; touch new.txt; git status --short"], " M README.md\n?? new.txt\n"],
+  ["diff --stat", ["echo 'Questions? Ask in #widgets.' >> README.md; git diff --stat"], " README.md | 1 +\n 1 file changed, 1 insertion(+)\n"],
+  ["diff, as a patch with context", ["echo 'Questions? Ask in #widgets.' >> README.md; git --no-pager diff"], /^diff --git a\/README\.md b\/README\.md\nindex [0-9a-f]{7}\.\.[0-9a-f]{7} 100644\n--- a\/README\.md\n\+\+\+ b\/README\.md\n@@ -6,3 \+6,4 @@\n \n     bun install\n     bun test\n\+Questions\? Ask in #widgets\.\n$/],
+  ["diff HEAD sees staged and unstaged", ["echo a >> README.md; git add README.md; echo b >> Makefile; git diff HEAD --name-only"], "Makefile\nREADME.md\n"],
+  ["diff is only what isn't staged; --cached what is", ["echo a >> README.md; git add README.md; echo b >> Makefile; git diff --name-only; echo --; git diff --cached --name-only"], "Makefile\n--\nREADME.md\n"],
+  ["diff main, from a branch with a commit", ["git checkout -b scout/x", "echo a >> README.md && git commit -qam 'docs: a'", "git diff main --stat"], " README.md | 1 +\n 1 file changed, 1 insertion(+)\n"],
+  ["diff HEAD~1", ["echo a >> README.md && git commit -qam 'docs: a'", "git diff HEAD~1 --name-only"], "README.md\n"],
+  ["diff origin/main...HEAD", ["echo a >> README.md && git commit -qam 'docs: a'", "echo b >> Makefile", "git diff origin/main...HEAD --name-only"], "README.md\n"],
+  ["diff of nothing", ["git diff HEAD"], ""],
+  ["nothing staged: commit says so and fails", ["echo a >> README.md; git commit -m 'docs: a'"], { code: 1, stdout: /no changes added to commit/ }],
+  ["checkout -b, add, commit, log --oneline -1", ["echo 'Questions? Ask in #widgets.' >> README.md", 'git checkout -b scout/readme && git add README.md && git commit -m "docs: say where to ask" && git log --oneline -1'], { stdout: /^\[scout\/readme ([0-9a-f]{7})\] docs: say where to ask\n 1 file changed, 1 insertion\(\+\)\n\1 docs: say where to ask\n$/, stderr: "Switched to a new branch 'scout/readme'\n" }],
+  ["after a commit the tree is clean and HEAD names the branch", ["git checkout -qb scout/x 2>/dev/null; echo a >> README.md; git commit -qam m", "git status --porcelain; git branch --show-current"], "scout/x\n"],
+  ["log origin/main..HEAD is only the commits ahead", ["echo a >> README.md && git commit -qam 'docs: a'", "echo b >> README.md && git commit -qam 'docs: b'", "git log origin/main..HEAD --format=%s"], "docs: b\ndocs: a\n"],
+  ["log origin/main..HEAD with nothing ahead", ["git log origin/main..HEAD --oneline"], ""],
+  ["log -1 --format=%H is a full id", ["git log -1 --format=%H"], /^[0-9a-f]{40}\n$/],
+  ["log --format with several fields", ["echo a >> README.md && git commit -qam 'docs: a'", "git log -1 --format='%h %an <%ae> %s'"], /^[0-9a-f]{7} octo <1\+octo@users\.noreply\.github\.com> docs: a\n$/],
+  ["log -1 --stat", ["echo a >> README.md && git commit -qam 'docs: a'", "git log -1 --stat"], /^commit [0-9a-f]{40}\nAuthor: octo <1\+octo@users\.noreply\.github\.com>\nDate: .*\n\n    docs: a\n\n README\.md \| 1 \+\n 1 file changed, 1 insertion\(\+\)\n$/],
+  ["show", ["echo a >> README.md && git commit -qam 'docs: a'", "git show"], /^commit [0-9a-f]{40}\nAuthor: octo .*\n[\s\S]*    docs: a\n\ndiff --git a\/README\.md b\/README\.md\n[\s\S]*\n\+a\n$/],
+  ["show --stat", ["echo a >> README.md && git commit -qam 'docs: a'", "git show --stat HEAD"], /    docs: a\n\n README\.md \| 1 \+\n 1 file changed, 1 insertion\(\+\)\n$/],
+  ["show HEAD:path is the file as committed", ["echo a >> README.md", "git show HEAD:README.md"], README],
+  ["checkout -- <file> puts it back", ["echo a >> README.md", "git checkout -- README.md && git status --porcelain && cat README.md"], README],
+  ["restore <file>", ["echo a >> README.md", "git restore README.md && git status --porcelain && tail -1 README.md"], "    bun test\n"],
+  ["restore --staged unstages", ["echo a >> README.md; git add .; git restore --staged README.md; git status --short"], " M README.md\n"],
+  ["reset --hard drops the edits", ["echo a >> README.md; git add README.md", "git reset --hard && git status --porcelain && tail -1 README.md"], /^HEAD is now at [0-9a-f]{7} Add sources, tests and scripts\n    bun test\n$/],
+  ["reset --hard HEAD~1 drops the commit", ["echo a >> README.md && git commit -qam 'docs: a'", "git reset --hard HEAD~1 > /dev/null && git log origin/main..HEAD --oneline && tail -1 README.md"], "    bun test\n"],
+  ["reset --soft HEAD~1 keeps the change staged", ["echo a >> README.md && git commit -qam 'docs: a'", "git reset --soft HEAD~1 && git status --short"], "M  README.md\n"],
+  ["commit --amend -m replaces the last commit", ["echo a >> README.md && git commit -qam 'wip'", "git commit --amend -qm 'docs: a' && git log origin/main..HEAD --format=%s"], "docs: a\n"],
+  ["commit --amend --no-edit takes in what is staged", ["echo a >> README.md && git commit -qam 'docs: a'", "echo b >> Makefile && git add Makefile && git commit --amend --no-edit -q && git show --stat --oneline HEAD | tail -1"], " 2 files changed, 2 insertions(+)\n"],
+  ["git grep", ["git grep -n price -- src"], "src/widgets.ts:2:export const price = (size: number) => size * 3;\n"],
+  ["the pull request tool's questions", ["git status --porcelain; git remote get-url origin; git rev-parse --abbrev-ref origin/HEAD"], `${URL_}\norigin/main\n`],
+  ["a plain clone, fetch or push has no access to GitHub", ["git fetch origin"], { code: 128, stderr: /could not read Username/ }],
+];
+
+for (const [name, commands, want] of TABLE) {
+  test(`shell: ${name}`, () => {
+    const sh = cloned();
+    let r = { exitCode: 0, stdout: "", stderr: "" };
+    for (const command of commands) r = sh.exec(command, WORKDIR, ME);
+    const w = typeof want === "string" || want instanceof RegExp ? { stdout: want, code: 0 } : want;
+    if (typeof w.stdout === "string") expect(r.stdout).toBe(w.stdout);
+    else if (w.stdout) expect(r.stdout).toMatch(w.stdout);
+    if (typeof w.stderr === "string") expect(r.stderr).toBe(w.stderr);
+    else if (w.stderr) expect(r.stderr).toMatch(w.stderr);
+    if (w.code !== undefined) expect({ code: r.exitCode, stderr: r.stderr }).toMatchObject({ code: w.code });
+    // Nothing in the table is something the shell refuses.
+    expect(sh.refused).toEqual([]);
+  });
+}
+
+// What it can't run: refused with 126 and a line that says what this is, and counted.
+const REFUSED: [command: string, part: string][] = [
+  ["python3 -c \"print('alive')\"", "python3 -c print('alive')"],
+  ["bun /tmp/t.ts", "bun /tmp/t.ts"],
+  ["make all", "make all"],
+  ["cargo test", "cargo test"],
+  ["od -c README.md", "od -c README.md"],
+  ["git stash", "git stash"],
+  ["git rebase -i origin/main", "git rebase -i origin/main"],
+  ["git add -p", "git add -p"],
+  ["sed -i 's/a/b/' README.md", "sed -i s/a/b/ README.md"],
+  ["echo $(date)", "echo $(date)"],
+  ["for f in *.md; do echo $f; done", "for f in README.md"],
+  ["(cd src && ls)", "(cd src && ls)"],
+  ["bun test &", "bun test &"],
+  ["./scripts/nope.sh", "./scripts/nope.sh"],
+];
+for (const [command, part] of REFUSED) {
+  test(`shell refuses, out loud and on the record: ${command}`, () => {
+    const sh = cloned();
+    const r = sh.exec(command, WORKDIR, ME);
+    expect(r.exitCode).toBe(126);
+    expect(r.stderr).toContain("this is the eval's simulated shell (evals/shell.ts), not bash, and it didn't run that");
+    expect(r.stderr).toContain(SUPPORTED);
+    expect(sh.refused.map((x) => x.part)).toContain(part);
+    // Never a silent success.
+    expect(r.stdout).not.toContain("alive");
+  });
+}
+
+test("a refusal inside a pipeline is still said and counted, though the pipeline's exit is its last command's", () => {
+  const sh = cloned();
+  const r = sh.exec("od -c README.md | tail -2", WORKDIR, ME);
+  expect(r).toMatchObject({ exitCode: 0, stdout: "" });
+  expect(r.stderr).toContain("eval-shell: `od` isn't supported");
+  expect(sh.refused).toEqual([{ part: "od -c README.md", why: "`od` isn't supported" }]);
+});
+
+test("a refused git command changes nothing: stash is refused, not pretended", () => {
+  const sh = cloned();
+  sh.exec("echo a >> README.md", WORKDIR, ME);
+  expect(sh.exec("git stash", WORKDIR, ME).exitCode).toBe(126);
+  expect(sh.exec("git status --short", WORKDIR, ME).stdout).toBe(" M README.md\n");
+});
 
 test("before a clone there is no checkout, and only Lorehouse's own clone reaches GitHub", () => {
   const sh = fresh();
@@ -24,115 +183,90 @@ test("before a clone there is no checkout, and only Lorehouse's own clone reache
   const own = sh.exec(`git clone ${URL_} ${WORKDIR}`, "/");
   expect(own.exitCode).toBe(128);
   expect(own.stderr).toContain("could not read Username");
-  const tool = sh.exec(gitWithToken(`clone --branch main ${URL_} ${WORKDIR}`), "/");
-  expect(tool).toMatchObject({ exitCode: 0, stdout: "" });
+  expect(sh.exec(gitWithToken(`clone https://github.com/acme/nope.git ${WORKDIR}`), "/")).toMatchObject({ exitCode: 128, stderr: expect.stringContaining("Repository not found") });
+  expect(sh.exec(gitWithToken(`clone --branch main ${URL_} ${WORKDIR}`), "/")).toMatchObject({ exitCode: 0, stdout: "" });
   expect(sh.exec(`git -C ${WORKDIR} remote get-url origin 2>/dev/null`, "/")).toEqual({ exitCode: 0, stdout: `${URL_}\n`, stderr: "" });
   expect(sh.exec(gitWithToken("fetch --prune origin")).exitCode).toBe(0);
-  expect(sh.exec("git fetch origin").exitCode).toBe(128);
-  expect(sh.exec("git config user.name 'octo' && git config user.email '1+octo@users.noreply.github.com'").exitCode).toBe(0);
+  expect(sh.exec("git config user.name 'octo' && git config user.email '1+octo@users.noreply.github.com' && git config user.name").stdout).toBe("octo\n");
+  expect(sh.read(`${WORKDIR}/.git/HEAD`)).toBe("ref: refs/heads/main\n");
 });
 
-test("the commands a model checks a sandbox with answer as a shell does", () => {
-  const sh = cloned();
-  expect(sh.exec("echo hello")).toEqual({ exitCode: 0, stdout: "hello\n", stderr: "" });
-  expect(sh.exec('pwd; echo "---"; ls').stdout).toBe("/workspace/repo\n---\nMakefile\nREADME.md\nbench\npackage.json\nscripts\nsrc\ntest\n");
-  expect(sh.exec("pwd && ls -a").stdout).toContain(".git\n");
-  const long = sh.exec("ls -la scripts/").stdout;
-  expect(long).toContain("count-widgets.sh");
-  expect(long).toMatch(/-rw-r--r-- 1 root root +\d+ Nov 19 10:00 plot_bench.py/);
-  expect(sh.exec('tail -20 README.md; echo "---"; wc -l README.md').stdout).toBe("# widgets\n\nWidgets for Acme.\n\n## Develop\n\n    bun install\n    bun test\n---\n8 README.md\n");
-  expect(sh.exec("sed -n '1,3p' README.md").stdout).toBe("# widgets\n\nWidgets for Acme.\n");
-  expect(sh.exec("cat package.json | grep -n test").stdout).toBe('5:    "test": "bun test",\n');
-  expect(sh.exec("head -1 README.md && cat nope.txt")).toEqual({ exitCode: 1, stdout: "# widgets\n", stderr: "cat: nope.txt: No such file or directory\n" });
-  expect(sh.exec("ls nope 2>/dev/null || echo missing").stdout).toBe("missing\n");
-  expect(sh.exec('false; echo "exit=$?"').stdout).toBe("exit=1\n");
-  expect(sh.exec("cd scripts && pwd && ls").stdout).toBe("/workspace/repo/scripts\nbench.ts\ncount-widgets.sh\ncount.ts\nplot_bench.py\n");
-  expect(sh.exec("find . -name '*.ts'").stdout).toBe("./scripts/bench.ts\n./scripts/count.ts\n./src/widgets.ts\n./test/widgets.test.ts\n");
-  expect(sh.exec("git grep -n price -- src").exitCode).toBe(0);
-  expect(sh.exec("which python3 git && which cargo").exitCode).toBe(1);
-  // Not installed is said the way bash says it; nothing pretends to have run.
-  expect(sh.exec("cargo test")).toEqual({ exitCode: 127, stdout: "", stderr: "bash: line 1: cargo: command not found\n" });
-  expect(sh.exec("echo $(date)").exitCode).toBe(2);
-  expect(sh.exec("ls && grep -n -A5 '^bench:' Makefile").stdout).toEndWith("test\n1:bench:\n2-\tbun run scripts/bench.ts\n");
-  expect(sh.exec("ls -l --time-style=full-iso Makefile").exitCode).toBe(0);
+test("a clone of acme/gadgets is gadgets, with its own tests, not the widgets files", () => {
+  const sh = cloned("https://github.com/acme/gadgets.git");
+  expect(sh.exec("ls").stdout).toBe("README.md\npackage.json\nsrc\ntest\n");
+  expect(sh.exec("head -1 README.md; bun test | grep -c '(pass)'").stdout).toBe("# gadgets\n2\n");
+  expect(sh.exec("git remote get-url origin").stdout).toBe("https://github.com/acme/gadgets.git\n");
+  // A widgets script isn't here, and isn't run.
+  expect(sh.exec("make bench").exitCode).toBe(126);
 });
 
-test("what is installed is there, says its own version, and never pretends to have run something it can't", () => {
-  const sh = cloned();
-  expect(sh.exec("python3 -V; make --version | head -1; bun --version").stdout).toBe("Python 3.12.3\nGNU Make 4.3\n1.4.3\n");
-  expect(sh.exec("which make; type make echo; command -v python3").stdout).toBe("/usr/bin/make\nmake is /usr/bin/make\necho is a shell builtin\n/usr/bin/python3\n");
-  expect(sh.exec("ls -l /usr/bin/python3 && file /usr/bin/make").stdout).toMatch(/^-rw-r--r-- 1 root root +24 Nov 19 10:00 \/usr\/bin\/python3\n\/usr\/bin\/make: ELF 64-bit LSB pie executable/);
-  // Code this shell can't run is refused out loud: exit 126, never a silent success.
-  for (const command of ["python3 -c \"print('alive')\"", "bun /tmp/t.ts", "make -d bench", "make all"]) {
-    const r = sh.exec(command);
-    expect([command, r.exitCode, r.stdout]).toEqual([command, 126, ""]);
-    expect(r.stderr).toContain("restricted in this sandbox");
-  }
-  expect(sh.exec("make bench").stdout).toEndWith("bench total 290 ms (5 benchmarks)\n");
-  expect(sh.exec("make -n bench").stdout).toBe("bun run scripts/bench.ts\n");
-  expect(sh.exec("cat scripts/bench.ts").exitCode).toBe(0);
-});
-
-test("a case's programs print their own output and leave their files; a chart is a real PNG", () => {
-  const sh = cloned();
-  expect(sh.exec("./scripts/count-widgets.sh").stdout).toBe("widgets counted: 4173\n");
-  expect(sh.exec("bun test").stdout).toContain(" 3 pass\n 0 fail\n");
-  expect(sh.exec("ls bench.png").exitCode).toBe(2);
-  expect(sh.exec('python3 scripts/plot_bench.py; echo "exit=$?"; ls -la bench.png').stdout).toMatch(/^wrote bench\.png\nexit=0\n-rw-r--r-- 1 root root +\d+ Nov 19 10:00 bench\.png\n$/);
-  expect(sh.exec("file bench.png").stdout).toBe("bench.png: PNG image data, 640 x 400, 8-bit/color RGB, non-interlaced\n");
+test("a chart is a real PNG", () => {
   const png = chartPng();
   expect(Buffer.from(png.subarray(0, 8)).toString("latin1")).toBe("\u0089PNG\r\n\u001a\n");
+  expect(Buffer.from(png).readUInt32BE(16)).toBe(640);
   expect(png.byteLength).toBeGreaterThan(500);
-  // Bun decodes it: the chunks and their checksums are right.
-  expect(new Bun.CryptoHasher("sha1").update(png).digest("hex")).toHaveLength(40);
 });
 
-test("a small change: edit, status, branch, add, commit, log; the pull request tool's questions", () => {
+// ── what a pull request publishes is the checkout's own ─────────────────────
+
+test("publishable: nothing committed is 'no commits to publish'; a commit is its files, diffstat, author and patch", () => {
+  const none = fresh();
+  expect(none.publishable("main")).toMatchObject({ status: 409, error: expect.stringContaining("isn't a git checkout") });
   const sh = cloned();
-  expect(sh.exec("git status --porcelain").stdout).toBe("");
-  expect(sh.exec("git status").stdout).toBe("On branch main\nnothing to commit, working tree clean\n");
-  expect(sh.exec("echo 'Questions? Ask in #widgets.' >> README.md").exitCode).toBe(0);
-  expect(sh.exec("tail -1 README.md").stdout).toBe("Questions? Ask in #widgets.\n");
-  expect(sh.exec("git status --short").stdout).toBe(" M README.md\n");
-  expect(sh.exec("git diff --stat").stdout).toBe(" README.md | 1 +\n 1 file changed, 1 insertion(+)\n");
-  expect(sh.exec("git --no-pager diff").stdout).toMatch(/^diff --git a\/README\.md b\/README\.md\nindex [0-9a-f]{7}\.\.[0-9a-f]{7} 100644\n--- a\/README\.md\n\+\+\+ b\/README\.md\n@@ -6,3 \+6,4 @@\n \n     bun install\n     bun test\n\+Questions\? Ask in #widgets\.\n$/);
-  expect(sh.exec("git show HEAD:README.md").stdout).toBe("# widgets\n\nWidgets for Acme.\n\n## Develop\n\n    bun install\n    bun test\n");
-  expect(sh.exec("cat -n README.md | tail -1").stdout).toBe("     9\tQuestions? Ask in #widgets.\n");
-  // Nothing staged: git says so and fails, as it does.
-  expect(sh.exec('git commit -m "docs: say where to ask"')).toMatchObject({ exitCode: 1 });
-  const done = sh.exec('git checkout -b scout/readme-questions && git add README.md && git commit -m "docs: say where to ask" && git log --oneline -1');
-  expect(done.exitCode).toBe(0);
-  expect(done.stderr).toBe("Switched to a new branch 'scout/readme-questions'\n");
-  expect(done.stdout).toMatch(/^\[scout\/readme-questions ([0-9a-f]{7})\] docs: say where to ask\n 1 file changed, 1 insertion\(\+\)\n\1 docs: say where to ask\n$/);
-  expect(sh.exec("git status --porcelain").stdout).toBe("");
-  expect(sh.exec("git branch --show-current").stdout).toBe("scout/readme-questions\n");
-  expect(sh.exec("git log --oneline").stdout.split("\n").length).toBe(4);
-  expect(sh.exec("git remote get-url origin").stdout).toBe(`${URL_}\n`);
-  expect(sh.exec("git rev-parse --abbrev-ref origin/HEAD").stdout).toBe("origin/main\n");
-  expect(sh.read(`${WORKDIR}/.git/HEAD`)).toBe("ref: refs/heads/scout/readme-questions\n");
-  expect(sh.exec("git push origin HEAD").exitCode).toBe(128);
-  // A new file, written by a here-document, is untracked until added.
-  expect(sh.exec("cat > notes.md <<'EOF'\n# Notes\nline two\nEOF\ngit status --short").stdout).toBe("?? notes.md\n");
-  expect(sh.exec("cat notes.md").stdout).toBe("# Notes\nline two\n");
-  expect(sh.exec("git add -A && git commit -qm 'add notes' ; git status --porcelain").stdout).not.toContain("notes.md");
+  expect(sh.publishable("main")).toEqual({ status: 409, error: "no commits to publish: HEAD has nothing that isn't on GitHub already (commit first?)" });
+  // An edit that isn't committed is still nothing to publish.
+  sh.exec("echo 'Questions? Ask in #widgets.' >> README.md", WORKDIR, ME);
+  expect(sh.publishable("main")).toMatchObject({ status: 409 });
+  sh.exec("git checkout -b scout/readme && git commit -am 'docs: say where to ask'", WORKDIR, ME);
+  const staged = sh.publishable("main");
+  if ("error" in staged) throw new Error(staged.error);
+  expect(staged).toMatchObject({ commits: 1, files: ["README.md"], stat: " README.md | 1 +\n 1 file changed, 1 insertion(+)\n", authors: ["octo <1+octo@users.noreply.github.com>|octo <1+octo@users.noreply.github.com>"] });
+  expect(staged.patch).toContain("+Questions? Ask in #widgets.\n");
+  expect(staged.sha).toMatch(/^[0-9a-f]{40}$/);
+  expect(staged.sha).toBe(sh.exec("git rev-parse HEAD").stdout.trim());
+  expect(staged.baseSha).toBe(sh.exec("git rev-parse origin/main").stdout.trim());
+  // A second commit by someone else is counted and named.
+  sh.exec("echo more >> Makefile && git commit -qam 'chore: more'", WORKDIR, { ...ME, GIT_AUTHOR_NAME: "Mallory", GIT_AUTHOR_EMAIL: "m@example.com" });
+  expect(sh.publishable("main")).toMatchObject({ commits: 2, files: ["Makefile", "README.md"], authors: [expect.stringContaining("octo <"), "Mallory <m@example.com>|octo <1+octo@users.noreply.github.com>"] });
+  expect(sh.publishable("release/1.x")).toMatchObject({ status: 409 });
 });
 
-test("the scripted sandbox: a refusal, an exec rule, the shell, files written and read back; the rest is the fake runner's", () => {
-  const b64 = (v: unknown) => Buffer.from(typeof v === "string" ? v : JSON.stringify(v)).toString("base64");
-  const exec = (command: string, cwd = WORKDIR) => ({ id: "j", sandbox: "s", op: "guest", method: "POST", path: "/exec", bodyBase64: b64({ command, cwd }) });
-  const file = (method: string, path: string, body?: string) => ({ id: "j", sandbox: "s", op: "guest", method, path: `/file?path=${encodeURIComponent(path)}`, bodyBase64: body === undefined ? undefined : b64(body) });
-  const result = (a: { bodyBase64?: string } | undefined) => JSON.parse(Buffer.from(a!.bodyBase64!, "base64").toString());
+const b64 = (v: unknown) => Buffer.from(typeof v === "string" ? v : JSON.stringify(v)).toString("base64");
+const exec = (command: string, cwd = WORKDIR) => ({ id: "j", sandbox: "s", op: "guest", method: "POST", path: "/exec", bodyBase64: b64({ command, cwd, env: ME }) });
+const file = (method: string, path: string, body?: string) => ({ id: "j", sandbox: "s", op: "guest", method, path: `/file?path=${encodeURIComponent(path)}`, bodyBase64: body === undefined ? undefined : b64(body) });
+const result = (a: { bodyBase64?: string } | undefined) => JSON.parse(Buffer.from(a!.bodyBase64!, "base64").toString());
+
+test("the scripted sandbox: a stage is the checkout's commits, a push must restate it, and nothing committed is the host's refusal", () => {
+  const sb = scriptedSandbox(widgets);
+  const stage = (branch: string) => sb({ id: "j", sandbox: "s", op: "stage", bodyBase64: b64({ owner: "acme", name: "widgets", base: "main", branch, token: "t" }) })!;
+  sb(exec(gitWithToken(`clone ${URL_} ${WORKDIR}`), "/"));
+  // Nothing committed: what sandboxd says, which open_pull_request hands the model.
+  expect(stage("scout/x")).toEqual({ id: "j", status: 409, error: "no commits to publish: HEAD has nothing that isn't on GitHub already (commit first?)" });
+  sb(exec("echo 'Questions? Ask in #widgets.' >> README.md && git commit -qam 'docs: say where to ask'"));
+  const staged = result(stage("scout/x"));
+  expect(staged).toMatchObject({ commits: 1, files: ["README.md"], patchTruncated: false, authors: ["octo <1+octo@users.noreply.github.com>|octo <1+octo@users.noreply.github.com>"] });
+  expect(staged.stat).toContain("README.md | 1 +");
+  expect(staged.patch).toContain("+Questions? Ask in #widgets.");
+  expect(staged.diffSha256).toMatch(/^[0-9a-f]{64}$/);
+  const push = (o: object) => sb({ id: "j", sandbox: "s", op: "push", bodyBase64: b64({ owner: "acme", name: "widgets", token: "t", ...o }) })!;
+  expect(push({ stage: staged.stage, sha: "0".repeat(40), branch: "scout/x" }).status).toBe(403);
+  expect(push({ stage: staged.stage, sha: staged.sha, branch: "scout/x" }).status).toBe(404); // a stage is used once
+  const again = result(stage("scout/x"));
+  expect(result(push({ stage: again.stage, sha: again.sha, branch: "scout/x" }))).toEqual({ sha: staged.sha, branch: "scout/x" });
+  // With no shell (under --dry), stage and push are the fake runner's.
+  expect(scriptedSandbox(widgets, { dry: true })({ id: "j", sandbox: "s", op: "stage" })).toBeUndefined();
+});
+
+test("the scripted sandbox: a refusal, an exec rule, the shell, files, background jobs, and what the shell refused", () => {
   const sb = scriptedSandbox({ ...widgets, exec: [{ match: /^make test$/, exitCode: 2, stderr: "boom" }], refuse: [{ command: /bench/, status: 422, code: "resource_over_maximum", error: "too big" }] });
   expect(sb(exec("make bench"))).toEqual({ id: "j", status: 422, code: "resource_over_maximum", error: "too big" });
   expect(sb({ id: "j", sandbox: "s", op: "guest", method: "POST", path: "/jobs", bodyBase64: b64({ id: "b", command: "make bench" }) })?.code).toBe("resource_over_maximum");
   expect(result(sb(exec("make test")))).toEqual({ exitCode: 2, stdout: "", stderr: "boom" });
   expect(result(sb(exec("echo hi", "/")))).toEqual({ exitCode: 0, stdout: "hi\n", stderr: "" });
-  // Stage and push stay the fake runner's.
-  expect(sb({ id: "j", sandbox: "s", op: "stage" })).toBeUndefined();
   expect(result(sb(exec(gitWithToken(`clone ${URL_} ${WORKDIR}`), "/"))).exitCode).toBe(0);
-  expect(Buffer.from(sb(file("GET", `${WORKDIR}/README.md`))!.bodyBase64!, "base64").toString()).toStartWith("# widgets\n");
+  expect(Buffer.from(sb(file("GET", `${WORKDIR}/README.md`))!.bodyBase64!, "base64").toString()).toBe(README);
   // With a shell, a file that isn't there isn't: no path reads as a placeholder PNG.
-  expect(sb(file("GET", `${WORKDIR}/bench.png`))).toEqual({ id: "j", status: 404 });
+  expect(sb(file("GET", `${WORKDIR}/chart.png`))).toEqual({ id: "j", status: 404 });
   expect(sb(file("PUT", `${WORKDIR}/new.txt`, "made"))?.status).toBe(200);
   expect(result(sb(exec("cat new.txt && git status --short")))).toMatchObject({ stdout: "made?? new.txt\n" });
   // A background job prints what its command prints, as it runs: nothing at the start,
@@ -152,12 +286,16 @@ test("the scripted sandbox: a refusal, an exec rule, the shell, files written an
   expect(sb(jobs("GET", "/jobs/nope?tailBytes=0"))?.status).toBe(404);
   sb(jobs("POST", "/jobs", { id: "long-1", command: "bun test", cwd: WORKDIR }));
   expect(result(sb(jobs("POST", "/jobs/long-1/cancel")))).toMatchObject({ state: "cancelled", exitCode: 143 });
+  // What the shell refused is on the sandbox's record, with the whole command line.
+  expect(sb.refused).toEqual([]);
+  expect(result(sb(exec("ls && python3 -c 'print(1)'"))).exitCode).toBe(126);
+  expect(sb.refused).toEqual([{ command: "ls && python3 -c 'print(1)'", part: "python3 -c print(1)", why: expect.stringContaining("`python3` runs only the repository's own scripts") }]);
   // With no rule naming what to refuse, every call into the sandbox is refused.
   expect(scriptedSandbox({ refuse: [{ status: 409, code: "resources_mismatch", error: "x" }] })(file("GET", "/a.png"))?.code).toBe("resources_mismatch");
   // Under --dry there is no shell: the scripted model's sandbox is the fake runner's.
   const dry = scriptedSandbox(widgets, { dry: true });
   expect(dry(exec("echo hi"))).toBeUndefined();
-  expect(dry(jobs("POST", "/jobs", { id: "b", command: "make all" }))).toBeUndefined();
   expect(dry(file("GET", `${WORKDIR}/bench.png`))).toBeUndefined();
+  expect(dry(jobs("POST", "/jobs", { id: "b", command: "make all" }))).toBeUndefined();
   expect(scriptedSandbox({})(exec("echo hi"))).toBeUndefined();
 });
