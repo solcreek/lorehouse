@@ -147,7 +147,7 @@ const REFUSED: [command: string, part: string, code: number, said: string | RegE
   ["make all", "make all", 2, "make: *** No rule to make target 'all'.  Stop.\n"],
   ["make -d bench", "make -d bench", 2, /^make: invalid option -- 'd'\nUsage: make/],
   ["git stash", "git stash", 1, "git: 'stash' is not a git command. See 'git --help'.\n"],
-  ["git rebase -i origin/main", "git rebase -i origin/main", 1, "git: 'rebase' is not a git command. See 'git --help'.\n"],
+  ["git cherry-pick HEAD", "git cherry-pick HEAD", 1, "git: 'cherry-pick' is not a git command. See 'git --help'.\n"],
   ["git add -p", "git add -p", 129, /^error: unknown option `p'\nusage: git add/],
   ["sed -i 's/a/b/' README.md", "sed -i s/a/b/ README.md", 1, /^sed: invalid option -- 'i'\nUsage: sed/],
   ["sed 's/a/b/' README.md", "sed s/a/b/ README.md", 1, "sed: -e expression #1, char 1: unknown command: `s'\n"],
@@ -233,6 +233,168 @@ test("nothing the model can see says it is being evaluated", () => {
   }
   expect(seen.length).toBeGreaterThan(80);
   for (const [where, text] of seen) expect([where, GIVEAWAY.exec(text)?.[0] ?? null]).toEqual([where, null]);
+});
+
+// ── the second review's rows: each was answered wrong in silence ─────────────
+const ROWS2: [name: string, commands: string[], want: Want][] = [
+  ["printf reuses its format for each argument", ["printf '%s\\n' one two three"], "one\ntwo\nthree\n"],
+  ["printf with two directives cycles in pairs", ["printf '%s=%d\\n' a 1 b 2"], "a=1\nb=2\n"],
+  ["printf with no arguments prints the format once", ["printf 'done\\n'"], "done\n"],
+  ["printf %%", ["printf '100%%\\n'"], "100%\n"],
+  ["[ 1 -eq 2 ] is false", ["[ 1 -eq 2 ] && echo yes || echo no"], "no\n"],
+  ["test 3 -gt 5 is false", ["test 3 -gt 5; echo $?"], "1\n"],
+  ["test's numeric operators", ["test 3 -lt 5 && test 5 -ge 5 && test 2 -ne 3 && [ 4 -le 4 ] && echo ok"], "ok\n"],
+  ["test's string operators and !", ["[ abc = abc ] && [ abc != abd ] && [ ! -f nope ] && [ -n x ] && [ -z '' ] && echo ok"], "ok\n"],
+  ["test of a non-number is an error, not true", ["[ abc -eq 1 ]"], { code: 2, stderr: "sh: 1: [: Illegal number: abc\n" }],
+  ["find prints paths under the start point as given", ["find src -name '*.ts'"], "src/widgets.ts\n"],
+  ["find . keeps the ./", ["find . -name 'widgets*'"], "./src/widgets.ts\n./test/widgets.test.ts\n"],
+  ["find -type d", ["find . -maxdepth 1 -type d"], ".\n./bench\n./scripts\n./src\n./test\n"],
+  ["find -type f -maxdepth 1", ["find . -maxdepth 1 -type f"], "./Makefile\n./README.md\n./catalog.json\n./package.json\n"],
+  ["tail -n +3 is from the third line on", ["tail -n +7 README.md"], "    bun install\n    bun test\n"],
+  ["head -n -N is all but the last N", ["head -n -6 README.md"], "# widgets\n\n"],
+  ["tail -c", ["tail -c 5 README.md"], "test\n"],
+  ["echo -ne", ["echo -ne 'a\\tb\\n'"], "a\tb\n"],
+  ["echo -e, and -n", ["echo -e 'x\\ny'; echo -n z; echo"], "x\ny\nz\n"],
+  ["echo of a word that only looks like a flag prints it", ["echo -Z hello"], "-Z hello\n"],
+  ["grep -o prints each match on its own line", ["grep -o 'bun [a-z]*' README.md"], "bun install\nbun test\n"],
+  ["grep -c of two files counts each", ["grep -c bun README.md Makefile"], "README.md:2\nMakefile:1\n"],
+  ["grep -c of one file is a bare count", ["grep -c bun README.md"], "2\n"],
+  ["grep -w", ["printf 'test\\ntesting\\n' | grep -w test"], "test\n"],
+  ["grep -h drops the names, -H adds one", ["grep -h widgets README.md package.json | head -1; grep -H Acme README.md"], "# widgets\nREADME.md:Widgets for Acme.\n"],
+  ["grep -e", ["grep -c -e install -e Acme README.md"], "2\n"],
+  ["a backslash-newline continues the line", ["echo one \\\n  two && \\\n  echo three"], "one two\nthree\n"],
+  ["an unquoted $VAR is split into words", ["FILES='README.md Makefile'; wc -l $FILES | head -2"], "8 README.md\n2 Makefile\n"],
+  ["a quoted $VAR is one word", ["FILES='README.md Makefile'; wc -l \"$FILES\""], { code: 1, stderr: "wc: README.md Makefile: No such file or directory\n" }],
+  ["an unquoted $VAR joins the text around it", ["D=scripts; ls $D/*.sh; EXT=ts; ls src/widgets.$EXT"], "scripts/count-widgets.sh\nsrc/widgets.ts\n"],
+  ["$VAR in an unquoted here-document is expanded", ["NAME=widgets\ncat <<EOF\nrepo: $NAME (${NAME})\nEOF"], "repo: widgets (widgets)\n"],
+  ["$VAR in a quoted here-document is not", ["NAME=widgets\ncat <<'EOF'\nrepo: $NAME\nEOF"], "repo: $NAME\n"],
+  ["set -u stops at a variable that isn't set", ["set -u; echo \"$NOPE\"; echo after"], { stdout: "", code: 2, stderr: "sh: 1: NOPE: parameter not set\n" }],
+  ["set -o pipefail makes a pipeline fail with its first failure", ["set -o pipefail; cat nope.txt 2>/dev/null | wc -l; echo \"exit=$?\""], "0\nexit=1\n"],
+  ["set -euo pipefail, the usual first line", ["set -euo pipefail\necho ok"], "ok\n"],
+  ["ls -lah", ["ls -lah catalog.json"], /^-rw-r--r-- 1 root root +961 Nov 19 10:00 catalog\.json\n$/],
+  ["ls -lh of a directory is 4.0K", ["ls -lh | grep src"], /^drwxr-xr-x 2 root root  4\.0K Nov 19 10:00 src\n$/],
+  ["ls -r", ["ls -r src test"], "src:\nwidgets.ts\n\ntest:\nwidgets.test.ts\n"],
+  ["sort -r, -u, -n", ["printf '10\\n9\\n9\\n' | sort -n -u; printf 'a\\nb\\n' | sort -r"], "9\n10\nb\na\n"],
+  ["mkdir without -p needs the parent", ["mkdir a/b"], { code: 1, stderr: "mkdir: cannot create directory 'a/b': No such file or directory\n" }],
+  ["mkdir -p", ["mkdir -p a/b && test -d a/b && echo made"], "made\n"],
+  ["chmod u+x and a-x", ["chmod u+x scripts/count.ts && test -x scripts/count.ts && chmod a-x scripts/count.ts && test -x scripts/count.ts || echo off"], "off\n"],
+  ["uname -sr", ["uname -sr; uname -m"], "Linux 6.8.0\nx86_64\n"],
+  // git: the index is what `add` saw.
+  ["add, edit again, commit: the commit holds what was added", ["echo first >> README.md && git add README.md && echo second >> README.md && git commit -qm 'docs: first'", "git show HEAD:README.md | tail -1; git status --short; tail -1 README.md"], "first\n M README.md\nsecond\n"],
+  ["status shows both columns for a file added and then edited", ["echo a >> README.md && git add README.md && echo b >> README.md && git status --short"], "MM README.md\n"],
+  ["diff --cached is what was added; diff is what came after", ["echo a >> README.md && git add README.md && echo b >> README.md", "git diff --cached | tail -1; git diff | tail -1"], "+a\n+b\n"],
+  ["a new file, added: A, then committed with the content it had", ["echo one > new.txt && git add new.txt && echo two >> new.txt && git status --short && git commit -qm new && git show HEAD:new.txt"], "AM new.txt\none\n"],
+  ["checkout -- <file> goes back to what was added", ["echo a >> README.md && git add README.md && echo b >> README.md && git checkout -- README.md && tail -1 README.md"], "a\n"],
+  ["commit -F - takes the message from stdin", ["echo a >> README.md && git add README.md && printf 'docs: from stdin\\n\\nbody line\\n' | git commit -q -F -", "git log -1 --format=%s; git log -1 --format=%B | tail -1"], "docs: from stdin\nbody line\n"],
+  ["commit -F <file>", ["echo 'docs: from a file' > /tmp/msg && echo a >> README.md && git commit -qa -F /tmp/msg && git log -1 --format=%s"], "docs: from a file\n"],
+  ["commit with no message says how to give one", ["echo a >> README.md && git commit -a"], { code: 1, stderr: /Please supply the message using either -m or -F option/ }],
+  ["rebase onto what HEAD already has is up to date", ["git checkout -qb scout/x && echo a >> README.md && git commit -qam 'docs: a' && git rebase origin/main"], "Current branch scout/x is up to date.\n"],
+];
+for (const [name, commands, want] of ROWS2) {
+  test(`shell: ${name}`, () => {
+    const sh = cloned();
+    let r = { exitCode: 0, stdout: "", stderr: "" };
+    for (const command of commands) r = sh.exec(command, WORKDIR, ME);
+    const w = typeof want === "string" || want instanceof RegExp ? { stdout: want, code: 0 } : want;
+    if (typeof w.stdout === "string") expect(r.stdout).toBe(w.stdout);
+    else if (w.stdout) expect(r.stdout).toMatch(w.stdout);
+    if (typeof w.stderr === "string") expect(r.stderr).toBe(w.stderr);
+    else if (w.stderr) expect(r.stderr).toMatch(w.stderr);
+    if (w.code !== undefined) expect({ code: r.exitCode, stderr: r.stderr }).toMatchObject({ code: w.code });
+    expect(sh.refused).toEqual([]);
+  });
+}
+
+test("git rebase --exec re-authors the commits ahead, the one form the product tells the model to run", () => {
+  const sh = cloned();
+  const mallory = { ...ME, GIT_AUTHOR_NAME: "Mallory", GIT_AUTHOR_EMAIL: "m@example.com", GIT_COMMITTER_NAME: "Mallory", GIT_COMMITTER_EMAIL: "m@example.com" };
+  sh.exec("git checkout -qb scout/x && echo a >> README.md && git commit -qam 'docs: a' && echo b >> Makefile && git commit -qam 'chore: b'", WORKDIR, mallory);
+  expect(sh.publishable("main")).toMatchObject({ commits: 2, authors: ["Mallory <m@example.com>|Mallory <m@example.com>", "Mallory <m@example.com>|Mallory <m@example.com>"] });
+  // What open_pull_request's error says to run (src/tools/pull-request.ts), as octo.
+  const r = sh.exec("git rebase --exec 'git commit --amend --no-edit --reset-author' origin/main", WORKDIR, ME);
+  expect(r).toEqual({ exitCode: 0, stdout: "Executing: git commit --amend --no-edit --reset-author\n".repeat(2), stderr: "Successfully rebased and updated refs/heads/scout/x.\n" });
+  const me = "octo <1+octo@users.noreply.github.com>";
+  expect(sh.publishable("main")).toMatchObject({ commits: 2, authors: [`${me}|${me}`, `${me}|${me}`], files: ["Makefile", "README.md"] });
+  expect(sh.exec("git log origin/main..HEAD --format='%an %s'", WORKDIR, ME).stdout).toBe("octo chore: b\nocto docs: a\n");
+  expect(sh.exec("git status --porcelain", WORKDIR, ME).stdout).toBe("");
+  expect(sh.refused).toEqual([]);
+  // Any other command to --exec isn't run, and says it failed.
+  const other = sh.exec("git rebase --exec 'bun test' origin/main", WORKDIR, ME);
+  expect(other.exitCode).toBe(1);
+  expect(other.stderr).toContain("warning: execution failed: bun test");
+  expect(sh.refused.map((x) => x.part)).toEqual(["git rebase --exec bun test origin/main"]);
+});
+
+// The rule, held for every command: an option or operator it doesn't implement is
+// refused in the tool's own words and recorded. Never ignored, never approximated.
+test("every command refuses an option it doesn't implement", () => {
+  // [command, what the model sees (start), exit code]
+  const walk: [string, string, number][] = [
+    ["ls -Z", "ls: invalid option -- 'Z'\nTry 'ls --help' for more information.", 2],
+    ["ls --zzz", "ls: unrecognized option '--zzz'", 2],
+    ["ls -l --time-style=full-iso", "ls: unrecognized option '--time-style=full-iso'", 2],
+    ["ls -R", "ls: invalid option -- 'R'", 2],
+    ["cat -Z README.md", "cat: invalid option -- 'Z'", 1],
+    ["head -Z README.md", "head: invalid option -- 'Z'", 1],
+    ["tail -f README.md", "tail: invalid option -- 'f'", 1],
+    ["wc -Z README.md", "wc: invalid option -- 'Z'", 1],
+    ["sort -k2 README.md", "sort: invalid option -- 'k'", 2],
+    ["mkdir -Z x", "mkdir: invalid option -- 'Z'", 1],
+    ["touch -d yesterday x", "touch: invalid option -- 'd'", 1],
+    ["rm -i README.md", "rm: invalid option -- 'i'", 1],
+    ["cp -Z README.md x", "cp: invalid option -- 'Z'", 1],
+    ["mv -n README.md x", "mv: invalid option -- 'n'", 1],
+    ["tee -Z x", "tee: invalid option -- 'Z'", 1],
+    ["sleep -Z 1", "sleep: invalid option -- 'Z'", 1],
+    ["which -Z git", "which: invalid option -- 'Z'", 1],
+    ["uname -Z", "uname: invalid option -- 'Z'", 1],
+    ["whoami -Z", "whoami: invalid option -- 'Z'", 1],
+    ["hostname -Z", "hostname: invalid option -- 'Z'", 1],
+    ["date -Z", "date: invalid option -- 'Z'", 1],
+    ["date +%s", "date: invalid date '+%s'", 1],
+    ["basename -Z x", "basename: invalid option -- 'Z'", 1],
+    ["dirname -Z x", "dirname: invalid option -- 'Z'", 1],
+    ["file -Z README.md", "file: invalid option -- 'Z'", 1],
+    ["pwd -Z", "sh: 1: pwd: Illegal option -Z", 2],
+    ["cd -Z /tmp", "sh: 1: cd: Illegal option -Z", 2],
+    ["unset -Z X", "sh: 1: unset: Illegal option -Z", 2],
+    ["type -Z ls", "sh: 1: type: Illegal option -Z", 2],
+    ["command -Z ls", "sh: 1: command: Illegal option -Z", 2],
+    ["export -p", "sh: 1: export: Illegal option -p", 2],
+    ["set -x", "sh: 1: set: Illegal option -x", 2],
+    ["set -o errexit", "sh: 1: set: Illegal option -o errexit", 2],
+    ["printf -Z x", "sh: 1: printf: Illegal option -Z", 2],
+    ["printf '%5.2f\\n' 3", "sh: 1: printf: %5: invalid directive", 1],
+    ["env -i ls", "env: invalid option -- 'i'", 125],
+    ["time -p ls", "sh: 1: -p: not found", 127],
+    ["test -Z x", "sh: 1: test: -Z: unexpected operator", 2],
+    ["[ a -ef b ]", "sh: 1: [: -ef: unexpected operator", 2],
+    ["[ -f README.md -a -f Makefile ]", "sh: 1: [: -a: unexpected operator", 2],
+    ["test a = b -o c = c", "sh: 1: test: -o: unexpected operator", 2],
+    ["find . -newer README.md", "find: unknown predicate `-newer'", 1],
+    ["find . -name '*.ts' -exec cat {} +", "find: unknown predicate `-exec'", 1],
+    ["find . -type l", "find: Unknown argument to -type: l", 1],
+    ["grep -P 'a+' README.md", "grep: invalid option -- 'P'", 2],
+    ["grep --include='*.ts' -r x .", "grep: unrecognized option '--include=*.ts'", 2],
+    ["sed -Z README.md", "sed: invalid option -- 'Z'", 1],
+    ["git status --ignored", "error: unknown option `ignored'\nusage: git status [<options>]", 129],
+    ["git log --graph", "error: unknown option `graph'", 129],
+    ["git diff -U10", "error: unknown switch `U'", 129],
+    ["git commit --fixup HEAD", "error: unknown option `fixup'", 129],
+    ["git branch -vv", "error: unknown switch `v'", 129],
+    ["git checkout --orphan x", "error: unknown option `orphan'", 129],
+    ["git reset --merge", "error: unknown option `merge'", 129],
+    ["git rebase -i origin/main", "error: unknown switch `i'", 129],
+    ["git rev-parse --symbolic-full-name HEAD", "error: unknown option `symbolic-full-name'", 129],
+  ];
+  for (const [command, said, code] of walk) {
+    const sh = cloned();
+    const r = sh.exec(command, WORKDIR, ME);
+    expect([command, r.exitCode, r.stderr.slice(0, said.length), r.stdout]).toEqual([command, code, said, ""]);
+    expect([command, sh.refused.length]).toEqual([command, 1]);
+    expect(sh.refused[0]!.said).toBe(r.stderr.trim());
+    expect(r.stderr).not.toMatch(GIVEAWAY);
+  }
 });
 
 test("a refused git command changes nothing: stash is refused, not pretended", () => {

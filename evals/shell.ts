@@ -52,9 +52,46 @@ export type ExecResult = { exitCode: number; stdout: string; stderr: string };
 export type Refused = { part: string; why: string; said: string };
 
 export const WORKDIR = "/workspace/repo";
-const BUILTIN = ["echo", "printf", "pwd", "cd", "test", "[", "true", "false", "command", "export", "unset", "type", "set", ":"];
+const BUILTIN = ["echo", "printf", "pwd", "cd", "test", "[", "true", "false", "command", "export", "unset", "type", "set", "exec", ":"];
 const COMMANDS = ["ls", "cat", "head", "tail", "wc", "sed", "grep", "find", "file", "mkdir", "touch", "rm", "cp", "mv", "chmod", "tee", "env", "sleep", "time", "which", "git", "sort", "uname", "whoami", "hostname", "date", "basename", "dirname"];
-const GIT = ["clone", "status", "add", "commit", "diff", "show", "log", "branch", "checkout", "switch", "restore", "reset", "rev-parse", "remote", "config", "fetch", "ls-files", "grep", "rm", "mv"];
+const GIT = ["rebase", "clone", "status", "add", "commit", "diff", "show", "log", "branch", "checkout", "switch", "restore", "reset", "rev-parse", "remote", "config", "fetch", "ls-files", "grep", "rm", "mv"];
+// The options each command implements. The rule (shell.ts's own): a command validates its
+// flags, operators and arguments against what it implements, and refuses the rest in the
+// tool's own words. Nothing is ignored and nothing is approximated: a flag that would
+// change the output and isn't here would make the answer wrong in silence.
+//   short: the letters it takes; valued: those that take a value; long: `--name` options;
+//   numeric: `-<n>` (head -5); builtin: a shell builtin (its error is the shell's).
+type Options = { short: string; valued?: string; long?: string[]; numeric?: boolean; code?: number; builtin?: boolean };
+const OPTIONS: Record<string, Options> = {
+  ls: { short: "aAl1htr", long: ["all", "almost-all", "color", "human-readable", "reverse"], code: 2 },
+  cat: { short: "nAE" },
+  head: { short: "nc", valued: "nc", numeric: true },
+  tail: { short: "nc", valued: "nc", numeric: true },
+  wc: { short: "lwcm" },
+  sort: { short: "run", code: 2 },
+  mkdir: { short: "p" },
+  touch: { short: "" },
+  rm: { short: "rRf" },
+  cp: { short: "rRafp" },
+  mv: { short: "f" },
+  tee: { short: "a" },
+  sleep: { short: "" },
+  which: { short: "a" },
+  uname: { short: "asrmn" },
+  whoami: { short: "" },
+  hostname: { short: "" },
+  date: { short: "" },
+  basename: { short: "" },
+  dirname: { short: "" },
+  file: { short: "" },
+  pwd: { short: "LP", builtin: true },
+  cd: { short: "", builtin: true },
+  unset: { short: "", builtin: true },
+  type: { short: "", builtin: true },
+  command: { short: "v", builtin: true },
+  export: { short: "", builtin: true },
+};
+
 // Shell words this shell doesn't parse: as the first word of a command, a syntax error.
 const KEYWORDS = ["for", "while", "until", "if", "then", "else", "elif", "fi", "do", "done", "case", "esac", "function", "select", "{", "}", "[["];
 
@@ -104,7 +141,7 @@ export function chartPng(width = 640, height = 400, bars = [0.35, 0.6, 0.45, 0.8
 
 // Inside a word, before it runs: a variable to expand, and a `*` or `?` that was not
 // quoted (a glob). Control characters no command line holds.
-const VAR = "\u0001", END = "\u0002", STAR = "\u0003", QUERY = "\u0004";
+const VAR = "\u0001", END = "\u0002", STAR = "\u0003", QUERY = "\u0004", SPLIT = "\u0005";
 type Token = { op: string } | { word: string; quoted: boolean };
 // Longest first. Those starting with a digit are operators only at the start of a word.
 const OPS = ["2>&1", "1>&2", ">&2", "2>>", "&>>", "2>", "&>", "&&", "||", ">>", ";", "|", ">", "<", "(", ")", "&"];
@@ -119,9 +156,10 @@ function tokenize(line: string): Token[] | { error: string } {
     quoted = false;
   };
   // `$NAME`, `${NAME}` or `$?` at `i`: the placeholder, and how much of the line it took.
-  const variable = (i: number): [string, number] | undefined => {
+  // `split`: outside quotes, where the value's whitespace separates words.
+  const variable = (i: number, split = false): [string, number] | undefined => {
     const m = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*|\?)\}|([A-Za-z_][A-Za-z0-9_]*|\?))/.exec(line.slice(i, i + 80));
-    return m ? [`${VAR}${m[1] ?? m[2]}${END}`, m[0].length] : undefined;
+    return m ? [`${VAR}${split ? SPLIT : ""}${m[1] ?? m[2]}${END}`, m[0].length] : undefined;
   };
   for (let i = 0; i < line.length; ) {
     const c = line[i]!;
@@ -141,6 +179,7 @@ function tokenize(line: string): Token[] | { error: string } {
     if (c === '"') {
       let j = i + 1, text = "";
       while (j < line.length && line[j] !== '"') {
+        if (line[j] === "\\" && line[j + 1] === "\n") { j += 2; continue; }
         if (line[j] === "\\" && j + 1 < line.length && '"\\$`'.includes(line[j + 1]!)) { text += line[j + 1]; j += 2; continue; }
         if (line[j] === "`" || line.startsWith("$(", j)) return { error: "substitution" };
         const v = line[j] === "$" ? variable(j) : undefined;
@@ -153,10 +192,12 @@ function tokenize(line: string): Token[] | { error: string } {
       i = j + 1;
       continue;
     }
-    if (c === "\\" && i + 1 < line.length) { word = (word ?? "") + line[i + 1]; i += 2; continue; }
+    // A backslash before a newline continues the line: both vanish.
+    if (c === "\\" && line[i + 1] === "\n") { i += 2; continue; }
+    if (c === "\\" && i + 1 < line.length) { word = (word ?? "") + line[i + 1]; quoted = true; i += 2; continue; }
     if (c === "`" || line.startsWith("$(", i) || line.startsWith("<(", i)) return { error: "substitution" };
     if (c === "$") {
-      const v = variable(i);
+      const v = variable(i, true);
       if (v) { word = (word ?? "") + v[0]; i += v[1]; continue; }
     }
     word = (word ?? "") + (c === "*" ? STAR : c === "?" ? QUERY : c);
@@ -167,8 +208,11 @@ function tokenize(line: string): Token[] | { error: string } {
 }
 
 // Here-documents out of the command line: each `<<WORD` becomes `< <n>`, a stdin by number.
-function heredocs(command: string): { line: string; docs: string[] } {
-  const docs: string[] = [];
+// With the delimiter unquoted the body's `$VAR` is expanded when the command runs; quoted
+// (`<<'EOF'`), the body is taken as written.
+type Heredoc = { text: string; expand: boolean };
+function heredocs(command: string): { line: string; docs: Heredoc[] } | { error: string } {
+  const docs: Heredoc[] = [];
   const lines = command.split("\n");
   const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {
@@ -177,7 +221,10 @@ function heredocs(command: string): { line: string; docs: string[] } {
     const body: string[] = [];
     let j = i + 1;
     while (j < lines.length && lines[j]!.trim() !== m[2]) body.push(lines[j++]!);
-    docs.push(body.length ? `${body.join("\n")}\n` : "");
+    const text = body.length ? `${body.join("\n")}\n` : "";
+    const expand = m[1] === "";
+    if (expand && /\$\(|`/.test(text)) return { error: "substitution" };
+    docs.push({ text, expand });
     out.push(lines[i]!.replace(m[0], `< \u0000${docs.length - 1}`));
     i = j;
   }
@@ -250,9 +297,43 @@ function patchOf(changes: Change[]): string {
   }).join("");
 }
 
+// The options of each git command this implements (shell.ts's rule: anything else is refused).
+const GIT_OPTIONS: Record<string, RegExp> = {
+  status: /^(--porcelain|--short|-s|-sb|-b|--branch)$/,
+  add: /^(-A|--all|-u|--update|-p|--patch|-i)$/, // the interactive ones are refused by `add` itself
+  commit: /^(-[qam]+|-m|-F|--message(=.*)?|--file(=.*)?|--all|--quiet|--amend|--no-edit|--reset-author|--allow-empty|--no-verify)$/,
+  diff: /^(--stat|--name-only|--name-status|--shortstat|--cached|--staged|--no-color)$/,
+  show: /^(--stat|--name-only|--name-status|--shortstat|--oneline|--no-color)$/,
+  log: /^(--oneline|--stat|-p|--patch|-\d+|-n|-n\d+|--max-count=\d+|--format=.*|--pretty=(oneline|t?format:.*)|--no-decorate|--no-color)$/,
+  branch: /^(--show-current|-a|-r|-d|-D|-m|-M|--list)$/,
+  checkout: /^(-b|-B|-q|-qb|-qB)$/,
+  switch: /^(-c|-C|-q|-qc|-qC)$/,
+  restore: /^(--staged|--worktree|--source=.*)$/,
+  reset: /^(--hard|--soft|--mixed|-q)$/,
+  "rev-parse": /^(--show-toplevel|--abbrev-ref|--is-inside-work-tree|--git-dir|--short|--verify|--quiet|-q)$/,
+  remote: /^(-v)$/,
+  config: /^(--list|-l|--get|--global|--local)$/,
+  fetch: /^(--prune|-p|--all|-q)$/,
+  "ls-files": /^$/,
+  rm: /^(-f|-r|-q|-rf)$/,
+  mv: /^$/,
+  rebase: /^(--exec|-x)$/,
+};
+
 type Commit = { sha: string; subject: string; message: string; author: string; committer: string; parent?: Commit; tree: Tree };
-type Repo = { name: string; url: string; branch: string; branches: Map<string, Commit>; origin: Commit; staged: Set<string>; config: Map<string, string>; programs: Program[] };
-type State = { cwd: string; env: Map<string, string>; status: number; errexit: boolean };
+type Repo = { name: string; url: string; branch: string; branches: Map<string, Commit>; origin: Commit; staged: Map<string, Content | null>; config: Map<string, string>; programs: Program[] };
+// errexit, nounset, pipefail: `set -e`, `set -u`, `set -o pipefail`.
+type State = { cwd: string; env: Map<string, string>; status: number; errexit: boolean; nounset: boolean; pipefail: boolean };
+// `set -u`, and a variable that isn't set: the shell stops there.
+class Unset extends Error {
+  constructor(readonly name: string) {
+    super(name);
+  }
+}
+
+// `staged` is git's index, as far as it differs from HEAD: each path that was added, with
+// its content at the moment of the `add` (null: its removal). A later edit to the file is
+// not in it until it is added again.
 
 // What a stage of the checkout's commits finds, as sandboxd computes it on the host
 // (sandbox/host/src/publish.rs): or why there is nothing to publish.
@@ -351,8 +432,9 @@ export class Shell {
   exec(command: string, cwd = WORKDIR, env: Record<string, string> = {}): ExecResult {
     // A working directory that isn't there (the checkout, before a clone).
     if (!this.isDir(cwd)) return fail(2, `sh: 1: cd: can't cd to ${cwd}`);
-    const { line, docs } = heredocs(command);
-    const tokens = tokenize(line);
+    const here = heredocs(command);
+    const tokens = "error" in here ? here : tokenize(here.line);
+    const docs = "error" in here ? [] : here.docs;
     if ("error" in tokens) {
       return tokens.error === "substitution"
         ? this.refuse(command.split("\n")[0]!.slice(0, 200), "command substitution ($(...) or backticks) isn't simulated", fail(2, command.includes("`") ? "sh: 1: Syntax error: EOF in backquote substitution" : 'sh: 1: Syntax error: "(" unexpected'))
@@ -364,7 +446,7 @@ export class Shell {
     // as in a real shell nothing of the line runs.
     const keyword = tokens.find((t, i) => "word" in t && !t.quoted && KEYWORDS.includes(t.word) && (i === 0 || ("op" in tokens[i - 1]! && ["&&", "||", ";", "|"].includes((tokens[i - 1] as { op: string }).op)))) as { word: string } | undefined;
     if (keyword) return this.refuse(command.split("\n")[0]!.slice(0, 200), `shell syntax (\`${keyword.word}\`) isn't simulated`, fail(2, `sh: 1: Syntax error: "${keyword.word}" unexpected`));
-    const st: State = { cwd, env: new Map(Object.entries({ HOME: "/root", USER: "root", PATH: "/usr/local/bin:/usr/bin:/bin", SHELL: "/bin/sh", ...env })), status: 0, errexit: false };
+    const st: State = { cwd, env: new Map(Object.entries({ HOME: "/root", USER: "root", PATH: "/usr/local/bin:/usr/bin:/bin", SHELL: "/bin/sh", ...env })), status: 0, errexit: false, nounset: false, pipefail: false };
     let stdout = "", stderr = "";
     let i = 0;
     let join: string | undefined;
@@ -382,13 +464,21 @@ export class Shell {
       if (!skip && pipeline.some((p) => p.length)) {
         let input = "";
         let last: ExecResult = ok();
-        for (const part of pipeline) {
-          last = this.simple(part, input, st, docs);
-          input = last.stdout;
-          stderr += last.stderr;
+        let failed = 0;
+        try {
+          for (const part of pipeline) {
+            last = this.simple(part, input, st, docs);
+            input = last.stdout;
+            stderr += last.stderr;
+            if (last.exitCode !== 0) failed = last.exitCode;
+          }
+        } catch (err) {
+          if (!(err instanceof Unset)) throw err;
+          return { exitCode: 2, stdout, stderr: `${stderr}sh: 1: ${err.name}: parameter not set\n` };
         }
         stdout += last.stdout;
-        st.status = last.exitCode;
+        // The pipeline's status is its last command's; with pipefail, the last failure's.
+        st.status = st.pipefail && failed ? failed : last.exitCode;
         // `set -e`: a failure that nothing tests ends the script.
         if (st.errexit && st.status !== 0 && next !== "&&" && next !== "||" && join !== "&&" && join !== "||") break;
       }
@@ -397,11 +487,42 @@ export class Shell {
     return { exitCode: st.status, stdout, stderr };
   }
 
-  // A word as the command gets it: variables filled in, then an unquoted glob expanded to
+  private value(name: string, st: State): string {
+    if (name === "?") return String(st.status);
+    if (name === "PWD") return st.cwd;
+    const v = st.env.get(name);
+    if (v === undefined && st.nounset) throw new Unset(name);
+    return v ?? "";
+  }
+
+  // A word as the command gets it: variables filled in; the value of one that stood
+  // outside quotes split into words at its whitespace; then an unquoted glob expanded to
   // the paths it matches (or left as written when it matches none).
   private expand(t: { word: string; quoted: boolean }, st: State): string[] {
-    const filled = t.word.replace(new RegExp(`${VAR}([^${END}]+)${END}`, "g"), (_m, name: string) => (name === "?" ? String(st.status) : name === "PWD" ? st.cwd : (st.env.get(name) ?? "")));
-    if (filled === "" && !t.quoted && t.word !== "") return []; // an unset variable, unquoted: no word at all
+    const fields: string[] = [];
+    let current: string | undefined = t.quoted ? "" : undefined;
+    const marker = new RegExp(`${VAR}(${SPLIT}?)([^${END}]+)${END}`, "g");
+    let at = 0;
+    for (const m of t.word.matchAll(marker)) {
+      if (m.index > at) current = (current ?? "") + t.word.slice(at, m.index);
+      at = m.index + m[0].length;
+      const v = this.value(m[2]!, st);
+      if (!m[1]) { current = (current ?? "") + v; continue; }
+      // Unquoted: whitespace in the value ends one word and begins the next.
+      const pieces = v.split(/[ \t\n]+/);
+      if (/^[ \t\n]/.test(v) && current !== undefined) { fields.push(current); current = undefined; }
+      pieces.forEach((piece, k) => {
+        if (k > 0 && current !== undefined) { fields.push(current); current = undefined; }
+        if (piece !== "") current = (current ?? "") + piece;
+      });
+      if (/[ \t\n]$/.test(v) && current !== undefined) { fields.push(current); current = undefined; }
+    }
+    if (at < t.word.length) current = (current ?? "") + t.word.slice(at);
+    if (current !== undefined) fields.push(current);
+    return fields.flatMap((f) => this.globbed(f, st));
+  }
+
+  private globbed(filled: string, st: State): string[] {
     const literal = filled.replaceAll(STAR, "*").replaceAll(QUERY, "?");
     if (!filled.includes(STAR) && !filled.includes(QUERY)) return [literal];
     const pattern = filled.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll(STAR, "[^/]*").replaceAll(QUERY, "[^/]");
@@ -417,7 +538,7 @@ export class Shell {
     return matches.map((m) => (literal.startsWith("/") ? m : m.slice((st.cwd === "/" ? "" : st.cwd).length + 1)));
   }
 
-  private simple(tokens: Token[], stdin: string, st: State, docs: string[]): ExecResult {
+  private simple(tokens: Token[], stdin: string, st: State, docs: Heredoc[]): ExecResult {
     const words: string[] = [];
     type Sink = "out" | "err" | "null" | { path: string; append: boolean };
     let outTo: Sink = "out", errTo: Sink = "err";
@@ -435,7 +556,10 @@ export class Shell {
       else if (t.op === "2>" || t.op === "2>>") errTo = sink(target, t.op === "2>>");
       else if (t.op === "&>" || t.op === "&>>") outTo = errTo = sink(target, t.op === "&>>");
       else if (t.op === "<") {
-        if (target.startsWith("\u0000")) stdin = docs[Number(target.slice(1))] ?? "";
+        if (target.startsWith("\u0000")) {
+          const doc = docs[Number(target.slice(1))];
+          stdin = !doc ? "" : !doc.expand ? doc.text : doc.text.replace(/\\\$|\$(?:\{([A-Za-z_][A-Za-z0-9_]*|\?)\}|([A-Za-z_][A-Za-z0-9_]*|\?))/g, (m, a?: string, b?: string) => (m === "\\$" ? "$" : this.value((a ?? b)!, st)));
+        }
         else {
           const f = this.read(this.abs(target, st.cwd));
           if (f === undefined) return fail(2, `sh: 1: cannot open ${target}: No such file`);
@@ -480,9 +604,32 @@ export class Shell {
       for (const [path, content] of Object.entries(program.writes ?? {})) this.write(this.abs(path, WORKDIR), content);
       return { exitCode: program.exitCode ?? 0, stdout: program.stdout ?? "", stderr: program.stderr ?? "" };
     }
-    const flags = args.filter((a) => /^-[A-Za-z0-9]+$/.test(a));
-    const has = (letter: string) => flags.some((f) => f.includes(letter));
-    const operands = args.filter((a) => !/^-[A-Za-z0-9]+$/.test(a) && !/^--[a-z]/.test(a));
+    // Its options, checked against what it implements: one it doesn't take is refused in
+    // the tool's own words, never ignored.
+    const spec = OPTIONS[name];
+    if (spec) {
+      const unknown = (text: string): ExecResult =>
+        this.refuse(written, `\`${name}\` is simulated without \`${text}\``, spec.builtin ? fail(2, `sh: 1: ${name}: Illegal option ${text.slice(0, 2)}`) : fail(spec.code ?? 1, `${name}: ${text.startsWith("--") ? `unrecognized option '${text}'` : `invalid option -- '${text.slice(1)}'`}\nTry '${name} --help' for more information.`));
+      for (let k = 0; k < args.length; k++) {
+        const a = args[k]!;
+        if (a === "--") break;
+        if (a.startsWith("--")) { if (!(spec.long ?? []).includes(a.slice(2).split("=")[0]!)) return unknown(a); continue; }
+        if (!a.startsWith("-") || a === "-") continue;
+        if (/^-\d+$/.test(a)) { if (!spec.numeric) return unknown(a.slice(0, 2)); continue; }
+        for (let c = 1; c < a.length; c++) {
+          if (!spec.short.includes(a[c]!)) return unknown(`-${a[c]}`);
+          if ((spec.valued ?? "").includes(a[c]!)) { if (c === a.length - 1) k++; break; } // its value: the rest, or the next word
+        }
+      }
+    }
+    // Flags are the words before `--` that start with a dash; a word after a valued flag is its value.
+    const dashes = args.indexOf("--");
+    const optional = dashes < 0 ? args : args.slice(0, dashes);
+    const valueAt = new Set<number>();
+    optional.forEach((a, k) => { if (spec?.valued && /^-[A-Za-z]+$/.test(a) && spec.valued.includes(a.at(-1)!)) valueAt.add(k + 1); });
+    const flags = optional.filter((a) => /^-[A-Za-z0-9]+$/.test(a) || /^--[a-z]/.test(a));
+    const has = (letter: string) => flags.some((f) => !f.startsWith("--") && f.includes(letter));
+    const operands = [...optional.filter((a, k) => !valueAt.has(k) && !(/^-[A-Za-z0-9]+$/.test(a) || /^--[a-z]/.test(a))), ...(dashes < 0 ? [] : args.slice(dashes + 1))];
     const errors: string[] = [];
     const done = (stdout: string, code = 1): ExecResult => ({ exitCode: errors.length ? code : 0, stdout, stderr: errors.length ? `${errors.join("\n")}\n` : "" });
     // The content of each operand (or stdin when there is none), for the reading commands.
@@ -509,10 +656,26 @@ export class Shell {
       case ":":
       case "true": return ok();
       case "false": return { exitCode: 1, stdout: "", stderr: "" };
-      case "sleep": return ok();
-      case "set":
-        if (args.some((a) => /^-[a-z]*e/.test(a))) st.errexit = true;
+      case "sleep":
+        if (operands.length !== 1 || !/^\d+(\.\d+)?[smh]?$/.test(operands[0]!)) return fail(1, operands.length ? `sleep: invalid time interval '${operands[0]}'` : "sleep: missing operand");
         return ok();
+      case "set": {
+        // -e, -u and -o pipefail (and +e, +u, +o pipefail), alone or together.
+        for (let k = 0; k < args.length; k++) {
+          const m = /^([-+])([euo]+)$/.exec(args[k]!);
+          if (!m) return this.refuse(written, `\`set ${args[k]}\` isn't simulated (only -e, -u, -o pipefail)`, fail(2, `sh: 1: set: Illegal option ${args[k]!.slice(0, 2)}`));
+          const on = m[1] === "-";
+          if (m[2]!.includes("e")) st.errexit = on;
+          if (m[2]!.includes("u")) st.nounset = on;
+          if (m[2]!.includes("o")) {
+            if (args[++k] !== "pipefail") return this.refuse(written, `\`set -o ${args[k] ?? ""}\` isn't simulated (only pipefail)`, fail(2, `sh: 1: set: Illegal option -o ${args[k] ?? ""}`));
+            st.pipefail = on;
+          }
+        }
+        return ok();
+      }
+      case "exec":
+        return args.length ? this.run(args, stdin, st) : ok();
       case "export":
         for (const a of operands) if (a.includes("=")) st.env.set(a.slice(0, a.indexOf("=")), a.slice(a.indexOf("=") + 1));
         return ok();
@@ -520,6 +683,7 @@ export class Shell {
         for (const a of operands) st.env.delete(a);
         return ok();
       case "env": {
+        if (args[0]?.startsWith("-")) return this.refuse(written, `\`env ${args[0]}\` isn't simulated`, fail(125, `env: invalid option -- '${args[0].replace(/^-+/, "").slice(0, 1)}'\nTry 'env --help' for more information.`));
         const rest = [...args];
         const extra: [string, string][] = [];
         while (rest.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rest[0]!)) { const w = rest.shift()!; extra.push([w.slice(0, w.indexOf("=")), w.slice(w.indexOf("=") + 1)]); }
@@ -532,24 +696,56 @@ export class Shell {
       }
       case "time": {
         if (!args.length) return ok();
+        if (args[0]!.startsWith("-")) return this.refuse(written, `\`time ${args[0]}\` isn't simulated`, fail(127, `sh: 1: ${args[0]}: not found`));
         const r = this.run(args, stdin, st);
         return { ...r, stderr: `${r.stderr}\nreal\t0m0.214s\nuser\t0m0.162s\nsys\t0m0.041s\n` };
       }
       case "echo": {
-        const n = args[0] === "-n", e = args[0] === "-e";
-        const body = (n || e ? args.slice(1) : args).join(" ");
-        return ok((e ? body.replace(/\\n/g, "\n").replace(/\\t/g, "\t") : body) + (n ? "" : "\n"));
+        // -n, -e and the two together; any other first word is text, as echo prints it.
+        const opt = /^-[ne]+$/.test(args[0] ?? "") ? args[0]! : "";
+        const body = (opt ? args.slice(1) : args).join(" ");
+        const escaped = opt.includes("e") ? body.replace(/\\([ntr\\])/g, (_m, c: string) => ({ n: "\n", t: "\t", r: "\r", "\\": "\\" })[c]!) : body;
+        return ok(escaped + (opt.includes("n") ? "" : "\n"));
       }
       case "printf": {
-        const [format = "", ...rest] = args;
-        let k = 0;
-        return ok(format.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/%[sd]/g, () => rest[k++] ?? ""));
+        const [format, ...rest] = args;
+        if (format === undefined) return fail(2, "sh: 1: printf: usage: printf format [arg ...]");
+        if (format.startsWith("-") && format !== "--") return this.refuse(written, `\`printf ${format}\` isn't simulated`, fail(2, `sh: 1: printf: Illegal option ${format.slice(0, 2)}`));
+        // %s, %d and %%; \\n, \\t, \\\\. Anything else isn't formatted here, so isn't printed wrong.
+        const directive = /%(.)/g;
+        for (const m of format.matchAll(directive)) if (!"sd%".includes(m[1]!)) return this.refuse(written, `printf's \`%${m[1]}\` isn't simulated (only %s, %d, %%)`, fail(1, `sh: 1: printf: %${m[1]}: invalid directive`));
+        const consumes = (format.replace(/%%/g, "").match(/%[sd]/g) ?? []).length;
+        const once = (argv: string[]): string | ExecResult => {
+          let k = 0, bad: string | undefined;
+          const out = format.replace(/\\([ntr\\])|%([sd%])/g, (_m, esc?: string, d?: string) => {
+            if (esc) return ({ n: "\n", t: "\t", r: "\r", "\\": "\\" })[esc]!;
+            if (d === "%") return "%";
+            const v = argv[k++] ?? (d === "d" ? "0" : "");
+            if (d === "d" && !/^-?\d+$/.test(v)) bad ??= v;
+            return v;
+          });
+          return bad === undefined ? out : fail(1, `sh: 1: printf: ${bad}: expected numeric value`);
+        };
+        // The format is reused until the arguments run out.
+        let out = "";
+        for (let k = 0; k === 0 || (consumes > 0 && k < rest.length); k += Math.max(1, consumes)) {
+          const piece = once(rest.slice(k, k + consumes));
+          if (typeof piece !== "string") return piece;
+          out += piece;
+        }
+        return ok(out);
       }
       case "pwd": return ok(`${st.cwd}\n`);
       case "whoami": return ok("root\n");
       case "hostname": return ok("sandbox\n");
-      case "uname": return ok(args.includes("-a") ? "Linux sandbox 6.8.0 #1 SMP x86_64 GNU/Linux\n" : "Linux\n");
-      case "date": return ok("Thu Nov 19 10:00:00 UTC 2026\n");
+      case "uname": {
+        if (operands.length) return fail(1, `uname: extra operand '${operands[0]}'\nTry 'uname --help' for more information.`);
+        const parts = has("a") ? ["Linux", "sandbox", "6.8.0", "#1 SMP", "x86_64", "GNU/Linux"] : [(has("s") || !flags.length) && "Linux", has("n") && "sandbox", has("r") && "6.8.0", has("m") && "x86_64"].filter(Boolean);
+        return ok(`${parts.join(" ")}\n`);
+      }
+      case "date":
+        if (operands.length) return this.refuse(written, "`date` is simulated without arguments", fail(1, `date: invalid date '${operands[0]}'`));
+        return ok("Thu Nov 19 10:00:00 UTC 2026\n");
       case "basename": return ok(`${(operands[0] ?? "").split("/").filter(Boolean).at(-1) ?? ""}\n`);
       case "dirname": return ok(`${(operands[0] ?? "").includes("/") ? (operands[0]!.slice(0, operands[0]!.lastIndexOf("/")) || "/") : "."}\n`);
       case "cd": {
@@ -559,8 +755,15 @@ export class Shell {
         return ok();
       }
       case "mkdir":
-        for (const p of operands) this.dirs.add(this.abs(p, st.cwd));
-        return ok();
+        if (!operands.length) return fail(1, "mkdir: missing operand\nTry 'mkdir --help' for more information.");
+        for (const p of operands) {
+          const path = this.abs(p, st.cwd);
+          const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+          if (this.read(path) !== undefined || (this.isDir(path) && !has("p"))) errors.push(`mkdir: cannot create directory '${p}': File exists`);
+          else if (!has("p") && !this.isDir(parent)) errors.push(`mkdir: cannot create directory '${p}': No such file or directory`);
+          else this.dirs.add(path);
+        }
+        return done("");
       case "touch":
         for (const p of operands) if (!this.files.has(this.abs(p, st.cwd))) this.write(this.abs(p, st.cwd), "");
         return ok();
@@ -598,17 +801,24 @@ export class Shell {
         return done("");
       }
       case "chmod": {
-        const [mode, ...paths] = operands.length ? operands : [args[0] ?? ""];
-        // `+x` arrives as a flag-less operand; `-x` looks like a flag.
-        const spec = mode ?? "";
-        for (const p of paths.length ? paths : []) {
+        // The mode is the first word (it may start with a dash: -x), unless that is -R.
+        const words = args[0] === "-R" ? args.slice(1) : args;
+        const [mode, ...paths] = words;
+        if (mode === undefined || !paths.length) return fail(1, `chmod: missing operand${mode === undefined ? "" : ` after '${mode}'`}\nTry 'chmod --help' for more information.`);
+        const octal = /^[0-7]{3,4}$/.test(mode), symbolic = /^[ugoa]*[-+=][rwxX]*(,[ugoa]*[-+=][rwxX]*)*$/.test(mode);
+        if (!octal && !symbolic) return fail(1, `chmod: invalid mode: '${mode}'\nTry 'chmod --help' for more information.`);
+        for (const p of paths) {
           const path = this.abs(p, st.cwd);
           if (this.read(path) === undefined && !this.isDir(path)) { errors.push(`chmod: cannot access '${p}': No such file or directory`); continue; }
-          if (/^[0-7]{3,4}$/.test(spec)) Number(spec.at(-3)) & 1 ? this.executable.add(path) : this.executable.delete(path);
-          else if (/\+[rw]*x/.test(spec)) this.executable.add(path);
-          else if (/-[rw]*x/.test(spec)) this.executable.delete(path);
+          if (octal) Number(mode.at(-3)) & 1 ? this.executable.add(path) : this.executable.delete(path);
+          else for (const clause of mode.split(",")) {
+            const m = /^([ugoa]*)([-+=])([rwxX]*)$/.exec(clause)!;
+            if (m[1] !== "" && !/[ua]/.test(m[1]!)) continue; // group and other bits aren't shown apart from the owner's
+            if (m[2] === "+" && /x/i.test(m[3]!)) this.executable.add(path);
+            else if (m[2] === "-" && /x/i.test(m[3]!)) this.executable.delete(path);
+            else if (m[2] === "=") /x/i.test(m[3]!) ? this.executable.add(path) : this.executable.delete(path);
+          }
         }
-        if (flags.includes("-x")) for (const p of operands) this.executable.delete(this.abs(p, st.cwd));
         return done("");
       }
       case "tee": {
@@ -639,11 +849,39 @@ export class Shell {
       }
       case "test":
       case "[": {
-        const a = args.filter((x) => x !== "]");
-        const negate = a[0] === "!";
-        if (negate) a.shift();
-        const path = a[1] === undefined ? "" : this.abs(a[1], st.cwd);
-        const yes = a[0] === "-f" ? this.read(path) !== undefined : a[0] === "-d" ? this.isDir(path) : a[0] === "-e" ? this.read(path) !== undefined || this.isDir(path) : a[0] === "-x" ? this.executable.has(path) : a[0] === "-s" ? size(this.read(path) ?? "") > 0 : a[0] === "-n" ? !!a[1] : a[0] === "-z" ? !a[1] : a[1] === "=" || a[1] === "==" ? a[0] === a[2] : a[1] === "!=" ? a[0] !== a[2] : !!a[0];
+        if (name === "[" && args.at(-1) !== "]") return fail(2, "sh: 1: [: missing ]");
+        const a = name === "[" ? args.slice(0, -1) : [...args];
+        let negate = false;
+        while (a[0] === "!") { negate = !negate; a.shift(); }
+        const bad = (op: string) => this.refuse(written, `\`${name}\`'s \`${op}\` isn't simulated`, fail(2, `sh: 1: ${name}: ${op}: unexpected operator`));
+        const num = (v: string) => (/^-?\d+$/.test(v) ? Number(v) : undefined);
+        let yes: boolean;
+        if (a.length === 0) yes = false;
+        else if (a.length === 1) yes = a[0] !== "";
+        else if (a.length === 2) {
+          const path = this.abs(a[1]!, st.cwd);
+          const f = this.read(path);
+          switch (a[0]) {
+            case "-f": yes = f !== undefined; break;
+            case "-d": yes = this.isDir(path); break;
+            case "-e": yes = f !== undefined || this.isDir(path); break;
+            case "-r": case "-w": yes = f !== undefined || this.isDir(path); break;
+            case "-x": yes = this.executable.has(path) || this.isDir(path); break;
+            case "-s": yes = f !== undefined && size(f) > 0; break;
+            case "-n": yes = a[1] !== ""; break;
+            case "-z": yes = a[1] === ""; break;
+            default: return bad(a[0]!);
+          }
+        } else if (a.length === 3) {
+          const [l, op, r] = a as [string, string, string];
+          if (op === "=" || op === "==") yes = l === r;
+          else if (op === "!=") yes = l !== r;
+          else if (["-eq", "-ne", "-gt", "-ge", "-lt", "-le"].includes(op)) {
+            const x = num(l), y = num(r);
+            if (x === undefined || y === undefined) return fail(2, `sh: 1: ${name}: Illegal number: ${x === undefined ? l : r}`);
+            yes = op === "-eq" ? x === y : op === "-ne" ? x !== y : op === "-gt" ? x > y : op === "-ge" ? x >= y : op === "-lt" ? x < y : x <= y;
+          } else return bad(op);
+        } else return bad(a.find((w) => w === "-a" || w === "-o") ?? a[1]!);
         return { exitCode: yes !== negate ? 0 : 1, stdout: "", stderr: "" };
       }
       case "ls": {
@@ -651,7 +889,8 @@ export class Shell {
         const entry = (path: string, label: string) => {
           if (!long) return label;
           const f = this.read(path);
-          return f === undefined ? `drwxr-xr-x 2 root root  4096 Nov 19 10:00 ${label}` : `${this.executable.has(path) ? "-rwxr-xr-x" : "-rw-r--r--"} 1 root root ${String(size(f)).padStart(5)} Nov 19 10:00 ${label}`;
+          const human = (n: number) => (!has("h") || n < 1024 ? String(n) : `${(n / 1024).toFixed(1)}K`);
+          return f === undefined ? `drwxr-xr-x 2 root root ${human(4096).padStart(5)} Nov 19 10:00 ${label}` : `${this.executable.has(path) ? "-rwxr-xr-x" : "-rw-r--r--"} 1 root root ${human(size(f)).padStart(5)} Nov 19 10:00 ${label}`;
         };
         const targets = operands.length ? operands : ["."];
         const out: string[] = [];
@@ -660,7 +899,9 @@ export class Shell {
           if (this.read(path) !== undefined) { out.push(entry(path, p)); continue; }
           if (!this.isDir(path)) { errors.push(`ls: cannot access '${p}': No such file or directory`); continue; }
           if (targets.length > 1) out.push(`${out.length ? "\n" : ""}${p}:`);
+          // -t: every file here has the one mtime, so the order is the names'. -r reverses it.
           const names = this.children(path).filter((n) => all || !n.startsWith("."));
+          if (has("r")) names.reverse();
           if (long) out.push(`total ${names.length * 4}`);
           if (all) out.push(entry(path, "."), entry(path, ".."));
           for (const n of names) out.push(entry(`${path === "/" ? "" : path}/${n}`, n));
@@ -673,33 +914,48 @@ export class Shell {
         if (has("n")) out = lines(out).map((l, i) => `${String(i + 1).padStart(6)}\t${l}\n`).join("");
         return done(out);
       }
-      case "sort": return ok(lines(inputs("sort").map(([, t]) => t).join("")).sort().map((l) => `${l}\n`).join(""));
+      case "sort": {
+        let rows = lines(inputs("sort").map(([, t]) => t).join(""));
+        rows = has("n") ? rows.sort((x, y) => (parseFloat(x) || 0) - (parseFloat(y) || 0) || x.localeCompare(y)) : rows.sort();
+        if (has("u")) rows = rows.filter((l, k) => k === 0 || l !== rows[k - 1]);
+        if (has("r")) rows.reverse();
+        return done(rows.map((l) => `${l}\n`).join(""), 2);
+      }
       case "head":
       case "tail": {
-        const numeric = args.find((a) => /^-\d+$/.test(a));
-        const bytes = args.some((a) => a.startsWith("-c"));
-        const n = numeric ? Number(numeric.slice(1)) : bytes ? count("-c", 10) : count("-n", 10);
-        const paths = operands.filter((a) => !/^\d+$/.test(a) || this.read(this.abs(a, st.cwd)) !== undefined);
+        // The count: -n N, -nN, -N (lines) or -c N (bytes). `tail -n +N` is from line N on;
+        // `head -n -N` is all but the last N.
+        // `-5` is a count of its own, unless it is the value of -n or -c (`head -n -5`).
+        const numeric = args.find((a, k) => /^-\d+$/.test(a) && !/^-[a-z]*[nc]$/.test(args[k - 1] ?? ""));
+        const bytes = flags.some((f) => /^-[a-z]*c/.test(f));
+        const letter = bytes ? "c" : "n";
+        const at = args.findIndex((a) => /^-[a-z]+$/.test(a) && a.endsWith(letter));
+        const joined = args.find((a) => new RegExp(`^-${letter}.+`).test(a));
+        const raw = numeric ? numeric.slice(1).replace(/^-/, "") : joined ? joined.slice(2) : at >= 0 ? args[at + 1] : "10";
+        if (raw === undefined || !/^[-+]?\d+$/.test(raw)) return fail(1, `${name}: invalid number of ${bytes ? "bytes" : "lines"}: '${raw ?? ""}'`);
+        const n = Math.abs(Number(raw));
+        const fromLine = name === "tail" && raw.startsWith("+"), allBut = name === "head" && raw.startsWith("-");
         const texts: [string, string][] = [];
-        if (!paths.length) texts.push(["", stdin]);
-        for (const p of paths) {
+        if (!operands.length) texts.push(["", stdin]);
+        for (const p of operands) {
           const f = this.read(this.abs(p, st.cwd));
           if (f === undefined) errors.push(`${name}: cannot open '${p}' for reading: No such file or directory`);
           else texts.push([p, text(f)]);
         }
         const cut = (t: string) => {
-          if (bytes) return name === "head" ? t.slice(0, n) : t.slice(-n);
+          if (bytes) return fromLine ? t.slice(Math.max(0, n - 1)) : allBut ? t.slice(0, Math.max(0, t.length - n)) : name === "head" ? t.slice(0, n) : n ? t.slice(-n) : "";
           const ls = lines(t);
-          return (name === "head" ? ls.slice(0, n) : ls.slice(-n)).map((l) => `${l}\n`).join("");
+          const kept = fromLine ? ls.slice(Math.max(0, n - 1)) : allBut ? ls.slice(0, Math.max(0, ls.length - n)) : name === "head" ? ls.slice(0, n) : n ? ls.slice(-n) : [];
+          return kept.map((l) => `${l}\n`).join("");
         };
         return done(texts.map(([p, t]) => (texts.length > 1 ? `==> ${p} <==\n` : "") + cut(t)).join(""));
       }
       case "wc": {
         const texts = inputs("wc");
-        const l = has("l"), c = has("c"), w = has("w");
+        const l = has("l"), c = has("c"), w = has("w"), m = has("m");
         const row = (p: string, t: string) => {
           const counts = [(t.match(/\n/g) ?? []).length, t.split(/\s+/).filter(Boolean).length, Buffer.byteLength(t, "latin1")];
-          const picked = l || c || w ? [l && counts[0], w && counts[1], c && counts[2]].filter((x) => x !== false) : counts;
+          const picked = l || c || w || m ? [l && counts[0], w && counts[1], m && [...Buffer.from(t, "latin1").toString("utf8")].length, c && counts[2]].filter((x) => x !== false) : counts;
           return `${picked.join(" ")}${p ? ` ${p}` : ""}\n`;
         };
         return done(texts.map(([p, t]) => row(p, t)).join(""));
@@ -730,16 +986,40 @@ export class Shell {
         return ok(`${out.join("\n")}\n`);
       }
       case "find": {
-        const root = this.abs(operands[0] && !operands[0].startsWith("-") ? operands[0] : ".", st.cwd);
-        const i = args.indexOf("-name");
-        const pattern = i >= 0 && args[i + 1] ? glob(args[i + 1]!) : undefined;
-        if (!this.isDir(root)) return fail(1, `find: '${operands[0]}': No such file or directory`);
-        const shown = (path: string) => (operands[0]?.startsWith("/") ? path : `.${path.slice(root.length)}` || ".");
-        const dirsOnly = args[args.indexOf("-type") + 1] === "d" && args.includes("-type");
-        const all = dirsOnly ? [...new Set(this.under(root).map((f) => f.slice(0, f.lastIndexOf("/"))))].filter((d) => d.length > root.length).sort() : this.under(root);
-        return ok(all.filter((f) => !pattern || pattern.test(f.split("/").at(-1)!)).map((f) => `${shown(f)}\n`).join(""));
+        // find [path...] [-name GLOB] [-type f|d] [-maxdepth N]: each path printed under the
+        // start point as it was given (`src/widgets.ts` for `find src`).
+        const starts: string[] = [];
+        let k = 0;
+        while (k < args.length && !args[k]!.startsWith("-")) starts.push(args[k++]!);
+        let pattern: RegExp | undefined, kind: string | undefined, depth = Infinity;
+        for (; k < args.length; k += 2) {
+          const pred = args[k]!, v = args[k + 1];
+          const refused = (said: string) => this.refuse(written, `find's \`${pred}\` isn't simulated (only -name, -type f|d, -maxdepth)`, fail(1, said));
+          if (!["-name", "-type", "-maxdepth"].includes(pred)) return refused(`find: unknown predicate \`${pred}'`);
+          if (v === undefined) return fail(1, `find: missing argument to \`${pred}'`);
+          if (pred === "-name") pattern = glob(v);
+          else if (pred === "-type") { if (v !== "f" && v !== "d") return refused(`find: Unknown argument to -type: ${v}`); kind = v; }
+          else { if (!/^\d+$/.test(v)) return fail(1, `find: Expected a positive decimal integer argument to -maxdepth, but got ‘${v}’`); depth = Number(v); }
+        }
+        const out: string[] = [];
+        for (const start of starts.length ? starts : ["."]) {
+          const root = this.abs(start, st.cwd);
+          if (this.read(root) !== undefined) { if (kind !== "d" && (!pattern || pattern.test(root.split("/").at(-1)!))) out.push(start); continue; }
+          if (!this.isDir(root)) { errors.push(`find: ‘${start}’: No such file or directory`); continue; }
+          const files = this.under(root);
+          const dirs = [...new Set(files.flatMap((f) => { const parts = f.slice(root.length + 1).split("/").slice(0, -1); return parts.map((_x, n) => `${root}/${parts.slice(0, n + 1).join("/")}`); }))];
+          const entries = [...(kind === "d" ? [] : files.map((f) => [f, "f"] as const)), ...(kind === "f" ? [] : [[root, "d"] as const, ...dirs.map((d) => [d, "d"] as const)])];
+          const base = start.replace(/\/+$/, "") || "/";
+          for (const [path] of entries.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))) {
+            const rel = path === root ? "" : path.slice(root === "/" ? 1 : root.length + 1);
+            if (rel !== "" && rel.split("/").length > depth) continue;
+            if (pattern && !pattern.test(rel === "" ? base.split("/").at(-1)! : rel.split("/").at(-1)!)) continue;
+            out.push(rel === "" ? base : `${base === "/" ? "" : base}/${rel}`);
+          }
+        }
+        return done(out.map((l) => `${l}\n`).join(""));
       }
-      case "grep": return this.grep(args, stdin, st.cwd, false);
+      case "grep": return this.grep(args, stdin, st.cwd, false, written);
       case "git": return this.git(args, stdin, st, written);
     }
     const versions = this.script.installed ?? {};
@@ -755,57 +1035,93 @@ export class Shell {
     return this.refuse(written, `\`${name}\` isn't simulated`, fail(127, `sh: 1: ${name}: not found`));
   }
 
-  private grep(args: string[], stdin: string, cwd: string, tracked: boolean): ExecResult {
+  // grep [-inrRlcvoqEFwHhs] [-A n] [-B n] [-C n] [-e PATTERN] PATTERN [FILE...]. Any other
+  // option is refused in grep's own words: one that changed which lines match, ignored,
+  // would be a wrong answer.
+  private grep(args: string[], stdin: string, cwd: string, tracked: boolean, written = `grep ${args.join(" ")}`): ExecResult {
     let after = 0, before = 0;
+    const flags = new Set<string>();
     const plain: string[] = [];
+    let pattern: string | undefined;
+    const unknown = (text: string) => this.refuse(written, `\`grep\` is simulated without \`${text}\``, fail(2, `grep: ${text.startsWith("--") ? `unrecognized option '${text}'` : `invalid option -- '${text.slice(1)}'`}\nUsage: grep [OPTION]... PATTERNS [FILE]...\nTry 'grep --help' for more information.`));
     for (let i = 0; i < args.length; i++) {
-      const m = /^-([ABC])(\d+)?$/.exec(args[i]!);
-      if (!m) { plain.push(args[i]!); continue; }
-      const n = Number(m[2] ?? args[++i] ?? 0);
-      if (m[1] !== "B") after = n;
-      if (m[1] !== "A") before = n;
+      const a = args[i]!;
+      if (a === "--") { plain.push(...args.slice(i + 1)); break; }
+      if (a.startsWith("--")) {
+        if (a === "--color" || a.startsWith("--color=")) continue; // there is no color here either way
+        return unknown(a);
+      }
+      if (!a.startsWith("-") || a === "-") { plain.push(a); continue; }
+      for (let c = 1; c < a.length; c++) {
+        const ch = a[c]!;
+        if ("ABCe".includes(ch)) {
+          const v = c < a.length - 1 ? a.slice(c + 1) : args[++i];
+          if (v === undefined) return fail(2, `grep: option requires an argument -- '${ch}'`);
+          if (ch === "e") pattern = pattern === undefined ? v : `${pattern}\n${v}`;
+          else {
+            if (!/^\d+$/.test(v)) return fail(2, `grep: ${v}: invalid context length argument`);
+            if (ch !== "B") after = Number(v);
+            if (ch !== "A") before = Number(v);
+          }
+          break;
+        }
+        if (!"inrRlcvoqEFwHhs".includes(ch)) return unknown(`-${ch}`);
+        flags.add(ch);
+      }
     }
-    const flags = plain.filter((a) => /^-[A-Za-z]+$/.test(a)).join("");
-    const [pattern, ...paths] = plain.filter((a) => !/^-[A-Za-z]+$/.test(a) && !/^--[a-z]/.test(a) && a !== "--");
-    if (pattern === undefined) return fail(2, "usage: grep [OPTION]... PATTERNS [FILE]...");
+    const has = (ch: string) => flags.has(ch);
+    if (pattern === undefined) pattern = plain.shift();
+    const paths = plain;
+    if (pattern === undefined) return fail(2, "Usage: grep [OPTION]... PATTERNS [FILE]...\nTry 'grep --help' for more information.");
     let re: RegExp;
     try {
       // grep's basic patterns: ( ) { } | + ? are themselves unless escaped, the reverse of -E.
       const basic = (p: string) => p.replace(/\\?[(){}|+?]/g, (m) => (m.length === 2 ? m[1]! : `\\${m}`));
-      re = new RegExp(flags.includes("F") ? pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : flags.includes("E") || flags.includes("P") ? pattern : basic(pattern), flags.includes("i") ? "i" : "");
+      const one = (p: string) => (has("F") ? p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : has("E") ? p : basic(p));
+      const source = pattern.split("\n").map(one).join("|");
+      re = new RegExp(has("w") ? `(?<![A-Za-z0-9_])(?:${source})(?![A-Za-z0-9_])` : source, `g${has("i") ? "i" : ""}`);
     } catch {
-      return fail(2, "grep: Invalid regular expression");
+      return fail(2, "grep: Unmatched ( or \\(");
     }
+    const recursive = has("r") || has("R");
     const sources: [string, string][] = [];
     if (tracked) {
       const roots = paths.length ? paths.map((p) => this.abs(p, cwd)) : [WORKDIR];
       for (const f of this.under(WORKDIR)) if (roots.some((r) => f === r || f.startsWith(`${r}/`))) sources.push([f.slice(WORKDIR.length + 1), text(this.files.get(f)!)]);
-    } else if (!paths.length && !/[rR]/.test(flags)) sources.push(["", stdin]);
+    } else if (!paths.length && !recursive) sources.push(["", stdin]);
     else for (const p of paths.length ? paths : ["."]) {
       const path = this.abs(p, cwd);
       const f = this.read(path);
       if (f !== undefined) sources.push([p, text(f)]);
       else if (this.isDir(path)) {
-        if (!/[rR]/.test(flags)) return fail(2, `grep: ${p}: Is a directory`);
+        if (!recursive) { if (!has("s")) return fail(2, `grep: ${p}: Is a directory`); continue; }
         for (const child of this.under(path)) sources.push([`${p === "." ? "" : `${p.replace(/\/$/, "")}/`}${child.slice(path.length + 1)}`, text(this.files.get(child)!)]);
-      } else return fail(2, `grep: ${p}: No such file or directory`);
+      } else if (!has("s")) return fail(2, `grep: ${p}: No such file or directory`);
     }
-    const named = sources.length > 1 || tracked || /[rR]/.test(flags);
+    // The file's name before each line: with several files, or -H; never with -h.
+    const named = !has("h") && (has("H") || sources.length > 1 || tracked || recursive) && !(sources.length === 1 && sources[0]![0] === "");
     const out: string[] = [];
+    let any = false;
     for (const [p, t] of sources) {
       if (t.includes("\u0000")) continue; // binary
       const all = lines(t);
-      const hits = all.map((l) => re.test(l) !== flags.includes("v"));
+      const matches = all.map((l) => [...l.matchAll(re)].map((m) => m[0]).filter((m) => m !== ""));
+      const hits = all.map((l, n) => (matches[n]!.length > 0 || (l === "" && new RegExp(re.source, re.flags.replace("g", "")).test(l))) !== has("v"));
+      const count = hits.filter(Boolean).length;
+      if (count) any = true;
+      if (has("c")) { out.push(`${named ? `${p}:` : ""}${count}`); continue; }
+      if (has("l")) { if (count) out.push(p); continue; }
       all.forEach((l, n) => {
         const near = !hits[n] && (after || before) && hits.some((h, k) => h && ((k < n && n - k <= after) || (k > n && k - n <= before)));
         if (!hits[n] && !near) return;
-        if (flags.includes("l")) { if (hits[n]) out.push(p); return; }
         const sep = hits[n] ? ":" : "-";
-        out.push(`${named ? `${p}${sep}` : ""}${flags.includes("n") ? `${n + 1}${sep}` : ""}${l}`);
+        const prefix = `${named ? `${p}${sep}` : ""}${has("n") ? `${n + 1}${sep}` : ""}`;
+        // -o: each match on a line of its own (and nothing of the lines around).
+        if (has("o")) { if (hits[n] && !has("v")) for (const m of matches[n]!) out.push(`${prefix}${m}`); return; }
+        out.push(`${prefix}${l}`);
       });
     }
-    const unique = flags.includes("l") ? [...new Set(out)] : out;
-    return { exitCode: unique.length ? 0 : 1, stdout: flags.includes("c") ? `${unique.length}\n` : flags.includes("q") ? "" : unique.map((l) => `${l}\n`).join(""), stderr: "" };
+    return { exitCode: any ? 0 : 1, stdout: has("q") ? "" : out.map((l) => `${l}\n`).join(""), stderr: "" };
   }
 
   // ── git ──
@@ -820,7 +1136,7 @@ export class Shell {
     const who = "A. Maintainer <maintainer@example.com>";
     const first: Commit = { sha: sha1(`${name}:first`), subject: "Initial commit", message: "Initial commit", author: who, committer: who, tree: new Map([...tree].filter(([p]) => !p.includes("/"))) };
     const tip: Commit = { sha: sha1(`${name}:tip`), subject: "Add sources, tests and scripts", message: "Add sources, tests and scripts", author: who, committer: who, parent: first, tree };
-    this.repo = { name, url, branch, branches: new Map([[branch, tip]]), origin: tip, staged: new Set(), config: new Map(), programs: script.programs ?? [] };
+    this.repo = { name, url, branch, branches: new Map([[branch, tip]]), origin: tip, staged: new Map(), config: new Map(), programs: script.programs ?? [] };
   }
 
   private head(): Commit {
@@ -903,8 +1219,13 @@ export class Shell {
     const repo = this.repo;
     if (!repo || !(cwd === WORKDIR || cwd.startsWith(`${WORKDIR}/`))) return fail(128, "fatal: not a git repository (or any of the parent directories): .git");
     const dashes = rest.indexOf("--");
-    const flags = (dashes < 0 ? rest : rest.slice(0, dashes)).filter((a) => a.startsWith("-"));
-    const operands = [...(dashes < 0 ? rest : rest.slice(0, dashes)).filter((a) => !a.startsWith("-")), ...(dashes < 0 ? [] : rest.slice(dashes + 1))];
+    // Options are the words before `--` that start with a dash; a lone "-" (stdin) and the
+    // word after an option that takes a value (a message, a count) are not.
+    const valued = /^(-[a-zA-Z]*[mF]|--message|--file|-n)$/;
+    const before = dashes < 0 ? rest : rest.slice(0, dashes);
+    const isValue = (k: number) => k > 0 && valued.test(before[k - 1]!) && (sub === "commit" || sub === "log");
+    const flags = before.filter((a, k) => a.startsWith("-") && a !== "-" && !isValue(k));
+    const operands = [...before.filter((a, k) => (!a.startsWith("-") || a === "-") && !(isValue(k) && sub === "commit")), ...(dashes < 0 ? [] : rest.slice(dashes + 1))];
     const pathsAfterDashes = dashes < 0 ? undefined : rest.slice(dashes + 1);
     const rel = (p: string) => this.abs(p, cwd).slice(WORKDIR.length + 1);
     const flag = (...names: string[]) => flags.some((f) => names.includes(f));
@@ -915,6 +1236,13 @@ export class Shell {
       return name && email ? { author: `${name} <${email}>`, committer: `${cn} <${ce}>` } : undefined;
     };
     // The working tree as far as git tracks it: what HEAD has, as it is now, and what was added.
+    const stage = (path: string) => repo.staged.set(path, this.files.get(`${WORKDIR}/${path}`) ?? null);
+    // HEAD's tree with what was added laid over it: what a commit made now would hold.
+    const index = (): Tree => {
+      const tree: Tree = new Map(head.tree);
+      for (const [path, content] of repo.staged) content === null ? tree.delete(path) : tree.set(path, content);
+      return tree;
+    };
     const tracked = (): Tree => {
       const work = this.worktree();
       const tree: Tree = new Map();
@@ -934,6 +1262,13 @@ export class Shell {
     const header = (c: Commit) => `commit ${c.sha}\nAuthor: ${c.author}\nDate:   Thu Nov 19 10:00:00 2026 +0000\n\n${c.message.split("\n").map((l) => `    ${l}`).join("\n")}\n`;
     const parentTree = (c: Commit): Tree => c.parent?.tree ?? new Map();
     const unknown = (name: string) => fail(128, `fatal: ambiguous argument '${name}': unknown revision or path not in the working tree.`);
+    // The options each command implements; another is refused as git refuses one it
+    // doesn't know, never ignored.
+    const allowed = GIT_OPTIONS[sub ?? ""];
+    if (allowed) {
+      const bad = flags.find((f) => !allowed.test(f));
+      if (bad) return this.refuse(written, `\`git ${sub}\` is simulated without \`${bad}\``, fail(129, `error: unknown ${bad.startsWith("--") ? "option" : "switch"} \`${bad.replace(/^-+/, "").slice(0, bad.startsWith("--") ? 80 : 1)}'\nusage: git ${sub} [<options>]`));
+    }
 
     switch (sub) {
       case "config": {
@@ -953,19 +1288,25 @@ export class Shell {
       case "ls-files": return ok([...tracked().keys()].sort().map((f) => `${f}\n`).join(""));
       case "grep": return this.grep(rest.filter((a) => a !== "--"), stdin, cwd, true);
       case "status": {
-        const changes = this.changes();
-        if (flag("--porcelain", "--short", "-s", "-sb")) {
-          const code = (c: (typeof changes)[number]) => (c.kind === "untracked" ? (repo.staged.has(c.path) ? "A " : "??") : repo.staged.has(c.path) ? `${c.kind === "deleted" ? "D" : "M"} ` : ` ${c.kind === "deleted" ? "D" : "M"}`);
-          return ok((flag("-sb") ? `## ${repo.branch}...origin/main\n` : "") + changes.map((c) => `${code(c)} ${c.path}\n`).join(""));
-        }
+        const work = this.worktree(), idx = index();
+        // For each path: X, the index against HEAD; Y, the file against the index.
+        const rows = [...new Set([...head.tree.keys(), ...idx.keys(), ...work.keys()])].sort().flatMap((path) => {
+          const h = head.tree.get(path), i = idx.get(path), w = work.get(path);
+          if (h === undefined && i === undefined) return w === undefined ? [] : [{ path, x: "?", y: "?" }];
+          const x = h === undefined ? "A" : i === undefined ? "D" : same(h, i) ? " " : "M";
+          const y = i === undefined ? " " : w === undefined ? "D" : same(i, w) ? " " : "M";
+          return x === " " && y === " " ? [] : [{ path, x, y }];
+        });
+        if (flag("--porcelain", "--short", "-s", "-sb")) return ok((flag("-sb") ? `## ${repo.branch}...origin/main\n` : "") + rows.map((r) => `${r.x}${r.y} ${r.path}\n`).join(""));
         const ahead = this.ancestors(head).filter((c) => !this.ancestors(repo.origin).includes(c)).length;
         const out = [`On branch ${repo.branch}`];
         if (repo.branch === "main") out.push(ahead ? `Your branch is ahead of 'origin/main' by ${ahead} commit${ahead === 1 ? "" : "s"}.\n` : "Your branch is up to date with 'origin/main'.\n");
-        const staged = changes.filter((c) => repo.staged.has(c.path)), unstaged = changes.filter((c) => !repo.staged.has(c.path) && c.kind !== "untracked"), untracked = changes.filter((c) => !repo.staged.has(c.path) && c.kind === "untracked");
-        if (staged.length) out.push("Changes to be committed:", '  (use "git restore --staged <file>..." to unstage)', ...staged.map((c) => `\t${c.kind === "untracked" ? "new file" : c.kind}:   ${c.path}`), "");
-        if (unstaged.length) out.push("Changes not staged for commit:", '  (use "git add <file>..." to update what will be committed)', ...unstaged.map((c) => `\t${c.kind}:   ${c.path}`), "");
-        if (untracked.length) out.push("Untracked files:", '  (use "git add <file>..." to include in what will be committed)', ...untracked.map((c) => `\t${c.path}`), "");
-        if (!changes.length) out.push("nothing to commit, working tree clean");
+        const word = (c: string) => (c === "A" ? "new file" : c === "D" ? "deleted" : "modified");
+        const staged = rows.filter((r) => "AMD".includes(r.x)), unstaged = rows.filter((r) => "MD".includes(r.y)), untracked = rows.filter((r) => r.x === "?");
+        if (staged.length) out.push("Changes to be committed:", '  (use "git restore --staged <file>..." to unstage)', ...staged.map((r) => `\t${word(r.x)}:   ${r.path}`), "");
+        if (unstaged.length) out.push("Changes not staged for commit:", '  (use "git add <file>..." to update what will be committed)', ...unstaged.map((r) => `\t${word(r.y)}:   ${r.path}`), "");
+        if (untracked.length) out.push("Untracked files:", '  (use "git add <file>..." to include in what will be committed)', ...untracked.map((r) => `\t${r.path}`), "");
+        if (!rows.length) out.push("nothing to commit, working tree clean");
         else if (!staged.length) out.push(unstaged.length ? 'no changes added to commit (use "git add" and/or "git commit -a")' : 'nothing added to commit but untracked files present (use "git add" to track)');
         return ok(`${out.join("\n")}\n`);
       }
@@ -977,53 +1318,65 @@ export class Shell {
           const path = rel(p);
           const under = changes.filter((c) => c.path === path || c.path.startsWith(`${path}/`));
           if (!under.length && !head.tree.has(path) && this.read(`${WORKDIR}/${path}`) === undefined && !this.isDir(`${WORKDIR}/${path}`)) return fail(128, `fatal: pathspec '${p}' did not match any files`);
-          for (const c of under) repo.staged.add(c.path);
+          for (const c of under) stage(c.path);
+          // Already added, then edited: the new content replaces the snapshot.
+          for (const staged of [...repo.staged.keys()]) if (staged === path || staged.startsWith(`${path}/`)) stage(staged);
         }
-        if (everything) for (const c of changes) repo.staged.add(c.path);
+        if (everything) {
+          for (const c of changes) stage(c.path);
+          for (const staged of [...repo.staged.keys()]) stage(staged);
+        }
         return ok();
       }
       case "rm":
       case "mv": {
-        if (sub === "rm") for (const p of operands) { this.files.delete(`${WORKDIR}/${rel(p)}`); repo.staged.add(rel(p)); }
+        if (sub === "rm") for (const p of operands) { this.files.delete(`${WORKDIR}/${rel(p)}`); stage(rel(p)); }
         else if (operands.length === 2) {
           const [a, b] = operands.map(rel) as [string, string];
           const f = this.files.get(`${WORKDIR}/${a}`);
           if (f === undefined) return fail(128, `fatal: bad source, source=${a}, destination=${b}`);
           this.write(`${WORKDIR}/${b}`, f);
           this.files.delete(`${WORKDIR}/${a}`);
-          repo.staged.add(a).add(b);
+          stage(a);
+          stage(b);
         }
         return ok();
       }
       case "commit": {
         const changes = this.changes();
-        if (flags.some((f) => /^-[a-z]*a[a-z]*$/.test(f) || f === "--all")) for (const c of changes) if (c.kind !== "untracked") repo.staged.add(c.path);
+        // -a: every tracked file as it is now.
+        if (flags.some((f) => /^-[a-zA-Z]*a[a-zA-Z]*$/.test(f) || f === "--all")) for (const c of changes) if (c.kind !== "untracked") stage(c.path);
         const messages: string[] = [];
-        rest.forEach((a, i) => {
-          if ((/^-[a-z]*m$/.test(a) || a === "--message") && rest[i + 1] !== undefined) messages.push(rest[i + 1]!);
+        for (let k = 0; k < rest.length; k++) {
+          const a = rest[k]!;
+          if (/^-[a-z]*m$/.test(a) || a === "--message") { if (rest[k + 1] !== undefined) messages.push(rest[++k]!); }
           else if (a.startsWith("--message=")) messages.push(a.slice(10));
-        });
+          else if (/^-[a-z]*F$/.test(a) || a === "--file" || a.startsWith("--file=")) {
+            // -F <file>, or -F - for the message on stdin.
+            const from = a.startsWith("--file=") ? a.slice(7) : rest[++k];
+            if (from === undefined) return fail(129, "error: switch `F' requires a value");
+            const body = from === "-" ? stdin : this.read(this.abs(from, cwd));
+            if (body === undefined) return fail(128, `fatal: could not read log file '${from}': No such file or directory`);
+            messages.push(text(body).replace(/\n+$/, ""));
+          }
+        }
         const amend = flag("--amend");
-        const staged = changes.filter((c) => repo.staged.has(c.path));
+        // What is committed is the index: each added path as it was when it was added.
+        const staged = [...repo.staged].filter(([path, content]) => (content === null ? head.tree.has(path) : !same(head.tree.get(path), content)));
         if (!staged.length && !amend && !flag("--allow-empty")) return { exitCode: 1, stdout: `On branch ${repo.branch}\n${changes.length ? 'no changes added to commit (use "git add" and/or "git commit -a")' : "nothing to commit, working tree clean"}\n`, stderr: "" };
         const message = messages.length ? messages.join("\n\n") : amend ? head.message : undefined;
-        if (!message) return fail(1, "error: no commit message given, and there is no editor in this sandbox: use `git commit -m \"<message>\"`");
+        if (!message?.trim()) return fail(1, messages.length ? "Aborting commit due to empty commit message." : "error: Terminal is dumb, but EDITOR unset\nPlease supply the message using either -m or -F option.");
         const who = me();
         if (!who) return fail(128, "Author identity unknown\n\n*** Please tell me who you are.\n\nfatal: unable to auto-detect email address");
-        const tree: Tree = new Map(head.tree);
-        for (const c of staged) {
-          const now = this.files.get(`${WORKDIR}/${c.path}`);
-          if (now === undefined) tree.delete(c.path);
-          else tree.set(c.path, now);
-        }
+        const tree = index();
         repo.staged.clear();
         const parent = amend ? head.parent : head;
         const subject = message.split("\n")[0]!;
         const author = amend && !flag("--reset-author") ? head.author : who.author;
         const commit: Commit = { sha: sha1(`${parent?.sha}\n${message}\n${author}\n${[...tree].map(([p, v]) => `${p}:${sha1(text(v))}`).join(",")}`), subject, message, author, committer: who.committer, parent, tree };
         repo.branches.set(repo.branch, commit);
-        const s = diffStat(changesBetween(parentTree(commit), tree));
-        return ok(flags.some((f) => f === "--quiet" || /^-[a-z]*q[a-z]*$/.test(f)) ? "" : `[${repo.branch} ${short(commit.sha)}] ${subject}\n${s.summary}\n`);
+        const stat = diffStat(changesBetween(parentTree(commit), tree));
+        return ok(flags.some((f) => f === "--quiet" || /^-[a-zA-Z]*q[a-zA-Z]*$/.test(f)) ? "" : `[${repo.branch} ${short(commit.sha)}] ${subject}\n${stat.summary}\n`);
       }
       case "checkout":
       case "switch":
@@ -1042,7 +1395,8 @@ export class Shell {
             if (!matched.some((f) => from.tree.has(f))) return fail(1, `error: pathspec '${p}' did not match any file(s) known to git`);
             for (const f of matched) {
               if (flag("--staged")) { repo.staged.delete(f); continue; }
-              const was = from.tree.get(f);
+              // From the index (what was last added), unless a --source was named.
+              const was = source ? from.tree.get(f) : index().get(f);
               if (was !== undefined) this.write(`${WORKDIR}/${f}`, was);
               repo.staged.delete(f);
             }
@@ -1078,7 +1432,7 @@ export class Shell {
         if (operands[0] && !target) return unknown(operands[0]);
         const to = target || head;
         if (flag("--soft")) {
-          for (const c of changesBetween(to.tree, head.tree)) repo.staged.add(c.path);
+          for (const c of changesBetween(to.tree, head.tree)) if (!repo.staged.has(c.path)) repo.staged.set(c.path, c.after ?? null);
           repo.branches.set(repo.branch, to);
           return ok();
         }
@@ -1165,6 +1519,35 @@ export class Shell {
         if (flag("--name-only", "--name-status", "--stat", "--shortstat")) return ok(`${flag("--oneline") ? `${short(c.sha)} ${c.subject}\n` : `${header(c)}\n`}${render(changes).stdout}`);
         return ok(`${header(c)}\n${patchOf(changes)}`);
       }
+      case "rebase": {
+        // Two forms. `git rebase <upstream>` when HEAD already has upstream (history here
+        // is a line, so it does unless a branch was reset): nothing to do. And
+        // `git rebase --exec '<command>' <upstream>` with the one command the product
+        // tells the model to run when a commit's author is wrong
+        // (src/tools/pull-request.ts): each commit ahead of upstream is made again by
+        // whoever commits now.
+        const at = rest.findIndex((a) => a === "--exec" || a === "-x");
+        const command = at < 0 ? undefined : rest[at + 1];
+        const upstreamName = rest.filter((a, k) => !a.startsWith("-") && k !== at + 1 || (at < 0 && !a.startsWith("-")))[0];
+        const upstream = upstreamName === undefined ? undefined : this.rev(upstreamName);
+        if (!upstream) return fail(128, upstreamName === undefined ? "fatal: no upstream configured for the current branch" : `fatal: invalid upstream '${upstreamName}'`);
+        const line = this.ancestors(head);
+        const cut = line.findIndex((c) => c.sha === upstream.sha);
+        if (cut < 0) return this.refuse(written, "a rebase onto a commit HEAD doesn't have isn't simulated", fail(128, `fatal: invalid upstream '${upstreamName}'`));
+        if (command === undefined) return ok(`Current branch ${repo.branch} is up to date.\n`);
+        if (command.replace(/\s+/g, " ").trim() !== "git commit --amend --no-edit --reset-author") {
+          return this.refuse(written, "`git rebase --exec` is simulated for `git commit --amend --no-edit --reset-author` only", fail(1, `Executing: ${command}\nwarning: execution failed: ${command}\nYou can fix the problem, and then run\n\n  git rebase --continue`));
+        }
+        const who = me();
+        if (!who) return fail(128, "Author identity unknown\n\nfatal: unable to auto-detect email address");
+        let parent = upstream;
+        const ahead = line.slice(0, cut).reverse();
+        for (const c of ahead) {
+          parent = { ...c, author: who.author, committer: who.committer, parent, sha: sha1(`${parent.sha}\n${c.message}\n${who.author}\n${[...c.tree].map(([p, v]) => `${p}:${sha1(text(v))}`).join(",")}`) };
+        }
+        repo.branches.set(repo.branch, parent);
+        return { exitCode: 0, stdout: ahead.map(() => `Executing: ${command}\n`).join(""), stderr: `Successfully rebased and updated refs/heads/${repo.branch}.\n` };
+      }
       case "diff": {
         const cached = flag("--cached", "--staged");
         const revs = (pathsAfterDashes ? rest.slice(0, dashes) : rest).filter((a) => !a.startsWith("-"));
@@ -1183,9 +1566,12 @@ export class Shell {
         }
         if (named.length >= 2) return render(only(changesBetween(this.rev(named[0]!)!.tree, this.rev(named[1]!)!.tree), paths));
         if (named.length === 1) return render(only(changesBetween(this.rev(named[0]!)!.tree, tracked()), paths));
-        // Plain `git diff`: what isn't staged. `--cached`: what is.
-        const all = changesBetween(head.tree, tracked());
-        return render(only(all.filter((c) => repo.staged.has(c.path) === cached), paths));
+        // `--cached`: the index against HEAD. Plain `git diff`: the files against the index.
+        if (cached) return render(only(changesBetween(head.tree, index()), paths));
+        const idx = index(), work = this.worktree();
+        const files: Tree = new Map();
+        for (const path of idx.keys()) if (work.has(path)) files.set(path, work.get(path)!);
+        return render(only(changesBetween(idx, files), paths));
       }
     }
     return this.refuse(written, `\`git ${sub ?? ""}\` isn't simulated`, fail(1, `git: '${sub ?? ""}' is not a git command. See 'git --help'.`));
