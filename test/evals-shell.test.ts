@@ -33,7 +33,7 @@ const TABLE: [name: string, commands: string[], want: Want][] = [
   ["a && b runs b after success", ["true && echo yes"], "yes\n"],
   ["a && b skips b after failure", ["false && echo yes"], { stdout: "", code: 1 }],
   ["a || b runs b after failure", ["ls nope 2>/dev/null || echo missing"], "missing\n"],
-  ["the README's own line", ["bun install && bun test"], new RegExp(`^bun install v1\\.4\\.3[\\s\\S]*${TESTS_END.replace(/[.[\]()]/g, "\\$&")}$`)],
+  ["the README's own line", ["bun install && bun test"], new RegExp(`^bun install v1\\.4\\.3[\\s\\S]*${TESTS_END.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}$`)],
   ["VAR=x cmd is that command's only", ["GREETING=hi env | grep GREETING; echo \"[$GREETING]\""], "GREETING=hi\n[]\n"],
   ["VAR=x alone, then $VAR and ${VAR}", ['NAME=widgets; echo "$NAME ${NAME}" $NAME'], "widgets widgets widgets\n"],
   ["export, then $VAR in a later command of the line", ["export CI=1 && echo ci=$CI"], "ci=1\n"],

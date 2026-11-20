@@ -25,7 +25,7 @@
 // true and further model calls are refused (HTTP 400, `x-should-retry: false`, so the SDK
 // doesn't retry). Calls in flight at that moment finish and are counted.
 
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { scrub, type Credential } from "./credential";
 import { addTokens, noTokens, responseFromJson, SseReader, StreamedMessage, totalTokens, type ModelResponse, type Tokens } from "./sse";
 
@@ -128,11 +128,14 @@ export function retryWaitMs(status: number, headers: Headers): number {
   return Math.min(RETRY_MAX_MS, said === undefined ? RETRY_DEFAULT_MS : Math.max(0, said) + 2000);
 }
 
-// Whether two keys are the same, in time that doesn't depend on where they first differ
-// (both are hashed, so the comparison is of equal lengths whatever was sent).
+// Whether two keys are the same, in time that doesn't depend on where they first differ.
+// The run's key is random and of a fixed length, so a length that differs tells nothing;
+// the bytes are compared in buffers of the key's own length, whatever was sent.
 function sameKey(given: string, key: string): boolean {
-  const digest = (s: string) => createHash("sha256").update(s).digest();
-  return timingSafeEqual(digest(given), digest(key));
+  const want = Buffer.from(key);
+  const got = Buffer.alloc(want.length);
+  got.write(given);
+  return timingSafeEqual(got, want) && Buffer.byteLength(given) === want.length;
 }
 
 export function startProxy(opts: ProxyOptions): Proxy {

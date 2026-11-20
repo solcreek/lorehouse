@@ -56,7 +56,9 @@ export const cases: Case[] = [
       said("the reply has the day", /星期四|週四|周四|禮拜四|礼拜四/),
       said("the reply has the place", /十樓|十楼|10 ?[樓楼]|10 ?F\b/i),
       check("the reply is mostly Chinese", (o) => {
-        const text = reply(o).replace(/https?:\/\/\S+|<[^>]+>/g, "");
+        // Links aside (a URL, or Slack's <url|label>): what is left is counted, not shown
+        // anywhere, so this is a tally of letters, not a cleaning of markup.
+        const text = reply(o).split(/https?:\/\/\S+|<[^>]+>/).join("");
         const cjk = (text.match(/[一-鿿]/g) ?? []).length;
         const latin = (text.match(/[A-Za-z]/g) ?? []).length;
         return { pass: cjk > 0 && cjk >= latin, evidence: `${cjk} Chinese character(s) and ${latin} Latin letter(s) in the reply, links aside` };
