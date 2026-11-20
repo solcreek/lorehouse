@@ -19,6 +19,7 @@
     "test": "bun test test/",
     "typecheck": "tsc --noEmit",
     "conformance": "bun conformance/run.ts",
+    "eval": "bun evals/run.ts",
     "doctor": "bun src/server.ts doctor"
   },
   "dependencies": {

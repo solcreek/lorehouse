@@ -39,6 +39,9 @@ target/
 # Proof from .claude/skills/verify-lorehouse. Cleanup leaves these in place.
 .claude/skills/verify-lorehouse/artifacts/
 
+# Evidence from `bun run eval` (evals/README.md): one directory per run.
+/evals/out/
+
 # nix build output
 /result
 /result-*
