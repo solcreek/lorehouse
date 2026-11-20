@@ -995,6 +995,11 @@ pub mod tests {
             let r = execute(&vms, &publisher, bad, Instant::now()).await;
             assert_eq!((r.status, r.code.as_deref()), (400, Some("invalid_exec_body")), "{body}: {:?}", r.error);
         }
+        // A command's body over its size, as a job brings it: refused the same way.
+        let mut large = wire(serde_json::json!({ "vcpus": 1 }));
+        large.body_base64 = Some(B64.encode(" ".repeat(crate::resources::MAX_EXEC_BODY + 1)));
+        let r = execute(&vms, &publisher, large, Instant::now()).await;
+        assert_eq!((r.status, r.code.as_deref()), (413, Some("invalid_exec_body")), "{:?}", r.error);
         assert!(!dir.join("state/acme.t1").exists());
         assert_eq!((vms.running_count().await, vms.in_flight().await), (0, 0));
         assert!(vms.list().await.is_empty());

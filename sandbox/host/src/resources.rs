@@ -22,6 +22,8 @@
 //!                                request could have been granted
 //!   invalid_exec_body       400  a command's body that isn't the JSON object guestd is
 //!                                sent (see `exec_body`)
+//!                           413  a command's body over 1 MiB (`MAX_EXEC_BODY`), refused
+//!                                before it is parsed
 //!
 //! A request, when there is one, says what the whole sandbox is: what it names, and the
 //! defaults for the rest. Resources are fixed only while the sandbox's VM runs: a request
@@ -229,6 +231,16 @@ pub struct ExecBody {
 
 impl ExecBody {
     pub fn parse(body: &[u8]) -> Result<ExecBody, Refusal> {
+        // Its size first: a body is parsed into a tree several times its size, and the
+        // router lets through what a file write may be (64 MiB). A command is not that.
+        if body.len() > MAX_EXEC_BODY {
+            return Err(Refusal::new(
+                413,
+                INVALID_EXEC,
+                format!("the exec body is {} bytes, over the {MAX_EXEC_BODY} a command's body may be. Put what is large in a file (PUT /file) and have the command read it; nothing was run", body.len()),
+                json!({ "bytes": body.len(), "maxBytes": MAX_EXEC_BODY }),
+            ));
+        }
         let bad = |why: String| Refusal::new(400, INVALID_EXEC, format!("{why}. A command's body is a JSON object with command, and optionally cwd, env and timeoutMs, spelled exactly so; nothing was run"), json!({}));
         let o = match serde_json::from_slice::<Value>(body) {
             Ok(Value::Object(o)) => o,
@@ -251,6 +263,11 @@ impl ExecBody {
         Ok(ExecBody { fields, asked_ms })
     }
 }
+
+/// The most bytes a `POST /exec` body may be: 1 MiB, what guestd reads of a job's start
+/// (sandbox/guest/jobs.go). Lorehouse sends a shell command, a directory and a few
+/// variables: kilobytes.
+pub const MAX_EXEC_BODY: usize = 1 << 20;
 
 /// The keys of a `POST /exec` body: guestd's execReq (sandbox/guest/main.go), exactly.
 const EXEC_KEYS: [&str; 4] = ["command", "cwd", "env", "timeoutMs"];
@@ -810,6 +827,17 @@ pub mod tests {
             let r = g.exec_body(&body).unwrap_err();
             assert_eq!((r.status, r.code), (400, INVALID_EXEC), "{}", String::from_utf8_lossy(&body));
             assert!(r.body()["error"].as_str().unwrap().contains("nothing was run"));
+        }
+        // A body over the limit: refused by its size, before it is parsed (it need not be
+        // JSON to be refused so), with the size and the limit. At the limit: read.
+        let command = |len: usize| format!(r#"{{"command":"{}"}}"#, "x".repeat(len - r#"{"command":""}"#.len())).into_bytes();
+        assert_eq!(command(MAX_EXEC_BODY).len(), MAX_EXEC_BODY);
+        assert!(g.exec_body(&command(MAX_EXEC_BODY)).is_ok());
+        for body in [command(MAX_EXEC_BODY + 1), vec![0xff; MAX_EXEC_BODY + 1]] {
+            let r = g.exec_body(&body).unwrap_err();
+            assert_eq!((r.status, r.code), (413, INVALID_EXEC));
+            assert_eq!(r.body(), json!({ "error": r.message, "code": "invalid_exec_body", "bytes": MAX_EXEC_BODY + 1, "maxBytes": MAX_EXEC_BODY }));
+            assert!(r.message.contains("1048577 bytes, over the 1048576") && r.message.contains("nothing was run"), "{}", r.message);
         }
         // The host's own deadline follows: the default's is the 15.5 minutes it always was.
         assert_eq!(g.exec_backstop(), std::time::Duration::from_secs(390));
