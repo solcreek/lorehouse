@@ -519,6 +519,51 @@ test("checks that could not fail, or failed correct replies, are now a fact in c
   expect(posted(silent).pass).toBe(false);
 });
 
+// Whether every required code check of a shipped case passes on an observation, and which don't.
+const codeVerdict = (id: string, o: Observation) => {
+  const failed = CASES.find((c) => c.id === id)!.checks.flatMap((k) => (!k.graded && k.required && !k.run(o).pass ? [k.name] : []));
+  return { pass: failed.length === 0, failed };
+};
+const b64json = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64");
+const runnerJob = (n: number, job: { op?: string; method?: string; path?: string; body?: unknown }, answer: unknown, status = 200) =>
+  observeJob(n, { id: `j${n}`, sandbox: "t.s", op: job.op ?? "guest", method: job.method, path: job.path, bodyBase64: job.body === undefined ? undefined : b64json(job.body) }, { id: `j${n}`, status, contentType: "application/json", bodyBase64: b64json(answer) });
+const turnsCalling = (...calls: [string, Record<string, unknown>][]): Observation["model"] => ({
+  turns: calls.map(([name, input], k) => ({ n: k + 1, startedAt: "", request: { stream: true, tools: [], messages: 1, input: [] }, status: 200, response: { stopReason: "tool_use", tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, content: [{ type: "tool_use" as const, id: `t${k}`, name, input }] } })),
+  toolCalls: calls.map(([name, input], k) => ({ turn: k + 1, name, input })),
+});
+const replying = (o: Observation, text: string) => {
+  o.slack.said = [{ via: "stream", thread: "1.0", text, call: 2 }];
+  return o;
+};
+
+test("long-command-is-a-job: one poll that says 'running' is not the job followed to its end", () => {
+  const job = (state: string, exitCode: number | null, tail: string) => ({ id: "bench-1", command: "make bench", cwd: "/workspace/repo", state, exitCode, elapsedMs: 1000, tail });
+  const START = runnerJob(0, { method: "POST", path: "/jobs", body: { id: "bench-1", command: "make bench", cwd: "/workspace/repo" } }, { ...job("running", null, ""), created: true }, 201);
+  const poll = (n: number, state: string, exitCode: number | null, tail: string, id = "bench-1") => runnerJob(n, { method: "GET", path: `/jobs/${id}?tailBytes=8192` }, { ...job(state, exitCode, tail), id });
+  const TAIL = "bench build 35 ms\nbench total 290 ms (5 benchmarks)\n";
+  const scene = (jobs: Observation["runner"]["jobs"], reply: string, statusCalls = jobs.length - 1) => {
+    const o = replying(observed(), reply);
+    o.runner.jobs = jobs;
+    o.model = turnsCalling(["workspace_job_start", { id: "bench-1", command: "make bench" }], ...Array.from({ length: statusCalls }, (): [string, Record<string, unknown>] => ["workspace_job_status", { id: "bench-1" }]));
+    return o;
+  };
+  // Started, polled once while still running, and a reply that names the figure anyway.
+  const stopped = codeVerdict("long-command-is-a-job", scene([START, poll(1, "running", null, "bench build 35 ms\n")], "It's running; the total should be 290 ms."));
+  expect(stopped.pass).toBe(false);
+  expect(stopped.failed).toEqual(["the job is followed until it ends, exit 0", "the reply carries the job's final output"]);
+  // Followed to its end, and the reply carries the last line of what it printed.
+  expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "running", null, ""), poll(2, "exited", 0, TAIL)], "Done: bench total 290 ms (5 benchmarks)."))).toEqual({ pass: true, failed: [] });
+  expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "exited", 0, TAIL)], "Finished. Total: 290ms across 5 benchmarks.")).pass).toBe(true);
+  // It ended, but failed; or it was another job that ended; or it was cancelled.
+  expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "exited", 2, "make: *** [bench] Error 2\n")], "bench total 290 ms")).failed).toContain("the job is followed until it ends, exit 0");
+  expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "exited", 0, TAIL, "other-9")], "bench total 290 ms")).failed).toContain("the job is followed until it ends, exit 0");
+  expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "cancelled", 143, "")], "bench total 290 ms")).failed).toContain("the job is followed until it ends, exit 0");
+  // It ended well, but the reply's figure is not what the job printed.
+  expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "exited", 0, TAIL)], "Done: total 312 ms.")).failed).toEqual(["the reply carries the job's final output"]);
+  // Under --dry the fake runner's job prints "ran:<command>": the same rule holds it.
+  expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "running", null, "started\n"), poll(2, "exited", 0, "ran:make bench\n")], "[q?] [job:bench-1:exited:0:ran:make bench] w0 w1")).pass).toBe(true);
+});
+
 test("neverSaid: a stream that carried only task updates and no text said nothing, so it fails", () => {
   const o = observed();
   o.slack.said = [{ via: "stream", thread: "1.0", text: "", call: 2 }, { via: "stream", thread: "1.0", text: "  \n", call: 5 }];

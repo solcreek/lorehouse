@@ -2,10 +2,20 @@
 // background job (#124), a chart attached to the thread (#125), and a sandbox refusal
 // told to the person (#109).
 
-import type { Case } from "../case";
-import { called, graded, ran, said, uploaded } from "../checks";
+import type { Case, Observation } from "../case";
+import { called, check, graded, ran, said, uploaded } from "../checks";
 import { RUBRICS } from "../rubrics";
 import { widgets, WIDGETS } from "./widgets";
+
+// The background job that ran `make bench`: its id, every status read of it, and the one
+// (if any) that says it ended with exit 0.
+type JobBody = { id?: string; state?: string; exitCode?: number | null; tail?: string };
+function benchJob(o: Observation) {
+  const start = o.runner.jobs.find((j) => j.method === "POST" && j.path === "/jobs" && /make bench/.test(j.command ?? "") && j.answer.status < 300);
+  const id = (start?.answer.body as JobBody | undefined)?.id;
+  const statuses = id === undefined ? [] : o.runner.jobs.filter((j) => j.method === "GET" && (j.path ?? "").split("?")[0] === `/jobs/${encodeURIComponent(id)}` && j.answer.status === 200 && (j.answer.body as JobBody | undefined)?.id === id);
+  return { id, statuses, ended: statuses.find((j) => (j.answer.body as JobBody).state === "exited" && (j.answer.body as JobBody).exitCode === 0) };
+}
 
 const repo = { defaultRepo: { repo: "acme/widgets", branch: "main" } };
 
@@ -32,7 +42,7 @@ export const cases: Case[] = [
   {
     id: "long-command-is-a-job",
     suite: "code",
-    why: "A command said to take half an hour runs as a background job, is followed until it ends, and its output is shown.",
+    why: "A command said to take half an hour runs as a background job, is followed until it has ended, and what it printed at its end is shown.",
     dry: "passes",
     setup: { ...repo, sandbox: widgets },
     conversation: [
@@ -41,10 +51,29 @@ export const cases: Case[] = [
     checks: [
       called("the command is started with workspace_job_start", "workspace_job_start", { input: (i) => /make bench/.test(String(i.command)) }),
       ran("the job reaches the sandbox", { method: "POST", path: /^\/jobs$/, command: /make bench/ }),
-      called("the job is followed with workspace_job_status", "workspace_job_status"),
       called("`make bench` is not run with workspace_exec", "workspace_exec", { max: 0, input: (i) => /make bench/.test(String(i.command)) }),
-      // What the benchmark prints at its end (under --dry, the fake runner's "ran:<command>").
-      said("the reply carries the job's output", /290 ?ms|ran:[^\n]*make bench/),
+      // Followed: not one look at a job still running, but a status of that very job that
+      // says it ended, with exit 0.
+      check("the job is followed until it ends, exit 0", (o) => {
+        const job = benchJob(o);
+        if (!job.id) return { pass: false, evidence: "no job running `make bench` was started" };
+        if (job.ended) return { pass: true, evidence: `job #${job.ended.n} is a status of ${job.id}: exited, exit 0` };
+        const seen = job.statuses.map((j) => `job #${j.n} ${(j.answer.body as JobBody).state} (exit ${(j.answer.body as JobBody).exitCode})`);
+        return { pass: false, evidence: seen.length ? `no status of ${job.id} says it exited with 0; the statuses seen: ${seen.join(", ")}` : `the status of ${job.id} was never read` };
+      }),
+      // What the reply shows is what that job printed at its end: the last line of its
+      // final output, or that line's figure (under --dry, the fake runner's "ran:<command>").
+      check("the reply carries the job's final output", (o) => {
+        const job = benchJob(o);
+        const tail = job.ended ? String((job.ended.answer.body as JobBody).tail ?? "") : "";
+        const last = tail.split("\n").map((l) => l.trim()).filter(Boolean).at(-1);
+        if (!last) return { pass: false, evidence: job.ended ? "the job's final status carries no output" : "there is no final status of the job to hold the reply to" };
+        const squash = (s: string) => s.replace(/\s+/g, " ");
+        const text = squash(o.slack.said.filter((s) => s.via !== "ephemeral").map((s) => s.text).join("\n"));
+        const figure = /(\d+) ?ms/.exec(last)?.[1];
+        const pass = text.includes(squash(last)) || (figure !== undefined && new RegExp(`\\b${figure} ?ms\\b`).test(text));
+        return { pass, evidence: `the job's last line was ${JSON.stringify(last)}; the reply ${pass ? "carries it" : `doesn't: ${JSON.stringify(text.slice(0, 200))}`}` };
+      }),
     ],
   },
   {
