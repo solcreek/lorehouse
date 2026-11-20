@@ -10,5 +10,5 @@
     "resolveJsonModule": true,
     "allowImportingTsExtensions": false
   },
-  "include": ["src", "test", "conformance"]
+  "include": ["src", "test", "conformance", "evals"]
 }
