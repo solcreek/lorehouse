@@ -61,6 +61,18 @@ export const cases: Case[] = [
       said("the reply has Chinese in it", /[一-鿿]/, { via: ["stream"] }),
       // Characters only Simplified Chinese writes, for words this answer needs.
       neverSaid("the reply uses no Simplified characters", /[会楼点议这们为]/),
+      // What the model writes between its tool calls is shown too, as a line of the reply's
+      // task timeline (June's `june_note:<n>` entries), and stays there: the asker reads it
+      // as much as the answer. A hard fact per line: it has Chinese in it. (The tools' own
+      // labels on that timeline are the app's fixed English, not the model's: not held here.)
+      check("every note shown while it works has Chinese in it", (o) => {
+        const notes = o.slack.calls
+          .flatMap((c) => (Array.isArray(c.body.chunks) ? (c.body.chunks as { type?: string; id?: string; title?: string }[]) : []))
+          .filter((chunk) => chunk.type === "task_update" && typeof chunk.id === "string" && chunk.id.startsWith("june_note:"))
+          .map((chunk) => chunk.title ?? "");
+        const not = notes.filter((n) => !/[一-鿿]/.test(n));
+        return { pass: not.length === 0, evidence: not.length ? `${not.length} of ${notes.length} note(s) with no Chinese: ${not.map((n) => JSON.stringify(n.slice(0, 90))).join(", ")}` : `${notes.length} note(s), each with Chinese in it` };
+      }),
       graded("the reply reads as Traditional Chinese", RUBRICS.traditionalChinese, { subject: reply }),
     ],
   },

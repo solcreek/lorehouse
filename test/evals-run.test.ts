@@ -198,6 +198,30 @@ test("checks: a step that never began bounds nothing after it and everything bef
   expect(run(ran("before a step that never ran", { op: "push" }, { max: 0, before: "member" }), o).pass).toBe(false);
 });
 
+test("the Traditional Chinese case holds the notes shown while the model works, not only the answer", () => {
+  const zh = CASES.find((c) => c.id === "answers-in-traditional-chinese")!;
+  const notes = zh.checks.find((k) => k.name === "every note shown while it works has Chinese in it")!;
+  if (notes.graded) throw new Error("graded");
+  // The reply's task timeline as June streams it: the model's notes (june_note:<n>) among
+  // the tools' own labels, which are the app's fixed English and not the model's.
+  const withNotes = (...titles: string[]) => {
+    const o = observed();
+    const chunk = (id: string, title: string) => ({ type: "task_update", id, title, status: "complete" });
+    o.slack.calls = [
+      { n: 0, method: "chat.startStream", body: { channel: "C1", thread_ts: "1.0", chunks: titles.slice(0, 1).map((t) => chunk("june_note:1", t)) } },
+      { n: 1, method: "chat.appendStream", body: { ts: "9.1", chunks: [chunk("toolu_01", "Searching what the company knows")] } },
+      ...titles.slice(1).map((t, i) => ({ n: 2 + i, method: "chat.appendStream", body: { ts: "9.1", chunks: [chunk(`june_note:${i + 2}`, t)] } })),
+      { n: 9, method: "chat.appendStream", body: { ts: "9.1", chunks: [{ type: "markdown_text", text: "週會改到星期四下午三點。" }] } },
+    ];
+    return o;
+  };
+  expect(notes.run(withNotes("我查一下。", "找到了。"))).toMatchObject({ pass: true, evidence: "2 note(s), each with Chinese in it" });
+  expect(notes.run(withNotes())).toMatchObject({ pass: true }); // no notes at all is not a note in English
+  // What it was written for (#194): the answer in Chinese, the notes around it in English.
+  expect(notes.run(withNotes("I'll look that up.", "找到了。"))).toMatchObject({ pass: false, evidence: `1 of 2 note(s) with no Chinese: "I'll look that up."` });
+  expect(notes.run(withNotes("我查一下。", "Found it — one message covers both."))).toMatchObject({ pass: false });
+});
+
 test("the pull request case fails when the model changed nothing, or something else", () => {
   const pr = CASES.find((c) => c.id === "pull-request-needs-approval")!;
   const named = (name: string) => {
