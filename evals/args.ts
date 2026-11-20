@@ -7,7 +7,8 @@ import type { Case } from "./case";
 export { UsageError };
 
 export const USAGE = `bun run eval [--dry] [--only <pattern>] [--trials <n>] [--model <id>] [--concurrency <n>]
-             [--max-tokens <n>] [--threshold <0..1>] [--grader-model <id>] [--out <dir>] [--list]
+             [--max-tokens <n>] [--threshold <0..1>] [--grader-model <id>] [--no-grader]
+             [--out <dir>] [--list] | --grader-selftest
 
   --dry               the scripted model of conformance/mock.ts: no credential, no network.
                       Judges each case by its \`dry\` field. Default --trials 1.
@@ -16,22 +17,28 @@ export const USAGE = `bun run eval [--dry] [--only <pattern>] [--trials <n>] [--
   --model <id>        the app's ANTHROPIC_MODEL (default: the app's own default)
   --concurrency <n>   trials at once (default 2)
   --max-tokens <n>    total tokens the run may use before model calls are refused (default 5000000)
-  --threshold <x>     a case is ok when its passing trials / trials >= x, code checks only (default 1)
+  --threshold <x>     a case is ok when its passing trials / trials >= x (default 1)
   --grader-model <id> the model for graded checks (default claude-haiku-5-5)
+  --no-grader         run without graded checks: they are "not judged", and a case whose
+                      required checks include one is reported as not fully judged, not passed
+  --grader-selftest   grade every rubric's known-good and known-bad replies with the real
+                      grader model and exit 1 if any comes out wrong; runs no case
   --out <dir>         where evidence goes (default evals/out)
   --list              print the cases and exit`;
 
-export type Args = { dry: boolean; list: boolean; only?: string; trials: number; model?: string; concurrency: number; maxTokens: number; threshold: number; graderModel?: string; out?: string };
+export type Args = { dry: boolean; list: boolean; noGrader: boolean; graderSelftest: boolean; only?: string; trials: number; model?: string; concurrency: number; maxTokens: number; threshold: number; graderModel?: string; out?: string };
 
 const VALUED = ["--only", "--trials", "--model", "--concurrency", "--max-tokens", "--threshold", "--grader-model", "--out"] as const;
 
 export function parseArgs(argv: string[]): Args {
   const raw: Record<string, string> = {};
-  let dry = false, list = false;
+  let dry = false, list = false, noGrader = false, graderSelftest = false;
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]!;
     if (flag === "--dry") { dry = true; continue; }
     if (flag === "--list") { list = true; continue; }
+    if (flag === "--no-grader") { noGrader = true; continue; }
+    if (flag === "--grader-selftest") { graderSelftest = true; continue; }
     if (!(VALUED as readonly string[]).includes(flag)) throw new UsageError(`unknown argument ${JSON.stringify(flag)}\n\n${USAGE}`);
     const value = argv[++i];
     if (value === undefined || value === "" || value.startsWith("--")) throw new UsageError(`${flag} needs a value`);
@@ -49,8 +56,9 @@ export function parseArgs(argv: string[]): Args {
     threshold = Number(raw["--threshold"]);
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) throw new UsageError(`--threshold ${raw["--threshold"]}: a number from 0 to 1 (1 means every trial must pass)`);
   }
+  if (graderSelftest && (dry || noGrader)) throw new UsageError("--grader-selftest grades with the real grader model: not with --dry or --no-grader");
   return {
-    dry, list, only: raw["--only"],
+    dry, list, noGrader, graderSelftest, only: raw["--only"],
     trials: int("--trials", dry ? 1 : 3, 1),
     model: raw["--model"],
     concurrency: int("--concurrency", 2, 1),
@@ -76,6 +84,6 @@ export function selectCases(all: Case[], only?: string): Case[] {
 
 export function listing(cases: Case[]): string {
   return cases
-    .map((c) => [`${c.suite}/${c.id}  (dry: ${c.dry})`, `  ${c.why}`, ...c.checks.map((k) => `    - ${k.name}${k.graded ? " [graded]" : k.required ? "" : " [optional]"}`)].join("\n"))
+    .map((c) => [`${c.suite}/${c.id}  (dry: ${c.dry})`, `  ${c.why}`, ...c.checks.map((k) => `    - ${k.name}${[k.graded ? "graded" : "", k.required ? "" : "optional"].filter(Boolean).map((t) => ` [${t}]`).join("")}`)].join("\n"))
     .join("\n\n");
 }

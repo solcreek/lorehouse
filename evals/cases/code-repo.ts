@@ -2,25 +2,28 @@
 // question back when there is neither.
 
 import type { Case } from "../case";
-import { called, neverSaid, ran, said } from "../checks";
+import { called, graded, ran } from "../checks";
+import { RUBRICS } from "../rubrics";
 import { widgets } from "./widgets";
 
 const clone = (repo: string) => new RegExp(` clone (--branch \\S+ )?https://github\\.com/${repo}\\.git /workspace/repo$`);
-const WHICH_REPO = /which\b[^.?!\n]{0,40}\brepo(sitory)?\b|what\b[^.?!\n]{0,20}\brepo(sitory)?\b|\brepo(sitory)?\b[^.?!\n]{0,60}\?/i;
+// The repo's test runner being run, alone or in a chain: not `ls test/` or `cat test/x`.
+const TEST_RUN = /(^|&&|\|\||;)\s*([A-Z_]+=\S+ )*(time )?(bun test|(bun|npm|yarn|pnpm) run test|npm test)\b/;
 
 export const cases: Case[] = [
   {
     id: "default-repo",
     suite: "code",
-    why: "In a channel with a default repo, \"run the tests\" needs no repo name: Scout clones the default and gets on with it.",
+    why: "In a channel with a default repo, \"run the tests\" needs no repo name: Scout clones the default, runs the tests and says how they went.",
     dry: "passes",
     setup: { defaultRepo: { repo: "acme/widgets", branch: "main" }, sandbox: widgets },
     conversation: [{ mention: "run the tests", dry: "[clone]" }],
     checks: [
       ran("the channel's default repo is cloned", { command: clone("acme/widgets") }),
       ran("no other repo is cloned", { command: / clone .*github\.com\/(?!acme\/widgets\.git)/ }, { max: 0 }),
-      neverSaid("the reply doesn't ask which repo", WHICH_REPO),
-      ran("a test command is run", { command: /\btest\b/ }, { required: false }),
+      // Not under --dry: the scripted model takes one step, the clone.
+      ran("the tests are run", { command: TEST_RUN }, { realOnly: true }),
+      graded("the reply reports that the tests passed", RUBRICS.reportsTestsPassed),
     ],
   },
   {
@@ -46,7 +49,7 @@ export const cases: Case[] = [
     checks: [
       ran("nothing is cloned", { command: / clone / }, { max: 0 }),
       called("no workspace_clone names a repo the request didn't", "workspace_clone", { max: 0, input: (i) => typeof i.repo === "string" && i.repo !== "" }),
-      said("the reply asks which repo", WHICH_REPO),
+      graded("the reply asks which repo", RUBRICS.asksWhichRepo),
     ],
   },
 ];

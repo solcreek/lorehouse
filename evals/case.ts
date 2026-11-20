@@ -6,6 +6,7 @@
 
 import type { Stats } from "../conformance/harness";
 import type { ModelTurn } from "./proxy";
+import type { Rubric } from "./rubrics";
 import type { SandboxScript } from "./sandbox";
 
 export type Suite = "code" | "knowledge";
@@ -63,13 +64,18 @@ export type CheckResult = { pass: boolean; evidence: string };
 
 export type Check = {
   name: string;
-  // A code check that isn't required is reported and never fails a trial.
+  // A check that isn't required is reported and never fails a trial.
   required: boolean;
+  // Not judged under --dry even in a case that "passes" there: it needs more than the
+  // scripted model's one step (the tests run after the clone).
+  realOnly?: boolean;
 } & (
+  // Code: a hard fact about what was observed (which jobs ran, which digits appear).
   | { graded: false; run: (o: Observation) => CheckResult }
-  // Judged by a model, against `rubric`, on what `subject` picks out of the observation
-  // (default: everything the agent said in the thread). Reported apart from code checks.
-  | { graded: true; rubric: string; subject: (o: Observation) => string }
+  // Graded: a judgment about prose, made by a model against a rubric (rubrics.ts) on what
+  // `subject` picks out of the observation (default: everything the agent said in the
+  // thread). Counted apart from code checks; with no verdict it is "not judged".
+  | { graded: true; rubric: Rubric; subject: (o: Observation) => string }
 );
 
 export type Case = {

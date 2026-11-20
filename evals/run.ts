@@ -12,10 +12,11 @@ import { listing, parseArgs, selectCases, UsageError, type Args } from "./args";
 import type { Case } from "./case";
 import { CASES } from "./cases";
 import { noCredential, resolveCredential, scrub, type Credential } from "./credential";
-import { DEFAULT_GRADER_MODEL, grader } from "./grader";
+import { DEFAULT_GRADER_MODEL, grader, selftest } from "./grader";
+import { RUBRICS } from "./rubrics";
 import { startProxy } from "./proxy";
-import { caseResult, judge, summarize, table, trialPassed, type TrialResult } from "./report";
-import { children, runTrial } from "./trial";
+import { caseResult, judge, summarize, table, trialVerdict, type TrialResult } from "./report";
+import { children, PLACEHOLDER_KEY, runTrial } from "./trial";
 
 const ROOT = join(import.meta.dir, "..");
 const exit2 = (message: string): never => {
@@ -63,9 +64,24 @@ const clean = (text: string) => scrub(text, credential.secrets());
 const log = (line: string) => console.error(clean(line));
 
 const proxy = startProxy({ credential, maxTokens: args.maxTokens });
-const graderModel = args.dry ? null : (args.graderModel ?? process.env.EVAL_GRADER_MODEL ?? DEFAULT_GRADER_MODEL);
-const hasGraded = cases.some((c) => c.checks.some((k) => k.graded));
-const grade = graderModel && hasGraded ? grader(proxy.open("grader", upstream), graderModel) : undefined;
+const graderModel = args.dry || args.noGrader ? null : (args.graderModel ?? process.env.EVAL_GRADER_MODEL ?? DEFAULT_GRADER_MODEL);
+const hasGraded = args.graderSelftest || cases.some((c) => c.checks.some((k) => k.graded));
+const grade = graderModel && hasGraded ? grader(proxy.open("grader", upstream), PLACEHOLDER_KEY, graderModel) : undefined;
+
+// ── --grader-selftest: is the grader itself right? ──────────────────────────
+// Every rubric's known-good and known-bad replies (rubrics.ts), graded by the real grader
+// model. No case runs. Exit 0 when every verdict is the one the example deserves.
+if (args.graderSelftest) {
+  log(`eval: grader self-test: ${Object.values(RUBRICS).reduce((n, r) => n + r.good.length + r.bad.length, 0)} known replies over ${Object.keys(RUBRICS).length} rubrics, grader ${graderModel} through ${upstream} (credential: ${credential.kind})`);
+  const rows = await selftest(grade!, Object.values(RUBRICS));
+  await proxy.stop();
+  for (const r of rows) console.log(clean(`${r.right ? "ok   " : "WRONG"} ${r.rubric}: known to ${r.expect}, graded ${r.got}: ${JSON.stringify(r.reply.length > 90 ? `${r.reply.slice(0, 90)}…` : r.reply)}${r.right ? "" : `\n      ${r.evidence}`}`));
+  const wrong = rows.filter((r) => !r.right);
+  const t = proxy.tokens("grader");
+  const result = { ok: wrong.length === 0, selftest: true, grader: graderModel, credential: credential.kind, examples: rows.length, right: rows.length - wrong.length, wrong: wrong.filter((r) => r.got !== "not judged").length, notJudged: wrong.filter((r) => r.got === "not judged").length, tokens: { ...t, total: t.input + t.output + t.cacheRead + t.cacheWrite }, failures: wrong.map((r) => ({ rubric: r.rubric, expect: r.expect, got: r.got, reply: r.reply, evidence: r.evidence })), ms: Date.now() - started };
+  console.log(clean(JSON.stringify(result)));
+  process.exit(result.ok ? 0 : 1);
+}
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
@@ -91,16 +107,17 @@ await Promise.all(
       const id = `${c.suite}.${c.id}.${trial}`;
       const run = await runTrial(c, id, { dry: args.dry, model: args.model, proxy, upstream, seq: seq + 1, quietMs: args.dry ? 300 : 1500, deadlineMs: args.dry ? 20_000 : 150_000, log });
       const checks = await judge(c, run.observation, { dry: args.dry, setupError: run.setupError, grade });
-      const passed = trialPassed(checks);
+      const verdict = trialVerdict(checks, args.dry);
+      const passed = verdict === "passed";
       modelSeen ??= run.observation.model.turns.find((t) => t.response?.model)?.response?.model;
       const file = join(outDir, c.id, `${trial}.json`);
       mkdirSync(join(outDir, c.id), { recursive: true });
       const tokens = proxy.tokens(id);
-      const result: TrialResult = { case: name, trial, passed, checks, tokens, ms: run.ms, file: shown(file), refused: run.observation.runner.refused };
+      const result: TrialResult = { case: name, trial, verdict, checks, tokens, ms: run.ms, file: shown(file), refused: run.observation.runner.refused };
       // What a reader needs first comes first: the verdict and the checks, then the
       // transcript (the model's turns in order), then everything observed.
       const evidence = {
-        case: name, why: c.why, trial, passed, dry: args.dry, model: args.model ?? modelSeen ?? null, ms: run.ms, tokens,
+        case: name, why: c.why, trial, verdict, passed, dry: args.dry, model: args.model ?? modelSeen ?? null, ms: run.ms, tokens,
         checks,
         conversation: c.conversation.map((step, n) => ({ ...step, ...run.observation.steps[n] })),
         transcript: run.observation.model.turns,
@@ -108,8 +125,8 @@ await Promise.all(
       };
       writeFileSync(file, clean(JSON.stringify(evidence, (_k, v) => (v instanceof RegExp ? String(v) : v), 2)) + "\n");
       results.push(result);
-      const failing = checks.filter((k) => !k.graded && k.judged && k.required && !k.pass);
-      log(`${passed ? "✓" : "✗"} ${name} trial ${trial} (${(run.ms / 1000).toFixed(1)} s, ${(tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite).toLocaleString("en-US")} tokens)${failing.length ? `\n${failing.map((k) => `    ✗ ${k.name}: ${k.evidence}`).join("\n")}\n    ${shown(file)}` : ""}`);
+      const failing = checks.filter((k) => k.required && (k.judged ? !k.pass : k.graded && !args.dry));
+      log(`${verdict === "passed" ? "✓" : verdict === "failed" ? "✗" : "?"} ${name} trial ${trial}${verdict === "unjudged" ? " not fully judged" : ""} (${(run.ms / 1000).toFixed(1)} s, ${(tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite).toLocaleString("en-US")} tokens)${failing.length ? `\n${failing.map((k) => `    ${k.judged ? "✗" : "?"} ${k.name}${k.graded ? " [graded]" : ""}: ${k.evidence}`).join("\n")}\n    ${shown(file)}` : ""}`);
     }
   }),
 );

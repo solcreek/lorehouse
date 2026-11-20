@@ -6,11 +6,13 @@
 // A window (`before` / `after` a step, by its `as` name or position) restricts a check to
 // what was observed before that step began, or from it on.
 
+import type { Rubric } from "./rubrics";
 import { stepMark, type Check, type CheckResult, type Observation, type RunnerJob, type Said, type ToolCall } from "./case";
 
 export type Window = { before?: string | number; after?: string | number };
 export type Count = { min?: number; max?: number };
-type Options = Window & Count & { required?: boolean };
+// `realOnly`: not judged under --dry (case.ts).
+type Options = Window & Count & { required?: boolean; realOnly?: boolean };
 
 const short = (s: string, n = 160) => {
   const one = s.replace(/\s+/g, " ").trim();
@@ -44,7 +46,7 @@ function counted<T>(found: T[], c: Count, what: string, show: (x: T) => string, 
   return { pass, evidence: `${found.length} ${what}, want ${want}. ${found.length ? `Found: ${short(found.slice(0, 4).map(show).join("; "), 400)}` : others()}` };
 }
 
-const code = (name: string, o: Options | undefined, run: (obs: Observation) => CheckResult): Check => ({ name, required: o?.required ?? true, graded: false, run });
+const code = (name: string, o: { required?: boolean; realOnly?: boolean } | undefined, run: (obs: Observation) => CheckResult): Check => ({ name, required: o?.required ?? true, ...(o?.realOnly ? { realOnly: true } : {}), graded: false, run });
 
 const showJob = (j: RunnerJob) => `job #${j.n} ${j.op}${j.method ? ` ${j.method} ${j.path?.split("?")[0]}` : ""}${j.command !== undefined ? ` ${JSON.stringify(short(j.command, 120))}` : ""}${j.answer.code ? ` → refused ${j.answer.code}` : ""}`;
 const showCall = (c: ToolCall) => `turn ${c.turn} ${c.name} ${short(JSON.stringify(c.input), 140)}`;
@@ -106,10 +108,12 @@ export function said(name: string, re: RegExp, o?: Window & { required?: boolean
 }
 
 // Nothing the agent said matches `re`. An agent that said nothing at all fails: silence
-// isn't the behavior any case wants.
+// isn't the behavior any case wants. A stream that carried only task updates and no text
+// said nothing.
 export function neverSaid(name: string, re: RegExp, o?: Window & { required?: boolean; via?: Said["via"][] }): Check {
   return code(name, o, (obs) => {
-    const { r, items } = saidIn(obs, { ...o, via: o?.via ?? PUBLIC });
+    const found = saidIn(obs, { ...o, via: o?.via ?? PUBLIC });
+    const r = found.r, items = found.items.filter((s) => s.text.trim() !== "");
     if (r.problem) return { pass: false, evidence: r.problem };
     const hit = items.find((s) => re.test(s.text));
     if (hit) return { pass: false, evidence: `${re} matches ${showSaid(hit)}` };
@@ -179,8 +183,8 @@ export function check(name: string, run: (obs: Observation) => CheckResult, o?: 
 // Everything the agent said to the thread, in order: what a graded check judges by default.
 export const everythingSaid = (obs: Observation) => obs.slack.said.filter((s) => PUBLIC.includes(s.via)).map((s) => s.text).join("\n\n");
 
-// A check only a model can decide (prose). Never required: graded checks are reported
-// apart from code checks and don't decide the exit code.
-export function graded(name: string, rubric: string, subject: (obs: Observation) => string = everythingSaid): Check {
-  return { name, required: false, graded: true, rubric, subject };
+// A judgment about prose, which only a model can make: the reply against a rubric
+// (rubrics.ts). Required unless said otherwise; counted apart from code checks.
+export function graded(name: string, rubric: Rubric, o?: { required?: boolean; subject?: (obs: Observation) => string }): Check {
+  return { name, required: o?.required ?? true, graded: true, rubric, subject: o?.subject ?? everythingSaid };
 }

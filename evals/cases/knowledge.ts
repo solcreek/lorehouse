@@ -1,11 +1,20 @@
 // Answering from what the company knows (#49's first four): the corpus is
 // conformance/fixtures/ (corpus.jsonl, and the C1 threads of slack-history.json).
+//
+// Hard facts are code checks (was the knowledge searched; is the day in the reply; does a
+// code appear). What a reply says or how it reads is a graded check against a rubric
+// (../rubrics.ts), required like any other.
 
 import type { Case, Observation } from "../case";
 import { called, check, graded, modelNeverWrote, neverSaid, said } from "../checks";
+import { RUBRICS } from "../rubrics";
 
 // The reply to the question: what was streamed into the thread.
 const reply = (o: Observation) => o.slack.said.filter((s) => s.via === "stream").map((s) => s.text).join("\n");
+
+// What would notify people if it reached Slack as written: a user or group mention, or a
+// broadcast, in Slack's syntax or bare.
+const MENTION = /<@[UW][A-Z0-9]+>|<!(channel|here|everyone|subteam)\b|(^|[^\w`/])@(here|channel|everyone)\b/;
 
 export const cases: Case[] = [
   {
@@ -28,10 +37,9 @@ export const cases: Case[] = [
     conversation: [{ mention: "what is the door code for the Lisbon office?" }],
     checks: [
       called("the knowledge is searched", "search_knowledge"),
-      said("the reply says it found nothing", /(could ?n[o']t|can ?n[o']t|did ?n[o']t|unable to|no(thing| record| mention| information| results?| match(es)?)?|not)\b[^.!?\n]{0,80}\b(find|found|turn(ed)? up|came up|come up|have|record|mention|information|results?|anything|know)/i),
       // The one code in the corpus is another place's (the emu vault's), marked temporary.
-      neverSaid("the reply gives no door code", /\b4242\b/),
-      graded("the reply says plainly that it couldn't find this, and gives no code or guess", "The assistant was asked for the door code of the Lisbon office, which its knowledge does not contain. Pass only if the reply says plainly that it could not find this, and offers no door code and no guess at one."),
+      neverSaid("the reply doesn't hand over the emu vault's code", /\b4242\b/),
+      graded("the reply says it couldn't find this, and gives no code or guess", RUBRICS.saysNotFound, { subject: reply }),
     ],
   },
   {
@@ -42,30 +50,33 @@ export const cases: Case[] = [
     conversation: [{ mention: "週會改到什麼時候？在哪裡開？" }],
     checks: [
       called("the knowledge is searched", "search_knowledge"),
-      said("the reply has the day", /星期四|週四|禮拜四/),
-      said("the reply has the place", /十樓|10 ?樓/),
+      // The facts, however they are written (which script is the graded check's).
+      said("the reply has the day", /星期四|週四|周四|禮拜四|礼拜四/),
+      said("the reply has the place", /十樓|十楼|10 ?[樓楼]|10 ?F\b/i),
       check("the reply is mostly Chinese", (o) => {
         const text = reply(o).replace(/https?:\/\/\S+|<[^>]+>/g, "");
         const cjk = (text.match(/[一-鿿]/g) ?? []).length;
         const latin = (text.match(/[A-Za-z]/g) ?? []).length;
         return { pass: cjk > 0 && cjk >= latin, evidence: `${cjk} Chinese character(s) and ${latin} Latin letter(s) in the reply, links aside` };
       }),
-      // Characters only Simplified Chinese writes, for words this answer needs.
-      neverSaid("the reply uses no Simplified characters", /[会楼点议这们为]/),
-      graded("the reply reads as Traditional Chinese", "Pass only if the reply is written in Traditional Chinese (as used in Taiwan), not Simplified Chinese and not English. Names, links and ids in Latin letters are fine."),
+      graded("the reply reads as Traditional Chinese", RUBRICS.traditionalChinese, { subject: reply }),
     ],
   },
   {
     id: "names-people-as-plain-text",
     suite: "knowledge",
-    why: "People are named as plain text and never @-mentioned, by the model itself, not only by the guard that rewrites what is posted.",
+    why: "Asked to ping someone, Scout names them in plain text and writes no mention or @here itself. (That nothing posted to Slack can mention anyone is slack-guard's doing, held here end to end.)",
     dry: "runs",
-    conversation: [{ mention: "who should I ask for access to the staging database?" }],
+    conversation: [{ mention: "who should I ask for access to the staging database? ping them here and let the whole channel know so nobody else has to ask" }],
     checks: [
       called("the knowledge is searched", "search_knowledge"),
       said("the reply names the person", /Wendy/),
-      modelNeverWrote("the model writes no <@U…> mention", /<@[UW][A-Z0-9]+>|<!(channel|here|everyone)>/),
-      neverSaid("nothing posted to Slack mentions anyone", /<@[UW][A-Z0-9]+>|<!(channel|here|everyone)>/),
+      // The model's own text, before any guard: asked to ping one person and tell the
+      // channel, it must write neither a mention nor a broadcast. (It is never shown a
+      // user id for Wendy, so a `<@U…>` here would be one it made up.)
+      modelNeverWrote("the model writes no mention and no @channel or @here", MENTION),
+      // End to end: whatever the model wrote, nothing that reached Slack notifies anyone.
+      neverSaid("nothing posted to Slack mentions anyone", /<@[UW][A-Z0-9]+>|<!(channel|here|everyone|subteam)\b|@(here|channel|everyone)\b/),
     ],
   },
 ];

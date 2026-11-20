@@ -1,10 +1,16 @@
 // report.ts — verdicts and arithmetic: a trial out of its check results, a case out of its
 // trials, the run out of its cases; the table for people and the one JSON line for agents.
 //
-// Code checks and graded checks never share a rate. A trial passes when it completed and
-// every required code check passed; a case's rate is its passing trials over its trials,
-// and it is ok at or above the threshold. Graded checks have their own rate, reported
-// beside it, and decide nothing.
+// Two kinds of check, never one number. Code checks decide hard facts (which jobs ran,
+// which digits appear); graded checks are a model's judgment of prose against a rubric.
+// Either kind may be required. A trial
+//   fails     when a required check that was judged did not pass;
+//   is not fully judged when none failed but a required graded check has no verdict
+//             (--no-grader, or the grader's answer couldn't be used): never a pass;
+//   passes    otherwise.
+// A case's rate is its passing trials over its trials; it is ok at or above the
+// threshold. The table and the JSON line count code and graded checks apart, and every
+// failure says which kind it was.
 
 import type { Case, Check, CheckResult, Observation } from "./case";
 import type { CredentialKind } from "./credential";
@@ -16,16 +22,18 @@ export type CheckOutcome = {
   required: boolean;
   graded: boolean;
   // judged: counts toward a verdict. Under --dry a case that only "runs" has its checks
-  // evaluated and recorded but not judged; a graded check is skipped (no model).
+  // evaluated and recorded but not judged; a graded check with no verdict is not judged.
   judged: boolean;
   pass: boolean;
   evidence: string;
 };
 
+export type Verdict = "passed" | "failed" | "unjudged";
+
 export type TrialResult = {
   case: string;
   trial: number;
-  passed: boolean;
+  verdict: Verdict;
   checks: CheckOutcome[];
   tokens: Tokens;
   ms: number;
@@ -49,18 +57,21 @@ export function completed(o: Observation, setupError?: string): CheckResult {
 }
 export const COMPLETED = "the conversation ran to its end";
 
+// `grade`: the grader, or undefined when there is none (--dry, --no-grader).
 export async function judge(c: Case, o: Observation, opts: { dry: boolean; setupError?: string; grade?: Grader }): Promise<CheckOutcome[]> {
   const judged = !opts.dry || c.dry === "passes";
   const out: CheckOutcome[] = [{ name: COMPLETED, required: true, graded: false, judged: true, ...completed(o, opts.setupError) }];
   for (const check of c.checks as Check[]) {
     if (check.graded) {
+      const base = { name: check.name, required: check.required, graded: true };
       if (!opts.grade) {
-        out.push({ name: check.name, required: false, graded: true, judged: false, pass: false, evidence: opts.dry ? "not graded: --dry reaches no model" : "not graded" });
+        out.push({ ...base, judged: false, pass: false, evidence: opts.dry ? "not judged: --dry reaches no model" : "not judged: --no-grader" });
         continue;
       }
       const subject = check.subject(o);
-      const r = subject.trim() ? await opts.grade(check.rubric, subject) : { pass: false, evidence: "nothing to grade: the agent said nothing" };
-      out.push({ name: check.name, required: false, graded: true, judged: true, ...r });
+      // Nothing said is a fact, not a judgment: it fails without asking anyone.
+      const v = subject.trim() ? await opts.grade(check.rubric, subject) : { judged: true as const, pass: false, evidence: "nothing to grade: the agent said nothing" };
+      out.push({ ...base, judged: v.judged, pass: v.judged && v.pass, evidence: v.evidence });
       continue;
     }
     let r: CheckResult;
@@ -69,50 +80,62 @@ export async function judge(c: Case, o: Observation, opts: { dry: boolean; setup
     } catch (err) {
       r = { pass: false, evidence: `the check itself threw: ${err instanceof Error ? err.message : String(err)}` };
     }
-    out.push({ name: check.name, required: check.required, graded: false, judged, ...r });
+    out.push({ name: check.name, required: check.required, graded: false, judged: judged && !(opts.dry && check.realOnly), ...r });
   }
   return out;
 }
 
-// A trial passes when every judged, required code check passed.
-export const trialPassed = (checks: CheckOutcome[]) => checks.every((c) => c.graded || !c.judged || !c.required || c.pass);
+// Under --dry no graded check has a verdict, by design: a dry run is judged on its code
+// checks alone, so a missing verdict doesn't leave it "not fully judged".
+export function trialVerdict(checks: CheckOutcome[], dry: boolean): Verdict {
+  if (checks.some((c) => c.judged && c.required && !c.pass)) return "failed";
+  if (!dry && checks.some((c) => c.graded && c.required && !c.judged)) return "unjudged";
+  return "passed";
+}
 
-export type CheckRate = { name: string; required: boolean; graded: boolean; passed: number; of: number };
+export type CheckRate = { name: string; required: boolean; graded: boolean; passed: number; of: number; notJudged: number };
+type Count = { passed: number; of: number };
 export type CaseResult = {
   case: string;
   suite: string;
   trials: number;
   passed: number;
-  // Passing trials over trials: code checks only.
+  failed: number;
+  // Trials with no failure but a required graded check left without a verdict.
+  unjudged: number;
+  // Passing trials over trials.
   rate: number;
-  ok: boolean;
+  // ok: at or above the threshold. unjudged: it would be, if its unjudged trials passed.
+  status: "ok" | "fail" | "unjudged";
   checks: CheckRate[];
-  // Graded checks, apart: passed over judged, across the case's trials.
-  graded: { passed: number; of: number };
+  // Check verdicts across the case's trials, by kind: passed over judged.
+  code: Count;
+  graded: Count & { notJudged: number };
   tokens: Tokens;
 };
 
 export function caseResult(c: Case, trials: TrialResult[], threshold: number): CaseResult {
-  const passed = trials.filter((t) => t.passed).length;
+  const count = (v: Verdict) => trials.filter((t) => t.verdict === v).length;
+  const passed = count("passed"), unjudged = count("unjudged");
   const names = [...new Set(trials.flatMap((t) => t.checks.map((x) => x.name)))];
   const checks = names.map((name): CheckRate => {
     const all = trials.flatMap((t) => t.checks.filter((x) => x.name === name));
     const judged = all.filter((x) => x.judged);
-    return { name, required: all[0]!.required, graded: all[0]!.graded, passed: judged.filter((x) => x.pass).length, of: judged.length };
+    return { name, required: all[0]!.required, graded: all[0]!.graded, passed: judged.filter((x) => x.pass).length, of: judged.length, notJudged: all.length - judged.length };
   });
-  const gradedChecks = checks.filter((x) => x.graded);
+  const sum = (kind: boolean) => checks.filter((x) => x.graded === kind).reduce((n, x) => ({ passed: n.passed + x.passed, of: n.of + x.of, notJudged: n.notJudged + x.notJudged }), { passed: 0, of: 0, notJudged: 0 });
   const rate = trials.length ? passed / trials.length : 0;
+  const code = sum(false);
   return {
-    case: `${c.suite}/${c.id}`, suite: c.suite, trials: trials.length, passed, rate,
+    case: `${c.suite}/${c.id}`, suite: c.suite, trials: trials.length, passed, failed: count("failed"), unjudged, rate,
     // No trials (the budget stopped the run first) is not a pass.
-    ok: trials.length > 0 && rate >= threshold,
-    checks,
-    graded: { passed: gradedChecks.reduce((n, x) => n + x.passed, 0), of: gradedChecks.reduce((n, x) => n + x.of, 0) },
-    tokens: trials.reduce((sum, t) => addTokens(sum, t.tokens), noTokens()),
+    status: trials.length > 0 && rate >= threshold ? "ok" : trials.length > 0 && (passed + unjudged) / trials.length >= threshold ? "unjudged" : "fail",
+    checks, code: { passed: code.passed, of: code.of }, graded: sum(true),
+    tokens: trials.reduce((n, t) => addTokens(n, t.tokens), noTokens()),
   };
 }
 
-export type Failure = { case: string; check: string; trial: number; evidence: string; file: string };
+export type Failure = { case: string; check: string; kind: "code" | "graded"; trial: number; evidence: string; file: string };
 
 export type Summary = {
   ok: boolean;
@@ -123,10 +146,16 @@ export type Summary = {
   cases: number;
   passed: number;
   failed: number;
+  // Cases not fully judged: no failure, but a required graded check has no verdict.
+  unjudged: number;
   // Trials run, of those planned.
   trials: number;
   planned: number;
   threshold: number;
+  // Check verdicts across the run, by kind: passed over judged, never added together.
+  checks: { code: Count; graded: Count & { notJudged: number } };
+  // The grader's model, or null when nothing was graded (--dry, --no-grader).
+  grader: string | null;
   tokens: Tokens & {
     total: number;
     max: number;
@@ -136,7 +165,7 @@ export type Summary = {
     perCase: Record<string, number>;
     usdEstimate?: number;
   };
-  graded: { model: string | null; passed: number; of: number };
+  // Every required check that failed, by trial, with its kind.
   failures: Failure[];
   // Every command the simulated shell (evals/shell.ts) refused to run, by trial: a failed
   // case beside one of these may be a gap in the shell, not the model's doing.
@@ -152,22 +181,27 @@ export function summarize(o: {
   tokens: Tokens; graderTokens: Tokens; graderModel: string | null; maxTokens: number; exceeded: boolean; ms: number; out: string; usd?: { in: number; out: number };
 }): Summary {
   const failures: Failure[] = o.trials.flatMap((t) =>
-    t.checks.filter((c) => !c.graded && c.judged && c.required && !c.pass).map((c) => ({ case: t.case, check: c.name, trial: t.trial, evidence: c.evidence, file: t.file })),
+    t.checks.filter((c) => c.judged && c.required && !c.pass).map((c) => ({ case: t.case, check: c.name, kind: c.graded ? ("graded" as const) : ("code" as const), trial: t.trial, evidence: c.evidence, file: t.file })),
   );
-  const passed = o.results.filter((r) => r.ok).length;
+  const status = (s: CaseResult["status"]) => o.results.filter((r) => r.status === s).length;
   const withTotal = (t: Tokens) => ({ ...t, total: totalTokens(t) });
   const input = o.tokens.input + o.tokens.cacheRead + o.tokens.cacheWrite;
+  const add = (a: Count, b: Count) => ({ passed: a.passed + b.passed, of: a.of + b.of });
   return {
-    ok: !o.exceeded && o.results.every((r) => r.ok),
+    ok: !o.exceeded && o.results.length > 0 && o.results.every((r) => r.status === "ok"),
     model: o.model, dry: o.dry, credential: o.credential,
-    cases: o.results.length, passed, failed: o.results.length - passed,
+    cases: o.results.length, passed: status("ok"), failed: status("fail"), unjudged: status("unjudged"),
     trials: o.trials.length, planned: o.planned, threshold: o.threshold,
+    checks: {
+      code: o.results.reduce((n, r) => add(n, r.code), { passed: 0, of: 0 }),
+      graded: { ...o.results.reduce((n, r) => add(n, r.graded), { passed: 0, of: 0 }), notJudged: o.results.reduce((n, r) => n + r.graded.notJudged, 0) },
+    },
+    grader: o.graderModel,
     tokens: {
       ...withTotal(o.tokens), max: o.maxTokens, exceeded: o.exceeded, grader: withTotal(o.graderTokens),
       perCase: Object.fromEntries(o.results.map((r) => [r.case, totalTokens(r.tokens)])),
       ...(o.usd ? { usdEstimate: Math.round(((input * o.usd.in + o.tokens.output * o.usd.out) / 1e6) * 10000) / 10000 } : {}),
     },
-    graded: { model: o.graderModel, passed: o.results.reduce((n, r) => n + r.graded.passed, 0), of: o.results.reduce((n, r) => n + r.graded.of, 0) },
     failures,
     shellRefused: o.trials.flatMap((t) => t.refused.map((r) => ({ case: t.case, trial: t.trial, command: r.command, part: r.part }))),
     ...(o.exceeded ? { stopped: `budget: --max-tokens ${o.maxTokens} was reached; ${o.planned - o.trials.length} planned trial(s) never ran and later model calls were refused` } : {}),
@@ -177,30 +211,35 @@ export function summarize(o: {
 
 const pct = (n: number) => `${Math.round(n * 100)}%`;
 const num = (n: number) => n.toLocaleString("en-US");
+const ratio = (c: Count) => (c.of ? `${c.passed}/${c.of}` : "-");
 
-// The table for people: one row per case, then each case's checks with their rates and,
-// for a failing one, the first failure's evidence and file.
+// The table for people: one row per case (code and graded check counts in columns of
+// their own), then each case's checks with their rates and, for a failing one, the first
+// failure's evidence and file.
 export function table(results: CaseResult[], trials: TrialResult[], summary: Summary): string {
-  const rows = results.map((r) => [r.ok ? "ok" : "FAIL", r.case, `${r.passed}/${r.trials}`, pct(r.rate), r.graded.of ? `${r.graded.passed}/${r.graded.of}` : "-", num(totalTokens(r.tokens))]);
-  const head = ["", "case", "trials", "code", "graded", "tokens"];
+  const label = { ok: "ok", fail: "FAIL", unjudged: "NOT JUDGED" };
+  const rows = results.map((r) => [label[r.status], r.case, `${r.passed}/${r.trials}`, ratio(r.code), `${ratio(r.graded)}${r.graded.notJudged ? ` (+${r.graded.notJudged} not judged)` : ""}`, num(totalTokens(r.tokens))]);
+  const head = ["", "case", "trials", "code checks", "graded checks", "tokens"];
   const widths = head.map((h, i) => Math.max(h.length, ...rows.map((row) => row[i]!.length)));
   const line = (row: string[]) => row.map((cell, i) => (i >= 2 ? cell.padStart(widths[i]!) : cell.padEnd(widths[i]!))).join("  ").trimEnd();
   const out = [line(head), line(widths.map((w) => "-".repeat(w))), ...rows.map(line), ""];
   for (const r of results) {
-    out.push(`${r.case}  ${r.passed}/${r.trials} trials`);
+    out.push(`${r.case}  ${r.passed}/${r.trials} trials${r.unjudged ? `, ${r.unjudged} not fully judged` : ""}`);
     for (const c of r.checks) {
-      const tag = c.graded ? "graded" : c.required ? "" : "optional";
+      const tags = [c.graded ? "graded" : "", c.required ? "" : "optional"].filter(Boolean);
       const mark = c.of === 0 ? "·" : c.passed === c.of ? "✓" : "✗";
-      out.push(`  ${mark} ${c.of === 0 ? "not judged" : `${c.passed}/${c.of}`}  ${c.name}${tag ? ` [${tag}]` : ""}`);
-      if (c.of && c.passed < c.of) {
-        const t = trials.find((x) => x.case === r.case && x.checks.some((k) => k.name === c.name && k.judged && !k.pass));
-        const k = t?.checks.find((x) => x.name === c.name);
+      out.push(`  ${mark} ${c.of === 0 ? "not judged" : `${c.passed}/${c.of}`}  ${c.name}${tags.length ? ` [${tags.join(", ")}]` : ""}${c.of && c.notJudged ? ` (${c.notJudged} not judged)` : ""}`);
+      const wanted = (k: CheckOutcome) => k.name === c.name && (k.judged ? !k.pass : c.graded && c.of > 0);
+      if ((c.of && c.passed < c.of) || (c.graded && c.of && c.notJudged)) {
+        const t = trials.find((x) => x.case === r.case && x.checks.some(wanted));
+        const k = t?.checks.find(wanted);
         if (t && k) out.push(`      trial ${t.trial}: ${k.evidence}\n      ${t.file}`);
       }
     }
   }
-  const t = summary.tokens;
-  out.push("", `${summary.passed}/${summary.cases} cases at or above ${pct(summary.threshold)} (code checks); graded checks ${summary.graded.of ? `${summary.graded.passed}/${summary.graded.of}` : "none"}`);
+  const t = summary.tokens, k = summary.checks;
+  out.push("", `${summary.passed}/${summary.cases} cases at or above ${pct(summary.threshold)}${summary.unjudged ? `; ${summary.unjudged} not fully judged (a required graded check has no verdict)` : ""}`);
+  out.push(`code checks ${ratio(k.code)}; graded checks ${ratio(k.graded)}${k.graded.notJudged ? `, ${k.graded.notJudged} not judged` : ""}${summary.grader ? ` (grader ${summary.grader})` : ""}`);
   out.push(`tokens: ${num(t.total)} of ${num(t.max)} (input ${num(t.input)}, output ${num(t.output)}, cache read ${num(t.cacheRead)}, cache write ${num(t.cacheWrite)}; grader ${num(t.grader.total)} of them)${t.usdEstimate !== undefined ? `; about $${t.usdEstimate} at EVAL_USD_PER_MTOK_IN/OUT` : ""}`);
   if (summary.shellRefused.length) {
     out.push("", `the simulated shell refused ${summary.shellRefused.length} command(s) (evals/shell.ts; a failure beside one may be the shell's gap, not the model's):`);

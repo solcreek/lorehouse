@@ -6,7 +6,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { afterEach, expect, test } from "bun:test";
 import { antToken, noCredential, resolveCredential, scrub, type Credential } from "../evals/credential";
-import { grader, parseVerdict } from "../evals/grader";
 import { startProxy, type Proxy } from "../evals/proxy";
 import { SseReader, StreamedMessage, totalTokens } from "../evals/sse";
 import { PLACEHOLDER_KEY, trialAppEnv } from "../evals/trial";
@@ -267,30 +266,4 @@ test("an upstream that can't be reached is the turn's error, and the app is told
 test("scrub replaces a credential wherever it turns up", () => {
   expect(scrub(`{"error":"key ${REAL} is invalid","again":"${REAL}"}`, [REAL])).toBe('{"error":"key [redacted credential] is invalid","again":"[redacted credential]"}');
   expect(scrub("nothing here", noCredential.secrets())).toBe("nothing here");
-});
-
-test("the grader's verdict is strict JSON, and anything else counts as not passed", () => {
-  expect(parseVerdict(' {"pass": true, "reason": "says it found nothing"}\n')).toEqual({ pass: true, evidence: "grader: says it found nothing" });
-  expect(parseVerdict('{"pass": false, "reason": "invents a code"}')).toEqual({ pass: false, evidence: "grader: invents a code" });
-  for (const bad of ['```json\n{"pass": true, "reason": "x"}\n```', '{"pass": "yes", "reason": "x"}', '{"pass": true}', "PASS", ""]) {
-    const v = parseVerdict(bad);
-    expect(v.pass).toBe(false);
-    expect(v.evidence).toContain("counts as not passed");
-  }
-});
-
-test("the grader asks through the proxy: its tokens are counted under its own name, and it holds no credential", async () => {
-  const answer = (text: string) => Response.json({ id: "msg_g", type: "message", role: "assistant", model: "claude-haiku-5-5", content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 200, output_tokens: 20 } });
-  const up = upstream((_s, n) => (n === 1 ? answer('{"pass": true, "reason": "it says so plainly"}') : answer("I think it passes.")));
-  const proxy = proxyFor(key());
-  const grade = grader(proxy.open("grader", up.url), "claude-haiku-5-5");
-  expect(await grade("Says it found nothing.", "I couldn't find that.")).toEqual({ pass: true, evidence: "grader: it says so plainly" });
-  expect((await grade("Says it found nothing.", "I couldn't find that.")).pass).toBe(false);
-  const sent = JSON.parse(up.seen[0]!.body) as { model: string; system: string; messages: { content: string }[] };
-  expect(sent.model).toBe("claude-haiku-5-5");
-  expect(sent.system).toContain('{"pass": true or false');
-  expect(sent.messages[0]!.content).toContain("Criterion:\nSays it found nothing.");
-  expect(sent.messages[0]!.content).toContain("<reply>\nI couldn't find that.\n</reply>");
-  expect(up.seen[0]!.headers["x-api-key"]).toBe(REAL);
-  expect(proxy.tokens("grader")).toEqual({ input: 400, output: 40, cacheRead: 0, cacheWrite: 0 });
 });

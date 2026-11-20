@@ -3,7 +3,8 @@
 // told to the person (#109).
 
 import type { Case } from "../case";
-import { called, neverSaid, ran, said, uploaded } from "../checks";
+import { called, graded, ran, said, uploaded } from "../checks";
+import { RUBRICS } from "../rubrics";
 import { widgets, WIDGETS } from "./widgets";
 
 const repo = { defaultRepo: { repo: "acme/widgets", branch: "main" } };
@@ -75,8 +76,8 @@ export const cases: Case[] = [
     conversation: [{ mention: "run the tests", dry: "[exec] bun test" }],
     checks: [
       ran("the sandbox refused the call", { refused: true }),
-      said("the reply says what was refused", /refus|65536|maximum|resource_over_maximum/i),
-      neverSaid("nothing claims the tests ran or passed", /\b\d+ pass\b|tests? (all )?pass(ed|ing)?\b|all (the )?tests|passed successfully|✅/i),
+      ran("nothing ran in the sandbox", { op: "guest", refused: false }, { max: 0 }),
+      graded("the reply says the sandbox was refused, and claims no result", RUBRICS.saysRefusedClaimsNoSuccess),
     ],
   },
 ];
