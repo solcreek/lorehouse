@@ -231,8 +231,9 @@ pub struct ExecBody {
 
 impl ExecBody {
     pub fn parse(body: &[u8]) -> Result<ExecBody, Refusal> {
-        // Its size first: a body is parsed into a tree several times its size, and the
-        // router lets through what a file write may be (64 MiB). A command is not that.
+        // Its size first: the values kept (command, cwd, env) are built as trees several
+        // times their size, and the router lets through what a file write may be
+        // (64 MiB). A command is not that.
         if body.len() > MAX_EXEC_BODY {
             return Err(Refusal::new(
                 413,
@@ -258,8 +259,10 @@ impl ExecBody {
                 r.detail.insert("field".into(), json!(key));
                 Err(r)
             }
-            (Err(e), None) if e.is_data() => Err(bad(format!("the exec body must be a JSON object ({e})"))),
-            (Err(e), None) => Err(bad(format!("the exec body is not JSON sandboxd can read ({e})"))),
+            // serde's words quote the value it met: clipped, so a refusal (and the log
+            // line it becomes) is never the size of the body.
+            (Err(e), None) if e.is_data() => Err(bad(format!("the exec body must be a JSON object ({})", clipped(&e.to_string())))),
+            (Err(e), None) => Err(bad(format!("the exec body is not JSON sandboxd can read ({})", clipped(&e.to_string())))),
         }
     }
 }
@@ -409,11 +412,15 @@ pub fn parse_header(text: &str) -> Result<Request, Refusal> {
 }
 
 fn shown(v: &Value) -> String {
-    let s = v.to_string();
+    clipped(&v.to_string())
+}
+
+/// At most 80 characters of a text, for a message.
+fn clipped(s: &str) -> String {
     if s.chars().count() > 80 {
         format!("{}…", s.chars().take(80).collect::<String>())
     } else {
-        s
+        s.to_string()
     }
 }
 
@@ -872,13 +879,21 @@ pub mod tests {
             assert!(r.message.contains(says), "{}: {}", String::from_utf8_lossy(body), r.message);
             assert_eq!(r.body().get("field"), None, "{}", String::from_utf8_lossy(body));
         }
+        // A refusal quotes at most a little of what it met, however long that was: it
+        // becomes a log line.
+        let long = format!(r#""{}""#, "A".repeat(100_000));
+        let r = g.exec_body(long.as_bytes()).unwrap_err();
+        assert!(r.message.contains(r#"must be a JSON object (invalid type: string "AAAA"#) && r.message.len() < 600, "{} bytes", r.message.len());
+        let r = g.exec_body(format!(r#"{{"{}":1}}"#, "k".repeat(100_000)).as_bytes()).unwrap_err();
+        assert!(r.message.contains("that is not one guestd is sent") && r.message.len() < 600, "{} bytes", r.message.len());
         // A key given twice counts once, the last: for timeoutMs even when the last is
         // not a number (the grant then), and for the others.
         assert_eq!(sent(r#"{"command":"make","timeoutMs":1000,"timeoutMs":"x"}"#), json!({ "command": "make", "timeoutMs": 60_000 }));
         assert_eq!(sent(r#"{"command":"a","cwd":"/x","command":"b"}"#), json!({ "command": "b", "cwd": "/x", "timeoutMs": 60_000 }));
         // Nesting deeper than serde_json reads (128) is refused, not followed.
         let deep = format!(r#"{{"command":"make","env":{}{}}}"#, "[".repeat(200), "]".repeat(200));
-        assert_eq!(g.exec_body(deep.as_bytes()).unwrap_err().status, 400);
+        let r = g.exec_body(deep.as_bytes()).unwrap_err();
+        assert!(r.status == 400 && r.message.contains("recursion limit exceeded"), "{}", r.message);
         // A body over the limit: refused by its size, before it is parsed (it need not be
         // JSON to be refused so), with the size and the limit. At the limit: read.
         let command = |len: usize| format!(r#"{{"command":"{}"}}"#, "x".repeat(len - r#"{"command":""}"#.len())).into_bytes();
