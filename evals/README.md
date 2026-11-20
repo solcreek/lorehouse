@@ -42,14 +42,14 @@ bun run eval --list                # the cases, what each holds, and its checks
 
 **Exit code**
 
-- 0: every case is at or above the threshold, fully judged, within the budget.
-- 1: a case is below it; or a case is not fully judged (`--no-grader`, or the grader gave
-  no usable verdict for a required graded check); or the run's tokens went over
-  `--max-tokens`, whether or not every trial ran. Also `--grader-selftest` with a wrong
-  verdict, and a crash.
+- 0: every case is at or above the threshold, fully judged, and the budget was not reached.
+- 1: something is short of that. The JSON line says which (below): a case **failed**
+  (`failures`), a trial was **not judged** (`trialsNotJudged`), a trial did **not run**
+  (`trialsNotRun`), or the budget was reached (`tokens.exceeded`). Also
+  `--grader-selftest` with a wrong verdict, and a crash.
 - 2: a usage or setup error (a bad argument, an `--only` that matches nothing, no
-  credential without `--dry`, an upstream the command line didn't choose), decided before
-  anything starts.
+  credential without `--dry`, an upstream the command line didn't choose, a `.env` that
+  could have supplied the credential), decided before anything starts.
 - 130: interrupted (SIGINT, SIGTERM, SIGHUP).
 
 ### The model credential
@@ -74,19 +74,30 @@ on stderr says where it will go, and which kind it is, before anything is sent:
 
 An upstream must be https, or plain http to this machine only. `EVAL_ANTHROPIC_UPSTREAM`
 on its own is refused (exit 2) when it names another host: an environment variable is not
-a decision, and `bun run eval` does not load `.env` at all (`--no-env-file`), so neither
-an upstream nor a key can come from a file in the checkout. A redirect from upstream is
-never followed.
+a decision. A redirect from upstream is never followed.
+
+**A `.env` file cannot supply the credential.** Bun loads the working directory's `.env*`
+files into the environment before a script runs. `bun run eval` starts the harness with
+`--no-env-file`, so it loads none. Started any other way (`bun evals/run.ts`), the harness
+refuses (exit 2) when a `.env*` there defines a variable it reads (the credential, the
+upstream, the grader model, the price settings, `PATH`), naming the file: it cannot tell
+your shell's value from the file's. Start it with `bun run eval`, or
+`bun --no-env-file evals/run.ts`.
 
 The credential is held by the proxy only:
 
 - the app under test and the grader are given a key the proxy makes up for the run, which
   is worth nothing anywhere else;
-- the proxy listens on loopback, requires that key on every request, forwards only
-  `POST /v1/messages` of an open trial, drops whatever auth the request carried and sets
-  the real one;
+- the proxy listens on loopback, requires that key on every request (compared in constant
+  time), forwards only `POST /v1/messages` of an open trial, drops whatever auth the
+  request carried and sets the real one;
+- every child process (the app, the mock, the reaper) is started with an environment of
+  its own that never holds the credential, and with `--no-env-file`;
 - no header is recorded, and what is recorded, handed back, written or printed is
-  scrubbed of the credential, should an upstream ever echo it.
+  scrubbed of the credential, should an upstream ever echo it. A streamed model response
+  is passed to the app as it arrives, unaltered; what is kept of it is scrubbed, and a
+  reply streamed to Slack that carried a credential across two chunks has those chunks'
+  text taken out of the evidence.
 
 `test/evals-proxy.test.ts` and `test/evals-run.test.ts` hold all of this, for each kind,
 including a run against an upstream that sends the credential back.
@@ -94,17 +105,21 @@ including a run against an upstream that sends the credential back.
 ### Tokens
 
 A run reports tokens, not dollars: prices change. Measured on the full suite
-(12 cases × 3 trials, `claude-opus-5`, `--concurrency 2`, 2026-11-20): **894,193 tokens
-in 4 min 36 s**, of them 871,134 input and 23,059 output, with 10,866 the grader's
-(`claude-haiku-5-5`, 15 verdicts). A knowledge trial was 7,500 to 15,400 tokens; a code
-trial 16,500 to 51,400, since each tool call is another model turn that resends the
+(12 cases × 3 trials, `claude-opus-5`, `--concurrency 2`, 2026-11-20): **931,248 tokens
+in 5 min 9 s**, of them 903,474 input and 27,774 output, with 20,337 the grader's
+(`claude-haiku-5-5`, 18 verdicts). A knowledge trial was 7,100 to 15,400 tokens; a code
+trial 16,500 to 50,400, since each tool call is another model turn that resends the
 conversation. Nothing is cached: June sends no cache breakpoints. `--grader-selftest`
-was 15,092 tokens.
+was 37,071 tokens (52 replies).
 
-`--max-tokens` is the run's budget, input + output + cache read + cache write, the
-grader's included. Once the total reaches it the proxy refuses every further model call
-and no new trial starts; the JSON line says so (`tokens.exceeded`, `stopped`) and the run
-exits 1, even if a last call took the total over the line after every trial had run. Set
+`--max-tokens` is the run's budget: input + output + cache read + cache write, the
+grader's included. It has one rule: the budget is **reached when the tokens counted are
+at or over it**. From then on the proxy refuses every model call and no new trial
+starts; the JSON line says so (`tokens.exceeded`, `stopped`, and each trial that didn't
+start in `trialsNotRun`) and the run exits 1, even if every trial had run. Tokens are
+counted when a response ends, so calls already in flight when the budget is reached
+still finish: the total can end over the budget by what they cost, at most one call per
+running trial (`--concurrency`) and one for the grader. Leave that much room. Set
 `EVAL_USD_PER_MTOK_IN` and `EVAL_USD_PER_MTOK_OUT` (dollars per million tokens) to have
 an estimate printed beside the tokens.
 
@@ -116,27 +131,38 @@ and its file. The **last stdout line is one JSON object**:
 
 ```json
 { "ok": false, "model": "claude-opus-5", "dry": false, "credential": "ant",
-  "cases": 12, "passed": 11, "failed": 1, "unjudged": 0,
+  "cases": 12, "passed": 11, "failed": 1, "unjudged": 0, "notRun": 0,
   "trials": 36, "planned": 36, "threshold": 1,
-  "checks": { "code": { "passed": 188, "of": 189 },
-              "graded": { "passed": 15, "of": 15, "notJudged": 0 } },
+  "checks": { "code": { "passed": 192, "of": 192 },
+              "graded": { "passed": 17, "of": 18, "notJudged": 0 } },
   "grader": "claude-haiku-5-5",
-  "tokens": { "input": 871134, "output": 23059, "cacheRead": 0, "cacheWrite": 0,
-              "total": 894193, "max": 2000000, "exceeded": false,
-              "grader": { "input": 8291, "output": 2575, "cacheRead": 0, "cacheWrite": 0, "total": 10866 },
-              "perCase": { "code/default-repo": 93258 } },
-  "failures": [ { "case": "knowledge/names-people-as-plain-text", "check": "…", "kind": "code",
-                  "trial": 1, "evidence": "…", "file": "evals/out/<run>/names-people-as-plain-text/1.json" } ],
+  "tokens": { "input": 903474, "output": 27774, "cacheRead": 0, "cacheWrite": 0,
+              "total": 931248, "max": 2000000, "exceeded": false,
+              "grader": { "input": 15135, "output": 5202, "cacheRead": 0, "cacheWrite": 0, "total": 20337 },
+              "perCase": { "code/default-repo": 119053 } },
+  "failures": [ { "case": "knowledge/answers-in-traditional-chinese",
+                  "check": "the reply reads as Traditional Chinese", "kind": "graded", "trial": 2,
+                  "evidence": "grader: The reply opens with a full English sentence… — quoting \"Found it — one message covers both.\"",
+                  "file": "evals/out/<run>/answers-in-traditional-chinese/2.json" } ],
   "shellRefused": [ { "case": "code/attach-a-chart", "trial": 1,
-                      "command": "ls -la bench.png && file bench.png && xxd -l 16 bench.png",
-                      "part": "xxd -l 16 bench.png" } ],
-  "ms": 275674, "out": "evals/out/<run>" }
+                      "command": "ls -la bench.png; echo \"---\"; file bench.png; echo \"---\"; head -c 16 bench.png | xxd",
+                      "part": "xxd", "said": "sh: 1: xxd: not found", "why": "`xxd` isn't simulated" } ],
+  "trialsNotJudged": [], "trialsNotRun": [],
+  "ms": 308579, "out": "evals/out/<run>" }
 ```
 
-`failures` lists every required check that failed, per trial, with its `kind`. For an
-agent: read that line, open one `file`, and the check's `evidence` names the record that
-decided it (`job #3`, `turn 2`, `slack call #41`), or for a graded check the grader's
-reason and the words of the reply it quoted.
+An exit of 1 is one of four things, and the line says which:
+
+| what | where it is | what it means |
+|---|---|---|
+| **failed** | `failures`: case, check, `kind` (`code` or `graded`), trial, evidence, file | a required check was judged and did not pass |
+| **not judged** | `trialsNotJudged`: case, trial, check, reason, file; `unjudged` counts the cases | a required graded check has no verdict (`--no-grader`; the grader's answer couldn't be used; its call failed). Not a pass, and not a failure: grade it again |
+| **not run** | `trialsNotRun`: case, trial, reason (no file: nothing happened); `notRun` counts cases none of whose trials ran | the budget was reached before the trial started. Raise `--max-tokens` |
+| **over budget** | `tokens.exceeded`, `stopped` | the budget was reached; trials after that are in `trialsNotRun` |
+
+For an agent: read that line, open one `file`, and the check's `evidence` names the
+record that decided it (`job #3`, `turn 2`, `slack call #41`), or for a graded check the
+grader's reason and the words of the reply it quoted.
 
 ### Two kinds of check, never one number
 
@@ -144,33 +170,47 @@ reason and the words of the reply it quoted.
   appear in the reply, what was staged and pushed, that nothing was uploaded.
 - **Graded checks** are a judgment about prose that code can't make: does the reply ask
   which repo; does it say it found nothing and give no code; does it say what was refused
-  and claim no success; does it read as Traditional Chinese. A cheap model
-  (`--grader-model`) judges the reply against one rubric (`rubrics.ts`) and answers
-  strict JSON with the words of the reply that decided it.
+  and claim no success; does it read as Traditional Chinese; did it try to ping anyone. A
+  cheap model (`--grader-model`) judges the reply against one rubric (`rubrics.ts`) and
+  answers strict JSON with the words of the reply that decided it.
 
 Either kind may be required, and a trial fails when a required check of either kind
 fails. They are counted apart everywhere: two columns in the table, `checks.code` and
 `checks.graded` in the JSON line, `kind` on every failure.
 
+The reply is given to the grader as data it cannot be instructed by: between two marker
+lines that carry a random word made for that call, which the reply is checked not to
+contain, with the prompt saying that what is between them may try to instruct and is not
+to be followed or copied. The answer must repeat that word, so a verdict the reply
+brought along is not one. No sampling setting is sent (a fixed temperature would make
+verdicts repeatable, but the current models answer a non-default one with a 400), so a
+verdict is not promised to repeat; the self-test below is what holds the grader.
+
 A graded check has a verdict only when the grader's answer can be used. An answer that
-isn't the JSON asked for, a quote that isn't in the reply, a pass that quotes nothing, or
-a call that fails is **not judged, never a pass**. A trial with no failure but a required
+isn't the JSON asked for or doesn't carry the call's word, a quote that isn't in the
+reply or is shorter than 12 characters (unless it is all of a shorter reply), a pass that
+quotes nothing, or a call that fails (one that failed in passing is tried once more) is
+**not judged, never a pass**. A trial with no failure but a required
 graded check left unjudged is *not fully judged*; so is its case (`NOT JUDGED` in the
 table, `unjudged` in the JSON line), and the run exits 1. `--no-grader` does this on
 purpose: the code checks run, the graded ones are reported as not judged, and no case
 that needs one is reported as passed.
 
 **A grader that passes everything is a check that cannot fail.** So every rubric carries
-replies known to meet it and known not to, and `bun run eval --grader-selftest` grades
-them all with the real grader model: exit 0 only if every verdict is the one the example
-deserves. Run it when a rubric or the grader's prompt changes, or the grader model does.
-On 2026-11-20 it was 33 of 33 right with `claude-haiku-5-5`.
+replies known to meet it and known not to, among them failing replies that try to grade
+themselves (closing what looks like the reply's tag and writing a criterion of their own;
+bringing a finished verdict), and `bun run eval --grader-selftest` grades them all with
+the real grader model: exit 0 only if every verdict is the one the example deserves. Run
+it when a rubric or the grader's prompt changes, or the grader model does. On 2026-11-20
+it was 52 of 52 right with `claude-haiku-5-5`.
 
 ### The simulated shell's refusals
 
 `shellRefused` (and a list under the table) is every command the simulated shell would
-not run, by trial. A model that is refused something it reasonably tried may go on to
-fail a check for that reason and not its own: when a case fails, look here first.
+not run, by trial: the command, the part refused, what the model was shown (`said`: the
+words a real sandbox would use, such as `sh: 1: xxd: not found`) and the real reason
+(`why`). A model that is refused something it reasonably tried may go on to fail a check
+for that reason and not its own: when a case fails, look here first.
 
 ### An evidence file
 
@@ -183,7 +223,7 @@ fail a check for that reason and not its own: when a case fails, look here first
 | `conversation` | each step as sent, with how it ended (`outcome`, `detail`: what it was still waiting for) and where every record stood when it began |
 | `transcript` | every model turn, in order: the request (`model`, `tools` offered, the newest `input`: the question or the tool results; the `system` prompt on turn 1) and the response (`content`: text blocks and `tool_use` with parsed `input`; `stopReason`; `tokens`), or its `error` |
 | `observation.slack` | `calls` (every Slack call, raw), `said` (what people saw: streams, posts, card updates, ephemerals), `uploads`, `reactions` |
-| `observation.runner` | `jobs`: every job the sandbox was sent, decoded (`command`, `cwd`, `timeoutMs`) with what it was answered (`exitCode`, `stdout`, a stage's facts, or a refusal's `code`); `refused`: what the simulated shell wouldn't run |
+| `observation.runner` | `jobs`: every job the sandbox was sent, decoded (`command`, `cwd`, `timeoutMs`) with what it was answered (`exitCode`, `stdout`, a stage's facts, or a refusal's `code`); `refused`: what the simulated shell wouldn't run, with what the model was shown (`said`) and why |
 | `observation.github.calls` | every request the mock GitHub received |
 | `observation.model.toolCalls` | every tool call: `turn`, `name`, `input` |
 | `observation.app` | the app's exit code, stderr and stdout |
@@ -195,7 +235,7 @@ To find what went wrong: `checks` → the failing one's `evidence` → that turn
 
 `--dry` swaps the model for the conformance mock's scripted one (through the same proxy,
 so the recording path runs too). It needs no credential and takes a few seconds (12
-cases in 4.7 s on a Mac Studio); CI runs it. It proves the harness: the app starts,
+cases in about 5 s on a Mac Studio); CI runs it. It proves the harness: the app starts,
 events are delivered, clicks land, everything is observed, checks evaluate, the report
 and evidence are written.
 
@@ -255,7 +295,8 @@ Cases are data in `evals/cases/`, one file per small group, listed in
   (a reply with no question mark is failed; "the code is 7731, I don't have the alarm
   code" is passed). Add a rubric to `rubrics.ts` instead, written as "Pass only if …",
   with at least two replies known to pass and two known to fail, the near misses
-  especially, and run `--grader-selftest`.
+  especially, plus the two self-grading attempts every rubric carries (`closesTheTag`,
+  `bringsAVerdict`), and run `--grader-selftest`.
 - **Ask whether the check can fail.** For each check, name a reply or a run that should
   fail it and make sure it does (`test/evals-run.test.ts` does this for the shipped
   ones). A check that only another part of the system can make fail (the guard that
@@ -282,13 +323,16 @@ rightly, that nothing was executing, and stopped (6 of 6 trials, 2026-11-19). So
 - `echo`, `printf`, `pwd`, `cd`, `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `find`,
   `sort`, `file`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `chmod`, `tee`, `env`, `test`,
   `which`, `type`, `sleep`, `time`, `sed -n 'N,Mp'`; `&&`, `||`, `;`, pipes, `>`, `>>`,
-  `<`, `2>`, `>&2`, `2>&1`, `&>`, here-documents, globs, `VAR=x cmd`, `export`, `$VAR`,
-  `$?`, `set -e`;
+  `<`, `2>`, `>&2`, `2>&1`, `&>`, here-documents (with `$VAR` expanded unless the
+  delimiter is quoted), a backslash-newline, globs, `VAR=x cmd`, `export`, `$VAR` (split
+  into words when unquoted), `$?`, `set -e`, `-u`, `-o pipefail`;
 - git: `clone` (only Lorehouse's own, with its credential helper, reaches GitHub),
-  `status`, `add`, `commit` (`-a`, `-m`, `--amend`), `diff` (against the index, `HEAD`,
+  `status`, `add` (the index is a snapshot: a file edited after `add` is committed as it
+  was added), `commit` (`-a`, `-m`, `-F`, `--amend`), `diff` (against the index, `HEAD`,
   a branch, `HEAD~1`, `A..B`, `A...B`; `--stat`, `--name-only`), `show`, `log`
   (`--oneline`, `--stat`, `--format`, `A..B`), `branch`, `checkout`, `switch`, `restore`,
-  `reset` (`--soft`, `--hard`), `rev-parse`, `remote`, `config`, `ls-files`, `grep`.
+  `reset` (`--soft`, `--hard`), `rev-parse`, `remote`, `config`, `ls-files`, `grep`,
+  and `rebase` in the two forms below.
   History is commits with trees, so what a commit did is what `log`, `show` and `diff`
   then say;
 - a pull request's stage and push: the commits `HEAD` has that GitHub doesn't, with
@@ -296,13 +340,37 @@ rightly, that nothing was executing, and stopped (6 of 6 trials, 2026-11-19). So
   "no commits to publish".
 
 **It is not bash, and it is not a sandbox.** It runs no inline code (`python3 -c`), no
-script that isn't one of the repo's `programs`, no loops, `$(…)`, subshells or background
-`&`, no `git stash`, `rebase` or `merge`, and no build. Each of those is refused with
-exit 126 and a line that says it is the eval's simulated shell and what it supports
-(never a silent success), and is counted in `shellRefused`. In the acceptance run a model
-was refused three times (`xxd`, `python3 -c`) and carried on. A case whose promise
-depends on code really running needs a real sandbox, which this is not: that is KVM's
-job (`sandbox/lab`), and running the code suite against one is future work.
+script that isn't one of the repo's `programs`, no loops, `if`, `$(…)`, subshells or
+background `&`, no `sed` beyond printing lines, no `git stash`, `merge` or `cherry-pick`,
+and no build. Its rule is that **every command validates its options, operators and
+arguments against what it implements, and refuses the rest**: nothing is ignored and
+nothing is approximated, because an option that would have changed the output, quietly
+dropped, is a wrong answer the model then trusts. `test/evals-shell.test.ts` walks every
+command with an option it doesn't take.
+
+**A refusal is in the words a real, small sandbox would use**, never in the harness's
+own: a program that isn't simulated is `sh: 1: xxd: not found` (exit 127), an option a
+tool doesn't implement is that tool's own usage error (`ls: invalid option -- 'R'`), an
+invocation a program's rules don't cover is that program's own error (`make: *** No rule
+to make target 'all'.  Stop.`), syntax that isn't parsed is a syntax error. A model told
+it is in an evaluation may act differently, so nothing it can see says so: a test
+searches what the shell prints, every file of the repos, their history and the Slack
+fixtures for the words that would. The honesty is in the report: every refusal is
+recorded with the real reason beside what the model was shown, and listed per trial
+(`shellRefused`). In the final run a model was refused eight times (`ls -R`, `ls --help`,
+`xxd`, `git ls-files --error-unmatch`) and carried on each time.
+
+`git rebase --exec 'git commit --amend --no-edit --reset-author' <upstream>` is
+supported: it is the one command the product itself tells the model to run, when
+`open_pull_request` finds a commit by the wrong author.
+
+A search pattern is the model's and runs in the runner's own process, so one that could
+take forever to fail (a repeat or an alternation inside a repeated group, or one over 256
+characters) is refused, not run.
+
+A case whose promise depends on code really running needs a real sandbox, which this is
+not: that is KVM's job (`sandbox/lab`), and running the code suite against one is future
+work.
 
 ## Cleaning up
 

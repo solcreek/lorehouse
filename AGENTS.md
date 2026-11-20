@@ -68,7 +68,7 @@ the fake runner (`conformance/fake-runner.ts`) as the sandbox, and the real mode
 a recording proxy (`evals/proxy.ts`), which alone holds the model credential and records
 every turn's tool calls, text and tokens. A code case's sandbox is a simulated shell over
 a checkout in memory (`evals/shell.ts`): it executes nothing on the machine, and what it
-doesn't support it refuses out loud and counts. Hard facts are code checks over what was
+can't run it refuses in the words a real shell would use, and the report lists each one. Hard facts are code checks over what was
 observed (Slack calls, runner jobs, GitHub requests, model turns); a judgment about prose
 is a graded check against a rubric (`evals/rubrics.ts`), counted apart, and a graded
 check with no verdict is "not judged", never a pass. The last stdout line is one JSON
@@ -279,7 +279,7 @@ and the evals against a real model, which are manual; run the ones you touched f
 |---|---|
 | TypeScript (`src/`, `test/`, `conformance/`, `evals/`) | `bun run typecheck`, `bun run test`, `bun run conformance`; for `evals/` or `conformance/`'s mock, fake runner or `harness.ts`, also `bun run eval --dry` |
 | `prompts/`, a tool's description or input schema, the profile (`src/profiles.ts`) | the evals with a real model: `bun run eval` (or `--only` the cases it touches, never fewer than 3 trials for a verdict). It spends tokens: say how many in Verification, with the pass rates before and after. `--dry` is not this check: it proves the harness runs, not what a model does |
-| a rubric or the grader's prompt (`evals/rubrics.ts`, `evals/grader.ts`) | `bun run eval --grader-selftest`: every rubric's known-good and known-bad replies, graded by the real grader model (about 15,000 tokens). A new rubric needs both kinds of example |
+| a rubric or the grader's prompt (`evals/rubrics.ts`, `evals/grader.ts`) | `bun run eval --grader-selftest`: every rubric's known-good and known-bad replies, graded by the real grader model (about 37,000 tokens). A new rubric needs both kinds of example |
 | user-visible behavior | the above, with a conformance scenario changed or added; Slack-facing: also verify-lorehouse (see "Verifying Slack-facing changes" above) |
 | `prompts/`, `migrations/`, `slack/manifest.yaml` | the above, then `bun run build` and `bun run conformance --app ./dist/lorehouse` |
 | a migration | also `bun test test/core.test.ts -t "migrations apply"` |
