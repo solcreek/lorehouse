@@ -245,6 +245,10 @@ const sha1 = (s: string) => new Bun.CryptoHasher("sha1").update(s).digest("hex")
 const short = (s: string) => s.slice(0, 7);
 const glob = (pattern: string) => new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")}$`);
 
+// Bounds on a search the model asks for: its pattern, and how much text it runs over.
+const MAX_PATTERN = 256;
+const MAX_GREP_INPUT = 2_000_000;
+
 // What changed between two versions of a file, as one run: the lines both start with, the
 // lines both end with, and what is between them on each side.
 function diffLines(before: string[], after: string[]): { prefix: number; suffix: number; removed: string[]; added: string[] } {
@@ -1079,6 +1083,13 @@ export class Shell {
       const basic = (p: string) => p.replace(/\\?[(){}|+?]/g, (m) => (m.length === 2 ? m[1]! : `\\${m}`));
       const one = (p: string) => (has("F") ? p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : has("E") ? p : basic(p));
       const source = pattern.split("\n").map(one).join("|");
+      // The pattern is the model's, and it runs in the runner's own process, beside the
+      // proxy and the other trials: one that could take forever to fail (a repeated group
+      // or an alternation inside a repeated group: `(a+)+$`, `(a|aa)+$`) or is very long is
+      // not run at all.
+      if (pattern.length > MAX_PATTERN || /\((?:[^()\\]|\\.)*[+*|](?:[^()\\]|\\.)*\)[+*{]/.test(source)) {
+        return this.refuse(written, "a pattern this long, or with a repeat or an alternation inside a repeated group, isn't run: it could stall the runner", fail(2, "grep: regular expression is too large"));
+      }
       re = new RegExp(has("w") ? `(?<![A-Za-z0-9_])(?:${source})(?![A-Za-z0-9_])` : source, `g${has("i") ? "i" : ""}`);
     } catch {
       return fail(2, "grep: Unmatched ( or \\(");
@@ -1098,6 +1109,7 @@ export class Shell {
         for (const child of this.under(path)) sources.push([`${p === "." ? "" : `${p.replace(/\/$/, "")}/`}${child.slice(path.length + 1)}`, text(this.files.get(child)!)]);
       } else if (!has("s")) return fail(2, `grep: ${p}: No such file or directory`);
     }
+    if (sources.reduce((n, [, t]) => n + t.length, 0) > MAX_GREP_INPUT) return this.refuse(written, "this much input isn't searched (the search runs in the runner's own process)", fail(2, "grep: memory exhausted"));
     // The file's name before each line: with several files, or -H; never with -h.
     const named = !has("h") && (has("H") || sources.length > 1 || tracked || recursive) && !(sources.length === 1 && sources[0]![0] === "");
     const out: string[] = [];

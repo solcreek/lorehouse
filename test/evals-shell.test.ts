@@ -397,6 +397,22 @@ test("every command refuses an option it doesn't implement", () => {
   }
 });
 
+test("a pattern that could stall the runner is not run: a repeated group inside a repeated group, or a very long one", () => {
+  const sh = cloned();
+  sh.exec(`printf '%s\\n' ${"a".repeat(40)}b > long.txt`, WORKDIR, ME);
+  const t0 = performance.now();
+  for (const command of ["grep -E '(a+)+$' long.txt", "grep -E '(a*)*b$' long.txt", "grep -E '^(a|aa)+$' long.txt | head -1; grep '\\(a\\+\\)\\+$' long.txt", `grep ${"a".repeat(300)} long.txt`, "git grep -E '(x+)+y'"]) {
+    const r = sh.exec(command, WORKDIR, ME);
+    if (command.startsWith("grep -E '^(a|aa)+$'")) { expect(r.stderr).toBe("grep: regular expression is too large\n".repeat(2)); continue; }
+    expect([command, r.exitCode, r.stderr]).toEqual([command, 2, "grep: regular expression is too large\n"]);
+  }
+  expect(performance.now() - t0).toBeLessThan(500);
+  expect(sh.refused.length).toBe(6);
+  expect(sh.refused[0]).toMatchObject({ part: "grep -E (a+)+$ long.txt", said: "grep: regular expression is too large", why: expect.stringContaining("could stall the runner") });
+  // Groups and repeats that aren't nested are fine.
+  expect(sh.exec("grep -cE 'bun (install|test)' README.md; grep -c 'a\\+b' long.txt; grep -cE '^ +bun' README.md", WORKDIR, ME).stdout).toBe("2\n1\n2\n");
+});
+
 test("a refused git command changes nothing: stash is refused, not pretended", () => {
   const sh = cloned();
   sh.exec("echo a >> README.md", WORKDIR, ME);
