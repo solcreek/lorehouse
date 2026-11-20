@@ -19,7 +19,7 @@ bun test test/core.test.ts           # one file
 bun test test/core.test.ts -t "migrations apply"   # one test by name
 bun run conformance                  # black-box contract against `bun src/server.ts`
 bun run conformance --only usage     # scenarios whose name contains "usage" (any case)
-bun run conformance --only '/^GET /' # or whose name a /regex/ matches (any case)
+bun run conformance --only '^GET '  # or starts with it; TEXT$ ends with it; 'a|b' either (text, not a regex)
 bun run build                        # → dist/lorehouse (single compiled binary)
 bun run conformance --app ./dist/lorehouse          # the same contract against the binary
 bun run eval                         # evals against a REAL model (needs a model credential; spends tokens)

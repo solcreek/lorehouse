@@ -1,7 +1,7 @@
 // args.ts — run.ts's command line and which cases `--only` picks. Kept apart from run.ts,
 // which starts processes, so test/ can check it directly.
 
-import { nameMatcher, UsageError } from "../conformance/select";
+import { nameMatcher, regexHint, UsageError } from "../conformance/select";
 import type { Case } from "./case";
 
 export { UsageError };
@@ -12,7 +12,8 @@ export const USAGE = `bun run eval [--dry] [--only <pattern>] [--trials <n>] [--
 
   --dry               the scripted model of conformance/mock.ts: no credential, no network.
                       Judges each case by its \`dry\` field. Default --trials 1.
-  --only <pattern>    cases whose "<suite>/<id>" contains TEXT, or that /RE/ matches (any case)
+  --only <pattern>    cases whose "<suite>/<id>" contains TEXT; ^TEXT starts with it, TEXT$ ends
+                      with it, A|B either (any case; text, never a regular expression)
   --trials <n>        trials per case (default 3)
   --model <id>        the app's ANTHROPIC_MODEL (default: the app's own default)
   --concurrency <n>   trials at once (default 2)
@@ -82,7 +83,7 @@ export function selectCases(all: Case[], only?: string): Case[] {
   if (only === undefined) return all;
   const matches = nameMatcher(only);
   const chosen = all.filter((c) => matches(`${c.suite}/${c.id}`));
-  if (!chosen.length) throw new UsageError(`--only ${JSON.stringify(only)} matches none of the ${all.length} cases (bun run eval --list names them); nothing ran`);
+  if (!chosen.length) throw new UsageError(`--only ${JSON.stringify(only)} matches none of the ${all.length} cases (bun run eval --list names them); nothing ran${regexHint(only)}`);
   return chosen;
 }
 

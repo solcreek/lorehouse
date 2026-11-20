@@ -17,7 +17,7 @@ KVM, and no command a model chooses is ever executed on your machine.
 
 ```bash
 bun run eval                       # every case × 3 trials, against the real model
-bun run eval --only code/          # one suite; or a case: --only default-repo; or /regex/
+bun run eval --only code/          # one suite; or a case: --only default-repo; or two: 'default-repo|named-repo'
 bun run eval --trials 1 --max-tokens 300000 --only cites-a-source   # one cheap trial
 bun run eval --model claude-sonnet-5-5   # the app's ANTHROPIC_MODEL for this run
 bun run eval --dry                 # the scripted model: no credential, no network (CI runs this)
@@ -28,7 +28,7 @@ bun run eval --list                # the cases, what each holds, and its checks
 | flag | default | |
 |---|---|---|
 | `--dry` | off | Use the mock's scripted model. Proves the harness's plumbing, not the model (below). |
-| `--only <pattern>` | all | Cases whose `<suite>/<id>` contains the text, or that `/regex/` matches. Any case. |
+| `--only <pattern>` | all | Cases whose `<suite>/<id>` contains the text; `^TEXT` starts with it, `TEXT$` ends with it, `A\|B` either. Any case. Compared as text, never compiled into a regular expression. |
 | `--trials <n>` | 3 (1 with `--dry`) | Trials per case. A real model is not deterministic: one trial is an anecdote. |
 | `--model <id>` | the app's default | Sets the app's `ANTHROPIC_MODEL`. |
 | `--concurrency <n>` | 2 | Trials at once. Each is its own processes and ports. |

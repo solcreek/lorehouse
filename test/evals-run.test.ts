@@ -417,8 +417,8 @@ test("--no-grader: a case whose required checks include a graded one is not full
 test("the command line: defaults, --dry's one trial, and what is refused", () => {
   expect(parseArgs([])).toEqual({ dry: false, list: false, noGrader: false, graderSelftest: false, only: undefined, trials: 3, model: undefined, concurrency: 2, maxTokens: 5_000_000, threshold: 1, graderModel: undefined, out: undefined });
   expect(parseArgs(["--dry"]).trials).toBe(1);
-  expect(parseArgs(["--dry", "--trials", "4", "--only", "/^code/", "--model", "claude-sonnet-5-5", "--concurrency", "3", "--max-tokens", "9000", "--threshold", "0.67", "--grader-model", "g", "--out", "/tmp/o"]))
-    .toEqual({ dry: true, list: false, noGrader: false, graderSelftest: false, only: "/^code/", trials: 4, model: "claude-sonnet-5-5", concurrency: 3, maxTokens: 9000, threshold: 0.67, graderModel: "g", out: "/tmp/o" });
+  expect(parseArgs(["--dry", "--trials", "4", "--only", "^code/", "--model", "claude-sonnet-5-5", "--concurrency", "3", "--max-tokens", "9000", "--threshold", "0.67", "--grader-model", "g", "--out", "/tmp/o"]))
+    .toEqual({ dry: true, list: false, noGrader: false, graderSelftest: false, only: "^code/", trials: 4, model: "claude-sonnet-5-5", concurrency: 3, maxTokens: 9000, threshold: 0.67, graderModel: "g", out: "/tmp/o" });
   expect(parseArgs(["--no-grader"])).toMatchObject({ noGrader: true, graderSelftest: false });
   expect(parseArgs(["--grader-selftest", "--grader-model", "claude-haiku-5-5"])).toMatchObject({ graderSelftest: true, graderModel: "claude-haiku-5-5" });
   for (const bad of [["--nope"], ["--trials"], ["--trials", "0"], ["--trials", "1.5"], ["--threshold", "2"], ["--threshold", "x"], ["--max-tokens", "-1"], ["--only", "--dry"], ["--model", "a", "--model", "b"], ["--concurrency", "0"], ["--grader-selftest", "--dry"], ["--grader-selftest", "--no-grader"]]) {
@@ -430,7 +430,7 @@ test("--only picks cases by suite/id, and a pattern matching nothing is a usage 
   expect(selectCases(CASES).length).toBe(CASES.length);
   expect(selectCases(CASES, "knowledge/").every((c) => c.suite === "knowledge")).toBe(true);
   expect(selectCases(CASES, "knowledge/").length).toBe(4);
-  expect(selectCases(CASES, "/^code\\/.*repo/").map((c) => c.id)).toEqual(["default-repo", "named-repo-wins"]);
+  expect(selectCases(CASES, "^code/default-repo|^code/named-repo").map((c) => c.id)).toEqual(["default-repo", "named-repo-wins"]);
   expect(selectCases(CASES, "DEFAULT-REPO").map((c) => c.id)).toEqual(["default-repo"]);
   expect(() => selectCases(CASES, "no-such-case")).toThrow(UsageError);
   expect(() => selectCases(CASES, "/(/")).toThrow(UsageError);
@@ -1111,7 +1111,7 @@ test("end to end: a credential echoed across two text blocks is withheld whole, 
 test("--dry runs a case of each suite end to end: a table, one JSON line last, and an evidence file per trial", async () => {
   const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));
   try {
-    const r = await evalCommand(["--dry", "--only", "/pull-request-needs-approval|cites-a-source|says-not-found/", "--out", out]);
+    const r = await evalCommand(["--dry", "--only", "pull-request-needs-approval|cites-a-source|says-not-found", "--out", out]);
     expect(r.stderr).toContain("the scripted model (--dry)");
     // On a failure, what the run said is the message.
     expect({ code: r.code, said: r.code === 0 ? "" : r.stderr + r.stdout }).toEqual({ code: 0, said: "" });
