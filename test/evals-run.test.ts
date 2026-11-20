@@ -11,7 +11,7 @@ import type { Case, Observation } from "../evals/case";
 import { CASES } from "../evals/cases";
 import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, said, toldAlone, uploaded } from "../evals/checks";
 import { caseResult, COMPLETED, judge, summarize, trialPassed, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
-import { saidFrom } from "../evals/trial";
+import { listeningPort, saidFrom, tail } from "../evals/trial";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -247,6 +247,48 @@ test("the shipped cases: both suites, unique ids, a promise each, and code check
   const text = listing(CASES);
   expect(text).toContain("code/pull-request-needs-approval  (dry: passes)");
   expect(text).toContain("[graded]");
+});
+
+// ── starting children ───────────────────────────────────────────────────────
+
+const child = (script: string, env: Record<string, string> = {}) => {
+  const proc = Bun.spawn([process.execPath, "-e", script], { env: { PATH: process.env.PATH, ...env }, stdout: "pipe", stderr: "pipe" });
+  return { proc, out: tail(proc.stdout as ReadableStream<Uint8Array>), err: tail(proc.stderr as ReadableStream<Uint8Array>) };
+};
+
+test("a child's port is the one it reports; one that exits while starting fails the start at once, with its stderr", async () => {
+  const ok = child('console.log("noise"); setTimeout(() => console.log("mock listening on :4321 (x)"), 50); setTimeout(() => {}, 2000)');
+  expect(await listeningPort(ok.proc, ok.out, ok.err, /mock listening on :(\d+)/, "the mock", 5000)).toBe(4321);
+  ok.proc.kill();
+
+  const dead = child('console.error("error: Failed to start server. Is port 9 in use? EADDRINUSE"); process.exit(1)');
+  const t0 = Date.now();
+  const failed = await listeningPort(dead.proc, dead.out, dead.err, /mock listening on :(\d+)/, "the mock", 15_000).catch((e: Error) => e.message);
+  expect(failed).toContain("the mock exited (1) while starting");
+  expect(failed).toContain("EADDRINUSE");
+  expect(Date.now() - t0).toBeLessThan(3000);
+
+  const silent = child("setTimeout(() => {}, 3000)");
+  expect(await listeningPort(silent.proc, silent.out, silent.err, /on :(\d+)/, "the app", 300).catch((e: Error) => e.message)).toContain("didn't say which port it listens on within 300 ms");
+  silent.proc.kill();
+});
+
+test("the mock binds port 0 itself and says which port it got: two started together never collide", async () => {
+  const start = () => {
+    const proc = Bun.spawn([process.execPath, join(ROOT, "conformance/mock.ts")], { env: { PATH: process.env.PATH, PORT: "0" }, stdout: "pipe", stderr: "pipe" });
+    return { proc, out: tail(proc.stdout as ReadableStream<Uint8Array>), err: tail(proc.stderr as ReadableStream<Uint8Array>) };
+  };
+  const mocks = Array.from({ length: 4 }, start);
+  try {
+    const ports = await Promise.all(mocks.map((m) => listeningPort(m.proc, m.out, m.err, /mock listening on :(\d+)/, "the mock", 15_000)));
+    expect(new Set(ports).size).toBe(4);
+    for (const port of ports) expect((await fetch(`http://localhost:${port}/stats`)).ok).toBe(true);
+    // An upload URL the mock hands out names the port it really listens on.
+    const reserved = (await (await fetch(`http://localhost:${ports[0]}/slack/api/files.getUploadURLExternal`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ filename: "a.png", length: 1 }) })).json()) as { upload_url: string };
+    expect(reserved.upload_url).toStartWith(`http://localhost:${ports[0]}/slack/upload/`);
+  } finally {
+    for (const m of mocks) m.proc.kill();
+  }
 });
 
 // ── the command itself ──────────────────────────────────────────────────────

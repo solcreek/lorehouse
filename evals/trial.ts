@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { wsRunner, type FakeRunner, type Job, type JobAnswer } from "../conformance/fake-runner";
-import { appEnv, buttonOn, postEvent, postInteraction, waitHttp, type Block, type Stats } from "../conformance/harness";
+import { appEnv, buttonOn, postEvent, postInteraction, type Block, type Stats } from "../conformance/harness";
 import type { Case, Observation, RunnerJob, Said, SlackCall, Step, StepMark, ToolCall, Until } from "./case";
 import type { Proxy } from "./proxy";
 import { commandOf, scriptedSandbox } from "./sandbox";
@@ -51,18 +51,28 @@ export type TrialRun = { observation: Observation; ms: number; setupError?: stri
 // Every process this run started and hasn't reaped, for a signal handler to kill.
 export const children = new Set<ReturnType<typeof Bun.spawn>>();
 
-// A local port nothing listens on: bound, then let go.
-// Never one this process already handed out: two trials starting together must not be
-// given the same port before either has bound it.
-const handedOut = new Set<number>();
-async function freePort(): Promise<number> {
+// The port a child says it listens on. Each child binds port 0 itself and prints the port
+// it was given, so no port is ever chosen here and then lost to someone else before the
+// child binds it. A child that exits while starting fails the start at once, with what
+// it wrote to stderr.
+export async function listeningPort(
+  proc: ReturnType<typeof Bun.spawn>,
+  out: { text: () => string },
+  err: { text: () => string },
+  announced: RegExp,
+  what: string,
+  ms: number,
+): Promise<number> {
+  const t0 = Date.now();
   for (;;) {
-    const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
-    const port = server.port;
-    server.stop(true);
-    if (handedOut.has(port)) continue;
-    handedOut.add(port);
-    return port;
+    const m = announced.exec(out.text());
+    if (m) return Number(m[1]);
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      await Bun.sleep(50); // its last words
+      throw new Error(`${what} exited (${proc.exitCode ?? proc.signalCode}) while starting: ${err.text().slice(-600).trim() || "it wrote nothing to stderr"}`);
+    }
+    if (Date.now() - t0 > ms) throw new Error(`${what} didn't say which port it listens on within ${ms} ms: ${err.text().slice(-600).trim() || out.text().slice(-300).trim() || "it wrote nothing"}`);
+    await Bun.sleep(10);
   }
 }
 
@@ -71,12 +81,13 @@ async function freePort(): Promise<number> {
 // holds, nor anything else that would configure Lorehouse.
 export function trialAppEnv(
   shell: Record<string, string | undefined>,
-  o: { port: number; mock: string; db: string; sessions: string; modelBase: string; model?: string; code: boolean; extra?: Record<string, string> },
+  o: { mock: string; db: string; sessions: string; modelBase: string; model?: string; code: boolean; extra?: Record<string, string> },
 ): Record<string, string | undefined> {
   const inherited = Object.fromEntries(["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER"].flatMap((k) => (shell[k] ? [[k, shell[k]!]] : [])));
   return appEnv(
     inherited,
-    { port: o.port, secret: SECRET, mock: o.mock, channels: CHANNEL, seed: join(FIXTURES, "corpus.jsonl"), db: o.db, statusToken: STATUS_TOKEN, adminToken: ADMIN_TOKEN },
+    // Port 0: the app binds a port of its own and says which (see listeningPort).
+    { port: 0, secret: SECRET, mock: o.mock, channels: CHANNEL, seed: join(FIXTURES, "corpus.jsonl"), db: o.db, statusToken: STATUS_TOKEN, adminToken: ADMIN_TOKEN },
     {
       ANTHROPIC_API_KEY: PLACEHOLDER_KEY,
       ANTHROPIC_AUTH_TOKEN: "",
@@ -171,7 +182,7 @@ function observeJob(n: number, job: Job, answer: JobAnswer): RunnerJob {
 }
 
 // The tail of a process's output, read as it runs.
-function tail(stream: ReadableStream<Uint8Array> | undefined, max = 60_000): { text: () => string; done: Promise<void> } {
+export function tail(stream: ReadableStream<Uint8Array> | undefined, max = 60_000): { text: () => string; done: Promise<void> } {
   let text = "";
   const done = (async () => {
     if (!stream) return;
@@ -195,6 +206,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
   let runner: FakeRunner | undefined;
   let appOut = { text: () => "", done: Promise.resolve() };
   let appErr = { text: () => "", done: Promise.resolve() };
+  let mockErr = { text: () => "", done: Promise.resolve() };
   let mockUrl = "";
   let thread: string | undefined;
   let setupError: string | undefined;
@@ -209,16 +221,14 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
   const turns = () => opts.proxy.turns(id);
 
   try {
-    const mockPort = await freePort();
-    const appPort = await freePort();
-    mockUrl = `http://localhost:${mockPort}`;
-    const target = `http://localhost:${appPort}/slack/events`;
     mock = Bun.spawn(["bun", join(ROOT, "conformance/mock.ts")], {
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: String(mockPort), TTFT_MS: "20", TOKEN_DELAY_MS: "1", TOKENS: "12", SLACK_FIXTURES: join(FIXTURES, "slack-history.json") },
-      stdout: "ignore", stderr: "ignore",
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", TTFT_MS: "20", TOKEN_DELAY_MS: "1", TOKENS: "12", SLACK_FIXTURES: join(FIXTURES, "slack-history.json") },
+      stdout: "pipe", stderr: "pipe",
     });
     children.add(mock);
-    if (!(await waitHttp(`${mockUrl}/stats`, 10_000))) throw new Error("the mock (conformance/mock.ts) never came up");
+    const mockOut = tail(mock.stdout as ReadableStream<Uint8Array>);
+    mockErr = tail(mock.stderr as ReadableStream<Uint8Array>);
+    mockUrl = `http://localhost:${await listeningPort(mock, mockOut, mockErr, /mock listening on :(\d+)/, "the mock (conformance/mock.ts)", 15_000)}`;
     const fixture = (path: string, body: unknown) => fetch(`${mockUrl}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     for (const m of c.setup?.messages ?? []) await fixture("/fixtures/messages", m);
 
@@ -226,16 +236,15 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
     const proc = Bun.spawn(["bun", join(ROOT, "src/server.ts")], {
       // Its own directory: the checkout's .env is never loaded.
       cwd: dir,
-      env: trialAppEnv(process.env, { port: appPort, mock: mockUrl, db: join(dir, "lorehouse.db"), sessions: join(dir, "sessions.db"), modelBase, model: opts.model, code, extra: c.setup?.env }),
+      env: trialAppEnv(process.env, { mock: mockUrl, db: join(dir, "lorehouse.db"), sessions: join(dir, "sessions.db"), modelBase, model: opts.model, code, extra: c.setup?.env }),
       stdout: "pipe", stderr: "pipe",
     });
     app = proc;
     children.add(proc);
     appOut = tail(proc.stdout as ReadableStream<Uint8Array>);
     appErr = tail(proc.stderr as ReadableStream<Uint8Array>);
-    const appUrl = `http://localhost:${appPort}`;
-    const up = await Promise.race([waitHttp(`${appUrl}/healthz`, 30_000), proc.exited.then(() => false)]);
-    if (!up) throw new Error(`the app never answered /healthz${proc.exitCode !== null ? ` (it exited ${proc.exitCode})` : ""}: ${appErr.text().slice(-600)}`);
+    const appUrl = `http://localhost:${await listeningPort(proc, appOut, appErr, /lorehouse: @\S+ on :(\d+)/, "the app (src/server.ts)", 30_000)}`;
+    const target = `${appUrl}/slack/events`;
     const status = async () => (await (await fetch(`${appUrl}/status`, { headers: { authorization: `Bearer ${STATUS_TOKEN}` } })).json()) as { knowledge?: { state?: string }; runners?: { runner: string; online: boolean }[] };
     const ready = Date.now();
     while ((await status().catch(() => undefined))?.knowledge?.state !== "ready") {
@@ -353,6 +362,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
         // The turn is over and what the step waits for never came: the model answered
         // some other way (a reply and no card). No need to sit out the deadline.
         if (!ok && turns().length > mark.turns && opts.proxy.inFlight(id) === 0 && now - Math.max(changedAt, busyAt) >= IDLE_MS) { failure = `no ${waitingFor[until]}: the turn ended without it (nothing new for ${IDLE_MS} ms and no model call in flight). ${since()}`; break; }
+        if (mock && mock.exitCode !== null) { failure = `the mock exited (${mock.exitCode}) while waiting for ${waitingFor[until]}: ${mockErr.text().slice(-400)}`; break; }
         if (app.exitCode !== null) { failure = `the app exited (${app.exitCode}) while waiting for ${waitingFor[until]}: ${appErr.text().slice(-400)}`; break; }
         if (now > deadline) { failure = `${ok ? "it never went quiet" : `no ${waitingFor[until]}`} within ${step.deadlineMs ?? opts.deadlineMs} ms. ${since()}`; break; }
         await Bun.sleep(50);

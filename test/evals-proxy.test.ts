@@ -189,7 +189,7 @@ for (const [kind, env, header] of [
     expect(JSON.stringify(proxy.turns("t"))).not.toContain(REAL);
     expect(credential.secrets()).toEqual([REAL]);
     // And the app's environment never has it, whatever this shell holds.
-    const appEnv = trialAppEnv({ ...env, PATH: "/usr/bin", ANTHROPIC_API_KEY: REAL, ANTHROPIC_AUTH_TOKEN: REAL }, { port: 1, mock: "http://localhost:2", db: "/tmp/x/lorehouse.db", sessions: "/tmp/x/sessions.db", modelBase: "http://127.0.0.1:3/t/t", code: true });
+    const appEnv = trialAppEnv({ ...env, PATH: "/usr/bin", ANTHROPIC_API_KEY: REAL, ANTHROPIC_AUTH_TOKEN: REAL }, { mock: "http://localhost:2", db: "/tmp/x/lorehouse.db", sessions: "/tmp/x/sessions.db", modelBase: "http://127.0.0.1:3/t/t", code: true });
     expect(JSON.stringify(appEnv)).not.toContain(REAL);
     expect(appEnv.ANTHROPIC_API_KEY).toBe(PLACEHOLDER_KEY);
     expect(appEnv.ANTHROPIC_AUTH_TOKEN).toBe("");
