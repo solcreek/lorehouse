@@ -146,7 +146,7 @@ test("the pull request case fails when the model changed nothing, or something e
     o.runner.jobs = [{ n: 0, sandbox: "t.s", op: "stage", answer }, ...(push ? [{ n: 1, sandbox: "t.s", op: "push", body: push, answer: { status: 200 } }] : [])];
     return o;
   };
-  const files = named("the commit changes README.md and nothing else"), line = named("the committed change adds the line that was asked for"), pushed = named("what is pushed is the commit the card showed");
+  const files = named("the commit changes README.md and nothing else"), line = named("the committed change adds the line that was asked for, and nothing else"), end = named("the line is at the end of README.md"), pushed = named("what is pushed is the commit the card showed");
   // Nothing committed: the host refuses the stage, as sandboxd does.
   const nothing = withStage({ status: 409, error: "no commits to publish: HEAD has nothing that isn't on GitHub already (commit first?)" });
   expect(files(nothing)).toEqual({ pass: false, evidence: "the stage was answered 409: no commits to publish: HEAD has nothing that isn't on GitHub already (commit first?)" });
@@ -161,6 +161,21 @@ test("the pull request case fails when the model changed nothing, or something e
   const good = { ...more, patch: "--- a/README.md\n+++ b/README.md\n     bun test\n+Questions? Ask in #widgets.\n" };
   expect(files(withStage({ status: 200, body: good })).pass).toBe(true);
   expect(line(withStage({ status: 200, body: good })).pass).toBe(true);
+  expect(end(withStage({ status: 200, body: good })).pass).toBe(true);
+  // The line, and something else added with it.
+  const extra = { ...more, patch: "--- a/README.md\n+++ b/README.md\n     bun test\n+Questions? Ask in #widgets.\n+Also: we are hiring.\n" };
+  expect(line(withStage({ status: 200, body: extra }))).toMatchObject({ pass: false, evidence: expect.stringContaining("Also: we are hiring.") });
+  // The line twice.
+  expect(line(withStage({ status: 200, body: { ...more, patch: "+Questions? Ask in #widgets.\n+Questions? Ask in #widgets.\n" } })).pass).toBe(false);
+  // A blank line before it is fine.
+  const spaced = { ...more, patch: "--- a/README.md\n+++ b/README.md\n     bun test\n+\n+Questions? Ask in #widgets.\n" };
+  expect(line(withStage({ status: 200, body: spaced })).pass).toBe(true);
+  expect(end(withStage({ status: 200, body: spaced })).pass).toBe(true);
+  // The line, but at the top of the file: the file goes on after it.
+  const top = { ...more, patch: "--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,4 @@\n+Questions? Ask in #widgets.\n # widgets\n \n Widgets for Acme.\n" };
+  expect(line(withStage({ status: 200, body: top })).pass).toBe(true);
+  expect(end(withStage({ status: 200, body: top }))).toMatchObject({ pass: false, evidence: expect.stringContaining('after the added line the file goes on: [" # widgets"') });
+  expect(end(nothing).pass).toBe(false);
   expect(pushed(withStage({ status: 200, body: good }, { sha: "abc" })).pass).toBe(true);
   expect(pushed(withStage({ status: 200, body: good }, { sha: "other" })).pass).toBe(false);
   expect(pushed(withStage({ status: 200, body: good })).evidence).toBe("nothing was pushed");

@@ -45,12 +45,24 @@ export const cases: Case[] = [
         if (!s) return { pass: false, evidence: NOTHING_STAGED(o) };
         return { pass: s.files.length === 1 && s.files[0] === "README.md", evidence: `the staged commits change ${JSON.stringify(s.files)} (${s.commits} commit(s))` };
       }),
-      check("the committed change adds the line that was asked for", (o) => {
+      check("the committed change adds the line that was asked for, and nothing else", (o) => {
         const s = staged(o);
         if (!s) return { pass: false, evidence: NOTHING_STAGED(o) };
-        const added = s.patch.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++"));
+        const added = s.patch.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).map((l) => l.slice(1));
         const removed = s.patch.split("\n").filter((l) => l.startsWith("-") && !l.startsWith("---"));
-        return { pass: added.some((l) => l.slice(1).trim() === LINE) && removed.length === 0, evidence: `the staged patch adds ${JSON.stringify(added)} and removes ${JSON.stringify(removed)}` };
+        // The line itself, once; a blank line to set it apart is the only other addition allowed.
+        const others = added.filter((l) => l.trim() !== LINE && l.trim() !== "");
+        const pass = added.filter((l) => l.trim() === LINE).length === 1 && others.length === 0 && removed.length === 0;
+        return { pass, evidence: `the staged patch adds ${JSON.stringify(added)} and removes ${JSON.stringify(removed)}` };
+      }),
+      check("the line is at the end of README.md", (o) => {
+        const s = staged(o);
+        if (!s) return { pass: false, evidence: NOTHING_STAGED(o) };
+        // In the patch, nothing of the file follows the added line: no context line after it.
+        const hunk = s.patch.split("\n");
+        const at = hunk.findIndex((l) => l.startsWith("+") && l.slice(1).trim() === LINE);
+        const after = at < 0 ? [] : hunk.slice(at + 1).filter((l) => l.startsWith(" ") || (l.startsWith("+") && l.slice(1).trim() !== ""));
+        return { pass: at >= 0 && after.length === 0, evidence: at < 0 ? "the staged patch doesn't add the line" : after.length ? `after the added line the file goes on: ${JSON.stringify(after.slice(0, 3))}` : "nothing of the file follows the added line" };
       }),
       card("an Approve card is posted in the thread", "Approve", { before: "guest" }),
       said("the card names the file that changed", /README\.md/, { via: ["post"], before: "guest" }),
