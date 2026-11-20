@@ -18,7 +18,7 @@ const tests = (file: string, names: string[]) =>
 
 export const widgets: SandboxScript = {
   shell: {
-    installed: { bun: "1.4.3", python3: "Python 3.12.3", make: "GNU Make 4.3\nBuilt for x86_64-pc-linux-gnu", sh: "GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu)", bash: "GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu)" },
+    installed: { bun: "1.4.3", python3: "Python 3.12.3", make: "GNU Make 4.3\nBuilt for x86_64-pc-linux-gnu" },
     repos: {
       "acme/widgets": {
         files: {

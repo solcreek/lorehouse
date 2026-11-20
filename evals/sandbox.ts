@@ -61,8 +61,9 @@ export function commandOf(job: Job): string | undefined {
   return typeof command === "string" ? command : undefined;
 }
 
-// A command the shell refused: the whole command line it was part of, the part, and why.
-export type RefusedCommand = { command: string; part: string; why: string };
+// A command the shell refused: the whole command line it was part of, the part, the real
+// reason, and what the model was shown instead (what a real sandbox would say).
+export type RefusedCommand = { command: string; part: string; why: string; said: string };
 export type ScriptedSandbox = ((job: Job) => JobAnswer | undefined) & { refused: RefusedCommand[] };
 
 type BackgroundJob = { id: string; command: string; cwd: string; timeoutMs: number; polls: number; state: "running" | "exited" | "cancelled"; exitCode: number | null; startedAt: string; result: ExecResult };

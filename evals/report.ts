@@ -40,7 +40,7 @@ export type TrialResult = {
   // The evidence file, relative to the working directory.
   file: string;
   // Commands the case's simulated shell refused to run in this trial (shell.ts).
-  refused: { command: string; part: string; why: string }[];
+  refused: { command: string; part: string; why: string; said: string }[];
 };
 
 // The check every trial has: the conversation ran to its end.
@@ -169,7 +169,8 @@ export type Summary = {
   failures: Failure[];
   // Every command the simulated shell (evals/shell.ts) refused to run, by trial: a failed
   // case beside one of these may be a gap in the shell, not the model's doing.
-  shellRefused: { case: string; trial: number; command: string; part: string }[];
+  // `said` is what the model saw (a real sandbox's words); `why` is the real reason.
+  shellRefused: { case: string; trial: number; command: string; part: string; said: string; why: string }[];
   // Why the run stopped early, when it did.
   stopped?: string;
   ms: number;
@@ -203,7 +204,7 @@ export function summarize(o: {
       ...(o.usd ? { usdEstimate: Math.round(((input * o.usd.in + o.tokens.output * o.usd.out) / 1e6) * 10000) / 10000 } : {}),
     },
     failures,
-    shellRefused: o.trials.flatMap((t) => t.refused.map((r) => ({ case: t.case, trial: t.trial, command: r.command, part: r.part }))),
+    shellRefused: o.trials.flatMap((t) => t.refused.map((r) => ({ case: t.case, trial: t.trial, command: r.command, part: r.part, said: r.said, why: r.why }))),
     ...(o.exceeded ? { stopped: `budget: --max-tokens ${o.maxTokens} was reached; ${o.planned - o.trials.length} planned trial(s) never ran and later model calls were refused` } : {}),
     ms: o.ms, out: o.out,
   };
@@ -243,7 +244,7 @@ export function table(results: CaseResult[], trials: TrialResult[], summary: Sum
   out.push(`tokens: ${num(t.total)} of ${num(t.max)} (input ${num(t.input)}, output ${num(t.output)}, cache read ${num(t.cacheRead)}, cache write ${num(t.cacheWrite)}; grader ${num(t.grader.total)} of them)${t.usdEstimate !== undefined ? `; about $${t.usdEstimate} at EVAL_USD_PER_MTOK_IN/OUT` : ""}`);
   if (summary.shellRefused.length) {
     out.push("", `the simulated shell refused ${summary.shellRefused.length} command(s) (evals/shell.ts; a failure beside one may be the shell's gap, not the model's):`);
-    for (const r of summary.shellRefused) out.push(`  ${r.case} trial ${r.trial}: ${JSON.stringify(r.part)}${r.part === r.command ? "" : ` in ${JSON.stringify(r.command.length > 160 ? `${r.command.slice(0, 160)}…` : r.command)}`}`);
+    for (const r of summary.shellRefused) out.push(`  ${r.case} trial ${r.trial}: ${JSON.stringify(r.part)}${r.part === r.command ? "" : ` in ${JSON.stringify(r.command.length > 160 ? `${r.command.slice(0, 160)}…` : r.command)}`}\n      the model saw: ${JSON.stringify(r.said.split("\n")[0])}; the reason: ${r.why}`);
   }
   if (summary.stopped) out.push(`STOPPED: ${summary.stopped}`);
   return out.join("\n");

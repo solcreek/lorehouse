@@ -9,10 +9,14 @@
 // redirections, a commit that `git log` then shows. Nothing is executed on this machine:
 // no process is spawned, no file is read or written, nothing is evaluated.
 //
-// It is not bash, and says so. What it runs is SUPPORTED below. Anything else (inline
-// code, loops, `$(…)`, a program no rule covers, a git command not listed) is refused with
-// exit 126 and a line that names this file and what it supports, and is recorded
-// (`refused`), so a run's report can tell a case the model failed from a gap here.
+// It is not bash. What it can't run (inline code, loops, `$(…)`, a program no rule covers,
+// a git command it doesn't implement) it refuses in the words a real, small sandbox would
+// use for that situation: a program that isn't there is `sh: 1: xxd: not found` (127), an
+// option a tool doesn't take is that tool's own usage error, syntax it doesn't parse is a
+// syntax error. It never says what it is: a model told it is being evaluated may act
+// differently. The honesty is in the record: every refusal is kept (`refused`, with the
+// real reason beside what the model was shown) and listed in the run's report, so a case
+// the model failed can be told from a gap here.
 
 import { deflateSync } from "node:zlib";
 
@@ -44,17 +48,15 @@ export type ShellScript = {
 
 export type ExecResult = { exitCode: number; stdout: string; stderr: string };
 // A command this shell wouldn't run: the simple command as written, and why.
-export type Refused = { part: string; why: string };
+// `why` is the real reason, for the report; `said` is what the model was shown instead.
+export type Refused = { part: string; why: string; said: string };
 
 export const WORKDIR = "/workspace/repo";
 const BUILTIN = ["echo", "printf", "pwd", "cd", "test", "[", "true", "false", "command", "export", "unset", "type", "set", ":"];
-const COMMANDS = ["ls", "cat", "head", "tail", "wc", "sed", "grep", "find", "file", "mkdir", "touch", "rm", "cp", "mv", "chmod", "tee", "env", "sleep", "time", "which", "git", "sort", "uname", "whoami", "date", "basename", "dirname"];
+const COMMANDS = ["ls", "cat", "head", "tail", "wc", "sed", "grep", "find", "file", "mkdir", "touch", "rm", "cp", "mv", "chmod", "tee", "env", "sleep", "time", "which", "git", "sort", "uname", "whoami", "hostname", "date", "basename", "dirname"];
 const GIT = ["clone", "status", "add", "commit", "diff", "show", "log", "branch", "checkout", "switch", "restore", "reset", "rev-parse", "remote", "config", "fetch", "ls-files", "grep", "rm", "mv"];
-export const SUPPORTED =
-  `${[...BUILTIN.filter((b) => b !== ":" && b !== "["), ...COMMANDS.filter((c) => c !== "git")].join(", ")} (sed only as \`sed -n 'N,Mp'\`), ` +
-  `git (${GIT.join(", ")}), the repository's own scripts and test runner, &&, ||, ;, pipes, redirections, globs and $VAR`;
-const refusal = (what: string) =>
-  `eval-shell: ${what}: this is the eval's simulated shell (evals/shell.ts), not bash, and it didn't run that. It supports: ${SUPPORTED}. It runs no inline code, loops, $(...) or other programs.`;
+// Shell words this shell doesn't parse: as the first word of a command, a syntax error.
+const KEYWORDS = ["for", "while", "until", "if", "then", "else", "elif", "fi", "do", "done", "case", "esac", "function", "select", "{", "}", "[["];
 
 // ── a PNG that is a picture ─────────────────────────────────────────────────
 
@@ -277,9 +279,35 @@ export class Shell {
     }
   }
 
-  private refuse(part: string, why: string): ExecResult {
-    this.refused.push({ part, why });
-    return fail(126, refusal(why));
+  // Refuse `part`: the model is shown `said`, what a real sandbox would say; the record
+  // keeps the real reason.
+  private refuse(part: string, why: string, said: ExecResult): ExecResult {
+    this.refused.push({ part, why, said: (said.stderr || said.stdout).trim() });
+    return said;
+  }
+
+  // A program that is installed, asked for something no rule covers (inline code, a file
+  // of the model's own, a target the Makefile lacks): its own error for that.
+  private denied(name: string, args: string[], cwd: string): ExecResult {
+    const first = args[0] ?? "";
+    const file = args.find((a) => !a.startsWith("-"));
+    const path = file === undefined ? undefined : this.abs(file, cwd);
+    const there = path !== undefined && this.read(path) !== undefined;
+    if (name === "make") {
+      if (first.startsWith("-")) return fail(2, `make: invalid option -- '${first.replace(/^-+/, "").slice(0, 1)}'\nUsage: make [options] [target] ...`);
+      return fail(2, `make: *** No rule to make target '${first}'.  Stop.`);
+    }
+    if (name === "python3" || name === "python") {
+      if (first.startsWith("-") || file === undefined) return fail(2, `Unknown option: ${first.slice(0, 2) || "-"}\nusage: ${name} [option] ... [-c cmd | -m mod | file | -] [arg] ...\nTry \`python -h' for more information.`);
+      return fail(2, `${name}: can't open file '${path}': [Errno ${there ? "13] Permission denied" : "2] No such file or directory"}`);
+    }
+    if (name === "bun" || name === "node" || name === "npm") {
+      if (first === "run" && args[1] !== undefined && !there) return fail(1, `error: Script not found "${args[1]}"`);
+      if (file !== undefined && file !== "run" && !there && /[./]/.test(file)) return fail(1, `error: Module not found "${file}"`);
+      if (there) return fail(1, `error: EACCES reading "${path}"`);
+      return fail(1, `error: unknown command "${first}"`);
+    }
+    return fail(126, `sh: 1: ${name}: Permission denied`);
   }
 
   // ── files ──
@@ -322,15 +350,21 @@ export class Shell {
   // `env`: what the caller sets for this command (the job's env), e.g. who commits.
   exec(command: string, cwd = WORKDIR, env: Record<string, string> = {}): ExecResult {
     // A working directory that isn't there (the checkout, before a clone).
-    if (!this.isDir(cwd)) return fail(1, `bash: cd: ${cwd}: No such file or directory`);
+    if (!this.isDir(cwd)) return fail(2, `sh: 1: cd: can't cd to ${cwd}`);
     const { line, docs } = heredocs(command);
     const tokens = tokenize(line);
     if ("error" in tokens) {
-      return tokens.error === "substitution" ? this.refuse(command.split("\n")[0]!.slice(0, 200), "command substitution ($(...) or backticks) isn't supported; run the commands one at a time") : fail(2, `bash: -c: line 1: ${tokens.error}`);
+      return tokens.error === "substitution"
+        ? this.refuse(command.split("\n")[0]!.slice(0, 200), "command substitution ($(...) or backticks) isn't simulated", fail(2, command.includes("`") ? "sh: 1: Syntax error: EOF in backquote substitution" : 'sh: 1: Syntax error: "(" unexpected'))
+        : fail(2, "sh: 1: Syntax error: Unterminated quoted string");
     }
     const unsupported = tokens.find((t) => "op" in t && ["(", ")", "&"].includes(t.op)) as { op: string } | undefined;
-    if (unsupported) return this.refuse(command.split("\n")[0]!.slice(0, 200), unsupported.op === "&" ? "background commands (&) aren't supported; a long command runs as a background job (workspace_job_start)" : "subshells and functions aren't supported");
-    const st: State = { cwd, env: new Map(Object.entries({ HOME: "/root", USER: "root", PATH: "/usr/local/bin:/usr/bin:/bin", SHELL: "/bin/bash", ...env })), status: 0, errexit: false };
+    if (unsupported) return this.refuse(command.split("\n")[0]!.slice(0, 200), unsupported.op === "&" ? "background commands (&) aren't simulated" : "subshells and functions aren't simulated", fail(2, `sh: 1: Syntax error: "${unsupported.op}" unexpected`));
+    // A shell word this doesn't parse, where a command would start: a syntax error, and
+    // as in a real shell nothing of the line runs.
+    const keyword = tokens.find((t, i) => "word" in t && !t.quoted && KEYWORDS.includes(t.word) && (i === 0 || ("op" in tokens[i - 1]! && ["&&", "||", ";", "|"].includes((tokens[i - 1] as { op: string }).op)))) as { word: string } | undefined;
+    if (keyword) return this.refuse(command.split("\n")[0]!.slice(0, 200), `shell syntax (\`${keyword.word}\`) isn't simulated`, fail(2, `sh: 1: Syntax error: "${keyword.word}" unexpected`));
+    const st: State = { cwd, env: new Map(Object.entries({ HOME: "/root", USER: "root", PATH: "/usr/local/bin:/usr/bin:/bin", SHELL: "/bin/sh", ...env })), status: 0, errexit: false };
     let stdout = "", stderr = "";
     let i = 0;
     let join: string | undefined;
@@ -395,7 +429,7 @@ export class Shell {
       if (t.op === ">&2" || t.op === "1>&2") { outTo = errTo; continue; }
       const nextToken = tokens[i + 1];
       const target = nextToken && "word" in nextToken ? this.expand(nextToken, st)[0] : undefined;
-      if (target === undefined) return fail(2, "bash: syntax error near unexpected token `newline'");
+      if (target === undefined) return fail(2, "sh: 1: Syntax error: newline unexpected");
       i++;
       if (t.op === ">" || t.op === ">>") outTo = sink(target, t.op === ">>");
       else if (t.op === "2>" || t.op === "2>>") errTo = sink(target, t.op === "2>>");
@@ -404,7 +438,7 @@ export class Shell {
         if (target.startsWith("\u0000")) stdin = docs[Number(target.slice(1))] ?? "";
         else {
           const f = this.read(this.abs(target, st.cwd));
-          if (f === undefined) return fail(1, `bash: ${target}: No such file or directory`);
+          if (f === undefined) return fail(2, `sh: 1: cannot open ${target}: No such file`);
           stdin = text(f);
         }
       }
@@ -513,13 +547,14 @@ export class Shell {
       }
       case "pwd": return ok(`${st.cwd}\n`);
       case "whoami": return ok("root\n");
+      case "hostname": return ok("sandbox\n");
       case "uname": return ok(args.includes("-a") ? "Linux sandbox 6.8.0 #1 SMP x86_64 GNU/Linux\n" : "Linux\n");
       case "date": return ok("Thu Nov 19 10:00:00 UTC 2026\n");
       case "basename": return ok(`${(operands[0] ?? "").split("/").filter(Boolean).at(-1) ?? ""}\n`);
       case "dirname": return ok(`${(operands[0] ?? "").includes("/") ? (operands[0]!.slice(0, operands[0]!.lastIndexOf("/")) || "/") : "."}\n`);
       case "cd": {
         const to = this.abs(operands[0] ?? "/root", st.cwd);
-        if (!this.isDir(to)) return fail(1, `bash: cd: ${operands[0]}: No such file or directory`);
+        if (!this.isDir(to)) return fail(2, `sh: 1: cd: can't cd to ${operands[0]}`);
         st.cwd = to;
         return ok();
       }
@@ -588,7 +623,7 @@ export class Shell {
         for (const p of operands) {
           if (BUILTIN.includes(p)) out.push(`${p} is a shell builtin`);
           else if (known.includes(p)) out.push(`${p} is /usr/bin/${p}`);
-          else errors.push(`bash: type: ${p}: not found`);
+          else errors.push(`${p}: not found`);
         }
         return done(out.length ? `${out.join("\n")}\n` : "");
       }
@@ -671,7 +706,11 @@ export class Shell {
       }
       case "sed": {
         const m = /^(\d+)(?:,(\d+|\$))?p$/.exec(operands[0] ?? "");
-        if (!flags.includes("-n") || !m) return this.refuse(written, "`sed` only prints line ranges here (`sed -n 'N,Mp' <file>`); read a file with workspace_read_file and edit it with workspace_write_file");
+        if (!flags.includes("-n") || !m) {
+          const script = operands[0] ?? "";
+          const at = Math.max(1, script.search(/[A-Za-z]/) + 1);
+          return this.refuse(written, "sed is simulated only as `sed -n 'N,Mp'`", flags.some((f) => f !== "-n") ? fail(1, `sed: invalid option -- '${flags.find((f) => f !== "-n")!.slice(1, 2)}'\nUsage: sed [OPTION]... {script-only-if-no-other-script} [input-file]...`) : fail(1, `sed: -e expression #1, char ${at}: unknown command: \`${script[at - 1] ?? ""}'`));
+        }
         const f = operands[1] === undefined ? stdin : this.read(this.abs(operands[1], st.cwd));
         if (f === undefined) return fail(2, `sed: can't read ${operands[1]}: No such file or directory`);
         const ls = lines(text(f));
@@ -706,11 +745,14 @@ export class Shell {
     const versions = this.script.installed ?? {};
     if (name in versions) {
       if (args.length === 1 && ["--version", "-V", "-v", "version"].includes(args[0]!)) return ok(`${versions[name]}\n`);
-      return this.refuse(written, `\`${name}\` runs only the repository's own scripts and targets here, not \`${written.slice(0, 120)}\``);
+      return this.refuse(written, `\`${name}\` is simulated only for the repository's own scripts and targets (its \`programs\`), not for \`${written.slice(0, 120)}\``, this.denied(name, args, st.cwd));
     }
-    // A script of the checkout that no rule runs.
-    if (this.read(this.abs(name, st.cwd)) !== undefined && name.includes("/")) return this.refuse(written, `\`${name}\` isn't one of the scripts this sandbox can run`);
-    return this.refuse(written, `\`${name}\` isn't supported`);
+    if (name.includes("/")) {
+      // A path: there or not, as a shell says. A file of the checkout that no rule runs can't be run here.
+      if (this.read(this.abs(name, st.cwd)) === undefined) return fail(127, `sh: 1: ${name}: not found`);
+      return this.refuse(written, `\`${name}\` isn't one of the scripts the case's \`programs\` run`, fail(126, `sh: 1: ${name}: Permission denied`));
+    }
+    return this.refuse(written, `\`${name}\` isn't simulated`, fail(127, `sh: 1: ${name}: not found`));
   }
 
   private grep(args: string[], stdin: string, cwd: string, tracked: boolean): ExecResult {
@@ -928,7 +970,7 @@ export class Shell {
         return ok(`${out.join("\n")}\n`);
       }
       case "add": {
-        if (flag("-p", "--patch", "-i")) return this.refuse(written, "interactive staging (`git add -p`) isn't supported; add whole files");
+        if (flag("-p", "--patch", "-i")) return this.refuse(written, "interactive staging isn't simulated", fail(129, `error: unknown option \`${flags.find((f) => ["-p", "--patch", "-i"].includes(f))!.replace(/^-+/, "")}'\nusage: git add [<options>] [--] <pathspec>...`));
         const changes = this.changes();
         const everything = flag("-A", "--all", "-u") || operands.includes(".");
         for (const p of operands.filter((o) => o !== ".")) {
@@ -1146,6 +1188,6 @@ export class Shell {
         return render(only(all.filter((c) => repo.staged.has(c.path) === cached), paths));
       }
     }
-    return this.refuse(written, `\`git ${sub ?? ""}\` isn't supported`);
+    return this.refuse(written, `\`git ${sub ?? ""}\` isn't simulated`, fail(1, `git: '${sub ?? ""}' is not a git command. See 'git --help'.`));
   }
 }

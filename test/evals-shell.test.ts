@@ -6,7 +6,9 @@
 import { expect, test } from "bun:test";
 import { BENCH, widgets, WIDGETS } from "../evals/cases/widgets";
 import { scriptedSandbox } from "../evals/sandbox";
-import { chartPng, Shell, SUPPORTED, WORKDIR } from "../evals/shell";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { chartPng, Shell, WORKDIR } from "../evals/shell";
 import { gitWithToken } from "../src/tools/git-credential";
 
 const URL_ = "https://github.com/acme/widgets.git";
@@ -130,48 +132,113 @@ for (const [name, commands, want] of TABLE) {
   });
 }
 
-// What it can't run: refused with 126 and a line that says what this is, and counted.
-const REFUSED: [command: string, part: string][] = [
-  ["python3 -c \"print('alive')\"", "python3 -c print('alive')"],
-  ["bun /tmp/t.ts", "bun /tmp/t.ts"],
-  ["make all", "make all"],
-  ["cargo test", "cargo test"],
-  ["od -c README.md", "od -c README.md"],
-  ["git stash", "git stash"],
-  ["git rebase -i origin/main", "git rebase -i origin/main"],
-  ["git add -p", "git add -p"],
-  ["sed -i 's/a/b/' README.md", "sed -i s/a/b/ README.md"],
-  ["echo $(date)", "echo $(date)"],
-  ["for f in *.md; do echo $f; done", "for f in README.md"],
-  ["(cd src && ls)", "(cd src && ls)"],
-  ["bun test &", "bun test &"],
-  ["./scripts/nope.sh", "./scripts/nope.sh"],
+// What it can't run: refused in the words a real, small sandbox would use for that
+// situation (a missing program, a tool's own usage error, a syntax error), and kept on
+// the record with the real reason. [command, the part refused, exit code, what the model sees]
+const REFUSED: [command: string, part: string, code: number, said: string | RegExp][] = [
+  ["xxd -l 16 bench.png", "xxd -l 16 bench.png", 127, "sh: 1: xxd: not found\n"],
+  ["cargo test", "cargo test", 127, "sh: 1: cargo: not found\n"],
+  ["od -c README.md", "od -c README.md", 127, "sh: 1: od: not found\n"],
+  ["python3 -c \"print('alive')\"", "python3 -c print('alive')", 2, "Unknown option: -c\nusage: python3 [option] ... [-c cmd | -m mod | file | -] [arg] ...\nTry `python -h' for more information.\n"],
+  ["echo 'print(1)' > /tmp/t.py; python3 /tmp/t.py", "python3 /tmp/t.py", 2, "python3: can't open file '/tmp/t.py': [Errno 13] Permission denied\n"],
+  ["python3 nope.py", "python3 nope.py", 2, "python3: can't open file '/workspace/repo/nope.py': [Errno 2] No such file or directory\n"],
+  ["touch /tmp/t.ts; bun /tmp/t.ts", "bun /tmp/t.ts", 1, 'error: EACCES reading "/tmp/t.ts"\n'],
+  ["bun run lint", "bun run lint", 1, 'error: Script not found "lint"\n'],
+  ["make all", "make all", 2, "make: *** No rule to make target 'all'.  Stop.\n"],
+  ["make -d bench", "make -d bench", 2, /^make: invalid option -- 'd'\nUsage: make/],
+  ["git stash", "git stash", 1, "git: 'stash' is not a git command. See 'git --help'.\n"],
+  ["git rebase -i origin/main", "git rebase -i origin/main", 1, "git: 'rebase' is not a git command. See 'git --help'.\n"],
+  ["git add -p", "git add -p", 129, /^error: unknown option `p'\nusage: git add/],
+  ["sed -i 's/a/b/' README.md", "sed -i s/a/b/ README.md", 1, /^sed: invalid option -- 'i'\nUsage: sed/],
+  ["sed 's/a/b/' README.md", "sed s/a/b/ README.md", 1, "sed: -e expression #1, char 1: unknown command: `s'\n"],
+  ["echo $(date)", "echo $(date)", 2, 'sh: 1: Syntax error: "(" unexpected\n'],
+  ["echo `date`", "echo `date`", 2, "sh: 1: Syntax error: EOF in backquote substitution\n"],
+  ["for f in *.md; do echo $f; done", "for f in *.md; do echo $f; done", 2, 'sh: 1: Syntax error: "for" unexpected\n'],
+  ["if [ -f README.md ]; then echo yes; fi", "if [ -f README.md ]; then echo yes; fi", 2, 'sh: 1: Syntax error: "if" unexpected\n'],
+  ["(cd src && ls)", "(cd src && ls)", 2, 'sh: 1: Syntax error: "(" unexpected\n'],
+  ["bun test &", "bun test &", 2, 'sh: 1: Syntax error: "&" unexpected\n'],
+  ["chmod 644 scripts/count.ts; ./scripts/count.ts", "./scripts/count.ts", 126, "sh: 1: ./scripts/count.ts: Permission denied\n"],
 ];
-for (const [command, part] of REFUSED) {
-  test(`shell refuses, out loud and on the record: ${command}`, () => {
+// What would tell a model it is being evaluated. None of it may reach the model.
+const GIVEAWAY = /\b(evals?|evaluat\w*|simulat\w*|mock\w*|fake\w*|conformance|harness|fixtures?)\b/i;
+
+for (const [command, part, code, said] of REFUSED) {
+  test(`shell refuses as a real sandbox would, and keeps the reason: ${command}`, () => {
     const sh = cloned();
     const r = sh.exec(command, WORKDIR, ME);
-    expect(r.exitCode).toBe(126);
-    expect(r.stderr).toContain("this is the eval's simulated shell (evals/shell.ts), not bash, and it didn't run that");
-    expect(r.stderr).toContain(SUPPORTED);
-    expect(sh.refused.map((x) => x.part)).toContain(part);
+    expect({ code: r.exitCode, stderr: r.stderr }).toMatchObject({ code });
+    if (typeof said === "string") expect(r.stderr).toBe(said);
+    else expect(r.stderr).toMatch(said);
+    // The model is never told what this is; the record is.
+    expect(r.stdout + r.stderr).not.toMatch(GIVEAWAY);
+    const kept = sh.refused.find((x) => x.part === part);
+    expect(kept).toBeDefined();
+    expect(kept!.said).toBe(r.stderr.trim());
+    expect(kept!.why).toMatch(/simulated|programs/);
     // Never a silent success.
     expect(r.stdout).not.toContain("alive");
   });
 }
 
+test("a path that isn't there is not found, as a shell says, and that is no gap", () => {
+  const sh = cloned();
+  expect(sh.exec("./scripts/nope.sh", WORKDIR, ME)).toEqual({ exitCode: 127, stdout: "", stderr: "sh: 1: ./scripts/nope.sh: not found\n" });
+  expect(sh.exec("cd nowhere", WORKDIR, ME)).toEqual({ exitCode: 2, stdout: "", stderr: "sh: 1: cd: can't cd to nowhere\n" });
+  expect(sh.exec("echo 'unterminated", WORKDIR, ME)).toEqual({ exitCode: 2, stdout: "", stderr: "sh: 1: Syntax error: Unterminated quoted string\n" });
+  expect(sh.exec("cat < nope.txt", WORKDIR, ME)).toEqual({ exitCode: 2, stdout: "", stderr: "sh: 1: cannot open nope.txt: No such file\n" });
+  expect(sh.refused).toEqual([]);
+});
+
 test("a refusal inside a pipeline is still said and counted, though the pipeline's exit is its last command's", () => {
   const sh = cloned();
   const r = sh.exec("od -c README.md | tail -2", WORKDIR, ME);
-  expect(r).toMatchObject({ exitCode: 0, stdout: "" });
-  expect(r.stderr).toContain("eval-shell: `od` isn't supported");
-  expect(sh.refused).toEqual([{ part: "od -c README.md", why: "`od` isn't supported" }]);
+  expect(r).toEqual({ exitCode: 0, stdout: "", stderr: "sh: 1: od: not found\n" });
+  expect(sh.refused).toEqual([{ part: "od -c README.md", why: "`od` isn't simulated", said: "sh: 1: od: not found" }]);
+});
+
+// Everything a trial can put in front of the model, searched for what would give the
+// evaluation away: what the shell prints for the commands a model looks around with, every
+// file of the repos it can clone, their history, and the Slack workspace's fixtures. (The
+// knowledge corpus, conformance/fixtures/corpus.jsonl, is left out: it is documentation
+// whose own subject uses "eval" as a word.)
+test("nothing the model can see says it is being evaluated", () => {
+  const seen: [string, string][] = [];
+  for (const repo of Object.keys(widgets.shell!.repos)) {
+    const sh = cloned(`https://github.com/${repo}.git`);
+    const look = ["env", "hostname", "uname -a", "whoami", "pwd", "ls -la", "ls -la /", "ls -la /usr/bin", "git log", "git log --stat", "git remote -v", "git status", "git branch -a", "git config --list", "cat .git/HEAD",
+      "which git bun python3 make", "bun --version; python3 -V; make --version", "bun test", "bun install", "make bench", "find . -name '*'", ...REFUSED.map(([c]) => c)];
+    for (const command of look) {
+      const r = sh.exec(command, WORKDIR, ME);
+      seen.push([`${repo}: ${command}`, r.stdout + r.stderr]);
+    }
+    for (const [path, content] of Object.entries(widgets.shell!.repos[repo]!.files)) seen.push([`${repo}: ${path}`, `${path}\n${content}`]);
+    for (const p of widgets.shell!.repos[repo]!.programs ?? []) seen.push([`${repo}: program ${p.match}`, `${p.stdout ?? ""}${p.stderr ?? ""}${Object.keys(p.writes ?? {}).join(" ")}`]);
+    seen.push([`${repo}: its name`, repo]);
+  }
+  seen.push(["installed", JSON.stringify(widgets.shell!.installed)]);
+  // The Slack workspace: channel names, people, messages.
+  seen.push(["slack fixtures", readFileSync(join(import.meta.dir, "../conformance/fixtures/slack-history.json"), "utf8")]);
+  // What a background job and a stage answer with (sandbox.ts).
+  const sb = scriptedSandbox(widgets);
+  sb(exec(gitWithToken(`clone ${URL_} ${WORKDIR}`), "/"));
+  sb(exec("echo x >> README.md && git commit -qam 'docs: x'"));
+  for (const job of [
+    { id: "j", sandbox: "s", op: "guest", method: "POST", path: "/jobs", bodyBase64: b64({ id: "bench-1", command: "make bench", cwd: WORKDIR }) },
+    { id: "j", sandbox: "s", op: "guest", method: "GET", path: "/jobs/bench-1?tailBytes=8192" },
+    { id: "j", sandbox: "s", op: "guest", method: "GET", path: "/jobs/nope?tailBytes=0" },
+    { id: "j", sandbox: "s", op: "stage", bodyBase64: b64({ owner: "acme", name: "widgets", base: "main", branch: "scout/x", token: "t" }) },
+  ]) {
+    const a = sb(job)!;
+    seen.push([`sandbox ${job.op} ${job.path ?? ""}`, `${a.error ?? ""}${a.bodyBase64 ? Buffer.from(a.bodyBase64, "base64").toString() : ""}`]);
+  }
+  expect(seen.length).toBeGreaterThan(80);
+  for (const [where, text] of seen) expect([where, GIVEAWAY.exec(text)?.[0] ?? null]).toEqual([where, null]);
 });
 
 test("a refused git command changes nothing: stash is refused, not pretended", () => {
   const sh = cloned();
   sh.exec("echo a >> README.md", WORKDIR, ME);
-  expect(sh.exec("git stash", WORKDIR, ME).exitCode).toBe(126);
+  expect(sh.exec("git stash", WORKDIR, ME).exitCode).toBe(1);
   expect(sh.exec("git status --short", WORKDIR, ME).stdout).toBe(" M README.md\n");
 });
 
@@ -179,7 +246,7 @@ test("before a clone there is no checkout, and only Lorehouse's own clone reache
   const sh = fresh();
   // workspace_clone's probe, then a model's own attempt, then the tool's.
   expect(sh.exec(`git -C ${WORKDIR} remote get-url origin 2>/dev/null`, "/")).toEqual({ exitCode: 128, stdout: "", stderr: "" });
-  expect(sh.exec("ls", WORKDIR)).toEqual({ exitCode: 1, stdout: "", stderr: "bash: cd: /workspace/repo: No such file or directory\n" });
+  expect(sh.exec("ls", WORKDIR)).toEqual({ exitCode: 2, stdout: "", stderr: "sh: 1: cd: can't cd to /workspace/repo\n" });
   const own = sh.exec(`git clone ${URL_} ${WORKDIR}`, "/");
   expect(own.exitCode).toBe(128);
   expect(own.stderr).toContain("could not read Username");
@@ -197,7 +264,7 @@ test("a clone of acme/gadgets is gadgets, with its own tests, not the widgets fi
   expect(sh.exec("head -1 README.md; bun test | grep -c '(pass)'").stdout).toBe("# gadgets\n2\n");
   expect(sh.exec("git remote get-url origin").stdout).toBe("https://github.com/acme/gadgets.git\n");
   // A widgets script isn't here, and isn't run.
-  expect(sh.exec("make bench").exitCode).toBe(126);
+  expect(sh.exec("make bench")).toEqual({ exitCode: 2, stdout: "", stderr: "make: *** No rule to make target 'bench'.  Stop.\n" });
 });
 
 test("a chart is a real PNG", () => {
@@ -288,8 +355,8 @@ test("the scripted sandbox: a refusal, an exec rule, the shell, files, backgroun
   expect(result(sb(jobs("POST", "/jobs/long-1/cancel")))).toMatchObject({ state: "cancelled", exitCode: 143 });
   // What the shell refused is on the sandbox's record, with the whole command line.
   expect(sb.refused).toEqual([]);
-  expect(result(sb(exec("ls && python3 -c 'print(1)'"))).exitCode).toBe(126);
-  expect(sb.refused).toEqual([{ command: "ls && python3 -c 'print(1)'", part: "python3 -c print(1)", why: expect.stringContaining("`python3` runs only the repository's own scripts") }]);
+  expect(result(sb(exec("ls && python3 -c 'print(1)'"))).exitCode).toBe(2);
+  expect(sb.refused).toEqual([{ command: "ls && python3 -c 'print(1)'", part: "python3 -c print(1)", why: expect.stringContaining("`python3` is simulated only for the repository's own scripts"), said: expect.stringContaining("Unknown option: -c") }]);
   // With no rule naming what to refuse, every call into the sandbox is refused.
   expect(scriptedSandbox({ refuse: [{ status: 409, code: "resources_mismatch", error: "x" }] })(file("GET", "/a.png"))?.code).toBe("resources_mismatch");
   // Under --dry there is no shell: the scripted model's sandbox is the fake runner's.

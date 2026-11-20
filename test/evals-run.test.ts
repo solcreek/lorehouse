@@ -247,7 +247,7 @@ test("judge: what --dry judges, and what fails a trial before any check", async 
 
 const outcome = (name: string, pass: boolean, o: Partial<CheckOutcome> = {}): CheckOutcome => ({ name, required: true, graded: false, judged: true, pass, evidence: pass ? "ok" : `${name} failed`, ...o });
 const g = (pass: boolean, o: Partial<CheckOutcome> = {}) => outcome("g", pass, { graded: true, ...o });
-const trial = (n: number, checks: CheckOutcome[], tokens = 100): TrialResult => ({ case: "code/x", trial: n, checks, verdict: trialVerdict(checks, false), tokens: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 }, ms: 1, file: `out/x/${n}.json`, refused: n === 2 ? [{ command: "ls && od -c x", part: "od -c x", why: "`od` isn't supported" }] : [] });
+const trial = (n: number, checks: CheckOutcome[], tokens = 100): TrialResult => ({ case: "code/x", trial: n, checks, verdict: trialVerdict(checks, false), tokens: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 }, ms: 1, file: `out/x/${n}.json`, refused: n === 2 ? [{ command: "ls && od -c x", part: "od -c x", why: "`od` isn't simulated", said: "sh: 1: od: not found" }] : [] });
 
 test("pass rates: per case over trials, per check over judged trials, code and graded counted apart", () => {
   const trials = [
@@ -295,10 +295,10 @@ test("summarize: the JSON line's counts by kind, failures with their kind and fi
   expect(s.tokens).toMatchObject({ input: 1000, output: 200, cacheRead: 50, cacheWrite: 10, total: 1260, max: 5000, exceeded: false, grader: { total: 35 }, perCase: { "code/x": 200, "code/y": 0 } });
   // (1000 + 50 + 10) input-side tokens at $5/M, 200 output at $25/M.
   expect(s.tokens.usdEstimate).toBe(0.0103);
-  expect(s.shellRefused).toEqual([{ case: "code/x", trial: 2, command: "ls && od -c x", part: "od -c x" }]);
+  expect(s.shellRefused).toEqual([{ case: "code/x", trial: 2, command: "ls && od -c x", part: "od -c x", said: "sh: 1: od: not found", why: "`od` isn't simulated" }]);
   const shown = table(results, trials, s);
   expect(shown).toContain("the simulated shell refused 1 command(s)");
-  expect(shown).toContain('code/x trial 2: "od -c x" in "ls && od -c x"');
+  expect(shown).toContain('code/x trial 2: "od -c x" in "ls && od -c x"\n      the model saw: "sh: 1: od: not found"; the reason: `od` isn\'t simulated');
   expect(shown).toContain("code checks 1/3; graded checks 1/2 (grader claude-haiku-5-5)");
   expect(shown).toContain("✗ 1/2  g [graded]");
   expect(s.stopped).toBeUndefined();
