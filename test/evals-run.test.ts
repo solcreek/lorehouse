@@ -13,7 +13,7 @@ import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, s
 import type { Grader } from "../evals/grader";
 import { caseResult, COMPLETED, judge, summarize, table, trialVerdict, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
 import { RUBRICS } from "../evals/rubrics";
-import { APP_ANNOUNCES, childEnv, listeningPort, MOCK_ANNOUNCES, saidFrom, scrubObservation, tail, track } from "../evals/trial";
+import { APP_ANNOUNCES, childEnv, listeningPort, MOCK_ANNOUNCES, observeJob, saidFrom, scrubObservation, tail, track } from "../evals/trial";
 import { envFileProblem } from "../evals/credential";
 
 const ROOT = join(import.meta.dir, "..");
@@ -106,6 +106,25 @@ test("a secret cut across two chunks of a stream is in no part of the observatio
   // With nothing to find, the observation is the same object.
   expect(scrubObservation(o, ["not-in-there-at-all"])).toBe(o);
   expect(scrubObservation(o, [])).toBe(o);
+});
+
+test("a runner job as evidence: an exec keeps its result, and a background job's status and cancel keep their whole body", () => {
+  const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64");
+  const answered = (v: unknown, status = 200) => ({ id: "j", status, contentType: "application/json", bodyBase64: b64(v) });
+  const exec = observeJob(0, { id: "j", sandbox: "t.s", op: "guest", method: "POST", path: "/exec", bodyBase64: b64({ command: "bun test", cwd: "/workspace/repo", env: { GIT_AUTHOR_NAME: "octo" } }) }, answered({ exitCode: 0, stdout: " 3 pass\n", stderr: "" }));
+  expect(exec).toMatchObject({ command: "bun test", cwd: "/workspace/repo", answer: { status: 200, exitCode: 0, stdout: " 3 pass\n", stderr: "" } });
+  expect((exec.body as { env: unknown }).env).toEqual(["GIT_AUTHOR_NAME"]);
+  // A job that has ended also carries a numeric exitCode: it is not an exec result, and
+  // its state, id, tail and elapsed time are what a check of the job reads.
+  const ended = { id: "bench-1", command: "make bench", cwd: "/workspace/repo", state: "exited", exitCode: 0, elapsedMs: 1_741_000, tail: "bench total 290 ms (5 benchmarks)\n", outputBytes: 34 };
+  const status = observeJob(1, { id: "j", sandbox: "t.s", op: "guest", method: "GET", path: "/jobs/bench-1?tailBytes=8192" }, answered(ended));
+  expect(status.answer).toEqual({ status: 200, code: undefined, error: undefined, body: ended });
+  const start = observeJob(2, { id: "j", sandbox: "t.s", op: "guest", method: "POST", path: "/jobs", bodyBase64: b64({ id: "bench-1", command: "make bench", cwd: "/workspace/repo" }) }, answered({ ...ended, state: "running", exitCode: null, tail: "", created: true }, 201));
+  expect(start).toMatchObject({ command: "make bench", answer: { status: 201, body: { id: "bench-1", state: "running", exitCode: null, created: true } } });
+  const cancelled = { ...ended, state: "cancelled", exitCode: 143, tail: "" };
+  expect(observeJob(3, { id: "j", sandbox: "t.s", op: "guest", method: "POST", path: "/jobs/bench-1/cancel" }, answered(cancelled)).answer.body).toEqual(cancelled);
+  // A stage's facts, as before.
+  expect(observeJob(4, { id: "j", sandbox: "t.s", op: "stage", bodyBase64: b64({ base: "main", token: "t" }) }, answered({ sha: "abc", files: ["README.md"] }))).toMatchObject({ body: { base: "main", token: "[redacted]" }, answer: { body: { sha: "abc", files: ["README.md"] } } });
 });
 
 test("checks: each passes on what was observed, with evidence that points at the record", () => {

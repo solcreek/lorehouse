@@ -225,7 +225,7 @@ export function scrubObservation(o: Observation, secrets: string[]): Observation
 }
 
 // A job as the observation keeps it: decoded, and with any token replaced.
-function observeJob(n: number, job: Job, answer: JobAnswer): RunnerJob {
+export function observeJob(n: number, job: Job, answer: JobAnswer): RunnerJob {
   const decode = (b64?: string): unknown => {
     if (!b64) return undefined;
     const text = Buffer.from(b64, "base64").toString();
@@ -243,7 +243,10 @@ function observeJob(n: number, job: Job, answer: JobAnswer): RunnerJob {
     body = b;
   }
   const result = answer.contentType === "application/json" ? decode(answer.bodyBase64) : undefined;
-  const exec = result && typeof result === "object" ? (result as { exitCode?: number; stdout?: string; stderr?: string }) : undefined;
+  // An exec's result is kept by its fields. Only an exec's: a background job that has ended
+  // carries an exitCode too, and its state, id, tail and elapsed time are kept whole, as a body.
+  const isExec = job.op === "guest" && job.method === "POST" && job.path === "/exec";
+  const exec = isExec && result && typeof result === "object" ? (result as { exitCode?: number; stdout?: string; stderr?: string }) : undefined;
   const fields = body && typeof body === "object" ? (body as { cwd?: string }) : undefined;
   return {
     n, sandbox: job.sandbox, op: job.op, method: job.method, path: job.path, timeoutMs: job.timeoutMs,
