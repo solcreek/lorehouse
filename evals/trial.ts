@@ -91,6 +91,11 @@ export function cleanUpNow(): void {
 // it was given, so no port is ever chosen here and then lost to someone else before the
 // child binds it. A child that exits while starting fails the start at once, with what
 // it wrote to stderr.
+// The line each child prints once it listens, anchored to the start of a line: the same
+// words inside some other line (a logged message, a path) are not it.
+export const MOCK_ANNOUNCES = /^mock listening on :(\d+) /m;
+export const APP_ANNOUNCES = /^(?:tenant=\S+ )?lorehouse: @\S+ on :(\d+)(?: |$)/m;
+
 export async function listeningPort(
   proc: ReturnType<typeof Bun.spawn>,
   out: { text: () => string },
@@ -278,7 +283,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
     started(mock);
     const mockOut = tail(mock.stdout as ReadableStream<Uint8Array>);
     mockErr = tail(mock.stderr as ReadableStream<Uint8Array>);
-    mockUrl = `http://localhost:${await listeningPort(mock, mockOut, mockErr, /mock listening on :(\d+)/, "the mock (conformance/mock.ts)", 15_000)}`;
+    mockUrl = `http://localhost:${await listeningPort(mock, mockOut, mockErr, MOCK_ANNOUNCES, "the mock (conformance/mock.ts)", 15_000)}`;
     const fixture = (path: string, body: unknown) => fetch(`${mockUrl}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     for (const m of c.setup?.messages ?? []) await fixture("/fixtures/messages", m);
 
@@ -293,7 +298,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
     started(proc);
     appOut = tail(proc.stdout as ReadableStream<Uint8Array>);
     appErr = tail(proc.stderr as ReadableStream<Uint8Array>);
-    const appUrl = `http://localhost:${await listeningPort(proc, appOut, appErr, /lorehouse: @\S+ on :(\d+)/, "the app (src/server.ts)", 30_000)}`;
+    const appUrl = `http://localhost:${await listeningPort(proc, appOut, appErr, APP_ANNOUNCES, "the app (src/server.ts)", 30_000)}`;
     const target = `${appUrl}/slack/events`;
     const status = async () => (await (await fetch(`${appUrl}/status`, { headers: { authorization: `Bearer ${STATUS_TOKEN}` } })).json()) as { knowledge?: { state?: string }; runners?: { runner: string; online: boolean }[] };
     const ready = Date.now();

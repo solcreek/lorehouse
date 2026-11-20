@@ -13,7 +13,7 @@ import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, s
 import type { Grader } from "../evals/grader";
 import { caseResult, COMPLETED, judge, summarize, table, trialVerdict, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
 import { RUBRICS } from "../evals/rubrics";
-import { childEnv, listeningPort, saidFrom, tail, track } from "../evals/trial";
+import { APP_ANNOUNCES, childEnv, listeningPort, MOCK_ANNOUNCES, saidFrom, tail, track } from "../evals/trial";
 import { envFileProblem } from "../evals/credential";
 
 const ROOT = join(import.meta.dir, "..");
@@ -471,7 +471,7 @@ const child = (script: string, env: Record<string, string> = {}) => {
 
 test("a child's port is the one it reports; one that exits while starting fails the start at once, with its stderr", async () => {
   const ok = child('console.log("noise"); setTimeout(() => console.log("mock listening on :4321 (x)"), 50); setTimeout(() => {}, 2000)');
-  expect(await listeningPort(ok.proc, ok.out, ok.err, /mock listening on :(\d+)/, "the mock", 5000)).toBe(4321);
+  expect(await listeningPort(ok.proc, ok.out, ok.err, MOCK_ANNOUNCES, "the mock", 5000)).toBe(4321);
   ok.proc.kill();
 
   const dead = child('console.error("error: Failed to start server. Is port 9 in use? EADDRINUSE"); process.exit(1)');
@@ -484,6 +484,14 @@ test("a child's port is the one it reports; one that exits while starting fails 
   const silent = child("setTimeout(() => {}, 3000)");
   expect(await listeningPort(silent.proc, silent.out, silent.err, /on :(\d+)/, "the app", 300).catch((e: Error) => e.message)).toContain("didn't say which port it listens on within 300 ms");
   silent.proc.kill();
+});
+
+test("the port line is the child's own line, not the same words inside another", () => {
+  expect(MOCK_ANNOUNCES.exec("mock listening on :18231 (TTFT 20ms, 12 tokens × 1ms)\n")?.[1]).toBe("18231");
+  expect(APP_ANNOUNCES.exec("tenant=t-2blclqzkjo5b lorehouse: knowledge seed: 286 documents\ntenant=t-2blclqzkjo5b lorehouse: @scout on :53112 — code tools via sandbox runners\n")?.[1]).toBe("53112");
+  expect(APP_ANNOUNCES.exec("lorehouse: @scout on :3000\n")?.[1]).toBe("3000");
+  for (const other of ["slack event: {\"text\":\"mock listening on :1 (x)\"}\n", "note: the mock listening on :22 was stopped\n"]) expect(MOCK_ANNOUNCES.test(other)).toBe(false);
+  for (const other of ["slack event: {\"text\":\"lorehouse: @scout on :1 \"}\n", "tenant=t lorehouse: asked \"is lorehouse: @scout on :80 up?\"\n", "tenant=t lorehouse: @scout on :80x\n"]) expect(APP_ANNOUNCES.test(other)).toBe(false);
 });
 
 test("the mock binds port 0 itself and says which port it got: two started together never collide", async () => {
