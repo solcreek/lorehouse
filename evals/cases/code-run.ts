@@ -50,7 +50,7 @@ export const cases: Case[] = [
     ],
     checks: [
       called("the command is started with workspace_job_start", "workspace_job_start", { input: (i) => /make bench/.test(String(i.command)) }),
-      ran("the job reaches the sandbox", { method: "POST", path: /^\/jobs$/, command: /make bench/ }),
+      ran("the job is started in the sandbox", { method: "POST", path: /^\/jobs$/, command: /make bench/, succeeded: true }),
       called("`make bench` is not run with workspace_exec", "workspace_exec", { max: 0, input: (i) => /make bench/.test(String(i.command)) }),
       // Followed: not one look at a job still running, but a status of that very job that
       // says it ended, with exit 0.
@@ -87,7 +87,7 @@ export const cases: Case[] = [
     ],
     checks: [
       called("workspace_attach_file is given a .png path", "workspace_attach_file", { input: (i) => /\.png$/.test(String(i.path)) }),
-      ran("the file is read from the sandbox", { method: "GET", path: /^\/file\?path=.*\.png$/ }),
+      ran("the file is read from the sandbox", { method: "GET", path: /^\/file\?path=.*\.png$/, succeeded: true }),
       uploaded("a PNG is uploaded into the thread", { filename: /\.png$/, contentType: /^image\/png$/, head: /PNG/ }),
     ],
   },

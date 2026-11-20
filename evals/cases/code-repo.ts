@@ -10,6 +10,9 @@ const clone = (repo: string) => new RegExp(` clone (--branch \\S+ )?https://gith
 // The repo's test runner being run, alone or in a chain: not `ls test/` or `cat test/x`.
 const TEST_RUN = /(^|&&|\|\||;)\s*([A-Z_]+=\S+ )*(time )?(bun test|(bun|npm|yarn|pnpm) run test|npm test)\b/;
 
+// The test runner's own summary of a run in which every test passed.
+const PASSED = /^ *[1-9]\d* pass\n *0 fail\n/m;
+
 export const cases: Case[] = [
   {
     id: "default-repo",
@@ -19,10 +22,13 @@ export const cases: Case[] = [
     setup: { defaultRepo: { repo: "acme/widgets", branch: "main" }, sandbox: widgets },
     conversation: [{ mention: "run the tests", dry: "[clone]" }],
     checks: [
-      ran("the channel's default repo is cloned", { command: clone("acme/widgets") }),
+      ran("the channel's default repo is cloned", { command: clone("acme/widgets"), succeeded: true }),
       ran("no other repo is cloned", { command: / clone .*github\.com\/(?!acme\/widgets\.git)/ }, { max: 0 }),
-      // Not under --dry: the scripted model takes one step, the clone.
-      ran("the tests are run", { command: TEST_RUN }, { realOnly: true }),
+      // Run, and seen to pass: the command exited 0 and printed the test runner's own
+      // passing summary. A command that was refused, failed, or printed something else is
+      // no evidence, whatever the reply then says. (Not under --dry: the scripted model
+      // takes one step, the clone.)
+      ran("the tests are run, and pass", { command: TEST_RUN, succeeded: true, output: PASSED }, { realOnly: true }),
       graded("the reply reports that the tests passed", RUBRICS.reportsTestsPassed),
     ],
   },
@@ -35,7 +41,7 @@ export const cases: Case[] = [
     conversation: [{ mention: "run the tests in acme/gadgets", dry: "[clone] acme/gadgets" }],
     checks: [
       called("workspace_clone names acme/gadgets", "workspace_clone", { input: (i) => /acme\/gadgets/i.test(String(i.repo)) }),
-      ran("acme/gadgets is cloned", { command: clone("acme/gadgets") }),
+      ran("acme/gadgets is cloned", { command: clone("acme/gadgets"), succeeded: true }),
       ran("the channel's default is not cloned", { command: clone("acme/widgets") }, { max: 0 }),
     ],
   },

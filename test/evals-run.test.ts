@@ -459,10 +459,10 @@ test("checks that could not fail, or failed correct replies, are now a fact in c
     return c.run;
   };
   // default-repo: `ls test/` is not the tests being run; the test runner is, alone or chained.
-  const tests = checkOf("default-repo", "the tests are run");
+  const tests = checkOf("default-repo", "the tests are run, and pass");
   const withJobs = (...commands: string[]) => {
     const o = observed();
-    o.runner.jobs = commands.map((command, n) => ({ n, sandbox: "t.s", op: "guest", method: "POST", path: "/exec", command, answer: { status: 200, exitCode: 0, stdout: "" } }));
+    o.runner.jobs = commands.map((command, n) => ({ n, sandbox: "t.s", op: "guest", method: "POST", path: "/exec", command, answer: { status: 200, exitCode: 0, stdout: " 3 pass\n 0 fail\n" } }));
     return o;
   };
   expect(tests(withJobs("ls test/", "cat test/widgets.test.ts", "grep -rn test .")).pass).toBe(false);
@@ -562,6 +562,52 @@ test("long-command-is-a-job: one poll that says 'running' is not the job followe
   expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "exited", 0, TAIL)], "Done: total 312 ms.")).failed).toEqual(["the reply carries the job's final output"]);
   // Under --dry the fake runner's job prints "ran:<command>": the same rule holds it.
   expect(codeVerdict("long-command-is-a-job", scene([START, poll(1, "running", null, "started\n"), poll(2, "exited", 0, "ran:make bench\n")], "[q?] [job:bench-1:exited:0:ran:make bench] w0 w1")).pass).toBe(true);
+});
+
+const execJob = (n: number, command: string, result: { exitCode: number; stdout?: string; stderr?: string }, cwd = "/workspace/repo") =>
+  runnerJob(n, { method: "POST", path: "/exec", body: { command, cwd } }, { stdout: "", stderr: "", ...result });
+const CLONE = "git -c x clone --branch main https://github.com/acme/widgets.git /workspace/repo";
+const PASSING = "bun test v1.4.3 (c6da4a4d)\n\ntest/widgets.test.ts:\n(pass) widgets > builds [0.12ms]\n\n 3 pass\n 0 fail\nRan 3 tests across 1 file. [21.00ms]\n";
+
+test("a command submitted is not a command that ran: a refused or failed one is no evidence that anything happened", () => {
+  const withJobs = (...jobs: Observation["runner"]["jobs"]) => {
+    const o = replying(observed(), "All three tests pass.");
+    o.runner.jobs = jobs;
+    return o;
+  };
+  // default-repo: `bun test --bogus` is refused by the shell, yet matched "the tests are run".
+  const bogus = codeVerdict("default-repo", withJobs(execJob(0, CLONE, { exitCode: 0 }), execJob(1, "bun test --bogus", { exitCode: 1, stderr: 'error: unknown command "--bogus"\n' })));
+  expect(bogus).toEqual({ pass: false, failed: ["the tests are run, and pass"] });
+  // Run, and failed: no evidence that they pass either.
+  expect(codeVerdict("default-repo", withJobs(execJob(0, CLONE, { exitCode: 0 }), execJob(1, "bun test", { exitCode: 1, stdout: " 2 pass\n 1 fail\n" }))).failed).toEqual(["the tests are run, and pass"]);
+  // Exit 0 but not the test runner's own passing output (a wrapper that swallowed the result).
+  expect(codeVerdict("default-repo", withJobs(execJob(0, CLONE, { exitCode: 0 }), execJob(1, "bun test | tail -1", { exitCode: 0, stdout: "\n" }))).failed).toEqual(["the tests are run, and pass"]);
+  // The real thing.
+  expect(codeVerdict("default-repo", withJobs(execJob(0, CLONE, { exitCode: 0 }), execJob(1, "cd /workspace/repo && bun test 2>&1 | tail -20", { exitCode: 0, stdout: PASSING }))).pass).toBe(true);
+  // A clone that failed is not the repo cloned.
+  expect(codeVerdict("default-repo", withJobs(execJob(0, CLONE, { exitCode: 128, stderr: "fatal: repository not found\n" }), execJob(1, "bun test", { exitCode: 0, stdout: PASSING }))).failed).toEqual(["the channel's default repo is cloned"]);
+  const gadgets = CLONE.replace("--branch main ", "").replace("widgets", "gadgets");
+  const named = (code: number) => {
+    const o = withJobs(execJob(0, gadgets, { exitCode: code }));
+    o.model = turnsCalling(["workspace_clone", { repo: "acme/gadgets" }]);
+    return codeVerdict("named-repo-wins", o);
+  };
+  expect(named(0).pass).toBe(true);
+  expect(named(128).failed).toEqual(["acme/gadgets is cloned"]);
+  // attach-a-chart: a read of the file that found nothing is not the file read.
+  const read = (status: number) => {
+    const o = observed();
+    o.model = turnsCalling(["workspace_attach_file", { path: "bench.png" }]);
+    o.runner.jobs = [observeJob(0, { id: "j", sandbox: "t.s", op: "guest", method: "GET", path: "/file?path=%2Fworkspace%2Frepo%2Fbench.png" }, { id: "j", status, contentType: "application/octet-stream", bodyBase64: status === 200 ? "iVBORw0KGgo=" : undefined })];
+    return codeVerdict("attach-a-chart", o);
+  };
+  expect(read(200).pass).toBe(true);
+  expect(read(404).failed).toEqual(["the file is read from the sandbox"]);
+  // The `ran` check itself: succeeded and output, and what a failure says.
+  const o = withJobs(execJob(0, "bun test --bogus", { exitCode: 1 }), execJob(1, "bun test", { exitCode: 0, stdout: PASSING }));
+  expect(run(ran("ran", { command: /bun test/ }, { min: 2 }), o).pass).toBe(true);
+  expect(run(ran("succeeded", { command: /bun test/, succeeded: true }, { min: 1, max: 1 }), o)).toMatchObject({ pass: true, evidence: expect.stringContaining("job #1") });
+  expect(run(ran("output", { command: /bogus/, succeeded: true, output: /3 pass/ }), o)).toMatchObject({ pass: false, evidence: expect.stringContaining('job #0 guest POST /exec "bun test --bogus" → exit 1') });
 });
 
 test("neverSaid: a stream that carried only task updates and no text said nothing, so it fails", () => {

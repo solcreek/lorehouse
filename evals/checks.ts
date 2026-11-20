@@ -48,13 +48,18 @@ function counted<T>(found: T[], c: Count, what: string, show: (x: T) => string, 
 
 const code = (name: string, o: { required?: boolean; realOnly?: boolean } | undefined, run: (obs: Observation) => CheckResult): Check => ({ name, required: o?.required ?? true, ...(o?.realOnly ? { realOnly: true } : {}), graded: false, run });
 
-const showJob = (j: RunnerJob) => `job #${j.n} ${j.op}${j.method ? ` ${j.method} ${j.path?.split("?")[0]}` : ""}${j.command !== undefined ? ` ${JSON.stringify(short(j.command, 120))}` : ""}${j.answer.code ? ` → refused ${j.answer.code}` : ""}`;
+const showJob = (j: RunnerJob) => `job #${j.n} ${j.op}${j.method ? ` ${j.method} ${j.path?.split("?")[0]}` : ""}${j.command !== undefined ? ` ${JSON.stringify(short(j.command, 120))}` : ""}${j.answer.code ? ` → refused ${j.answer.code}` : j.answer.exitCode !== undefined ? ` → exit ${j.answer.exitCode}` : ` → ${j.answer.status}`}`;
 const showCall = (c: ToolCall) => `turn ${c.turn} ${c.name} ${short(JSON.stringify(c.input), 140)}`;
 const showSaid = (s: Said) => `${s.via} (slack call #${s.call}) ${JSON.stringify(short(s.text, 200))}`;
 
 // Jobs the sandbox runner was sent. `command` matches an exec's or a background job's
 // command line; `op` is "guest", "stage" or "push"; `path` matches a guest call's path.
-export function ran(name: string, what: { command?: RegExp; op?: string; method?: string; path?: RegExp; refused?: boolean }, o?: Options): Check {
+//
+// A command that was sent is not a command that ran. Where a check stands for "this
+// happened" (the tests ran, the repo was cloned, the file was read), say `succeeded`: the
+// job was not refused, was answered 2xx, and an exec exited 0; and `output`, matched
+// against an exec's stdout, where what it printed is the evidence.
+export function ran(name: string, what: { command?: RegExp; op?: string; method?: string; path?: RegExp; refused?: boolean; succeeded?: boolean; output?: RegExp }, o?: Options): Check {
   return code(name, o, (obs) => {
     const r = range(obs, o ?? {}, "jobs");
     if (r.problem) return { pass: false, evidence: r.problem };
@@ -65,9 +70,11 @@ export function ran(name: string, what: { command?: RegExp; op?: string; method?
         (what.method === undefined || j.method === what.method) &&
         (what.path === undefined || what.path.test(j.path ?? "")) &&
         (what.command === undefined || (j.command !== undefined && what.command.test(j.command))) &&
-        (what.refused === undefined || !!j.answer.code === what.refused),
+        (what.refused === undefined || !!j.answer.code === what.refused) &&
+        (!what.succeeded || (!j.answer.code && j.answer.status >= 200 && j.answer.status < 300 && (j.answer.exitCode === undefined || j.answer.exitCode === 0))) &&
+        (what.output === undefined || what.output.test(j.answer.stdout ?? "")),
     );
-    const described = [what.op, what.method, what.path && `path ${what.path}`, what.command && `command ${what.command}`, what.refused && "refused"].filter(Boolean).join(" ");
+    const described = [what.op, what.method, what.path && `path ${what.path}`, what.command && `command ${what.command}`, what.refused && "refused", what.succeeded && "that succeeded", what.output && `printing ${what.output}`].filter(Boolean).join(" ");
     return counted(found, o ?? {}, `runner job(s) matching ${described}${windowText(o ?? {})}`, showJob, () =>
       inWindow.length ? `The runner was sent: ${short(inWindow.slice(0, 8).map(showJob).join("; "), 600)}` : obs.runner.connected ? "The runner was sent nothing." : "No runner was connected.",
     );
