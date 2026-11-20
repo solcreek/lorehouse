@@ -48,12 +48,15 @@ describe("the lorehouse profile", () => {
   // they were, byte for byte, what prompts/system.md rendered to on main before it became
   // this profile's (#39). #126 changed one step, "Working in code" 1: with no repo named in
   // the request, workspace_clone is called without one, for the channel's default repo.
+  // #194 moved the reply-language rule to the opening and made it cover every line the
+  // model writes (its notes between tool calls are shown in the thread too), with one
+  // example pair; the old sentence under "Working in code" is gone.
   test("its prompt renders to the pinned bytes", () => {
     const rendered = (name?: string, coAuthor?: string) => sha256(profilePrompt(LOREHOUSE.prompt, agentIdentity(name, coAuthor)));
-    expect(rendered()).toBe("e525ca1ee8ab13ff26fbb1bec3cafe599801e3635d577d3d741c4b2daa7852e3");
-    expect(rendered("scout", "Scout <scout@example.com>")).toBe("29bb23817a9533d22d111ab3a8b7009cc96c23051e5ca2efbef8ace6d97ad515");
-    expect(rendered("atlas")).toBe("593323e04ce07ef0c7fd281e3bba96aba15663399c3df59ec4a0c686bdd04d65");
-    expect(sha256(readFileSync(join(import.meta.dir, "..", "prompts", "profiles", "lorehouse.md"), "utf8"))).toBe("c87020353a7eacb01ffdf5a10ebbafb3883051c5191c181fb060fe07b037d9b0");
+    expect(rendered()).toBe("6c9da3d5d63b6df9feb2b7cd1f19d3bfc3a153639681280355f9bb9c0c7958bd");
+    expect(rendered("scout", "Scout <scout@example.com>")).toBe("cfa35da06ba8c8efd0c29d278080634615a415c4a5822dc2db1cbf87a822d385");
+    expect(rendered("atlas")).toBe("b574f0a6f4da71c09a774f06296b1d152e314c2fef86a82ccc25a2506c7af138");
+    expect(sha256(readFileSync(join(import.meta.dir, "..", "prompts", "profiles", "lorehouse.md"), "utf8"))).toBe("9e0dedf5fa118e09afe530507252f4b8f04a03bfa39b89602ddaac3a91aa6b5f");
   });
 
   test("every file in prompts/profiles/ is registered, and every profile's prompt is a file there", () => {

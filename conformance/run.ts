@@ -27,6 +27,7 @@ import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CHART_PNG, MIRRORS, pollRunner, wsRunner } from "./fake-runner";
+import { appEnv as appEnvFor, buttonOn, listenerPids, postEvent, postInteraction, until, waitHttp, type Stats } from "./harness";
 import { parseArgs, selectScenarios, UsageError, type Args } from "./select";
 
 const ROOT = join(import.meta.dir, "..");
@@ -54,30 +55,11 @@ const ALLOWED = "C1"; // the one channel the app may work in
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-async function waitHttp(url: string, ms: number): Promise<boolean> {
-  const t0 = Date.now();
-  while (Date.now() - t0 < ms) {
-    try { if ((await fetch(url)).ok) return true; } catch { /* not up yet */ }
-    await Bun.sleep(20);
-  }
-  return false;
-}
-
-async function listenerPids(port: number): Promise<string[]> {
-  const lsof = await $`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`.quiet().nothrow();
-  if (lsof.exitCode === 0) return lsof.text().trim().split("\n").filter(Boolean);
-  const ss = await $`ss -ltnpH sport = :${port}`.quiet().nothrow().text();
-  return [...ss.matchAll(/pid=(\d+)/g)].map((m) => m[1]!);
-}
+// Signing, waiting and the app's environment are conformance/harness.ts's, shared with evals/.
 
 let seq = 0;
 async function sendEvent(event: Record<string, unknown>, opts: { eventId?: string; retry?: string; badSig?: boolean } = {}) {
-  const body = JSON.stringify({ type: "event_callback", team_id: "T1", event_id: opts.eventId ?? `EvConf${Date.now()}-${++seq}`, event });
-  const now = String(Math.floor(Date.now() / 1000));
-  const sig = "v0=" + createHmac("sha256", opts.badSig ? "wrong" : SECRET).update(`v0:${now}:${body}`).digest("hex");
-  const headers: Record<string, string> = { "content-type": "application/json", "x-slack-request-timestamp": now, "x-slack-signature": sig };
-  if (opts.retry) headers["x-slack-retry-num"] = opts.retry;
-  return fetch(TARGET, { method: "POST", headers, body });
+  return postEvent(TARGET, SECRET, opts.eventId ?? `EvConf${Date.now()}-${++seq}`, event, opts);
 }
 
 const mention = (channel: string, extra: Record<string, unknown> = {}) => {
@@ -85,15 +67,6 @@ const mention = (channel: string, extra: Record<string, unknown> = {}) => {
   return { type: "app_mention", user: "U1", team: "T1", text: "<@UBOT> [q1] how does soft navigation work", ts, event_ts: ts, channel, ...extra };
 };
 
-type Block = { type: string; elements?: { type: string; text?: { text: string }; action_id?: string; value?: string }[] };
-type Stats = {
-  slackCalls: number; modelCalls: number; byMethod: Record<string, number>; readChannels: string[]; reactionChannels: string[];
-  posts: { channel: string; thread_ts?: string; text: string; blocks?: Block[]; ts: string }[];
-  updates: { channel: string; ts: string; text: string }[];
-  responses: { path: string; text?: string; response_type?: string; replace_original?: boolean }[];
-  github: { method: string; path: string; body?: unknown; auth?: string }[];
-  uploads: { fileId: string; filename: string; length: number; bytes?: number; contentType?: string; head?: string; channel?: string; thread_ts?: string; title?: string }[];
-};
 const stats = async () => (await (await fetch(`${MOCK}/stats`)).json()) as Stats;
 const reset = () => fetch(`${MOCK}/reset`, { method: "POST" });
 
@@ -179,10 +152,7 @@ const holdLookup = async (user: string, on: boolean) =>
 // A button click, as Slack's interactivity delivers one: form-encoded `payload=<json>`,
 // signed like an event, to the same URL.
 async function sendInteraction(payload: Record<string, unknown>) {
-  const body = `payload=${encodeURIComponent(JSON.stringify(payload))}`;
-  const now = String(Math.floor(Date.now() / 1000));
-  const sig = "v0=" + createHmac("sha256", SECRET).update(`v0:${now}:${body}`).digest("hex");
-  return fetch(TARGET, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "x-slack-request-timestamp": now, "x-slack-signature": sig }, body });
+  return postInteraction(TARGET, SECRET, payload);
 }
 
 // U1 asks for a pull request from `branch` in a new thread; resolves to the Approve/Deny
@@ -200,7 +170,7 @@ async function prCard(branch: string, requester = "U1"): Promise<Card | string> 
 // `user` clicks a button on the card, with a response_url of their own on the mock.
 let clicks = 0;
 async function click(user: string, card: Card, label: "Approve" | "Deny") {
-  const button = card.prompt.blocks!.flatMap((b) => b.elements ?? []).find((e) => e.type === "button" && e.text?.text === label);
+  const button = buttonOn(card.prompt.blocks, label);
   if (!button?.action_id) throw new Error(`the prompt has no ${label} button: ${JSON.stringify(card.prompt.blocks).slice(0, 300)}`);
   await sendInteraction({
     type: "block_actions", user: { id: user }, team: { id: "T1" }, channel: { id: ALLOWED },
@@ -240,17 +210,6 @@ async function openedBy(runner: { jobs: { op: string }[] }, approver: string | n
   const body = String((opened[0]!.body as { body?: string }).body);
   const want = approver ? `approved there by ${approver}.` : "approved there.";
   return body.includes(want) && !/U\d/.test(body) ? null : `the pull request's body ${JSON.stringify(body.slice(-160))}, want "${want}"`;
-}
-
-// The first truthy value check() returns within ms, or undefined.
-async function until<T>(check: () => Promise<T | undefined>, ms = 15000): Promise<T | undefined> {
-  const t0 = Date.now();
-  while (Date.now() - t0 < ms) {
-    const v = await check();
-    if (v) return v;
-    await Bun.sleep(50);
-  }
-  return undefined;
 }
 
 // A reply in a thread, as Slack delivers one: a `message` event with thread_ts.
@@ -2269,43 +2228,7 @@ const { SESSIONS_DB: _sessions, LOREHOUSE_ENV_FILE: _envFile, LOREHOUSE_SETTINGS
 // for a start where /status is closed) has finished its Slack backfill/reconcile
 // (GET /status → ready).
 function appEnv(extraEnv: Record<string, string>): Record<string, string | undefined> {
-  return {
-    ...inherited,
-    PORT: String(APP_PORT),
-    SLACK_SIGNING_SECRET: SECRET,
-    SLACK_BOT_TOKEN: "xoxb-conformance",
-    SLACK_API_URL: `${MOCK}/slack/api`,
-    ANTHROPIC_API_KEY: "conformance",
-    ANTHROPIC_BASE_URL: `${MOCK}/anthropic`,
-    AGENT_CHANNELS: ALLOWED,
-    KNOWLEDGE_SEED: join(HERE, "fixtures/corpus.jsonl"),
-    LOREHOUSE_DB: DB,
-    // Fixture timestamps are fixed, so look back far enough that they never age out.
-    INGEST_BACKFILL_DAYS: "36500",
-    INGEST_REFRESH_DAYS: "36500",
-    INGEST_DEBOUNCE_MS: "200",
-    STATUS_TOKEN,
-    ADMIN_TOKEN,
-    LOREHOUSE_ENV_FILE: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "lorehouse.env"),
-    // Set, not left to its default: the app's Bun loads the checkout's .env for every
-    // variable not set here, and one naming a settings file would fill in the rest.
-    LOREHOUSE_SETTINGS: join(dirname(extraEnv.LOREHOUSE_DB ?? DB), "settings.json"),
-    // The PDF settings at their defaults (empty is unset), never this shell's or the .env's:
-    // the PDF scenarios test PDF replies off by default and PDF_FONTS=local, which an
-    // inherited PDF_FONTS=google would turn into a test of Google Fonts over the network.
-    PDF_REPLIES: "",
-    PDF_FONTS: "",
-    FILE_STORE: "",
-    // The tenant from the data directory LOREHOUSE_DB names, never this shell's or the .env's.
-    TENANT_ID: "",
-    TENANT_NEW: "",
-    LOREHOUSE_DATA_DIR: "",
-    // Plaintext files unless a scenario gives the tenant a Strongroom (the mock's).
-    STRONGROOM_URL: "",
-    STRONGROOM_TOKEN: "",
-    STRONGROOM_KEY: "",
-    ...extraEnv,
-  };
+  return appEnvFor(inherited, { port: APP_PORT, secret: SECRET, mock: MOCK, channels: ALLOWED, seed: join(HERE, "fixtures/corpus.jsonl"), db: DB, statusToken: STATUS_TOKEN, adminToken: ADMIN_TOKEN }, extraEnv);
 }
 
 async function startApp(extraEnv: Record<string, string> = {}, { waitReady = true } = {}): Promise<void> {

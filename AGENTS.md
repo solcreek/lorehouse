@@ -19,9 +19,12 @@ bun test test/core.test.ts           # one file
 bun test test/core.test.ts -t "migrations apply"   # one test by name
 bun run conformance                  # black-box contract against `bun src/server.ts`
 bun run conformance --only usage     # scenarios whose name contains "usage" (any case)
-bun run conformance --only '/^GET /' # or whose name a /regex/ matches (any case)
+bun run conformance --only '^GET '  # or starts with it; TEXT$ ends with it; 'a|b' either (text, not a regex)
 bun run build                        # → dist/lorehouse (single compiled binary)
 bun run conformance --app ./dist/lorehouse          # the same contract against the binary
+bun run eval                         # evals against a REAL model (needs a model credential; spends tokens)
+bun run eval --dry                   # the same harness on the scripted model: no credential, seconds
+bun run eval --only default-repo --trials 1   # one case, once; --list names them
 bun start                            # serve (needs Slack/Anthropic env, see README)
 bun run doctor                       # check Slack/Anthropic/GitHub/sandbox setup; exits 1 on failure
 ```
@@ -38,8 +41,8 @@ like regressions.
 shebang asks; since TypeScript 7 `tsc` is a launcher that runs TypeScript's own
 executable, not a Node addon, so either Node gives the same result.)
 
-CI (`.github/workflows/ci.yml`) runs typecheck, tests, conformance on source, build, and
-conformance on the binary; plus the sandbox guest (`go vet/test/build` in
+CI (`.github/workflows/ci.yml`) runs typecheck, tests, conformance on source, the evals
+with `--dry`, build, and conformance on the binary; plus the sandbox guest (`go vet/test/build` in
 `sandbox/guest`), host (`cargo clippy -D warnings`, `cargo test --locked` in
 `sandbox/host`) and the website build. A merge to `main` deploys to Fly.io.
 CI always runs every conformance scenario. Locally, `--only <pattern>` (combinable with
@@ -47,6 +50,7 @@ CI always runs every conformance scenario. Locally, `--only <pattern>` (combinab
 lists in `needs` (marked `[needed]`). A pattern matching nothing, or a bad argument, exits
 2 before anything starts. A new scenario that checks what an earlier one left behind must
 name it in `needs`, or it will fail when run alone.
+CI never runs the evals against a real model: no workflow holds a model credential.
 
 ## Architecture
 
@@ -56,6 +60,21 @@ Anthropic (`conformance/mock.ts`, reached via `SLACK_API_URL` / `ANTHROPIC_BASE_
 observed. Its scripted model echoes the top search hit as `[cite:…]`/`[src:…]`.
 `conformance/fixtures/expected-cites.json` pins the search ranking. A user-visible
 behavior change means a conformance scenario change, reviewed like an API change.
+
+**Evals: what a real model does with the prompts** (`evals/`, `evals/README.md`).
+`bun run eval` runs each case of `evals/cases/` (data: a setup, a conversation, named
+checks) as trials, each a fresh app subprocess with the same mock for Slack and GitHub,
+the fake runner (`conformance/fake-runner.ts`) as the sandbox, and the real model behind
+a recording proxy (`evals/proxy.ts`), which alone holds the model credential and records
+every turn's tool calls, text and tokens. A code case's sandbox is a simulated shell over
+a checkout in memory (`evals/shell.ts`): it executes nothing on the machine, and what it
+can't run it refuses in the words a real shell would use, and the report lists each one. Hard facts are code checks over what was
+observed (Slack calls, runner jobs, GitHub requests, model turns); a judgment about prose
+is a graded check against a rubric (`evals/rubrics.ts`), counted apart, and a graded
+check with no verdict is "not judged", never a pass. The last stdout line is one JSON
+object; every trial leaves an evidence file under `evals/out/`. What it shares with
+conformance lives in `conformance/harness.ts`. The evals judge the model's behavior and
+are not the contract: a behavior change still means a conformance scenario.
 
 **Entry and wiring.** `src/server.ts` dispatches `lorehouse` (serve), `lorehouse setup`
 (`src/setup.ts`) and `lorehouse doctor` (`src/doctor.ts`). With setup-provided secrets
@@ -253,12 +272,14 @@ with `main`, merge it in; never force-push. The PR description:
 "Stacked on #31. Retarget to `main` once it merges." When the base merges, retarget
 it: `gh pr edit <n> --base main`.
 
-**Checks by change.** CI runs all of them on every PR except the verify-lorehouse drive,
-which is manual; run the ones you touched first.
+**Checks by change.** CI runs all of them on every PR except the verify-lorehouse drive
+and the evals against a real model, which are manual; run the ones you touched first.
 
 | change | run |
 |---|---|
-| TypeScript (`src/`, `test/`, `conformance/`) | `bun run typecheck`, `bun run test`, `bun run conformance` |
+| TypeScript (`src/`, `test/`, `conformance/`, `evals/`) | `bun run typecheck`, `bun run test`, `bun run conformance`; for `evals/` or `conformance/`'s mock, fake runner or `harness.ts`, also `bun run eval --dry` |
+| `prompts/`, a tool's description or input schema, the profile (`src/profiles.ts`) | the evals with a real model: `bun run eval` (or `--only` the cases it touches, never fewer than 3 trials for a verdict). It spends tokens: say how many in Verification, with the pass rates before and after. `--dry` is not this check: it proves the harness runs, not what a model does |
+| a rubric or the grader's prompt (`evals/rubrics.ts`, `evals/grader.ts`) | `bun run eval --grader-selftest`: every rubric's known-good and known-bad replies, graded by the real grader model (about 38,000 tokens). A new rubric needs both kinds of example |
 | user-visible behavior | the above, with a conformance scenario changed or added; Slack-facing: also verify-lorehouse (see "Verifying Slack-facing changes" above) |
 | `prompts/`, `migrations/`, `slack/manifest.yaml` | the above, then `bun run build` and `bun run conformance --app ./dist/lorehouse` |
 | a migration | also `bun test test/core.test.ts -t "migrations apply"` |
@@ -268,8 +289,9 @@ which is manual; run the ones you touched first.
 | `bun.lock`, `go.sum`, `flake.nix`, `nix/` | `nix flake check`; new hashes per `docs/nix.md`. Without Nix installed, or on an Intel Mac (the flake doesn't cover `x86_64-darwin`), CI's `nix` job runs it |
 
 The mock's scripted model answers from the question, not the prompts: conformance proves
-a prompt is embedded and loads, not that its wording works. Say in Verification what
-still needs a real model.
+a prompt is embedded and loads, not that its wording works. The evals are what tests the
+wording (`evals/README.md`); say in Verification what you ran with a real model, and what
+no case covers yet.
 
 **Decisions.** A decision that later work must follow (the contract, where data lives,
 a new language or service, a security rule) gets an ADR: `docs/adr/NNNN-<slug>.md`

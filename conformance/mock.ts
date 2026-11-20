@@ -17,6 +17,9 @@
 //                              GitHub requests, channels whose reactions were listed, and
 //                              uploads: each file's name, size, first bytes and where
 //                              files.completeUploadExternal shared it
+//   GET  /calls                every recorded Slack call as it arrived, in order: its method,
+//                              its body and when (epoch ms). What /stats summarizes, whole,
+//                              for a harness that reads streams and timelines itself (evals/)
 //   POST /fixtures/messages    {channel, message} — add a message to Slack's history
 //   POST /fixtures/edit        {channel, ts, text, editedTs} — edit a message
 //   POST /fixtures/delete      {channel, ts} — delete one (a root with replies → tombstone)
@@ -76,6 +79,9 @@
 import { readFileSync } from "node:fs";
 
 const PORT = Number(process.env.PORT ?? 8900);
+// The port listened on: PORT, or with PORT=0 the one the system gave, which the last
+// line printed names ("mock listening on :<port>"), for a harness that reads it there.
+let port = PORT;
 const TTFT_MS = Number(process.env.TTFT_MS ?? 300);
 const TOKENS = Number(process.env.TOKENS ?? 80);
 const TOKEN_DELAY_MS = Number(process.env.TOKEN_DELAY_MS ?? 15);
@@ -186,7 +192,7 @@ function slack(method: string, body: Record<string, unknown>, token = ""): Respo
   if (method === "files.getUploadURLExternal") {
     const fileId = `F${++nextTs}`;
     uploads.push({ fileId, filename: String(body.filename), length: Number(body.length) });
-    return Response.json({ ok: true, upload_url: `http://localhost:${PORT}/slack/upload/${fileId}`, file_id: fileId });
+    return Response.json({ ok: true, upload_url: `http://localhost:${port}/slack/upload/${fileId}`, file_id: fileId });
   }
   if (method === "files.completeUploadExternal") {
     const files = Array.isArray(body.files) ? (body.files as { id?: string }[]) : [];
@@ -448,7 +454,7 @@ async function strongroom(req: Request, path: string): Promise<Response> {
 
 // ── server ───────────────────────────────────────────────────────────────────
 
-Bun.serve({
+const server = Bun.serve({
   port: PORT,
   idleTimeout: 120,
   async fetch(req) {
@@ -554,6 +560,7 @@ Bun.serve({
       });
       return Response.json({ slackCalls: calls.length, modelCalls, byMethod: countBy(calls.map((c) => c.method)), readChannels, reactionChannels, posts, updates, responses, github: githubCalls, uploads: shared });
     }
+    if (url.pathname === "/calls") return Response.json({ calls });
     if (url.pathname === "/reset") { calls = []; modelCalls = 0; githubCalls = []; uploads = []; return Response.json({ ok: true }); }
     return new Response("not found", { status: 404 });
   },
@@ -574,4 +581,5 @@ function summarize(cs: SlackCall[]) {
 }
 const countBy = (xs: string[]) => xs.reduce<Record<string, number>>((m, x) => ((m[x] = (m[x] ?? 0) + 1), m), {});
 
-console.log(`mock listening on :${PORT} (TTFT ${TTFT_MS}ms, ${TOKENS} tokens × ${TOKEN_DELAY_MS}ms)`);
+port = server.port ?? PORT;
+console.log(`mock listening on :${port} (TTFT ${TTFT_MS}ms, ${TOKENS} tokens × ${TOKEN_DELAY_MS}ms)`);
