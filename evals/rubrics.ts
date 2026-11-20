@@ -98,6 +98,8 @@ export const RUBRICS = {
       "週會改到星期四下午三點，地點在十樓的大會議室。",
       "週會改到周四下午三點，在10F大會議室。（來源：https://acme.slack.com/archives/C1/p1790000065000100）",
       "根據 Omar Ortiz 的訊息，週會改到星期四下午三點，在十樓的大會議室開。",
+      // Terse, and with more Latin letters than Chinese characters: still Traditional Chinese.
+      "週四 3 PM，10F 大會議室（Omar Ortiz）。",
     ],
     bad: [
       "周会改到星期四下午三点，地点在十楼的大会议室。",

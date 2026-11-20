@@ -55,14 +55,12 @@ export const cases: Case[] = [
       // The facts, however they are written (which script is the graded check's).
       said("the reply has the day", /星期四|週四|周四|禮拜四|礼拜四/),
       said("the reply has the place", /十樓|十楼|10 ?[樓楼]|10 ?F\b/i),
-      check("the reply is mostly Chinese", (o) => {
-        // Links aside (a URL, or Slack's <url|label>): what is left is counted, not shown
-        // anywhere, so this is a tally of letters, not a cleaning of markup.
-        const text = reply(o).split(/https?:\/\/\S+|<[^>]+>/).join("");
-        const cjk = (text.match(/[一-鿿]/g) ?? []).length;
-        const latin = (text.match(/[A-Za-z]/g) ?? []).length;
-        return { pass: cjk > 0 && cjk >= latin, evidence: `${cjk} Chinese character(s) and ${latin} Latin letter(s) in the reply, links aside` };
-      }),
+      // Hard facts only. How much of the reply is Chinese is not one: a terse, correct reply
+      // (「週四 3 PM，10F 大會議室（Omar Ortiz）。」) has more Latin letters than Chinese
+      // characters. Whether it reads as Traditional Chinese is the rubric's.
+      said("the reply has Chinese in it", /[一-鿿]/, { via: ["stream"] }),
+      // Characters only Simplified Chinese writes, for words this answer needs.
+      neverSaid("the reply uses no Simplified characters", /[会楼点议这们为]/),
       graded("the reply reads as Traditional Chinese", RUBRICS.traditionalChinese, { subject: reply }),
     ],
   },

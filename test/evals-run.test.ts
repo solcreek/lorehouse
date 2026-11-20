@@ -610,6 +610,28 @@ test("a command submitted is not a command that ran: a refused or failed one is 
   expect(run(ran("output", { command: /bogus/, succeeded: true, output: /3 pass/ }), o)).toMatchObject({ pass: false, evidence: expect.stringContaining('job #0 guest POST /exec "bun test --bogus" → exit 1') });
 });
 
+test("answers-in-traditional-chinese: code holds the facts, and no count of letters stands in for the rubric", () => {
+  const TERSE = "週四 3 PM，10F 大會議室（Omar Ortiz）。";
+  const answering = (text: string) => {
+    const o = replying(observed(), text);
+    o.model = turnsCalling(["search_knowledge", { query: "週會" }]);
+    return o;
+  };
+  // A terse, correct reply the rubric allows: 6 Chinese characters, 12 Latin letters.
+  expect(codeVerdict("answers-in-traditional-chinese", answering(TERSE))).toEqual({ pass: true, failed: [] });
+  expect(RUBRICS.traditionalChinese.good).toContain(TERSE);
+  expect(codeVerdict("answers-in-traditional-chinese", answering("週會改到星期四下午三點，地點在十樓的大會議室。")).pass).toBe(true);
+  // The hard facts still fail in code: no Chinese at all; Simplified characters; no day; no place.
+  expect(codeVerdict("answers-in-traditional-chinese", answering("Thursday 3 PM, 10F big meeting room.")).failed).toEqual(["the reply has the day", "the reply has Chinese in it"]);
+  expect(codeVerdict("answers-in-traditional-chinese", answering("周会改到星期四下午三点，地点在十楼的大会议室。")).failed).toEqual(["the reply uses no Simplified characters"]);
+  expect(codeVerdict("answers-in-traditional-chinese", answering("週會改到下午三點，在十樓。")).failed).toEqual(["the reply has the day"]);
+  expect(codeVerdict("answers-in-traditional-chinese", answering("週會改到星期四下午三點。")).failed).toEqual(["the reply has the place"]);
+  // Whether it reads as Traditional Chinese (an English opening sentence, say) is the rubric's.
+  const mixed = "Found it — one clear message covers both.\n\n週會改到星期四下午三點，地點在十樓的大會議室。";
+  expect(codeVerdict("answers-in-traditional-chinese", answering(mixed)).pass).toBe(true);
+  expect(RUBRICS.traditionalChinese.bad).toContain(mixed);
+});
+
 test("neverSaid: a stream that carried only task updates and no text said nothing, so it fails", () => {
   const o = observed();
   o.slack.said = [{ via: "stream", thread: "1.0", text: "", call: 2 }, { via: "stream", thread: "1.0", text: "  \n", call: 5 }];
