@@ -284,7 +284,7 @@ and the evals against a real model, which are manual; run the ones you touched f
 | `prompts/`, `migrations/`, `slack/manifest.yaml` | the above, then `bun run build` and `bun run conformance --app ./dist/lorehouse` |
 | a migration | also `bun test test/core.test.ts -t "migrations apply"` |
 | `sandbox/guest` | `go vet ./...`, `go test ./...`, `CGO_ENABLED=0 go build ./...` in that directory. Linux only: on a Mac, vet and build with `GOOS=linux`; `go test` runs in CI |
-| `sandbox/host` | `cargo clippy --locked -- -D warnings`, `cargo test --locked` in that directory; for a change to boot, networking, the unit or limits, also prove it on real KVM with `sandbox/lab/lab.sh` (`up`, `deploy`, `bench`; see `sandbox/lab/README.md`) |
+| `sandbox/host` | `cargo clippy --locked -- -D warnings`, `cargo test --locked` in that directory; for a change to boot, networking, the unit or limits, also prove it on real KVM with `sandbox/lab/lab.sh` (`up`, `deploy`, `bench`; see `sandbox/lab/README.md`). For a code scanning alert in it, `scripts/codeql-rust.sh` runs CI's CodeQL queries over all of it on a Linux machine: on a pull request, code scanning reports only the lines the pull request changes, so a clean pull request doesn't show that an alert on another line is gone |
 | `website/` | `bun install`, `bun run typecheck`, `bun run build` in that directory |
 | `bun.lock`, `go.sum`, `flake.nix`, `nix/` | `nix flake check`; new hashes per `docs/nix.md`. Without Nix installed, or on an Intel Mac (the flake doesn't cover `x86_64-darwin`), CI's `nix` job runs it |
 
