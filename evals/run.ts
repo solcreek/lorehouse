@@ -16,7 +16,7 @@ import { DEFAULT_GRADER_MODEL, grader, selftest } from "./grader";
 import { RUBRICS } from "./rubrics";
 import { startProxy } from "./proxy";
 import { caseResult, judge, summarize, table, trialVerdict, type TrialResult } from "./report";
-import { children, runTrial } from "./trial";
+import { cleanUpNow, runTrial, startReaper } from "./trial";
 
 const ROOT = join(import.meta.dir, "..");
 const exit2 = (message: string): never => {
@@ -73,7 +73,7 @@ const log = (line: string) => console.error(clean(line));
 for (const event of ["uncaughtException", "unhandledRejection"] as const) {
   process.on(event, (err: unknown) => {
     console.error(clean(`eval: crashed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`));
-    for (const child of children) child.kill("SIGKILL");
+    cleanUpNow();
     process.exit(1);
   });
 }
@@ -98,9 +98,12 @@ if (args.graderSelftest) {
   process.exit(result.ok ? 0 : 1);
 }
 
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
+// Stopped from outside: the children are killed and the trials' temp directories removed.
+// A runner that can't run this (SIGKILL, a crash) is cleaned up after by the reaper.
+startReaper();
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
-    for (const child of children) child.kill("SIGKILL");
+    cleanUpNow();
     console.error(`eval: ${signal}: stopped; evidence so far is in ${shown(outDir)}`);
     process.exit(130);
   });

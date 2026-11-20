@@ -466,6 +466,101 @@ test("the mock binds port 0 itself and says which port it got: two started toget
   }
 });
 
+// ── cleaning up after a run that couldn't ───────────────────────────────────
+
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const sleeper = () => Bun.spawn(["sleep", "120"], { stdout: "ignore", stderr: "ignore" });
+
+test("the reaper: when the runner's end of the pipe closes, what is still listed is killed and removed, and nothing else", async () => {
+  const reaper = Bun.spawn([process.execPath, join(ROOT, "evals/reaper.ts")], { stdin: "pipe", stdout: "ignore", stderr: "pipe" });
+  const orphan = sleeper(), finished = sleeper();
+  const left = mkdtempSync(join(tmpdir(), "lorehouse-eval-")), removed = mkdtempSync(join(tmpdir(), "lorehouse-eval-")), notOurs = mkdtempSync(join(tmpdir(), "someone-elses-"));
+  try {
+    reaper.stdin.write(`pid ${orphan.pid}\npid ${finished.pid}\ndir ${left}\ndir ${removed}\ndir ${notOurs}\ndir /\n`);
+    reaper.stdin.write(`done ${finished.pid}\ngone ${removed}\n`);
+    reaper.stdin.flush();
+    // The signals a runner dies of don't take the reaper with it (once it is up).
+    await Bun.sleep(400);
+    reaper.kill("SIGINT");
+    reaper.kill("SIGHUP");
+    await Bun.sleep(150);
+    expect(reaper.exitCode).toBeNull();
+    expect(alive(orphan.pid)).toBe(true);
+    // The runner goes away.
+    reaper.stdin.end();
+    expect(await reaper.exited).toBe(0);
+    expect(alive(orphan.pid) && orphan.exitCode === null && orphan.signalCode === null).toBe(false);
+    expect(existsSync(left)).toBe(false);
+    // What the runner had reaped and removed itself is left alone; so is anything not the harness's.
+    expect(alive(finished.pid)).toBe(true);
+    expect(existsSync(removed)).toBe(true);
+    expect(existsSync(notOurs)).toBe(true);
+  } finally {
+    orphan.kill();
+    finished.kill();
+    for (const d of [left, removed, notOurs]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("a runner killed outright leaves no app, no mock and no temp directory behind", async () => {
+  const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));
+  const before = new Set(readdirSync(tmpdir()).filter((d) => d.startsWith("lorehouse-eval-")));
+  const runner = Bun.spawn([process.execPath, join(ROOT, "evals/run.ts"), "--dry", "--concurrency", "2", "--trials", "3", "--out", out], { cwd: ROOT, stdout: "ignore", stderr: "pipe" });
+  try {
+    // Wait until trials are under way: the runner has children that are the app and the mock.
+    const kids = async () => (await Bun.$`pgrep -P ${runner.pid}`.quiet().nothrow().text()).trim().split("\n").filter(Boolean).map(Number);
+    const servers = async () => {
+      const found: number[] = [];
+      for (const pid of await kids()) if (/src\/server\.ts|conformance\/mock\.ts/.test(await Bun.$`ps -o command= -p ${pid}`.quiet().nothrow().text())) found.push(pid);
+      return found;
+    };
+    let running: number[] = [];
+    for (let i = 0; i < 200 && running.length < 2; i++) { await Bun.sleep(25); running = await servers(); }
+    expect(running.length).toBeGreaterThanOrEqual(2);
+    const made = readdirSync(tmpdir()).filter((d) => d.startsWith("lorehouse-eval-") && !before.has(d) && !d.startsWith("lorehouse-eval-out-"));
+    expect(made.length).toBeGreaterThan(0);
+
+    runner.kill("SIGKILL"); // no handler runs
+    await runner.exited;
+    let left = running;
+    for (let i = 0; i < 100 && left.length; i++) { await Bun.sleep(50); left = running.filter(alive); }
+    expect(left).toEqual([]);
+    let dirs = made;
+    for (let i = 0; i < 100 && dirs.length; i++) { await Bun.sleep(50); dirs = made.filter((d) => existsSync(join(tmpdir(), d))); }
+    expect(dirs).toEqual([]);
+  } finally {
+    runner.kill("SIGKILL");
+    rmSync(out, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test("a runner sent SIGINT stops its children, removes its temp directories and exits 130", async () => {
+  const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));
+  const before = new Set(readdirSync(tmpdir()).filter((d) => d.startsWith("lorehouse-eval-")));
+  const runner = Bun.spawn([process.execPath, join(ROOT, "evals/run.ts"), "--dry", "--trials", "3", "--out", out], { cwd: ROOT, stdout: "ignore", stderr: "pipe" });
+  try {
+    const mine = () => readdirSync(tmpdir()).filter((d) => d.startsWith("lorehouse-eval-") && !before.has(d) && !d.startsWith("lorehouse-eval-out-"));
+    for (let i = 0; i < 200 && !mine().length; i++) await Bun.sleep(25);
+    expect(mine().length).toBeGreaterThan(0);
+    runner.kill("SIGINT");
+    expect(await runner.exited).toBe(130);
+    expect(await new Response(runner.stderr).text()).toContain("eval: SIGINT: stopped; evidence so far is in");
+    let dirs = mine();
+    for (let i = 0; i < 60 && dirs.length; i++) { await Bun.sleep(50); dirs = mine(); }
+    expect(dirs).toEqual([]);
+  } finally {
+    runner.kill("SIGKILL");
+    rmSync(out, { recursive: true, force: true });
+  }
+}, 60_000);
+
 // ── the command itself ──────────────────────────────────────────────────────
 
 async function evalCommand(args: string[], env: Record<string, string | undefined> = { ...process.env }) {

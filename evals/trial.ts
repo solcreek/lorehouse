@@ -46,8 +46,40 @@ export type TrialOptions = {
 
 export type TrialRun = { observation: Observation; ms: number; setupError?: string };
 
-// Every process this run started and hasn't reaped, for a signal handler to kill.
+// Every process this run started and hasn't reaped, and every temp directory it made and
+// hasn't removed: what a signal handler kills and removes, and what the reaper
+// (reaper.ts) is told, so a runner that dies without warning leaves neither behind.
 export const children = new Set<ReturnType<typeof Bun.spawn>>();
+export const tempDirs = new Set<string>();
+let reaper: ReturnType<typeof Bun.spawn> | undefined;
+const tell = (line: string) => {
+  try {
+    const stdin = reaper?.stdin;
+    if (stdin && typeof stdin !== "number") {
+      stdin.write(`${line}\n`);
+      stdin.flush();
+    }
+  } catch { /* the reaper is gone: the signal handlers still clean up */ }
+};
+// Start the reaper: from here on, what is started and made is cleaned up even if this
+// process is killed outright.
+export function startReaper(): void {
+  reaper = Bun.spawn([process.execPath, join(import.meta.dir, "reaper.ts")], { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+  reaper.unref();
+}
+function started(proc: ReturnType<typeof Bun.spawn>): void {
+  children.add(proc);
+  tell(`pid ${proc.pid}`);
+}
+function reaped(proc: ReturnType<typeof Bun.spawn>): void {
+  children.delete(proc);
+  tell(`done ${proc.pid}`);
+}
+// Kill and remove everything still tracked (a signal handler's last act).
+export function cleanUpNow(): void {
+  for (const child of children) child.kill("SIGKILL");
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+}
 
 // The port a child says it listens on. Each child binds port 0 itself and prints the port
 // it was given, so no port is ever chosen here and then lost to someone else before the
@@ -198,6 +230,8 @@ export function tail(stream: ReadableStream<Uint8Array> | undefined, max = 60_00
 export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise<TrialRun> {
   const t0 = Date.now();
   const dir = mkdtempSync(join(tmpdir(), "lorehouse-eval-"));
+  tempDirs.add(dir);
+  tell(`dir ${dir}`);
   const code = c.suite === "code";
   const jobs: RunnerJob[] = [];
   const marks: StepMark[] = c.conversation.map((s, n) => ({ n, as: s.as, step: describe(s), slack: 0, jobs: 0, github: 0, turns: 0, outcome: "skipped" as const }));
@@ -226,7 +260,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
       env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", TTFT_MS: "20", TOKEN_DELAY_MS: "1", TOKENS: "12", SLACK_FIXTURES: join(FIXTURES, "slack-history.json") },
       stdout: "pipe", stderr: "pipe",
     });
-    children.add(mock);
+    started(mock);
     const mockOut = tail(mock.stdout as ReadableStream<Uint8Array>);
     mockErr = tail(mock.stderr as ReadableStream<Uint8Array>);
     mockUrl = `http://localhost:${await listeningPort(mock, mockOut, mockErr, /mock listening on :(\d+)/, "the mock (conformance/mock.ts)", 15_000)}`;
@@ -241,7 +275,7 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
       stdout: "pipe", stderr: "pipe",
     });
     app = proc;
-    children.add(proc);
+    started(proc);
     appOut = tail(proc.stdout as ReadableStream<Uint8Array>);
     appErr = tail(proc.stderr as ReadableStream<Uint8Array>);
     const appUrl = `http://localhost:${await listeningPort(proc, appOut, appErr, /lorehouse: @\S+ on :(\d+)/, "the app (src/server.ts)", 30_000)}`;
@@ -390,14 +424,16 @@ export async function runTrial(c: Case, id: string, opts: TrialOptions): Promise
     }
     exit = app.exitCode;
     await Promise.race([Promise.all([appOut.done, appErr.done]), Bun.sleep(1000)]);
-    children.delete(app);
+    reaped(app);
   }
   if (mock) {
     mock.kill();
     await mock.exited;
-    children.delete(mock);
+    reaped(mock);
   }
   rmSync(dir, { recursive: true, force: true });
+  tempDirs.delete(dir);
+  tell(`gone ${dir}`);
 
   const modelTurns = turns();
   const toolCalls: ToolCall[] = modelTurns.flatMap((t) => (t.response?.content ?? []).flatMap((b) => (b.type === "tool_use" ? [{ turn: t.n, name: b.name, input: b.input }] : [])));
