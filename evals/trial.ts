@@ -67,13 +67,19 @@ export function startReaper(): void {
   reaper = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "reaper.ts")], { env: childEnv(process.env), stdin: "pipe", stdout: "ignore", stderr: "ignore" });
   reaper.unref();
 }
+// A child is the reaper's to kill from its start until the moment it exits, however it
+// exits: told then, not when the trial gets round to it, so a pid the system has since
+// given to some other process is never killed.
+export function track(proc: { pid: number; exited: Promise<unknown> }, say: (line: string) => void = tell): void {
+  say(`pid ${proc.pid}`);
+  void proc.exited.then(() => say(`done ${proc.pid}`), () => say(`done ${proc.pid}`));
+}
 function started(proc: ReturnType<typeof Bun.spawn>): void {
   children.add(proc);
-  tell(`pid ${proc.pid}`);
+  track(proc);
 }
 function reaped(proc: ReturnType<typeof Bun.spawn>): void {
   children.delete(proc);
-  tell(`done ${proc.pid}`);
 }
 // Kill and remove everything still tracked (a signal handler's last act).
 export function cleanUpNow(): void {

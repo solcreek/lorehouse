@@ -13,7 +13,7 @@ import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, s
 import type { Grader } from "../evals/grader";
 import { caseResult, COMPLETED, judge, summarize, table, trialVerdict, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
 import { RUBRICS } from "../evals/rubrics";
-import { childEnv, listeningPort, saidFrom, tail } from "../evals/trial";
+import { childEnv, listeningPort, saidFrom, tail, track } from "../evals/trial";
 import { envFileProblem } from "../evals/credential";
 
 const ROOT = join(import.meta.dir, "..");
@@ -544,6 +544,33 @@ test("the reaper: when the runner's end of the pipe closes, what is still listed
     orphan.kill();
     finished.kill();
     for (const d of [left, removed, notOurs]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("a child is the reaper's only until it exits: it is marked done then, so a reused pid is never killed", async () => {
+  const said: string[] = [];
+  const quick = Bun.spawn(["sleep", "0.2"], { stdout: "ignore", stderr: "ignore" });
+  const slow = sleeper();
+  try {
+    track(quick, (line) => said.push(line));
+    track(slow, (line) => said.push(line));
+    expect(said).toEqual([`pid ${quick.pid}`, `pid ${slow.pid}`]);
+    await quick.exited;
+    await Bun.sleep(20);
+    // Done as soon as it exited, with nobody having reaped it; the one still running is not.
+    expect(said).toEqual([`pid ${quick.pid}`, `pid ${slow.pid}`, `done ${quick.pid}`]);
+    // And the reaper, told so, leaves that pid alone when the runner goes.
+    const reaper = Bun.spawn([process.execPath, join(ROOT, "evals/reaper.ts")], { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+    const reused = sleeper(); // stands for whatever process now has the exited child's pid
+    reaper.stdin.write(`pid ${reused.pid}\ndone ${reused.pid}\npid ${slow.pid}\n`);
+    reaper.stdin.end();
+    await reaper.exited;
+    expect(alive(reused.pid) && reused.exitCode === null).toBe(true);
+    expect(slow.exitCode !== null || slow.signalCode !== null || !alive(slow.pid)).toBe(true);
+    reused.kill();
+  } finally {
+    quick.kill();
+    slow.kill();
   }
 });
 
