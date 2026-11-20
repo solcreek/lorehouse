@@ -16,7 +16,7 @@ import { DEFAULT_GRADER_MODEL, grader, selftest } from "./grader";
 import { RUBRICS } from "./rubrics";
 import { startProxy } from "./proxy";
 import { caseResult, judge, summarize, table, trialVerdict, type TrialResult } from "./report";
-import { cleanUpNow, runTrial, startReaper } from "./trial";
+import { cleanUpNow, runTrial, scrubObservation, startReaper } from "./trial";
 
 const ROOT = join(import.meta.dir, "..");
 const exit2 = (message: string): never => {
@@ -145,7 +145,9 @@ await Promise.all(
         checks,
         conversation: c.conversation.map((step, n) => ({ ...step, ...run.observation.steps[n] })),
         transcript: run.observation.model.turns,
-        observation: { ...run.observation, model: { toolCalls: run.observation.model.toolCalls } },
+        // A secret cut across a stream's chunks is whole nowhere in the raw calls, so the
+        // text scrub below couldn't find it: scrubObservation takes such a stream's text out.
+        observation: { ...scrubObservation(run.observation, credential.secrets()), model: { toolCalls: run.observation.model.toolCalls } },
       };
       writeFileSync(file, clean(JSON.stringify(evidence, (_k, v) => (v instanceof RegExp ? String(v) : v), 2)) + "\n");
       results.push(result);

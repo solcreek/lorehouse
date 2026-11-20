@@ -201,6 +201,29 @@ export function saidFrom(calls: SlackCall[]): Said[] {
   return out;
 }
 
+// The observation as it may be written down. Scrubbing a file's text finds a secret that
+// stands whole somewhere; a reply streamed to Slack arrives in pieces, and a secret cut
+// across two of them stands whole nowhere in the raw calls. So: where the text a stream
+// adds up to holds a secret, that text is scrubbed in `said`, and every raw call of that
+// stream has its text taken out (the pieces would spell it).
+export function scrubObservation(o: Observation, secrets: string[]): Observation {
+  const real = secrets.filter((s) => s.length >= 8);
+  const holds = (text: string) => real.some((s) => text.includes(s));
+  const streams = new Set(o.slack.said.filter((s) => s.via === "stream" && holds(s.text)).map((s) => s.ts));
+  if (!streams.size) return o;
+  const GONE = "[redacted: this stream carried a credential across its chunks]";
+  const calls = o.slack.calls.map((c) => {
+    const ts = c.method === "chat.startStream" ? String(c.body.__stream_ts) : String(c.body.ts);
+    if (!c.method.endsWith("Stream") || !streams.has(ts)) return c;
+    const body = { ...c.body };
+    if (typeof body.markdown_text === "string" && body.markdown_text) body.markdown_text = GONE;
+    if (Array.isArray(body.chunks)) body.chunks = (body.chunks as { type?: string; text?: string }[]).map((k) => (k?.type === "markdown_text" && k.text ? { ...k, text: GONE } : k));
+    return { ...c, body };
+  });
+  const said = o.slack.said.map((s) => (s.via === "stream" && streams.has(s.ts) ? { ...s, text: real.reduce((t, secret) => t.split(secret).join("[redacted credential]"), s.text) } : s));
+  return { ...o, slack: { ...o.slack, calls, said } };
+}
+
 // A job as the observation keeps it: decoded, and with any token replaced.
 function observeJob(n: number, job: Job, answer: JobAnswer): RunnerJob {
   const decode = (b64?: string): unknown => {

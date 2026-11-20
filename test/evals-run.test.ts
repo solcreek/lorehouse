@@ -13,7 +13,7 @@ import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, s
 import type { Grader } from "../evals/grader";
 import { caseResult, COMPLETED, judge, summarize, table, trialVerdict, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
 import { RUBRICS } from "../evals/rubrics";
-import { APP_ANNOUNCES, childEnv, listeningPort, MOCK_ANNOUNCES, saidFrom, tail, track } from "../evals/trial";
+import { APP_ANNOUNCES, childEnv, listeningPort, MOCK_ANNOUNCES, saidFrom, scrubObservation, tail, track } from "../evals/trial";
 import { envFileProblem } from "../evals/credential";
 
 const ROOT = join(import.meta.dir, "..");
@@ -75,6 +75,37 @@ test("saidFrom: a stream's text is its markdown, a card's its sections, an updat
   expect(s[0]).toMatchObject({ thread: "1.0", ts: "9.1" });
   expect(s[0]!.open).toBeUndefined();
   expect(saidFrom([{ n: 0, method: "chat.startStream", body: { thread_ts: "1.0", __stream_ts: "9.9" } }])[0]!.open).toBe(true);
+});
+
+test("a secret cut across two chunks of a stream is in no part of the observation that is written", () => {
+  const SECRET = "sk-ant-real-credential-0123456789abcdef";
+  const calls = [
+    { method: "chat.startStream", body: { channel: "C1", thread_ts: "1.0", __stream_ts: "9.1" } },
+    { method: "chat.appendStream", body: { ts: "9.1", markdown_text: "The key is sk-ant-real-cred" } },
+    { method: "chat.appendStream", body: { ts: "9.1", chunks: [{ type: "task_update", title: "Searching" }, { type: "markdown_text", text: "ential-0123456789abcdef, keep it safe." }] } },
+    { method: "chat.stopStream", body: { ts: "9.1" } },
+    { method: "chat.startStream", body: { channel: "C1", thread_ts: "1.0", __stream_ts: "9.2", markdown_text: "Another reply, " } },
+    { method: "chat.stopStream", body: { ts: "9.2", markdown_text: "with nothing secret in it." } },
+  ].map((c, n) => ({ n, ...c }));
+  const o = observed();
+  o.slack.calls = calls;
+  o.slack.said = saidFrom(calls);
+  // The whole secret is in what the stream adds up to, and in no single call.
+  expect(o.slack.said[0]!.text).toContain(SECRET);
+  expect(calls.some((c) => JSON.stringify(c).includes(SECRET))).toBe(false);
+  const written = JSON.stringify(scrubObservation(o, [SECRET]));
+  expect(written).not.toContain(SECRET);
+  // Nor its halves, which together would spell it.
+  expect(written).not.toContain("sk-ant-real-cred");
+  expect(written).not.toContain("ential-0123456789abcdef");
+  expect(written).toContain("The key is [redacted credential], keep it safe.");
+  expect(written).toContain("[redacted: this stream carried a credential across its chunks]");
+  // The other stream, and what isn't text, is as it was.
+  expect(written).toContain("with nothing secret in it.");
+  expect(written).toContain('"title":"Searching"');
+  // With nothing to find, the observation is the same object.
+  expect(scrubObservation(o, ["not-in-there-at-all"])).toBe(o);
+  expect(scrubObservation(o, [])).toBe(o);
 });
 
 test("checks: each passes on what was observed, with evidence that points at the record", () => {
