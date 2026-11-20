@@ -58,6 +58,14 @@ describe("withCacheMarks", () => {
     expect(marked.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 
+  test("system blocks are never rewritten, and the request is still marked", () => {
+    const blocks = [{ type: "text" as const, text: "a" }, { type: "text" as const, text: "b" }];
+    const marked = withCacheMarks(request({ system: blocks }));
+    expect(marked.system).toBe(blocks);
+    expect(blocks).toEqual([{ type: "text", text: "a" }, { type: "text", text: "b" }]);
+    expect(marked.cache_control).toEqual({ type: "ephemeral" });
+  });
+
   test("a request with its own setting on the request gets no mark on its system prompt", () => {
     // A five-minute mark on the system prompt ahead of a one-hour mark on the request is
     // refused by the API (a longer lifetime must come first): the string stays a string.
