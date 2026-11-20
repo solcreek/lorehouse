@@ -31,6 +31,9 @@ jobs:
       # The behavioral contract — against the source, then against the compiled binary
       # (which proves prompts/ and migrations/ are embedded, not read from the checkout).
       - run: bun run conformance
+      # The eval harness (evals/) on the scripted model: no credential, no network. It
+      # proves the harness runs, not what a model does; no workflow runs it for real.
+      - run: bun run eval --dry
       - run: bun run build
       - run: bun run conformance --app ./dist/lorehouse
 
