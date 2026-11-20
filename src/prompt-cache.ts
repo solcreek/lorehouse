@@ -24,13 +24,17 @@ type MessageStream = ReturnType<Anthropic["messages"]["stream"]>;
 const EPHEMERAL = { type: "ephemeral" } as const;
 
 // The same request with its repeating parts marked. A request that already says how it is
-// to be cached (a mark of its own on the request, or system blocks instead of a string) is
-// left as its author wrote it.
+// to be cached is left as its author wrote it: one with a setting of its own on the
+// request (a mark, or null for none) gets nothing added, and system blocks are never
+// rewritten. Adding to a request that has its own setting could also make it invalid: a
+// five-minute mark on the system prompt ahead of a one-hour mark on the request breaks the
+// API's rule that a longer lifetime comes first.
 export function withCacheMarks(body: StreamParams): StreamParams {
+  if (body.cache_control !== undefined) return body;
   return {
     ...body,
     ...(typeof body.system === "string" && body.system !== "" ? { system: [{ type: "text" as const, text: body.system, cache_control: EPHEMERAL }] } : {}),
-    ...(body.cache_control === undefined ? { cache_control: EPHEMERAL } : {}),
+    cache_control: EPHEMERAL,
   };
 }
 

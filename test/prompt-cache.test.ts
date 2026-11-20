@@ -56,8 +56,18 @@ describe("withCacheMarks", () => {
     const marked = withCacheMarks(request({ system: blocks, cache_control: { type: "ephemeral", ttl: "1h" } }));
     expect(marked.system).toBe(blocks);
     expect(marked.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-    // An explicit null is the caller turning the request's mark off.
-    expect(withCacheMarks(request({ cache_control: null })).cache_control).toBeNull();
+  });
+
+  test("a request with its own setting on the request gets no mark on its system prompt", () => {
+    // A five-minute mark on the system prompt ahead of a one-hour mark on the request is
+    // refused by the API (a longer lifetime must come first): the string stays a string.
+    const hour = request({ cache_control: { type: "ephemeral", ttl: "1h" } });
+    expect(withCacheMarks(hour)).toBe(hour);
+    expect(withCacheMarks(hour).system).toBe("You are scout.");
+    // An explicit null is the caller turning caching off for the request: nothing is added.
+    const off = request({ cache_control: null });
+    expect(withCacheMarks(off)).toBe(off);
+    expect(withCacheMarks(off).cache_control).toBeNull();
   });
 });
 
