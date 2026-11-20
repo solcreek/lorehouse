@@ -93,11 +93,27 @@ The credential is held by the proxy only:
   request carried and sets the real one;
 - every child process (the app, the mock, the reaper) is started with an environment of
   its own that never holds the credential, and with `--no-env-file`;
-- no header is recorded, and what is recorded, handed back, written or printed is
-  scrubbed of the credential, should an upstream ever echo it. A streamed model response
-  is passed to the app as it arrives, unaltered; what is kept of it is scrubbed, and a
-  reply streamed to Slack that carried a credential across two chunks has those chunks'
-  text taken out of the evidence.
+- no header is recorded, and a non-streamed body the proxy hands back to the app has the
+  credential taken out.
+
+**If the credential comes back, the trial's content is not written at all.** An upstream
+could echo it (in an error, in a reply), and the app could then repeat it to Slack or
+into a command. So before a trial is judged or anything of it is written, everything it
+carried that came from upstream or from the app is searched for the credential: every
+turn's text blocks and tool inputs and what the model was handed, every Slack call, every
+runner job and its answer, every GitHub request, the app's stdout and stderr. It is
+searched put back together, each kind of content joined end to end in the order it came,
+so a credential cut across two text blocks, two stream chunks or two turns is found. If
+it is anywhere, the trial is marked `credentialEchoed` and fails for that alone; its
+evidence file says so and holds no transcript, no observation and no check that would
+quote them; the run exits 1 and says which trials. Nothing is cut out and the rest kept:
+redacting around a match is what a split defeats. Treat the credential as seen by
+whatever repeated it.
+
+The limit that remains: a credential whose pieces are **interleaved with other content**
+(a character per line, halves in two unrelated sentences) is not found. Nobody could find
+it, and nothing here would put it back together either. What is written and printed is
+still passed through a last text scrub for a credential that stands whole.
 
 `test/evals-proxy.test.ts` and `test/evals-run.test.ts` hold all of this, for each kind,
 including a run against an upstream that sends the credential back.
@@ -147,11 +163,11 @@ and its file. The **last stdout line is one JSON object**:
   "shellRefused": [ { "case": "code/attach-a-chart", "trial": 1,
                       "command": "ls -la bench.png; echo \"---\"; file bench.png; echo \"---\"; head -c 16 bench.png | xxd",
                       "part": "xxd", "said": "sh: 1: xxd: not found", "why": "`xxd` isn't simulated" } ],
-  "trialsNotJudged": [], "trialsNotRun": [],
+  "credentialEchoed": [], "trialsNotJudged": [], "trialsNotRun": [],
   "ms": 308579, "out": "evals/out/<run>" }
 ```
 
-An exit of 1 is one of four things, and the line says which:
+An exit of 1 is one of five things, and the line says which:
 
 | what | where it is | what it means |
 |---|---|---|
@@ -159,6 +175,7 @@ An exit of 1 is one of four things, and the line says which:
 | **not judged** | `trialsNotJudged`: case, trial, check, reason, file; `unjudged` counts the cases | a required graded check has no verdict (`--no-grader`; the grader's answer couldn't be used; its call failed). Not a pass, and not a failure: grade it again |
 | **not run** | `trialsNotRun`: case, trial, reason (no file: nothing happened); `notRun` counts cases none of whose trials ran | the budget was reached before the trial started. Raise `--max-tokens` |
 | **over budget** | `tokens.exceeded`, `stopped` | the budget was reached; trials after that are in `trialsNotRun` |
+| **credential echoed** | `credentialEchoed`: case, trial, where, file; also in `failures` | the model credential came back in what the trial carried. Its evidence is withheld. Find out what repeated it before running again |
 
 For an agent: read that line, open one `file`, and the check's `evidence` names the
 record that decided it (`job #3`, `turn 2`, `slack call #41`), or for a graded check the
@@ -214,7 +231,9 @@ for that reason and not its own: when a case fails, look here first.
 
 ### An evidence file
 
-`evals/out/<run id>/<case id>/<trial>.json`, written for every trial, pass or fail:
+`evals/out/<run id>/<case id>/<trial>.json`, written for every trial, pass or fail (for
+a trial in which the credential came back, only the verdict, `credentialEchoed`, `where`
+and its tokens: see "The model credential"):
 
 | key | holds |
 |---|---|

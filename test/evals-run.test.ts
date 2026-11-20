@@ -11,9 +11,9 @@ import type { Case, Observation } from "../evals/case";
 import { CASES } from "../evals/cases";
 import { called, card, check, github, graded, modelNeverWrote, neverSaid, ran, said, toldAlone, uploaded } from "../evals/checks";
 import type { Grader } from "../evals/grader";
-import { caseResult, COMPLETED, judge, summarize, table, trialVerdict, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
+import { caseResult, COMPLETED, CREDENTIAL_ECHOED, judge, summarize, table, trialVerdict, type CheckOutcome, type Summary, type TrialResult } from "../evals/report";
 import { RUBRICS } from "../evals/rubrics";
-import { APP_ANNOUNCES, childEnv, listeningPort, MOCK_ANNOUNCES, observeJob, saidFrom, scrubObservation, tail, track } from "../evals/trial";
+import { APP_ANNOUNCES, childEnv, listeningPort, MOCK_ANNOUNCES, credentialEchoes, observeJob, saidFrom, tail, track } from "../evals/trial";
 import { envFileProblem } from "../evals/credential";
 
 const ROOT = join(import.meta.dir, "..");
@@ -77,54 +77,68 @@ test("saidFrom: a stream's text is its markdown, a card's its sections, an updat
   expect(saidFrom([{ n: 0, method: "chat.startStream", body: { thread_ts: "1.0", __stream_ts: "9.9" } }])[0]!.open).toBe(true);
 });
 
-test("a secret cut across two chunks of a stream is in no part of the observation that is written", () => {
+// The one rule (trial.ts, credentialEchoes): everything a trial carried is searched for the
+// credential, put back together in the order it came, before any of it is judged or written.
+test("a credential that came back is found wherever it is, whole or cut across any boundary that keeps its pieces in order", () => {
   const SECRET = "sk-ant-real-credential-0123456789abcdef";
-  const calls = [
-    { method: "chat.startStream", body: { channel: "C1", thread_ts: "1.0", __stream_ts: "9.1" } },
-    { method: "chat.appendStream", body: { ts: "9.1", markdown_text: "The key is sk-ant-real-cred" } },
-    { method: "chat.appendStream", body: { ts: "9.1", chunks: [{ type: "task_update", title: "Searching" }, { type: "markdown_text", text: "ential-0123456789abcdef, keep it safe." }] } },
-    { method: "chat.stopStream", body: { ts: "9.1" } },
-    { method: "chat.startStream", body: { channel: "C1", thread_ts: "1.0", __stream_ts: "9.2", markdown_text: "Another reply, " } },
-    { method: "chat.stopStream", body: { ts: "9.2", markdown_text: "with nothing secret in it." } },
-  ].map((c, n) => ({ n, ...c }));
-  const o = observed();
-  o.slack.calls = calls;
-  o.slack.said = saidFrom(calls);
-  // The whole secret is in what the stream adds up to, and in no single call.
-  expect(o.slack.said[0]!.text).toContain(SECRET);
-  expect(calls.some((c) => JSON.stringify(c).includes(SECRET))).toBe(false);
-  const written = JSON.stringify(scrubObservation(o, [SECRET]));
-  expect(written).not.toContain(SECRET);
-  // Nor its halves, which together would spell it.
-  expect(written).not.toContain("sk-ant-real-cred");
-  expect(written).not.toContain("ential-0123456789abcdef");
-  expect(written).toContain("The key is [redacted credential], keep it safe.");
-  expect(written).toContain("[redacted: this stream carried a credential across its chunks]");
-  // The other stream, and what isn't text, is as it was.
-  expect(written).toContain("with nothing secret in it.");
-  expect(written).toContain('"title":"Searching"');
-  // With nothing to find, the observation is the same object.
-  expect(scrubObservation(o, ["not-in-there-at-all"])).toBe(o);
-  expect(scrubObservation(o, [])).toBe(o);
-});
-
-test("a runner job as evidence: an exec keeps its result, and a background job's status and cancel keep their whole body", () => {
-  const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64");
-  const answered = (v: unknown, status = 200) => ({ id: "j", status, contentType: "application/json", bodyBase64: b64(v) });
-  const exec = observeJob(0, { id: "j", sandbox: "t.s", op: "guest", method: "POST", path: "/exec", bodyBase64: b64({ command: "bun test", cwd: "/workspace/repo", env: { GIT_AUTHOR_NAME: "octo" } }) }, answered({ exitCode: 0, stdout: " 3 pass\n", stderr: "" }));
-  expect(exec).toMatchObject({ command: "bun test", cwd: "/workspace/repo", answer: { status: 200, exitCode: 0, stdout: " 3 pass\n", stderr: "" } });
-  expect((exec.body as { env: unknown }).env).toEqual(["GIT_AUTHOR_NAME"]);
-  // A job that has ended also carries a numeric exitCode: it is not an exec result, and
-  // its state, id, tail and elapsed time are what a check of the job reads.
-  const ended = { id: "bench-1", command: "make bench", cwd: "/workspace/repo", state: "exited", exitCode: 0, elapsedMs: 1_741_000, tail: "bench total 290 ms (5 benchmarks)\n", outputBytes: 34 };
-  const status = observeJob(1, { id: "j", sandbox: "t.s", op: "guest", method: "GET", path: "/jobs/bench-1?tailBytes=8192" }, answered(ended));
-  expect(status.answer).toEqual({ status: 200, code: undefined, error: undefined, body: ended });
-  const start = observeJob(2, { id: "j", sandbox: "t.s", op: "guest", method: "POST", path: "/jobs", bodyBase64: b64({ id: "bench-1", command: "make bench", cwd: "/workspace/repo" }) }, answered({ ...ended, state: "running", exitCode: null, tail: "", created: true }, 201));
-  expect(start).toMatchObject({ command: "make bench", answer: { status: 201, body: { id: "bench-1", state: "running", exitCode: null, created: true } } });
-  const cancelled = { ...ended, state: "cancelled", exitCode: 143, tail: "" };
-  expect(observeJob(3, { id: "j", sandbox: "t.s", op: "guest", method: "POST", path: "/jobs/bench-1/cancel" }, answered(cancelled)).answer.body).toEqual(cancelled);
-  // A stage's facts, as before.
-  expect(observeJob(4, { id: "j", sandbox: "t.s", op: "stage", bodyBase64: b64({ base: "main", token: "t" }) }, answered({ sha: "abc", files: ["README.md"] }))).toMatchObject({ body: { base: "main", token: "[redacted]" }, answer: { body: { sha: "abc", files: ["README.md"] } } });
+  const A = SECRET.slice(0, 16), B = SECRET.slice(16);
+  const turn = (n: number, content: Observation["model"]["turns"][number]["response"] extends infer R ? (R extends { content: infer C } ? C : never) : never, extra: Partial<Observation["model"]["turns"][number]> = {}) =>
+    ({ n, startedAt: "", request: { stream: true, tools: [], messages: 1, input: [] }, status: 200, response: { stopReason: "end_turn", tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, content }, ...extra });
+  const clean = () => {
+    const o = observed();
+    o.model.turns = [turn(1, [{ type: "text", text: "nothing secret" }])];
+    return o;
+  };
+  const cases: [string, (o: Observation) => void, string[]][] = [
+    ["nowhere", () => {}, []],
+    ["whole, in one text block", (o) => { o.model.turns = [turn(1, [{ type: "text", text: `key ${SECRET}.` }])]; }, ["model"]],
+    // The finding: cut across two text blocks of one response. Whole in neither, and with
+    // JSON between them once written down.
+    ["across two text blocks of one response", (o) => { o.model.turns = [turn(1, [{ type: "text", text: `key ${A}` }, { type: "text", text: `${B}.` }])]; }, ["model"]],
+    ["across two text blocks with a tool call between them", (o) => { o.model.turns = [turn(1, [{ type: "text", text: A }, { type: "tool_use", id: "t", name: "search_knowledge", input: { query: "x" } }, { type: "text", text: B }])]; }, ["model"]],
+    ["across the text of two turns", (o) => { o.model.turns = [turn(1, [{ type: "text", text: A }]), turn(2, [{ type: "text", text: B }])]; }, ["model"]],
+    ["in a tool call's input", (o) => { o.model.turns = [turn(1, [{ type: "tool_use", id: "t", name: "workspace_exec", input: { command: `curl -H 'x-api-key: ${SECRET}' x` } }])]; }, ["model"]],
+    ["across two fields of a tool call's input", (o) => { o.model.turns = [turn(1, [{ type: "tool_use", id: "t", name: "workspace_write_file", input: { path: A, content: B } }])]; }, ["model"]],
+    ["in an upstream error", (o) => { o.model.turns = [turn(1, [], { status: 401, error: `authentication_error: invalid x-api-key ${SECRET}` })]; }, ["model"]],
+    ["in what the model was handed (a tool result)", (o) => { o.model.turns = [{ ...turn(1, []), request: { stream: true, tools: [], messages: 2, input: [{ type: "tool_result", toolUseId: "t", isError: false, content: `stdout: ${SECRET}` }] } }]; }, ["model"]],
+    // The earlier splits, under the one rule. Chunks of a streamed model response arrive
+    // as one text block (sse.ts puts them together), which is the first row; two chunks
+    // of a reply streamed to Slack:
+    ["across two chunks of a reply streamed to Slack", (o) => {
+      const calls = [
+        { method: "chat.startStream", body: { channel: "C1", thread_ts: "1.0", __stream_ts: "9.1" } },
+        { method: "chat.appendStream", body: { ts: "9.1", markdown_text: `The key is ${A}` } },
+        { method: "chat.appendStream", body: { ts: "9.1", chunks: [{ type: "task_update", title: "Searching" }, { type: "markdown_text", text: `${B}, keep it safe.` }] } },
+        { method: "chat.stopStream", body: { ts: "9.1" } },
+      ].map((c, n) => ({ n, ...c }));
+      o.slack.calls = calls;
+      o.slack.said = saidFrom(calls);
+    }, ["slack"]],
+    ["in a card posted to Slack", (o) => { o.slack.said = [{ via: "post", thread: "1.0", text: `Open a pull request? ${SECRET}`, call: 3 }]; }, ["slack"]],
+    ["in a command the runner was sent", (o) => { o.runner.jobs = [execJob(0, `echo ${SECRET}`, { exitCode: 0 })]; }, ["runner"]],
+    ["across the output of two commands", (o) => { o.runner.jobs = [execJob(0, "cat a", { exitCode: 0, stdout: A }), execJob(1, "cat b", { exitCode: 0, stdout: B })]; }, ["runner"]],
+    ["in a pull request's body", (o) => { o.github.calls = [{ n: 0, method: "POST", path: "/repos/acme/widgets/pulls", body: { title: "x", body: `token ${SECRET}` }, auth: "token" }]; }, ["github"]],
+    ["in the app's stderr", (o) => { o.app.stderr = `slack: AuthenticationError: 401 invalid x-api-key ${SECRET}\n`; }, ["app"]],
+    ["in a step's note of why it failed", (o) => { o.steps[0] = { ...o.steps[0]!, outcome: "failed", detail: `a model call failed: ${SECRET}` }; }, ["steps"]],
+    ["in the model's text and in what reached Slack", (o) => { o.model.turns = [turn(1, [{ type: "text", text: SECRET }])]; o.slack.said = [{ via: "stream", thread: "1.0", text: SECRET, call: 2 }]; }, ["model", "slack"]],
+  ];
+  for (const [name, put, where] of cases) {
+    const o = clean();
+    put(o);
+    expect([name, credentialEchoes(o, [SECRET])]).toEqual([name, where]);
+  }
+  // Any of the credential's values counts (ant's token before and after a refresh).
+  const refreshed = clean();
+  refreshed.app.stdout = "old-token-0123456789";
+  expect(credentialEchoes(refreshed, ["new-token-0123456789", "old-token-0123456789"])).toEqual(["app"]);
+  // No credential (--dry), or one too short to mean anything: nothing is searched for.
+  expect(credentialEchoes(clean(), [])).toEqual([]);
+  expect(credentialEchoes(clean(), ["dry"])).toEqual([]);
+  // The limit, stated: pieces interleaved with other content are not a credential anyone
+  // could find, or put back together by reading the file.
+  const interleaved = clean();
+  interleaved.model.turns = [turn(1, [{ type: "text", text: `${A} and then, much later, ${B}` }])];
+  expect(credentialEchoes(interleaved, [SECRET])).toEqual([]);
 });
 
 test("checks: each passes on what was observed, with evidence that points at the record", () => {
@@ -972,11 +986,15 @@ test("end to end against an upstream that echoes the credential back: it reaches
     for (const f of files) expect([f, readFileSync(f, "utf8").includes(KEY)]).toEqual([f, false]);
     const summary = JSON.parse(r.stdout.trimEnd().split("\n").at(-1)!) as Summary;
     expect(summary).toMatchObject({ ok: false, credential: "api_key", dry: false });
-    const failure = summary.failures.find((f) => f.check === COMPLETED)!;
-    expect(failure.evidence).toContain("model turn 1 failed (HTTP 401): authentication_error: invalid x-api-key [redacted credential]");
-    // The app under test never had it: its environment holds the run's own key.
-    const evidence = readFileSync(files.find((f) => f.endsWith("1.json"))!, "utf8");
-    expect(evidence).toContain("[redacted credential]");
+    // Upstream sent it back, so it was in what the trial carried: by the one rule the trial
+    // fails for that and none of its content is written (not the 401, not a redacted copy).
+    expect(summary.credentialEchoed).toEqual([{ case: "knowledge/cites-a-source", trial: 1, where: ["model"], file: expect.stringContaining("cites-a-source/1.json") }]);
+    expect(summary.failures.map((f) => f.check)).toEqual([CREDENTIAL_ECHOED]);
+    const evidence = JSON.parse(readFileSync(files.find((f) => f.endsWith("1.json"))!, "utf8"));
+    expect(evidence).toMatchObject({ credentialEchoed: true, where: ["model"], verdict: "failed" });
+    expect("transcript" in evidence || "observation" in evidence).toBe(false);
+    // The app was handed the body with the credential taken out, so it is not in the
+    // app's own output: only the model's side carried it.
   } finally {
     server.stop(true);
     rmSync(out, { recursive: true, force: true });
@@ -1028,6 +1046,67 @@ test("--grader-selftest follows the budget's rule: reached, it is not ok, though
     up.stop();
   }
 }, 60_000);
+
+// A model upstream that answers every call with two text blocks, the credential it was
+// sent cut across them: whole in neither, and with JSON between them once it is written down.
+function splittingUpstream() {
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const key = req.headers.get("x-api-key") ?? "";
+      await req.text();
+      const event = (name: string, data: unknown) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+      const half = Math.floor(key.length / 2);
+      const body =
+        event("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", model: "claude-opus-5", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 50, output_tokens: 1 } } }) +
+        event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) +
+        event("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `The wombat review is on Thursday. Your key is ${key.slice(0, half)}` } }) +
+        event("content_block_stop", { type: "content_block_stop", index: 0 }) +
+        event("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }) +
+        event("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: `${key.slice(half)}, as sent.` } }) +
+        event("content_block_stop", { type: "content_block_stop", index: 1 }) +
+        event("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 30 } }) +
+        event("message_stop", { type: "message_stop" });
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+}
+
+test("end to end: a credential echoed across two text blocks is withheld whole, the trial fails as credentialEchoed, and the run exits non-zero saying so", async () => {
+  const up = splittingUpstream();
+  const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));
+  const half = Math.floor(KEY.length / 2);
+  const pieces = [KEY, KEY.slice(0, half), KEY.slice(half)];
+  try {
+    const r = await evalCommand(["--only", "cites-a-source", "--trials", "1", "--no-grader", "--upstream", up.url, "--out", out], withKey());
+    // No file the run wrote holds the credential, or either half of it.
+    const files: string[] = [];
+    const walk = (dir: string) => { for (const e of readdirSync(dir, { withFileTypes: true })) e.isDirectory() ? walk(join(dir, e.name)) : files.push(join(dir, e.name)); };
+    walk(out);
+    expect(files.length).toBeGreaterThanOrEqual(2);
+    for (const f of files) for (const piece of pieces) expect([f, readFileSync(f, "utf8").includes(piece)]).toEqual([f, false]);
+    // Nor anything it printed.
+    for (const piece of pieces) expect((r.stdout + r.stderr).includes(piece)).toBe(false);
+    // The trial is failed and marked, the run says so and exits non-zero.
+    expect(r.code).toBe(1);
+    const summary = JSON.parse(r.stdout.trimEnd().split("\n").at(-1)!) as Summary;
+    expect(summary).toMatchObject({ ok: false, passed: 0, failed: 1 });
+    expect(summary.credentialEchoed).toEqual([{ case: "knowledge/cites-a-source", trial: 1, where: expect.arrayContaining(["model"]), file: expect.stringContaining("cites-a-source/1.json") }]);
+    expect(summary.failures).toEqual([{ case: "knowledge/cites-a-source", check: CREDENTIAL_ECHOED, kind: "code", trial: 1, evidence: expect.stringContaining("this trial's evidence is withheld"), file: expect.stringContaining("cites-a-source/1.json") }]);
+    expect(r.stderr).toContain("the model credential came back");
+    expect(r.stdout).toContain("CREDENTIAL ECHOED");
+    // What is written of the trial: that it happened, and nothing of what was said in it.
+    const evidence = JSON.parse(readFileSync(files.find((f) => f.endsWith("1.json"))!, "utf8"));
+    expect(evidence).toMatchObject({ case: "knowledge/cites-a-source", trial: 1, verdict: "failed", passed: false, credentialEchoed: true });
+    expect(evidence.where).toContain("model");
+    for (const k of ["transcript", "observation", "conversation"]) expect([k, k in evidence]).toEqual([k, false]);
+    expect(evidence.checks).toEqual([{ name: CREDENTIAL_ECHOED, required: true, graded: false, judged: true, pass: false, evidence: expect.stringContaining("withheld") }]);
+  } finally {
+    up.stop();
+    rmSync(out, { recursive: true, force: true });
+  }
+}, 90_000);
 
 test("--dry runs a case of each suite end to end: a table, one JSON line last, and an evidence file per trial", async () => {
   const out = mkdtempSync(join(tmpdir(), "lorehouse-eval-out-"));

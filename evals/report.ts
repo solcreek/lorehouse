@@ -41,6 +41,9 @@ export type TrialResult = {
   file: string;
   // Commands the case's simulated shell refused to run in this trial (shell.ts).
   refused: { command: string; part: string; why: string; said: string }[];
+  // Where the model credential came back in what the trial carried, when it did: the
+  // trial failed for that alone and its evidence was withheld (trial.ts, credentialEchoes).
+  credentialEchoed?: string[];
 };
 
 // The check every trial has: the conversation ran to its end.
@@ -56,6 +59,8 @@ export function completed(o: Observation, setupError?: string): CheckResult {
   return { pass: true, evidence: `all ${o.steps.length} step(s) ran` };
 }
 export const COMPLETED = "the conversation ran to its end";
+// The check a trial fails, alone, when the model credential came back in what it carried.
+export const CREDENTIAL_ECHOED = "no model credential came back in what the trial carried";
 
 // `grade`: the grader, or undefined when there is none (--dry, --no-grader).
 export async function judge(c: Case, o: Observation, opts: { dry: boolean; setupError?: string; grade?: Grader }): Promise<CheckOutcome[]> {
@@ -174,6 +179,9 @@ export type Summary = {
   // case beside one of these may be a gap in the shell, not the model's doing.
   // `said` is what the model saw (a real sandbox's words); `why` is the real reason.
   shellRefused: { case: string; trial: number; command: string; part: string; said: string; why: string }[];
+  // Every trial in which the model credential came back in what it carried (from upstream
+  // or the app), and where. Such a trial fails and its evidence is withheld whole.
+  credentialEchoed: { case: string; trial: number; where: string[]; file: string }[];
   // Every trial that has no verdict because a required graded check has none, with the
   // check and why (--no-grader; the grader's answer couldn't be used; its call failed).
   trialsNotJudged: { case: string; trial: number; check: string; reason: string; file: string }[];
@@ -214,6 +222,7 @@ export function summarize(o: {
     },
     failures,
     shellRefused: o.trials.flatMap((t) => t.refused.map((r) => ({ case: t.case, trial: t.trial, command: r.command, part: r.part, said: r.said, why: r.why }))),
+    credentialEchoed: o.trials.flatMap((t) => (t.credentialEchoed ? [{ case: t.case, trial: t.trial, where: t.credentialEchoed, file: t.file }] : [])),
     trialsNotJudged: o.dry ? [] : o.trials.flatMap((t) => t.checks.filter((c) => c.graded && c.required && !c.judged).map((c) => ({ case: t.case, trial: t.trial, check: c.name, reason: c.evidence, file: t.file }))),
     trialsNotRun: (o.plan ?? []).filter(([name, n]) => !o.trials.some((t) => t.case === name && t.trial === n)).map(([name, n]) => ({ case: name, trial: n, reason: o.exceeded ? `the run's tokens reached --max-tokens ${o.maxTokens} before this trial started` : "the run ended before this trial started", file: null })),
     ...(o.exceeded ? { stopped: `budget: --max-tokens ${o.maxTokens} was reached; ${o.planned - o.trials.length} planned trial(s) never ran and later model calls were refused` } : {}),
@@ -256,6 +265,10 @@ export function table(results: CaseResult[], trials: TrialResult[], summary: Sum
   if (summary.shellRefused.length) {
     out.push("", `the simulated shell refused ${summary.shellRefused.length} command(s) (evals/shell.ts; a failure beside one may be the shell's gap, not the model's):`);
     for (const r of summary.shellRefused) out.push(`  ${r.case} trial ${r.trial}: ${JSON.stringify(r.part)}${r.part === r.command ? "" : ` in ${JSON.stringify(r.command.length > 160 ? `${r.command.slice(0, 160)}…` : r.command)}`}\n      the model saw: ${JSON.stringify(r.said.split("\n")[0])}; the reason: ${r.why}`);
+  }
+  if (summary.credentialEchoed.length) {
+    out.push("", `CREDENTIAL ECHOED: the model credential came back in what ${summary.credentialEchoed.length} trial(s) carried; they fail and their evidence is withheld:`);
+    for (const t of summary.credentialEchoed) out.push(`  ${t.case} trial ${t.trial}: in ${t.where.join(", ")}\n      ${t.file}`);
   }
   if (summary.trialsNotJudged.length) {
     out.push("", `${summary.trialsNotJudged.length} required graded check(s) have no verdict (not judged is not passed, and not failed):`);

@@ -323,7 +323,7 @@ test("a redirect from upstream is not followed: the credential would go with it"
   expect(proxy.inFlight("t")).toBe(0);
 });
 
-test("an upstream that echoes the credential back: it is in no record and not in what the app is handed", async () => {
+test("an upstream that echoes the credential back: the app is not handed it, and the record keeps it for the one rule to find", async () => {
   const echo = `Invalid API key ${REAL} (header x-api-key: ${REAL})`;
   const up = upstream((_s, n) =>
     n === 1 ? Response.json({ type: "error", error: { type: "authentication_error", message: echo } }, { status: 403 })
@@ -338,13 +338,13 @@ test("an upstream that echoes the credential back: it is in no record and not in
   // What the app was handed (and may log) for the two bodies the proxy read whole.
   for (const err of [first, second]) expect(`${err.message} ${JSON.stringify(err.error ?? "")}`).not.toContain(REAL);
   expect(String(first.message)).toContain("Invalid API key [redacted credential]");
-  // What was recorded, of all three.
-  const records = JSON.stringify(proxy.turns("t"));
+  // What was recorded is what upstream said, held in memory only. Nothing here cuts the
+  // credential out and keeps the rest: before a trial's content is judged or written it is
+  // searched whole (trial.ts, credentialEchoes) and, found, none of it is written.
   expect(proxy.turns("t").map((t) => t.status)).toEqual([403, 400, 200]);
-  expect(records).not.toContain(REAL);
-  expect(proxy.turns("t")[0]!.error).toBe("authentication_error: Invalid API key [redacted credential] (header x-api-key: [redacted credential])");
-  expect(proxy.turns("t")[1]!.error).toContain("<html>bad gateway for [redacted credential]</html>");
-  expect(proxy.turns("t")[2]!.error).toBe("overloaded_error: overloaded for [redacted credential]");
+  expect(proxy.turns("t")[0]!.error).toBe(`authentication_error: ${echo}`);
+  expect(proxy.turns("t")[1]!.error).toContain(`<html>bad gateway for ${REAL}</html>`);
+  expect(proxy.turns("t")[2]!.error).toBe(`overloaded_error: overloaded for ${REAL}`);
 });
 
 test("resolveUpstream: api.anthropic.com unless --upstream says otherwise; https, or http to this machine only", () => {

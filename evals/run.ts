@@ -15,8 +15,8 @@ import { DEFAULT_UPSTREAM, envFileProblem, noCredential, resolveCredential, reso
 import { DEFAULT_GRADER_MODEL, grader, selftest } from "./grader";
 import { RUBRICS } from "./rubrics";
 import { startProxy } from "./proxy";
-import { caseResult, judge, summarize, table, trialVerdict, type TrialResult } from "./report";
-import { cleanUpNow, runTrial, scrubObservation, startReaper } from "./trial";
+import { caseResult, CREDENTIAL_ECHOED, judge, summarize, table, trialVerdict, type TrialResult } from "./report";
+import { cleanUpNow, credentialEchoes, runTrial, startReaper } from "./trial";
 
 const ROOT = join(import.meta.dir, "..");
 const exit2 = (message: string): never => {
@@ -141,13 +141,24 @@ await Promise.all(
       const name = `${c.suite}/${c.id}`;
       const id = `${c.suite}.${c.id}.${trial}`;
       const run = await runTrial(c, id, { dry: args.dry, model: args.model, proxy, upstream, seq: seq + 1, quietMs: args.dry ? 300 : 1500, deadlineMs: args.dry ? 20_000 : 150_000, log });
-      const checks = await judge(c, run.observation, { dry: args.dry, setupError: run.setupError, grade });
-      const verdict = trialVerdict(checks, args.dry);
-      const passed = verdict === "passed";
       modelSeen ??= run.observation.model.turns.find((t) => t.response?.model)?.response?.model;
       const file = join(outDir, c.id, `${trial}.json`);
       mkdirSync(join(outDir, c.id), { recursive: true });
       const tokens = proxy.tokens(id);
+      // Before anything is judged, derived or written: did the credential come back in
+      // what this trial carried? If so none of its content is kept (trial.ts).
+      const echoed = credentialEchoes(run.observation, credential.secrets());
+      if (echoed.length) {
+        const checks = [{ name: CREDENTIAL_ECHOED, required: true, graded: false, judged: true, pass: false, evidence: `the model credential came back in what the trial carried (${echoed.join(", ")}); this trial's evidence is withheld, whole` }];
+        const withheld = { case: name, why: c.why, trial, verdict: "failed", passed: false, credentialEchoed: true, where: echoed, dry: args.dry, ms: run.ms, tokens, checks, withheld: "the transcript, the observation and every check that would quote them: the credential was in this trial's content, so none of it is written" };
+        writeFileSync(file, clean(JSON.stringify(withheld, null, 2)) + "\n");
+        results.push({ case: name, trial, verdict: "failed", checks, tokens, ms: run.ms, file: shown(file), refused: [], credentialEchoed: echoed });
+        log(`✗ ${name} trial ${trial}: the model credential came back in what the trial carried (${echoed.join(", ")}); its evidence is withheld\n    ${shown(file)}`);
+        continue;
+      }
+      const checks = await judge(c, run.observation, { dry: args.dry, setupError: run.setupError, grade });
+      const verdict = trialVerdict(checks, args.dry);
+      const passed = verdict === "passed";
       const result: TrialResult = { case: name, trial, verdict, checks, tokens, ms: run.ms, file: shown(file), refused: run.observation.runner.refused };
       // What a reader needs first comes first: the verdict and the checks, then the
       // transcript (the model's turns in order), then everything observed.
@@ -156,9 +167,7 @@ await Promise.all(
         checks,
         conversation: c.conversation.map((step, n) => ({ ...step, ...run.observation.steps[n] })),
         transcript: run.observation.model.turns,
-        // A secret cut across a stream's chunks is whole nowhere in the raw calls, so the
-        // text scrub below couldn't find it: scrubObservation takes such a stream's text out.
-        observation: { ...scrubObservation(run.observation, credential.secrets()), model: { toolCalls: run.observation.model.toolCalls } },
+        observation: { ...run.observation, model: { toolCalls: run.observation.model.toolCalls } },
       };
       writeFileSync(file, clean(JSON.stringify(evidence, (_k, v) => (v instanceof RegExp ? String(v) : v), 2)) + "\n");
       results.push(result);
@@ -179,6 +188,7 @@ const summary = summarize({
 });
 await proxy.stop();
 writeFileSync(join(outDir, "summary.json"), clean(JSON.stringify({ ...summary, results: perCase }, null, 2)) + "\n");
+if (summary.credentialEchoed.length) console.error(`eval: the model credential came back in what ${summary.credentialEchoed.length} trial(s) carried (${summary.credentialEchoed.map((t) => `${t.case} trial ${t.trial}`).join(", ")}). Their evidence is withheld and the run fails. Something upstream or in the app repeated it: find out what before running again, and consider the credential exposed to that party`);
 console.log(clean(table(perCase, results, summary)));
 console.log(clean(JSON.stringify(summary)));
 process.exit(summary.ok ? 0 : 1);

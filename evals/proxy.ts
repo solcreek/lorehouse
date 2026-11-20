@@ -18,8 +18,10 @@
 //     ever recorded;
 //   - a redirect from upstream is not followed (the credential would go with it): it is
 //     an upstream error;
-//   - what is recorded, and a non-streamed body handed back, is scrubbed of the
-//     credential, should an upstream ever echo it.
+//   - a non-streamed body handed back to the app is scrubbed of the credential, should an
+//     upstream echo it. What is recorded is kept as upstream said it, in memory only:
+//     the trial's content is searched whole for the credential before any of it is
+//     judged or written (trial.ts, credentialEchoes), and withheld whole if it is there.
 //
 // The budget: once the run's tokens reach `maxTokens` (at or over it), `exceeded()` is
 // true and further model calls are refused (HTTP 400, `x-should-retry: false`, so the SDK
@@ -150,7 +152,7 @@ export function startProxy(opts: ProxyOptions): Proxy {
   // the total can end up over the budget by what those calls cost (at most one per
   // trial running and one for the grader).
   const reached = () => totalTokens(spent) >= opts.maxTokens;
-  // Nothing recorded or handed back holds the credential, whatever upstream said.
+  // Nothing handed back to the app holds the credential, whatever upstream said.
   const clean = (text: string) => scrub(text, opts.credential.secrets());
 
   const refusal = (status: number, type: string, message: string) =>
@@ -195,7 +197,7 @@ export function startProxy(opts: ProxyOptions): Proxy {
         spent = addTokens(spent, response.tokens);
         if (response.error && !error) error = `${response.error.type}: ${response.error.message}`;
       }
-      if (error) turn.error = clean(error);
+      if (error) turn.error = error;
     };
 
     const send = () => {
@@ -245,20 +247,21 @@ export function startProxy(opts: ProxyOptions): Proxy {
 
     const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
     if (!streamed || !upstream.body) {
-      let text: string;
+      let raw: string;
       try {
-        text = clean(await upstream.text());
+        raw = await upstream.text();
       } catch (err) {
         // The body was cut off: the request is over all the same.
         settle(undefined, `upstream's answer (${upstream.status}) was cut off: ${err instanceof Error ? err.message : String(err)}`);
         return refusal(502, "api_error", "eval proxy: the model upstream's answer was cut off");
       }
+      // Recorded as upstream said it; handed to the app scrubbed.
       let parsed: unknown;
       try {
-        parsed = JSON.parse(text);
+        parsed = JSON.parse(raw);
       } catch { /* not JSON */ }
-      settle(parsed === undefined ? undefined : responseFromJson(parsed), parsed === undefined ? `upstream answered ${upstream.status} with a body that isn't JSON: ${text.slice(0, 300)}` : undefined);
-      return new Response(text, { status: upstream.status, headers });
+      settle(parsed === undefined ? undefined : responseFromJson(parsed), parsed === undefined ? `upstream answered ${upstream.status} with a body that isn't JSON: ${raw.slice(0, 300)}` : undefined);
+      return new Response(clean(raw), { status: upstream.status, headers });
     }
 
     // Streamed: each chunk goes to the app as it arrives, and is read here on the way.
@@ -268,7 +271,6 @@ export function startProxy(opts: ProxyOptions): Proxy {
     const finish = (error?: string) => {
       sse.end();
       const response = message.result();
-      if (response.error) response.error.message = clean(response.error.message);
       settle(response, error ?? (response.stopReason === null && !response.error ? "the stream ended before the model said why it stopped" : undefined));
     };
     const stream = new ReadableStream<Uint8Array>({
