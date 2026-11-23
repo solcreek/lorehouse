@@ -23,13 +23,13 @@
     "doctor": "bun src/server.ts doctor"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.131.0",
+    "@anthropic-ai/sdk": "^1.9.0",
     "@junejs/core": "0.2.2",
     "@junejs/pdf": "0.2.2",
     "@junejs/pdf-font-noto-sans-tc": "0.2.2",
     "@junejs/pdf-typst-wasm": "0.2.2",
     "@junejs/server": "0.2.2",
-    "better-sqlite3-multiple-ciphers": "13.0.3",
+    "better-sqlite3-multiple-ciphers": "13.1.1",
     "strongroom": "0.2.0"
   },
   "devDependencies": {
